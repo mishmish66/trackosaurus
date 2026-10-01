@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+*.log
+.pytest_cache/
+.trex_cache/
+demo_runs/
+dist/
+*.egg-info/
+.ruff_cache/
+node_modules/
+.coverage
+.coverage.*
+site/

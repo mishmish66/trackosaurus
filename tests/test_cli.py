@@ -1,0 +1,374 @@
+import io
+import json
+import math
+import re
+import shlex
+import shutil
+import statistics
+import subprocess
+import sys
+import threading
+import time
+from typing import cast
+
+import pytest
+
+import trex
+from trex import query as Q
+from trex.cli import main
+from trex.format import connect_ro
+
+
+@pytest.fixture
+def runs(tmp_path, monkeypatch):
+    """sweep/lr{0.001,0.01}/seed{0,1,2}: loss falls faster with larger lr; seed2 has info notes."""
+    root = tmp_path / "runs"
+    for lr in (0.001, 0.01):
+        for seed in range(3):
+            r = trex.init(root / "sweep" / f"lr{lr}" / f"seed{seed}", config={"lr": lr, "seed": seed, "opt": {"name": "adam"}},
+                          info={"notes": "flaky"} if seed == 2 else None, commit_interval=0.05)
+            for step in range(100):
+                r.log({"loss": 1.0 / (1 + lr * step * (seed + 1)), "acc": step / 100}, step=step)
+            r.log_image("img", b"\x89PNG\r\n\x1a\n" + bytes(8), step=50)
+            r.log_image("img", b"\x89PNG\r\n\x1a\n" + bytes(9), step=99)
+            r.finish()
+    trex.folder_info(root / "sweep", question="does lr matter?")
+    monkeypatch.setenv("TREX_CACHE", str(tmp_path / "cache"))
+    return root
+
+
+def run_json(capsys, *argv):
+    main([*map(str, argv), "--json"])
+    return json.loads(capsys.readouterr().out)
+
+
+def test_ls_filters_sorts_and_limits(runs, capsys):
+    out = run_json(capsys, "ls", runs, "-w", "config.lr=0.01", "-w", "summary.loss<0.4", "--sort", "summary.loss:desc")
+    assert [r["path"] for r in out] == ["sweep/lr0.01/seed1", "sweep/lr0.01/seed2"]
+    assert all(r["config"]["lr"] == 0.01 and r["summary"]["loss"] < 0.6 for r in out)
+    out = run_json(capsys, "ls", runs, "--sort=-summary.loss", "-n", "1")
+    assert out[0]["path"] == "sweep/lr0.001/seed0"
+    assert [r["path"] for r in run_json(capsys, "ls", runs, "-w", "has:info.notes")] == ["sweep/lr0.001/seed2", "sweep/lr0.01/seed2"]
+    assert len(run_json(capsys, "ls", runs, "-w", "path~seed[01]$", "-w", "config.opt/name=adam")) == 4
+    assert run_json(capsys, "ls", runs / "sweep" / "lr0.01")[0]["path"] == "seed0"
+
+
+def test_ls_paths_pipe_into_series_and_diff(runs, capsys, monkeypatch):
+    main(["ls", str(runs), "-w", "config.seed=0", "--paths"])
+    paths = capsys.readouterr().out
+    assert len(paths.split()) == 2
+    monkeypatch.setattr("sys.stdin", io.StringIO(paths))
+    rows = run_json(capsys, "series", "-", "-k", "loss", "--last", "1")
+    assert [(r["run"], r["step"]) for r in rows] == [("seed0", 99.0), ("seed0", 99.0)]
+    monkeypatch.setattr("sys.stdin", io.StringIO(paths))
+    assert run_json(capsys, "diff", "-") == [{"key": "lr", "lr0.001/seed0": 0.001, "lr0.01/seed0": 0.01}]
+
+
+def test_groups_report_center_and_order_statistic_ci(runs, capsys):
+    out = run_json(capsys, "groups", runs / "sweep", "-g", "subfolder", "-m", "loss")
+    assert [g["subfolder"] for g in out] == ["lr0.001", "lr0.01"]
+    for g in out:
+        lr = float(g["subfolder"][2:])
+        vals = sorted(1.0 / (1 + lr * 99 * (s + 1)) for s in range(3))
+        st = g["loss:stats"]
+        assert g["runs"] == 3 and st["median"] == pytest.approx(statistics.median(vals))
+        assert (st["ci_lo"], st["ci_hi"]) == pytest.approx((vals[0], vals[-1]))
+        assert st["ci_coverage"] == pytest.approx(0.75)
+    at = run_json(capsys, "groups", runs, "-g", "config.lr", "-m", "loss", "--at", "10", "--center", "mean")
+    g = next(g for g in at if g["config.lr"] == 0.01)
+    vals = [1.0 / (1 + 0.01 * 10 * (s + 1)) for s in range(3)]
+    assert g["loss"] == pytest.approx(statistics.mean(vals))
+    assert g["loss:stats"]["ci_hi"] - g["loss"] == pytest.approx(4.303 * statistics.stdev(vals) / math.sqrt(3))
+
+
+def test_keys_lists_metrics_and_media(runs, capsys):
+    out = run_json(capsys, "keys", runs)
+    assert {(k["key"], k["kind"], k["runs"]) for k in out} == {("loss", "metric", 6), ("acc", "metric", 6), ("img", "image", 6)}
+
+
+def test_show_tail_media_and_tree(runs, capsys):
+    run = runs / "sweep" / "lr0.01" / "seed2"
+    s = run_json(capsys, "show", run)
+    assert s["info"] == {"notes": "flaky"} and s["keys"]["loss"]["points"] == 100 and s["rows"] == 100
+    assert s["folders"][-1]["info"] == {"question": "does lr matter?"}
+    main(["tail", str(run), "-n", "2", "-k", "acc", "--format", "jsonl"])
+    assert [json.loads(l)["seq"] for l in capsys.readouterr().out.split()] == [98, 99]
+    media = run_json(capsys, "media", run, "--latest")
+    assert [(m["key"], m["step"]) for m in media] == [("img", 99.0)] and media[0]["file"].endswith(".png")
+    tree = run_json(capsys, "tree", runs)
+    (sweep,) = tree["dirs"]
+    assert (sweep["runs"], sweep["states"], sweep["info"]) == (6, {"finished": 6}, {"question": "does lr matter?"})
+
+
+def test_series_downsampling_and_smoothing_match_query_helpers(runs, capsys):
+    run = runs / "sweep" / "lr0.01" / "seed0"
+    rows = run_json(capsys, "series", run, "-k", "loss", "--points", "5", "--smooth", "0.9")
+    assert [r["step"] for r in rows] == [0, 25, 50, 74, 99]
+    xs = list(range(100))
+    ys = [1.0 / (1 + 0.01 * s) for s in xs]
+    sm = Q.twema(xs, ys, 0.9, Q.smooth_scale(99))
+    assert [r["smoothed"] for r in rows] == pytest.approx([sm[i] for i in (0, 25, 50, 74, 99)])
+
+
+def test_table_output_is_aligned_text(runs, capsys):
+    main(["ls", str(runs), "-c", "config.lr"])
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["path", "state", "step", "runtime", "config.lr"] and len(lines) == 7
+
+
+def test_refuses_to_index_home(capsys):
+    with pytest.raises(SystemExit):
+        main(["ls", "~"])
+
+
+@pytest.mark.parametrize("expr,rec,want", [
+    ("config.lr>=0.01", {"config": {"lr": 0.01}}, True),
+    ("config.lr>0.01", {"config": {"lr": 0.01}}, False),
+    ("config.lr!=0.01", {"config": {}}, True),
+    ("config.lr=0.01", {"config": {}}, False),
+    ("config.flag=true", {"config": {"flag": True}}, True),
+    ("config.name~^ad", {"config": {"name": "adam"}}, True),
+    ("config.name!~^ad", {"config": {"name": "adam"}}, False),
+    ("summary.loss<1", {"summary": {"loss": "NaN"}}, False),
+    ("!has:info.notes", {"info": {}}, True),
+    ("state=running", {"state": "running"}, True),
+])
+def test_filter_semantics(expr, rec, want):
+    full = cast(Q.Record, {"config": {}, "summary": {}, "info": {}, **rec})
+    assert Q.parse_filter(expr)(full) is want
+
+
+def test_median_ci_rank_matches_exact_binomial_coverage():
+    for n in range(1, 60):
+        k = Q.median_ci_rank(n)
+        cov = 1 - 2 * sum(math.comb(n, j) for j in range(k)) / 2**n
+        better = 1 - 2 * sum(math.comb(n, j) for j in range(k + 1)) / 2**n
+        assert (cov >= 0.95 or k == 1) and not (better >= 0.95 and k + 1 <= n // 2)
+
+
+@pytest.fixture
+def mixed(tmp_path):
+    """One run written in three sessions (one commit each): every step logs a train row {loss, acc};
+    even steps 0..8 also log an eval row {loss, eval/score} at the same step. Runtime equals step."""
+    path = tmp_path / "mixed"
+    expected = []
+    for steps in (range(0, 5), range(5, 10), range(10, 11)):
+        r = trex.init(path, commit_interval=60)
+        for s in steps:
+            r.log({"loss": float(s), "acc": s / 10}, step=s, timestamp=r.created + s)
+            expected.append((float(s), {"loss": float(s), "acc": s / 10}))
+            if s % 2 == 0 and s < 10:
+                r.log({"loss": -float(s), "eval/score": 100.0 + s}, step=s, timestamp=r.created + s)
+                expected.append((float(s), {"loss": -float(s), "eval/score": 100.0 + s}))
+        r.finish()
+    c = connect_ro(path)
+    assert c.execute("SELECT count(*) FROM rowmeta").fetchone()[0] == 3
+    c.close()
+    return path, expected
+
+
+def test_series_returns_each_keys_points_in_row_order_across_commits_of_mixed_rows(mixed, capsys):
+    path, expected = mixed
+    rows = run_json(capsys, "series", path, "-k", "loss", "-k", "eval/score", "-k", "absent")
+    for key in ("loss", "eval/score"):
+        want = [(s, d[key]) for s, d in expected if key in d]
+        assert [(r["step"], r["value"]) for r in rows if r["key"] == key] == want
+    assert not [r for r in rows if r["key"] == "absent"]
+    xs, ys = Q.series(path, ["loss"], x="runtime")["loss"]
+    assert list(xs) == pytest.approx([s for s, d in expected])
+    assert list(ys) == [d["loss"] for _, d in expected]
+
+
+def test_tail_last_rows_span_a_commit_boundary(mixed, capsys):
+    path, expected = mixed
+    main(["tail", str(path), "-n", "3", "--format", "jsonl"])
+    got = [json.loads(l) for l in capsys.readouterr().out.split()]
+    n = len(expected)
+    assert [r["seq"] for r in got] == [n - 3, n - 2, n - 1]
+    for r, (step, d) in zip(got, expected[-3:]):
+        assert r["step"] == step and r["runtime"] == pytest.approx(step)
+        assert {k: v for k, v in r.items() if k not in ("seq", "step", "runtime")} == d
+    main(["tail", str(path), "-n", "3", "-k", "acc", "--format", "jsonl"])
+    got = [json.loads(l) for l in capsys.readouterr().out.split()]
+    assert [r["seq"] for r in got] == [n - 3, n - 2, n - 1]
+    assert [r.get("acc") for r in got] == [d.get("acc") for _, d in expected[-3:]]
+
+
+def test_read_rows_from_mid_commit_start_matches_logged_rows(mixed):
+    path, expected = mixed
+    rows = Q.read_rows(path, start=3)
+    assert [r[0] for r in rows] == list(range(3, len(expected)))
+    assert [(r[1], r[3]) for r in rows] == expected[3:]
+
+
+def test_show_reports_point_counts_and_last_values_of_mixed_rows(mixed, capsys):
+    path, expected = mixed
+    s = run_json(capsys, "show", path)
+    assert (s["rows"], s["step"]) == (len(expected), 10.0)
+    assert s["runtime"] == pytest.approx(10.0)
+    assert s["keys"] == {
+        "acc": {"points": 11, "first_step": 0.0, "last_step": 10.0, "last": 1.0},
+        "eval/score": {"points": 5, "first_step": 0.0, "last_step": 8.0, "last": 108.0},
+        "loss": {"points": 16, "first_step": 0.0, "last_step": 10.0, "last": 10.0},
+    }
+
+
+def text_of(capsys, *argv):
+    main([*map(str, argv)])
+    return capsys.readouterr()
+
+
+@pytest.mark.parametrize("argv", [
+    ("ls", "{runs}", "-c", "config.lr"), ("keys", "{runs}"), ("tree", "{runs}", "--runs"), ("show", "{run}"),
+    ("groups", "{runs}", "-g", "config.lr", "-m", "loss"), ("series", "{run}", "-k", "loss", "--last", "3"),
+    ("tail", "{run}", "-n", "3"), ("media", "{run}"), ("diff", "{run}", "{other}"), ("index", "{runs}"),
+])
+def test_piped_text_output_has_no_color_codes_or_trailing_spaces(runs, capsys, argv):
+    run, other = runs / "sweep" / "lr0.01" / "seed0", runs / "sweep" / "lr0.001" / "seed0"
+    out = text_of(capsys, *(a.format(runs=runs, run=run, other=other) for a in argv)).out
+    assert out and "\x1b[" not in out
+    assert not [line for line in out.splitlines() if line != line.rstrip()]
+
+
+def test_groups_table_goes_to_stdout_and_the_ci_note_to_stderr(runs, capsys):
+    res = text_of(capsys, "groups", runs, "-g", "config.lr", "-m", "loss", "--reduce", "max")
+    header, *rows = res.out.splitlines()
+    assert header.split() == ["config.lr", "runs", "loss", "loss:ci", "loss:range", "loss:n"] and len(rows) == 2
+    assert "max over the run" in res.err and "n=3: 75.0%" in res.err
+    assert [r.split()[2] for r in rows] == ["1", "1"]
+
+
+def test_groups_without_metrics_count_runs_per_group(runs, capsys):
+    out = run_json(capsys, "groups", runs, "-g", "subfolder")
+    assert [(g["subfolder"], g["runs"]) for g in out] == [("sweep", 6)]
+
+
+def test_show_lists_media_and_folder_notes(runs, capsys):
+    out = text_of(capsys, "show", runs / "sweep" / "lr0.01" / "seed2").out
+    assert "img [image] 2 items, steps 50..99" in out
+    assert "folder info" in out and "question: does lr matter?" in out
+
+
+def test_diff_compares_info_and_lists_equal_keys_with_all(runs, capsys):
+    a, b = runs / "sweep" / "lr0.01" / "seed2", runs / "sweep" / "lr0.01" / "seed0"
+    assert run_json(capsys, "diff", a, b, "--info") == [{"key": "notes", "seed2": "flaky", "seed0": None}]
+    assert {r["key"] for r in run_json(capsys, "diff", a, b, "--all")} == {"lr", "seed", "opt/name"}
+
+
+def test_tail_follow_streams_new_rows_until_the_run_ends(tmp_path, capsys):
+    run = trex.init(tmp_path / "live", commit_interval=0.02)
+    run.log({"loss": 0.0}, step=0)
+    time.sleep(0.2)
+
+    def write():
+        for s in range(1, 4):
+            time.sleep(0.1)
+            run.log({"loss": float(s)}, step=s)
+        time.sleep(0.1)
+        run.finish()
+
+    t = threading.Thread(target=write)
+    t.start()
+    res = text_of(capsys, "tail", tmp_path / "live", "-n", "1", "-f", "--interval", "0.05", "--timeout", "20")
+    t.join()
+    lines = res.out.splitlines()
+    assert lines[0].split() == ["seq", "step", "runtime", "loss"] and lines[1].split()[:2] == ["0", "0"]
+    assert [l.split()[1] for l in lines[2:]] == ["step=1", "step=2", "step=3"]
+    assert "is finished" in res.err
+
+
+def test_tail_follow_of_a_finished_run_returns(runs, capsys):
+    res = text_of(capsys, "tail", runs / "sweep" / "lr0.01" / "seed0", "-n", "0", "-f", "--interval", "0.01")
+    assert res.out == "" and "is finished" in res.err
+
+
+def test_index_reports_run_counts_by_state(runs, capsys):
+    out = run_json(capsys, "index", runs)
+    assert (out[0]["runs"], out[0]["states"]) == (6, {"finished": 6})
+
+
+def test_short_sort_flag_takes_a_descending_field(runs, capsys):
+    out = run_json(capsys, "ls", runs, "-s", "-summary.loss", "-n", "1")
+    assert out[0]["path"] == "sweep/lr0.001/seed0"
+
+
+@pytest.mark.parametrize("argv,message", [
+    (("ls", "{runs}", "-w", "config.lr"), "trex ls: bad filter"),
+    (("ls", "{runs}", "--name", "("), "trex ls:"),
+    (("series", "{run}"), "give --key"),
+    (("series", "{runs}", "-k", "loss"), "not a run directory"),
+    (("diff", "{run}"), "at least two runs"),
+    (("ls", "{runs}/missing"), "does not exist"),
+    (("ls", "{run}", "--root", "{other}"), "is not under --root"),
+])
+def test_bad_input_exits_with_a_message_naming_the_command(runs, capsys, argv, message):
+    run, other = runs / "sweep" / "lr0.01" / "seed0", runs / "sweep" / "lr0.001"
+    with pytest.raises(SystemExit) as e:
+        main([a.format(runs=runs, run=run, other=other) for a in argv])
+    assert e.value.code != 0
+    err = capsys.readouterr().err + str(e.value.code)
+    assert message in err
+
+
+def test_unknown_options_are_usage_errors(capsys):
+    with pytest.raises(SystemExit) as e:
+        main(["ls", "--bogus"])
+    assert e.value.code == 2 and "--bogus" in re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().err)
+
+
+RECORD = cast(Q.Record, {"path": "a/r", "name": "r", "state": "finished", "config": {"lr": 0.1, "both": "config", "opt/name": "adam"},
+                         "summary": {"loss": "NaN", "both": 2.0, "acc": 0.5}, "info": {"git": {"sha": "abc"}, "a.b": 1}})
+
+
+@pytest.mark.parametrize("field,want", [
+    ("lr", 0.1), ("both", "config"), ("acc", 0.5), ("missing", None), ("opt/name", "adam"),
+    ("config.lr", 0.1), ("c.lr", 0.1), ("summary.acc", 0.5), ("s.both", 2.0), ("m.missing", None),
+    ("info.git.sha", "abc"), ("info.a.b", 1), ("info.git.nope", None), ("state", "finished"),
+])
+def test_fields_resolve_config_first_then_summary_with_prefixes_and_nested_info(field, want):
+    assert Q.get(RECORD, field) == want
+
+
+def test_summary_markers_are_numbers():
+    assert str(Q.get(RECORD, "loss")) == "nan" and Q.num("-Infinity") == -math.inf and Q.num("abc") is None and Q.num(True) == 1.0
+
+
+@pytest.mark.parametrize("expr,want", [("name>q", True), ("name<q", False), ("name>=r", True), ("config.both<d", True)])
+def test_text_values_compare_lexically(expr, want):
+    assert Q.parse_filter(expr)(RECORD) is want
+
+
+def test_statistics_and_reductions_of_series_without_finite_values():
+    assert Q.stats([None, math.nan]) == {"n": 0}
+    assert Q.reduce([0.0, 1.0], [math.nan, math.inf], "mean") is None
+    assert Q.reduce([5.0, 6.0], [1.0, 2.0], "last", at=4.0) is None
+    assert Q.twema([0.0, 1.0, 2.0], [1.0, math.nan, None], 0.9, 1.0)[1:] == pytest.approx([math.nan, None], nan_ok=True)
+
+
+def test_folder_notes_run_from_the_root_down_and_skip_unreadable_files(tmp_path):
+    run = tmp_path / "a" / "b" / "r"
+    run.mkdir(parents=True)
+    (tmp_path / "trex_info.json").write_text('{"level": 0}')
+    (tmp_path / "a" / "trex_info.json").write_text("{broken")
+    (tmp_path / "a" / "b" / "trex_info.json").write_text('{"level": 2}')
+    assert [i for _, i in Q.folder_infos(run, tmp_path)] == [{"level": 0}, {"level": 2}]
+    assert [i for _, i in Q.folder_infos(run, tmp_path / "a" / "b")] == [{"level": 2}]
+
+
+def test_systemd_unit_runs_this_trex_and_restarts_it_after_an_update(capsys, tmp_path):
+    main(["systemd-unit", "--host", "127.0.0.1", "--port", "9000", "--source", "git+https://example.org/trex"])
+    unit = capsys.readouterr().out
+    lines = set(unit.splitlines())
+    assert f"ExecStart={shlex.join([sys.executable, '-m', 'trex', 'daemon', '--host', '127.0.0.1', '--port', '9000'])}" in lines
+    assert {"Environment=TREX_SOURCE=git+https://example.org/trex", "SuccessExitStatus=75", "RestartForceExitStatus=75",
+            "Restart=on-failure", "WantedBy=default.target"} <= lines
+    if shutil.which("systemd-analyze"):
+        (tmp_path / "trex.service").write_text(unit)
+        res = subprocess.run(["systemd-analyze", "verify", str(tmp_path / "trex.service")], capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+
+
+def test_systemd_unit_without_a_source_has_no_update_source(capsys, monkeypatch):
+    monkeypatch.delenv("TREX_SOURCE", raising=False)
+    main(["systemd-unit"])
+    assert "TREX_SOURCE" not in capsys.readouterr().out.split("[Unit]")[1]

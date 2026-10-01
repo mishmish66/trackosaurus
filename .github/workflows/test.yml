@@ -1,0 +1,40 @@
+# One Linux job on the oldest supported Python. Docs-only changes skip it, and a newer push cancels
+# the run it supersedes. The browser smoke test needs Chromium and a GPU, so it runs locally.
+name: test
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  pull_request:
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: uv sync --locked
+      - run: npm ci
+      - run: uv run pyright
+      - run: uv run pytest -q --cov
+      - run: >-
+          node --test --experimental-test-coverage --test-coverage-include='trex/static/**'
+          --test-coverage-lines=95 --test-coverage-branches=85 tests/*.test.mjs

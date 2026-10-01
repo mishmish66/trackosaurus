@@ -1,0 +1,65 @@
+[project]
+name = "trex"
+version = "0.1.0"
+description = "trackosaurus exp: a fast, file-based experiment tracker and explorer"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "LicenseRef-VibeCoded-AI-Slop-1.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "numpy>=1.24",
+    "typer>=0.27.2",
+]
+keywords = ["experiment tracking", "machine learning", "sqlite", "visualization"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Source = "https://github.com/mishmish66/trackosaurus"
+Documentation = "https://mishmish66.github.io/trackosaurus/"
+
+[project.scripts]
+trex = "trex.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pyright",
+    "radon",
+    "pytest-cov",
+    "pdoc>=16.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["trex"]
+
+[tool.hatch.build.targets.sdist]
+include = ["trex", "tests", "examples", "docs", "README.md", "AGENTS.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["trex"]
+branch = true
+patch = ["subprocess"]  # measure the `trex` processes tests start
+
+[tool.coverage.report]
+fail_under = 94
+show_missing = true
+skip_covered = true
+exclude_also = ['if __name__ == "__main__":', "if TYPE_CHECKING:", 'if sys.byteorder != "little":', 'raise AssertionError\("unreachable"\)']
+
+[tool.pyright]
+include = ["trex", "tests", "examples", "docs"]
+exclude = ["tests/browser_smoke.py"]  # needs playwright: `uv run --with playwright`
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+strict = ["trex/writer.py", "trex/media.py", "trex/format.py", "trex/chunks.py", "trex/tiles.py"]

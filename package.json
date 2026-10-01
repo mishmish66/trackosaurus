@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Dev tooling for the trex UI tests; the UI itself has no dependencies or build step.",
+  "scripts": { "test": "node --test tests/*.test.mjs" },
+  "devDependencies": { "eslint": "^9.36.0" }
+}
