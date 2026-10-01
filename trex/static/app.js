@@ -24,6 +24,9 @@ const h = (tag, attrs = {}, ...kids) => {
 const esc = (s) => String(s ?? "");
 const opt = (value, text, sel) => h("option", { value, textContent: text, selected: sel });
 
+/** [user@]host:path in scp form; its first group is the host. */
+const REMOTE = /^((?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s[\]]+)):(.+)$/;
+
 /** The last `n` characters of `s`, after an ellipsis when cut. */
 const tailOf = (s, n) => (s.length > n ? `…${s.slice(1 - n)}` : s);
 
@@ -377,19 +380,22 @@ class App {
   /** Daemon directories: open one, stop serving one (×), or add one by path or from the remembered ones.
    * `refresh` redraws the panel. */
   daemonPanel(d, refresh) {
-    const err = h("div", { className: "merr" });
+    const err = h("div", { className: "merr" }), note = h("div", { className: "mhint" });
     const add = async (path) => {
-      err.textContent = "";
+      const host = REMOTE.exec(path.trim())?.[1];
+      [err.textContent, note.textContent] = ["", host ? `starting trex on ${host}…` : ""];
       const r = await fetch("/api/daemon/add", { method: "POST", body: JSON.stringify({ path: path.trim() }) });
       const j = await r.json();
+      note.textContent = "";
       if (r.ok) location.href = j.url;
       else err.textContent = j.error;
     };
-    const input = h("input", { type: "text", placeholder: "/path/to/runs or ~/runs", spellcheck: false,
+    const input = h("input", { type: "text", placeholder: "/path/to/runs, ~/runs or host:path", spellcheck: false,
       onkeydown: (e) => e.key === "Enter" && add(input.value) });
     const served = d.roots.map((r) => h("div", { className: "mrow" },
-      h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.root, onclick: () => (location.href = r.url) },
-        h("span", { className: "ml", textContent: r.name }), h("span", { className: "ms", textContent: tailOf(r.root, 36) })),
+      h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || r.root, onclick: () => (location.href = r.url) },
+        h("span", { className: "ml", textContent: r.name }),
+        h("span", { className: "ms", textContent: tailOf(r.root, 36) + (r.state === "local" || r.state === "connected" ? "" : ` · ${r.state}`) })),
       h("button", { className: "chev", textContent: "×", title: "stop serving this directory (its files are kept)",
         onclick: () => this.removeRoot(r, refresh) })));
     const recent = d.history.map((path) => h("button", { className: "mitem", title: `serve ${path}`, onclick: () => add(path) },
@@ -401,7 +407,7 @@ class App {
     return h("div", { className: "dpanel" },
       h("div", { className: "mtitle", textContent: "trex daemon" }),
       served.length ? h("div", { className: "mlist" }, ...served) : h("div", { className: "mhint", textContent: "no directories served" }),
-      h("div", { className: "madd" }, input, h("button", { textContent: "add", onclick: () => add(input.value) })), err,
+      h("div", { className: "madd" }, input, h("button", { textContent: "add", onclick: () => add(input.value) })), note, err,
       recent.length ? h("div", { className: "mrecent" }, h("div", { className: "mtitle", textContent: "recent" }),
         h("div", { className: "mlist" }, ...recent), h("button", { className: "mclear", textContent: "clear history", onclick: clear })) : null,
       this.versionRow(d, err));

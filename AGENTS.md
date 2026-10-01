@@ -15,12 +15,14 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/index.py` | `Explorer`: crawl, per-run scans (inline or process pool), index cache, top tiles, on-demand finer tiles with a size-bounded cache, event hub |
 | `trex/server.py` | read-only HTTP + SSE for the UI: `/api/runs`, `/api/tiles`, `/api/rows`, `/api/stream`, media |
 | `trex/daemon.py` | `trex daemon`: `Roots` (directories by name in `roots.json`, remembered ones in `history.json`), the Unix control socket, its client |
+| `trex/remote.py` | `host:path` directories: `parse`, the ssh + `uvx` command, `Remote` (one ssh session, reconnected with backoff) |
 | `trex/update.py` | the daemon's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd to restart it |
 | `trex/query.py` | read-side queries for the CLI: records, filters, sorting, statistics, series |
 | `trex/cli.py` | `trex` command (Typer): `serve daemon systemd-unit ls groups keys tree show series tail media diff index` |
 | `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (tile store, scheduler, IndexedDB, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (columns, smoothing, decimation, group stats, CRC-32); `index.html` |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/`; the user guide is the `trex` and `trex.daemon` docstrings (Markdown) |
+| `docs/media/` | the README's and docs' screenshot and video tour (left out of the sdist) |
 | `tests/` | pytest suites (`test_processes.py` runs real `trex` processes), the node kernel tests, and the browser smoke test |
 
 Runtime dependencies: Python ≥ 3.12, numpy, and Typer for the CLI (ffmpeg only to log frame arrays
@@ -62,7 +64,8 @@ them WebGL falls back to software and timings mean nothing.
   or crash. The index never holds a full copy of the data.
 - **Server**: `/api/tiles` answers `[run, key, "top" | "overview"]` from the index and
   `[run, key, level, index]` by building the tile from the run file, cached in the index up to
-  `TREX_TILE_CACHE_MB` (least recently used evicted). A cached tile stays valid while later rows
+  `TREX_TILE_CACHE_MB` across all of a process's Explorers (`TileBudget`; least recently used
+  evicted). A cached tile stays valid while later rows
   lie beyond its step range. `/api/tiles/bundle` answers one kept tier of one metric for every run
   of a folder in one indexed read.
 - **Daemon**: one server, one `Explorer` per directory. A directory's URLs are its standalone URLs
@@ -71,6 +74,11 @@ them WebGL falls back to software and timings mean nothing.
   added over the control socket (mode 0600) or HTTP and removed over HTTP. An update installs
   `$TREX_SOURCE` and exits with `update.RESTART_STATUS`; the unit's `RestartForceExitStatus` restarts
   it, and the UI reloads once `/api/daemon` reports the new install (`update.RUNNING`, read at start).
+  A removed directory's `Explorer` is closed (`Explorer.close`). A `host:path` directory is a `Remote`:
+  one `ssh -L <local socket>:<remote socket> host uvx --from <source>@<this commit> trex serve PATH --unix
+  <remote socket> --exit-on-eof`, and `Handler._proxy` passes its `/r/<name>/` requests (the stream too)
+  to the local socket; the remote server ends when the session's stdin closes. Tests use a fake `ssh`
+  and `uvx` (`tests/test_remote.py`).
 - **Browser** (`data.js`): visible charts state what they show (`plan`). Each run needs buckets
   about `LINE_PX_PER_BUCKET` wide on screen (`DENSITY_PX_PER_BUCKET` in a density heatmap),
   within a point budget per chart. Charts with many runs start from overview tiles and fetch top
@@ -106,6 +114,9 @@ them WebGL falls back to software and timings mean nothing.
     `Col.ensureSmooth`, `plot.js` `smoothScale`, `query.py` `twema`/`smooth_scale`;
   - group statistics (order-statistic median CI, Student-t mean CI): `kernel.js` `agg` /
     `medianCiRank`, `plot.js` `bandOf`, `query.py` `stats`.
+- **Other sites cannot use the server.** `Handler._refusal` answers only requests whose Host is an
+  IP address, `localhost`, this machine's name or an `--allow-host` name (DNS rebinding), and
+  refuses a POST whose Origin is not its Host. The UI sends no cross-origin requests.
 - **Writer never crashes training.** Errors in the commit thread are recorded and raised from
   `finish()`, not from `log()`. Media files are written (temp name, then rename) before the row
   that references them commits.

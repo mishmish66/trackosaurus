@@ -1,7 +1,10 @@
+import http.client as http_client
 import json
 import socket
 import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
@@ -239,3 +242,71 @@ def test_standalone_server_refuses_daemon_changes(tmp_path, dirs):
             assert post_status(f"{url}/api/daemon/{path}", body)[0] == 404
     finally:
         srv.shutdown()
+
+
+def raw(url, method="GET", headers=None, body=None):
+    """(status, JSON body) of a request with exactly these headers."""
+    parts = urllib.parse.urlsplit(url)
+    conn = http_client.HTTPConnection(parts.hostname, parts.port)
+    try:
+        conn.putrequest(method, parts.path, skip_host=True)
+        for k, v in (headers or {}).items():
+            conn.putheader(k, v)
+        conn.putheader("Content-Length", str(len(body or b"")))
+        conn.endheaders(body)
+        r = conn.getresponse()
+        return r.status, json.loads(r.read() or b"null")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("host", ["evil.example.com", "evil.example.com:80", "localhost.evil.example.com"])
+def test_requests_addressed_to_unknown_host_names_are_refused(http, host):
+    status, body = raw(f"{http}/api/daemon", headers={"Host": host})
+    assert status == 403 and "--allow-host" in body["error"]
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1:{port}", "[::1]:{port}", "localhost:{port}", "app.localhost:{port}",
+                                  "{hostname}:{port}", "100.64.0.9:{port}"])
+def test_requests_by_address_localhost_or_machine_name_are_served(http, host):
+    port = urllib.parse.urlsplit(http).port
+    status, body = raw(f"{http}/api/daemon", headers={"Host": host.format(port=port, hostname=socket.gethostname())})
+    assert status == 200 and body["daemon"]
+
+
+def test_allowed_host_names_are_served(roots):
+    srv = server.serve(None, "127.0.0.1", 0, roots, allow=["Box.Tailnet.ts.net"])
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        assert raw(f"http://127.0.0.1:{srv.server_address[1]}/api/daemon", headers={"Host": "box.tailnet.ts.net"})[0] == 200
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize("origin", ["https://evil.example.com", "http://127.0.0.1:1", "null"])
+def test_changes_posted_from_another_origin_are_refused(roots, dirs, http, origin):
+    host = urllib.parse.urlsplit(http).netloc
+    status, body = raw(f"{http}/api/daemon/add", "POST", {"Host": host, "Origin": origin}, json.dumps({"path": str(dirs[0])}).encode())
+    assert status == 403 and roots.served() == []
+
+
+def test_changes_from_the_ui_itself_or_without_an_origin_are_allowed(roots, dirs, http):
+    host = urllib.parse.urlsplit(http).netloc
+    body = json.dumps({"path": str(dirs[0])}).encode()
+    assert raw(f"{http}/api/daemon/add", "POST", {"Host": host, "Origin": f"http://{host}"}, body)[0] == 200
+    assert raw(f"{http}/api/daemon/add", "POST", {"Host": host}, json.dumps({"path": str(dirs[1])}).encode())[0] == 200
+    assert len(roots.served()) == 2
+
+
+def test_daemon_directories_share_one_tile_budget(roots, dirs):
+    a, b = (roots.get(roots.add(d)) for d in dirs)
+    assert a.budget is b.budget is roots.budget and roots.budget.members == [a, b]
+    roots.remove("runs")
+    assert wait_closed(a) and roots.budget.members == [b]
+
+
+def wait_closed(ex, timeout=10.0):
+    end = time.time() + timeout
+    while not ex._closed and time.time() < end:
+        time.sleep(0.02)
+    return ex._closed

@@ -11,7 +11,8 @@ from trex import chunks, tiles
 def db(tmp_path):
     c = sqlite3.connect(tmp_path / "r.sqlite", isolation_level=None)
     c.executescript(chunks.SCHEMA)
-    return c
+    yield c
+    c.close()
 
 
 def write_commits(c, commits):
@@ -169,3 +170,12 @@ def test_coarsening_past_the_top_level_is_an_error():
     blob = tiles.build(np.arange(10.0), np.arange(10.0), np.arange(10.0), tiles.MAX_LEVEL, 0)
     with pytest.raises(ValueError, match="out of range"):
         tiles.coarsen([blob], 1)
+
+
+@pytest.mark.parametrize("k", range(-19, 60, 3))
+def test_tiles_of_the_span_level_are_the_narrowest_at_least_the_span_wide(k):
+    base = 2.0 ** k * tiles.TILE
+    for span in (base, math.nextafter(base, math.inf), math.nextafter(base, 0), base * 1.5):
+        level = tiles.level_for(span)
+        assert 2.0 ** level * tiles.TILE >= span > 2.0 ** (level - 1) * tiles.TILE
+        assert len(tiles.covering(level, 3 * base - span / 2, 3 * base + span / 2)) <= 2

@@ -9,6 +9,10 @@ As a systemd user service:
     loginctl enable-linger "$USER"
 
 With `--source`, the UI's update button installs the newest trex and systemd restarts the daemon on it.
+
+A directory added as `host:path` (in the UI or with `trex serve host:path`) is served from that machine
+over ssh: the daemon runs this trex there with uvx (`trex.remote`), so the machine needs only uv and an
+ssh key that works without a prompt.
 """
 
 import json
@@ -22,7 +26,9 @@ from pathlib import Path
 from typing import Final, TypedDict, cast
 from urllib.parse import quote
 
-from .index import Explorer
+from . import remote
+from .index import Explorer, TileBudget
+from .remote import Remote
 
 TIMEOUT: Final = 60.0  # seconds a client waits for the daemon's reply
 HISTORY_MAX: Final = 50  # directories remembered for re-adding
@@ -30,8 +36,10 @@ HISTORY_MAX: Final = 50  # directories remembered for re-adding
 
 class RootInfo(TypedDict):
     name: str
-    root: str
+    root: str  # a local path, or host:path
     url: str
+    state: str  # local, or a remote directory's connection state
+    error: str
 
 
 def state_dir() -> Path:
@@ -53,15 +61,17 @@ def root_url(name: str) -> str:
 
 
 class Roots:
-    """Runs directories served by the daemon, by name, each with its own polling Explorer; saved to `state`.
-    Every directory added or removed is remembered, most recent first, in history.json beside it."""
+    """Runs directories served by the daemon, by name: local ones each with a polling Explorer, remote ones
+    (host:path) each with a `Remote`; saved to `state`. Every directory added or removed is remembered, most
+    recent first, in history.json beside it."""
 
     def __init__(self, cache: Path, state: Path) -> None:
         self.cache = cache
         self.state = state
         self.history_path = state.with_name("history.json")
         self.lock = threading.Lock()
-        self.explorers: dict[str, Explorer] = {}
+        self.entries: dict[str, Explorer | Remote] = {}
+        self.budget = TileBudget()
         try:
             saved = json.loads(self.history_path.read_text())
         except (FileNotFoundError, ValueError):
@@ -75,67 +85,98 @@ class Roots:
         except FileNotFoundError:
             return
         for e in saved if isinstance(saved, list) else []:
-            root = Path(str(e.get("root", "")))
-            if root.is_dir():
-                self.add(root, str(e.get("name") or root.name))
+            spec, name = str(e.get("root", "")), e.get("name")
+            if remote.parse(spec):
+                self.add_remote(spec, name, wait=False)
+            elif Path(spec).is_dir():
+                self.add(Path(spec), str(name or Path(spec).name))
             else:
-                print(f"[trex] skipping saved directory {root}: not a directory", file=sys.stderr, flush=True)
+                print(f"[trex] skipping saved directory {spec}: not a directory", file=sys.stderr, flush=True)
 
     def add(self, root: Path, name: str | None = None) -> str:
         """Name of the served directory `root`, starting to serve it if new."""
         root = root.resolve()
         with self.lock:
-            for n, ex in self.explorers.items():
-                if ex.root == root:
-                    return n
+            if (n := self._named(str(root))) is not None:
+                return n
             name = self._free_name(name or root.name)
-            ex = Explorer(root, self.cache)
-            threading.Thread(target=ex.poll_forever, name=f"trex-poll-{name}", daemon=True).start()
-            self.explorers[name] = ex
-            self._remember(root)
+            self.entries[name] = Explorer(root, self.cache, budget=self.budget).start()
+            self._remember(str(root))
             self._save()
         return name
 
+    def add_remote(self, spec: str, name: str | None = None, wait: bool = True) -> str:
+        """Name of the served remote directory `spec` (host:path), starting it if new. With `wait`, wait for
+        its first start, and raise ValueError (forgetting it) if that fails."""
+        addr = remote.parse(spec)
+        if addr is None:
+            raise ValueError(f"{spec} is not a host:path address")
+        spec = f"{addr.host}:{addr.path}"
+        with self.lock:
+            if (n := self._named(spec)) is not None:
+                return n
+        r = Remote(spec, addr).start()
+        if wait and r.settled.wait(remote.ADD_TIMEOUT) and r.state == "unreachable":
+            r.close()
+            raise ValueError(f"cannot serve {spec}: {r.error}")
+        with self.lock:
+            if (n := self._named(spec)) is not None:
+                r.close()
+                return n
+            name = self._free_name(name or f"{Path(addr.path).name or addr.path}@{addr.host.split('@')[-1].split('.')[0]}")
+            self.entries[name] = r
+            self._remember(spec)
+            self._save()
+        return name
+
+    def _named(self, spec: str) -> str | None:
+        return next((n for n, e in self.entries.items() if _spec(e) == spec), None)
+
     def _free_name(self, base: str) -> str:
         name, i = base, 2
-        while name in self.explorers:
+        while name in self.entries:
             name, i = f"{base}-{i}", i + 1
         return name
 
     def remove(self, name: str) -> None:
         """Stop serving `name`; its index cache stays on disk."""
         with self.lock:
-            ex = self.explorers.pop(name)
-            self._remember(ex.root)
+            entry = self.entries.pop(name)
+            self._remember(_spec(entry))
             self._save()
-        ex.stop()
-        ex.hub.close()
+        threading.Thread(target=entry.close, name=f"trex-close-{name}", daemon=True).start()
 
-    def get(self, name: str) -> Explorer:
+    def get(self, name: str) -> Explorer | Remote:
         with self.lock:
-            return self.explorers[name]
+            return self.entries[name]
 
     def served(self) -> list[RootInfo]:
         with self.lock:
-            return [{"name": n, "root": str(ex.root), "url": root_url(n)} for n, ex in self.explorers.items()]
+            return [{"name": n, "root": _spec(e), "url": root_url(n), "state": e.state if isinstance(e, Remote) else "local",
+                     "error": e.error if isinstance(e, Remote) else ""} for n, e in self.entries.items()]
 
     def history(self) -> list[str]:
-        """Remembered directories that exist and are not served, most recent first."""
+        """Remembered directories that are not served, most recent first; local ones only while they exist."""
         with self.lock:
-            served = {str(ex.root) for ex in self.explorers.values()}
-            return [r for r in self._history if r not in served and Path(r).is_dir()]
+            served = {_spec(e) for e in self.entries.values()}
+            return [r for r in self._history if r not in served and (remote.parse(r) is not None or Path(r).is_dir())]
 
     def clear_history(self) -> None:
         with self.lock:
             self._history = []
             _write_json(self.history_path, self._history)
 
-    def _remember(self, root: Path) -> None:
-        self._history = [str(root), *(r for r in self._history if r != str(root))][:HISTORY_MAX]
+    def _remember(self, spec: str) -> None:
+        self._history = [spec, *(r for r in self._history if r != spec)][:HISTORY_MAX]
         _write_json(self.history_path, self._history)
 
     def _save(self) -> None:
-        _write_json(self.state, [{"name": n, "root": str(ex.root)} for n, ex in self.explorers.items()])
+        _write_json(self.state, [{"name": n, "root": _spec(e)} for n, e in self.entries.items()])
+
+
+def _spec(entry: Explorer | Remote) -> str:
+    """What names a served directory: its path, or its host:path."""
+    return entry.spec if isinstance(entry, Remote) else str(entry.root)
 
 
 def _write_json(path: Path, obj: object) -> None:
@@ -181,7 +222,9 @@ class ControlServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         if req.get("op") == "status":
             return {"urls": self.urls, "roots": self.roots.served()}
         if req.get("op") == "add":
-            name = self.roots.add(resolve_root(str(req.get("path")), bool(req.get("force"))))
+            path = str(req.get("path"))
+            name = (self.roots.add_remote(path) if remote.parse(path) else
+                    self.roots.add(resolve_root(path, bool(req.get("force")))))
             return {"name": name, "url": self.urls[0].rstrip("/") + root_url(name)}
         return {"error": f"unknown request {req.get('op')!r}"}
 

@@ -32,6 +32,7 @@ type OutRow = Mapping[str, object]
 type Format = Literal["table", "json", "jsonl", "csv", "tsv"]
 type Series = dict[str, tuple[array[float], array[float]]]
 
+OPEN: "list[Explorer]" = []  # indexes a command opened, closed when it ends
 DEFAULT_COLUMNS: Final = ["path", "state", "step", "runtime"]
 STATE_COLORS: Final = {"running": "green", "failed": "red", "crashed": "red", "finished": "bright_black"}
 
@@ -156,7 +157,9 @@ class Selection:
     def index(self) -> tuple[Q.Explorer, Path, str]:
         """(index brought up to date, root, prefix)."""
         root, prefix = self.scope()
-        return Q.open_index(root, cache_dir(self.cache)), root, prefix
+        ex = Q.open_index(root, cache_dir(self.cache))
+        OPEN.append(ex)
+        return ex, root, prefix
 
     def records(self) -> tuple[list[Q.Record], Q.Explorer, str]:
         """(selected records, index, prefix)."""
@@ -265,6 +268,21 @@ app = typer.Typer(name="trex", help="trackosaurus exp: explore and query directo
                   context_settings={"help_option_names": ["-h", "--help"]})
 
 
+def _version(show: bool) -> None:
+    if show:
+        from .update import installed
+
+        inst = installed()
+        typer.echo(f"trex {inst['version']}" + (f" ({inst['commit'][:12]})" if inst["commit"] else ""))
+        raise typer.Exit()
+
+
+@app.callback()
+def _options(version: Annotated[bool, typer.Option("--version", "-V", callback=_version, is_eager=True,
+                                                   help="Print the version (and git commit) and exit.")] = False) -> None:
+    """trackosaurus exp: explore and query directories of trex runs."""
+
+
 def command[**P](name: str, *aliases: str) -> Callable[[Callable[P, None]], Callable[P, None]]:
     """Register a command (and hidden aliases); filter and regex errors become CLI errors."""
 
@@ -276,6 +294,9 @@ def command[**P](name: str, *aliases: str) -> Callable[[Callable[P, None]], Call
             except (ValueError, re.error) as e:
                 typer.echo(f"trex {name}: {e}", err=True)
                 raise typer.Exit(2) from e
+            finally:
+                while OPEN:
+                    OPEN.pop().close()
 
         app.command(name)(run)
         for alias in aliases:
@@ -288,15 +309,18 @@ def command[**P](name: str, *aliases: str) -> Callable[[Callable[P, None]], Call
 # ---- commands ----
 
 Hosts = Annotated[list[str] | None, typer.Option("--host", help="Bind address; repeat to listen on several (default 127.0.0.1).")]
+AllowHosts = Annotated[list[str] | None, typer.Option("--allow-host", metavar="NAME",
+                       help="Host name the UI may be opened by besides addresses, localhost and this machine's names (repeatable).")]
 Port = Annotated[int | None, typer.Option(help=f"Port (default the first free one from {DEFAULT_PORT}).", show_default=False)]
 
 
-def listen(explorer: "Explorer | None", hosts: list[str] | None, port: int | None, roots: "Roots | None" = None) -> list["Server"]:
+def listen(explorer: "Explorer | None", hosts: list[str] | None, port: int | None, allow: list[str] | None,
+           roots: "Roots | None" = None) -> list["Server"]:
     """`server.bind`, exiting with a message when an address is unavailable."""
     from .server import bind
 
     try:
-        return bind(explorer, hosts or ["127.0.0.1"], port, roots)
+        return bind(explorer, hosts or ["127.0.0.1"], port, roots, allow or [])
     except OSError as e:
         sys.exit(f"trex: cannot listen on {', '.join(hosts or ['127.0.0.1'])} port {port or f'from {DEFAULT_PORT}'}: {e.strerror or e}")
 
@@ -316,10 +340,13 @@ def run_servers(servers: Sequence["Server"], banner: Sequence[str]) -> None:
         servers[0].serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        for srv in servers:
+            srv.server_close()
 
 
-def add_to_daemon(root: Path, force: bool, yes: bool) -> bool:
-    """Offer to add `root` to a running daemon; whether it was added."""
+def add_to_daemon(root: str, force: bool, yes: bool) -> bool:
+    """Offer to add `root` (a path or host:path) to a running daemon; whether it was added."""
     from . import daemon
 
     status = daemon.request({"op": "status"})
@@ -328,41 +355,60 @@ def add_to_daemon(root: Path, force: bool, yes: bool) -> bool:
     url = urls[0] if isinstance(urls := status.get("urls"), list) and urls else "?"
     if not (yes or not sys.stdin.isatty() or typer.confirm(f"Add {root} to the trex daemon at {url}?", default=True)):
         return False
-    reply = daemon.request({"op": "add", "path": str(root), "force": force}) or {"error": "the daemon stopped"}
+    reply = daemon.request({"op": "add", "path": root, "force": force}) or {"error": "the daemon stopped"}
     if "error" in reply:
         sys.exit(f"trex serve: {reply['error']}")
-    typer.echo(f"trex daemon serving {typer.style(str(root), bold=True)} at {reply['url']}")
+    typer.echo(f"trex daemon serving {typer.style(root, bold=True)} at {reply['url']}")
     return True
 
 
 @command("serve")
-def serve_cmd(runs_dir: PathArg, host: Hosts = None, port: Port = None, cache: Cache = None, force: Force = False,
+def serve_cmd(runs_dir: PathArg, host: Hosts = None, port: Port = None, allow_host: AllowHosts = None, cache: Cache = None,
+              force: Force = False,
               yes: Annotated[bool, typer.Option("--yes", "-y", help="Add to a running daemon without asking.")] = False,
-              standalone: Annotated[bool, typer.Option("--standalone", help="Serve on its own even if a daemon runs.")] = False) -> None:
-    """Crawl a runs directory and serve the web UI, or add it to a running `trex daemon`."""
+              standalone: Annotated[bool, typer.Option("--standalone", help="Serve on its own even if a daemon runs.")] = False,
+              unix: Annotated[str | None, typer.Option("--unix", metavar="SOCKET", help="Listen on this Unix socket instead.")] = None,
+              exit_on_eof: Annotated[bool, typer.Option("--exit-on-eof", hidden=True)] = False) -> None:
+    """Crawl a runs directory and serve the web UI, or add it to a running `trex daemon` (which also serves
+    host:path directories over ssh)."""
+    from . import remote
     from .index import Explorer
-    from .server import check_root, urls
+    from .server import check_root, serve_unix, urls
 
-    root = check_root(runs_dir, force)
-    if not standalone and add_to_daemon(root, force, yes):
+    if remote.parse(runs_dir):
+        if not add_to_daemon(runs_dir, force, yes=True):
+            sys.exit("trex serve: host:path directories are served by `trex daemon`; start one first")
         return
-    ex = Explorer(root, cache_dir(cache))
-    threading.Thread(target=ex.poll_forever, name="trex-poll", daemon=True).start()
-    servers = listen(ex, host, port)
-    run_servers(servers, [f"trex serving {typer.style(str(root), bold=True)} on {'  '.join(urls(servers))}  cache={ex.cache_dir.resolve()}"])
+    root = check_root(runs_dir, force)
+    if not standalone and add_to_daemon(str(root), force, yes):
+        return
+    ex = Explorer(root, cache_dir(cache)).start()
+    servers = [serve_unix(ex, Path(unix))] if unix else listen(ex, host, port, allow_host)
+    where = f"unix:{unix}" if unix else "  ".join(urls(servers))
+    if exit_on_eof:
+        signal.signal(signal.SIGTERM, _interrupt)
+        threading.Thread(target=_exit_on_eof, name="trex-stdin", daemon=True).start()
+    run_servers(servers, [f"trex serving {typer.style(str(root), bold=True)} on {where}  cache={ex.cache_dir.resolve()}"])
+
+
+def _exit_on_eof() -> None:
+    """End the process as SIGTERM does once stdin closes."""
+    while sys.stdin.buffer.read(1 << 16):
+        pass
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 @command("daemon")
 def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]...", help="Runs directories to add.", show_default=False)] = None,
-               host: Hosts = None, port: Port = None,
+               host: Hosts = None, port: Port = None, allow_host: AllowHosts = None,
                cache: Annotated[str | None, typer.Option(help="Cache directory (default $TREX_CACHE or ~/.cache/trex).")] = None,
                force: Force = False) -> None:
     """Serve several runs directories from one server; `trex serve DIR` offers to add to it."""
-    from . import daemon, update
+    from . import daemon, remote, update
     from .server import check_root, urls
 
     roots = daemon.Roots(Path(cache).expanduser() if cache else daemon.default_cache(), daemon.state_dir() / "roots.json")
-    servers = listen(None, host, port, roots)
+    servers = listen(None, host, port, allow_host, roots)
     try:
         control = daemon.ControlServer(daemon.socket_path(), roots, urls(servers))
     except RuntimeError as e:
@@ -379,7 +425,10 @@ def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]..
     threading.Thread(target=control.serve_forever, name="trex-control", daemon=True).start()
     roots.load()
     for d in dirs or []:
-        roots.add(check_root(d, force))
+        if remote.parse(d):
+            roots.add_remote(d, wait=False)
+        else:
+            roots.add(check_root(d, force))
     banner = [f"trex daemon on {'  '.join(urls(servers))}  socket={control.path}  cache={roots.cache}",
               *(f"  {r['name']}  {r['root']}" for r in roots.served())]
     try:
@@ -421,13 +470,13 @@ WantedBy=default.target
 """
 
 
-def systemd_unit(hosts: list[str], port: int, cache: str | None, source: str | None) -> str:
+def systemd_unit(hosts: list[str], port: int, allow: list[str], cache: str | None, source: str | None) -> str:
     """The unit for `trex systemd-unit`."""
     import shlex
 
     from . import update
 
-    host_args = [a for h in hosts for a in ("--host", h)]
+    host_args = [*(a for h in hosts for a in ("--host", h)), *(a for n in allow for a in ("--allow-host", n))]
     options = [*(["--port", str(port)] if port != DEFAULT_PORT else []), *(["--cache", cache] if cache else []),
                *(["--source", source] if source else [])]
     env = {"TREX_CACHE": str(Path(cache).expanduser().resolve()) if cache else None, "TREX_SOURCE": source}
@@ -438,7 +487,7 @@ def systemd_unit(hosts: list[str], port: int, cache: str | None, source: str | N
 
 
 @command("systemd-unit")
-def systemd_unit_cmd(host: Hosts = None, port: Annotated[int, typer.Option(help="Port.")] = DEFAULT_PORT,
+def systemd_unit_cmd(host: Hosts = None, port: Annotated[int, typer.Option(help="Port.")] = DEFAULT_PORT, allow_host: AllowHosts = None,
                      cache: Annotated[str | None, typer.Option(help="Cache directory (default ~/.cache/trex).")] = None,
                      source: Annotated[str | None, typer.Option(envvar="TREX_SOURCE", show_envvar=False,
                                        help="What the UI's update button installs, e.g. git+https://github.com/mishmish66/trackosaurus "
@@ -446,7 +495,7 @@ def systemd_unit_cmd(host: Hosts = None, port: Annotated[int, typer.Option(help=
     """Print a systemd user unit that runs `trex daemon` on this trex; its header says how to install it."""
     from . import update
 
-    typer.echo(systemd_unit(host or [], port, cache, source), nl=False)
+    typer.echo(systemd_unit(host or [], port, allow_host or [], cache, source), nl=False)
     if source and update.tool_env() != Path(sys.prefix).resolve():
         typer.echo(f"trex systemd-unit: this trex ({sys.prefix}) is not the uv tool install, so the update button will "
                    f"not show; run the unit from `uv tool install {source}`", err=True)

@@ -2,21 +2,25 @@
 
 import errno
 import gzip
+import html
+import ipaddress
 import json
 import os
 import queue
 import re
 import socket
+import socketserver
 import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import update
+from . import remote, update
 from .daemon import root_url
+from .remote import Remote
 from .index import Explorer, dumps, sse
 
 if TYPE_CHECKING:
@@ -28,6 +32,8 @@ type RouteFn = Callable[..., None]
 STATIC: Final = Path(__file__).parent / "static"
 DEFAULT_PORT: Final = 13898
 PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
+HOP_HEADERS: Final = frozenset({"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
+                                "proxy-authorization", "proxy-authenticate", "content-length"})
 ROOT_PREFIX: Final = re.compile(r"/r/([^/]+)(/.*)?")  # a daemon directory's URLs
 HB_INTERVAL: Final = 10.0  # seconds of stream silence after which a heartbeat is sent
 MAX_TILE_REQUESTS: Final = 4096
@@ -91,6 +97,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlsplit(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
+            if (refusal := self._refusal(method)) is not None:
+                return self._json({"error": refusal}, 403)
             path = self._scope(u.path, u.query)
             if path is None:
                 return
@@ -109,6 +117,18 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[trex] {method} {self.path}: {e!r}", file=sys.stderr, flush=True)
             self._json({"error": f"internal error: {e!r}"}, 500)
 
+    def _refusal(self, method: str) -> str | None:
+        """Why a request that may come from another site is refused: a Host that is not an address or a known
+        name of this server (DNS rebinding), or a POST from a page of another origin."""
+        host = self.headers.get("Host", "")
+        name = (urlsplit(f"//{host}").hostname or "").lower()
+        if host and not (_is_ip(name) or name in self.srv.names or name.endswith(".localhost")):
+            return f"Host {name!r} is not one of this server's names; allow it with --allow-host {name}"
+        origin = self.headers.get("Origin")
+        if method != "GET" and origin is not None and urlsplit(origin).netloc.lower() != host.lower():
+            return f"a request from {origin} is not allowed to change this server"
+        return None
+
     def _scope(self, path: str, query: str) -> str | None:
         """Choose the directory the request is for and return the path within it, or None after redirecting
         a daemon page that names no served directory, or lacks its trailing slash."""
@@ -117,14 +137,53 @@ class Handler(BaseHTTPRequestHandler):
         if self.srv.roots is None or pm is None:
             return path
         try:
-            self._ex = self.srv.roots.get(unquote(pm[1]))
+            entry = self.srv.roots.get(unquote(pm[1]))
         except KeyError:
             if pm[2] in (None, "/"):
                 return self.redirect("/")
             raise
         if pm[2] is None:
             return self.redirect(path + "/" + (f"?{query}" if query else ""))
+        if isinstance(entry, Remote):
+            return self._proxy(entry, pm[2] + (f"?{query}" if query else ""))
+        self._ex = entry
         return pm[2]
+
+    def _proxy(self, remote: Remote, target: str) -> None:
+        """Pass the request through to the remote directory's server, streaming its answer back."""
+        if remote.state != "connected":
+            return self._unavailable(remote, target)
+        conn = remote.connection()
+        try:
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS | {"host", "origin"}}
+            try:
+                conn.request(self.command, target, body=self._body or None, headers={**headers, "Host": "localhost"})
+                resp = conn.getresponse()
+            except OSError:
+                return self._unavailable(remote, target)
+            self.send_response(resp.status)
+            for k, v in resp.getheaders():
+                if k.lower() not in HOP_HEADERS | {"server", "date"}:
+                    self.send_header(k, v)
+            if resp.getheader("Content-Length") is None:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+            while chunk := resp.read1(1 << 16):
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        finally:
+            conn.close()
+
+    def _unavailable(self, remote: Remote, target: str) -> None:
+        """503: a page that reloads itself for the directory's page, else JSON."""
+        what = f"trex on {remote.addr.host} is {remote.state}" + (f": {remote.error}" if remote.error else "")
+        if target.split("?")[0] != "/":
+            return self._json({"error": what}, 503)
+        body = (f'<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="2"><title>trex</title>'
+                f'<p>{html.escape(remote.spec)}: {html.escape(what)}</p><pre>{html.escape(remote.error)}</pre>'
+                f'<p><a href="/">back</a></p>').encode()
+        self.send(body, "text/html; charset=utf-8", 503, {"Cache-Control": "no-store"})
 
     def redirect(self, location: str) -> None:
         self.send_response(301)
@@ -246,12 +305,16 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("POST", r"/api/daemon/add")
     def daemon_add(self, q: Query) -> None:
-        """Body: {path}, absolute or ~/…. Response: {name, url}, or 400 with {error} for a path it refuses."""
-        roots, path = self.daemon_roots, self.body_field("path")
+        """Body: {path}: absolute, ~/…, or host:path for a remote directory (which this waits to start).
+        Response: {name, url}, or 400 with {error} for a path it refuses or a remote that fails to start."""
+        roots, path = self.daemon_roots, self.body_field("path").strip()
         try:
-            if not Path(path).expanduser().is_absolute():
-                raise ValueError(f"{path} is not an absolute path")
-            name = roots.add(resolve_root(path, force=False))
+            if remote.parse(path):
+                name = roots.add_remote(path)
+            elif not Path(path).expanduser().is_absolute():
+                raise ValueError(f"{path} is not an absolute path or host:path")
+            else:
+                name = roots.add(resolve_root(path, force=False))
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
         self._json({"name": name, "url": root_url(name)})
@@ -343,7 +406,9 @@ class Handler(BaseHTTPRequestHandler):
                   compress=not self._loopback())
 
     def _loopback(self) -> bool:
-        host = self.client_address[0]
+        if not isinstance(self.client_address, tuple):
+            return True
+        host = str(self.client_address[0])
         return host == "::1" or host.startswith("127.") or host.startswith("::ffff:127.")
 
     @route("GET", r"/api/stream")
@@ -383,28 +448,72 @@ class Server(ThreadingHTTPServer):
     roots: "Roots | None" = None
     restart: Callable[[], None] | None = None  # ends the daemon so that systemd starts the updated one
     updating: threading.Lock  # held during an update, and from a successful one until the restart
+    names: frozenset[str] = frozenset()  # host names besides IP addresses that requests may address it by
 
 
 class Server6(Server):
     address_family = socket.AF_INET6
 
 
-def serve(explorer: Explorer | None, host: str, port: int, roots: "Roots | None" = None) -> Server:
-    """Unstarted server on host:port (IPv6 if host has a colon) for one directory, or the daemon's `roots`."""
+class UnixServer(Server):
+    """Server on a Unix socket (mode 0600), removed when closed."""
+
+    address_family = socket.AF_UNIX
+    allow_reuse_port = False
+
+    def server_bind(self) -> None:
+        old = os.umask(0o177)
+        try:
+            socketserver.TCPServer.server_bind(self)
+        finally:
+            os.umask(old)
+        self.server_name, self.server_port = "localhost", 0
+
+    def server_close(self) -> None:
+        super().server_close()
+        Path(str(self.server_address)).unlink(missing_ok=True)
+
+
+def serve_unix(explorer: Explorer, path: Path) -> Server:
+    """Unstarted server for one directory on the Unix socket `path`."""
+    path.unlink(missing_ok=True)
+    srv = UnixServer(cast(Any, str(path)), Handler)  # an AF_UNIX address is a path
+    srv.explorer, srv.names, srv.updating = explorer, host_names(), threading.Lock()
+    return srv
+
+
+def _is_ip(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return True
+
+
+def host_names(hosts: Sequence[str] = (), allow: Sequence[str] = ()) -> frozenset[str]:
+    """Names a server answers to besides IP addresses: localhost, this machine's names, named `hosts`, `allow`."""
+    names = {"localhost", socket.gethostname(), socket.getfqdn(), *(h for h in hosts if not _is_ip(h)), *allow}
+    return frozenset(n.lower() for n in names)
+
+
+def serve(explorer: Explorer | None, host: str, port: int, roots: "Roots | None" = None, allow: Sequence[str] = ()) -> Server:
+    """Unstarted server on host:port (IPv6 if host has a colon) for one directory, or the daemon's `roots`;
+    `allow` adds host names it answers to."""
     srv = (Server6 if ":" in host else Server)((host, port), Handler)
-    srv.explorer, srv.roots = explorer, roots
+    srv.explorer, srv.roots, srv.names = explorer, roots, host_names([host], allow)
     srv.updating = threading.Lock()
     return srv
 
 
-def bind(explorer: Explorer | None, hosts: Sequence[str], port: int | None, roots: "Roots | None" = None) -> list[Server]:
+def bind(explorer: Explorer | None, hosts: Sequence[str], port: int | None, roots: "Roots | None" = None,
+         allow: Sequence[str] = ()) -> list[Server]:
     """Unstarted servers on every host at `port`, or without one at the first free port from DEFAULT_PORT."""
     ports = [port] if port is not None else range(DEFAULT_PORT, DEFAULT_PORT + PORT_TRIES)
     for p in ports:
         servers: list[Server] = []
         try:
             for h in hosts:
-                servers.append(serve(explorer, h, p, roots))
+                servers.append(serve(explorer, h, p, roots, allow))
             return servers
         except OSError as e:
             for s in servers:

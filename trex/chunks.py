@@ -37,12 +37,16 @@ class Series(NamedTuple):
     times: Floats
 
 
+type _IntView = memoryview[int]
+type _FloatView = memoryview[float]
+
+
 class Chunk(NamedTuple):
     """One metric's values in one commit; `positions` (rows within the commit) is None when dense."""
 
     dense: bool
-    positions: "memoryview[int] | None"
-    values: "memoryview[float]"
+    positions: _IntView | None
+    values: _FloatView
 
 MAX_ROWS: Final = 65535
 

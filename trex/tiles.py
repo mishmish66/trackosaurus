@@ -48,14 +48,13 @@ def level_for(span: float) -> int:
     """Smallest level whose tiles are at least `span` steps wide."""
     if not span > 0:
         return 0
-    return max(MIN_LEVEL, min(MAX_LEVEL, math.ceil(math.log2(span / TILE))))
+    mantissa, exp = math.frexp(span / TILE)
+    return max(MIN_LEVEL, min(MAX_LEVEL, exp - 1 if mantissa == 0.5 else exp))
 
 
 def top_tiles(step_lo: float, step_hi: float) -> tuple[int, list[int]]:
     """(level, indices) of the finest level covering [step_lo, step_hi] in at most two tiles."""
     level = level_for(step_hi - step_lo)
-    while len(covering(level, step_lo, step_hi)) > 2 and level < MAX_LEVEL:
-        level += 1
     return level, list(covering(level, step_lo, step_hi))
 
 

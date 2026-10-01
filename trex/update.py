@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, TypedDict
 
+DEFAULT_SOURCE: Final = "git+https://github.com/mishmish66/trackosaurus"
 INSTALL_TIMEOUT: Final = 600.0  # seconds
 RESTART_STATUS: Final = 75  # exit status asking systemd to start the daemon again (the unit's RestartForceExitStatus)
 

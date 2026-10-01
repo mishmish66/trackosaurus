@@ -5,6 +5,7 @@ description = "trackosaurus exp: a fast, file-based experiment tracker and explo
 readme = "README.md"
 requires-python = ">=3.12"
 license = "LicenseRef-VibeCoded-AI-Slop-1.0"
+authors = [{ name = "Misha Lvovsky" }]
 license-files = ["LICENSE"]
 dependencies = [
     "numpy>=1.24",
@@ -12,7 +13,15 @@ dependencies = [
 ]
 keywords = ["experiment tracking", "machine learning", "sqlite", "visualization"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: JavaScript",
     "Typing :: Typed",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -42,6 +51,7 @@ packages = ["trex"]
 
 [tool.hatch.build.targets.sdist]
 include = ["trex", "tests", "examples", "docs", "README.md", "AGENTS.md", "LICENSE", "pyproject.toml"]
+exclude = ["docs/media"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -728,3 +728,48 @@ def test_binding_an_explicit_port_in_use_is_an_error():
         taken.listen()
         with pytest.raises(OSError):
             bind(None, ["127.0.0.1"], taken.getsockname()[1])
+
+
+def test_close_stops_polling_ends_subscriptions_and_closes_connections(root, tmp_path):
+    write_run(root / "r", 3)
+    ex = Explorer(root, tmp_path / "cache").start()
+    assert ex.ready.wait(10)
+    sub = ex.hub.subscribe("")
+    c = ex.reader()
+    ex.close()
+    assert ex._poller is not None and not ex._poller.is_alive() and sub.dead
+    ex.release(c)
+    with pytest.raises(sqlite3.ProgrammingError):
+        c.execute("SELECT 1")
+    with pytest.raises(sqlite3.ProgrammingError):
+        ex.w.execute("SELECT 1")
+
+
+def test_a_shared_tile_budget_evicts_the_least_recently_used_tiles_of_any_explorer(tmp_path, monkeypatch):
+    roots = [tmp_path / "a", tmp_path / "b"]
+    for r in roots:
+        write_run(r / "r", 300)
+    clock = iter(range(1, 10_000))
+    monkeypatch.setattr(trex_index.time, "time", lambda: float(next(clock)))
+    probe = Explorer(roots[0], tmp_path / "probe")
+    probe.rewalk()
+    probe.poll()
+    size = len(probe.tiles([["r", "loss", -6, 0]])[0][0])
+    budget = trex_index.TileBudget(limit=int(4.5 * size))
+    a, b = (Explorer(r, tmp_path / "cache", budget=budget) for r in roots)
+    for ex in (a, b):
+        ex.rewalk()
+        ex.poll()
+    a.tiles([["r", "loss", -6, i] for i in range(3)])
+    b.tiles([["r", "loss", -6, i] for i in range(3)])
+
+    def cached(ex):
+        c = sqlite3.connect(ex.db_path)
+        try:
+            idx = [i for (i,) in c.execute("SELECT idx FROM tiles WHERE top = 0 ORDER BY idx")]
+            return idx, c.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE top = 0").fetchone()[0]
+        finally:
+            c.close()
+
+    (kept_a, bytes_a), (kept_b, bytes_b) = cached(a), cached(b)
+    assert kept_a == [2] and kept_b == [0, 1, 2] and budget.used() == bytes_a + bytes_b <= 4.5 * size

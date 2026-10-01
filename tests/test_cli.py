@@ -269,11 +269,13 @@ def test_tail_follow_streams_new_rows_until_the_run_ends(tmp_path, capsys):
 
     t = threading.Thread(target=write)
     t.start()
-    res = text_of(capsys, "tail", tmp_path / "live", "-n", "1", "-f", "--interval", "0.05", "--timeout", "20")
+    res = text_of(capsys, "tail", tmp_path / "live", "-n", "10", "-f", "--interval", "0.05", "--timeout", "20")
     t.join()
-    lines = res.out.splitlines()
-    assert lines[0].split() == ["seq", "step", "runtime", "loss"] and lines[1].split()[:2] == ["0", "0"]
-    assert [l.split()[1] for l in lines[2:]] == ["step=1", "step=2", "step=3"]
+    header, *lines = res.out.splitlines()
+    table = [l.split()[1] for l in lines if "=" not in l]
+    followed = [l.split()[1].removeprefix("step=") for l in lines if "=" in l]
+    assert header.split() == ["seq", "step", "runtime", "loss"] and table[0] == "0" and followed
+    assert table + followed == ["0", "1", "2", "3"]
     assert "is finished" in res.err
 
 
@@ -372,3 +374,14 @@ def test_systemd_unit_without_a_source_has_no_update_source(capsys, monkeypatch)
     monkeypatch.delenv("TREX_SOURCE", raising=False)
     main(["systemd-unit"])
     assert "TREX_SOURCE" not in capsys.readouterr().out.split("[Unit]")[1]
+
+
+def test_version_names_the_installed_trex(capsys):
+    main(["--version"])
+    out = capsys.readouterr().out
+    assert re.fullmatch(r"trex \d+\.\d+\.\d+\S*( \([0-9a-f]{12}\))?\n", out)
+
+
+def test_systemd_unit_passes_allowed_host_names_to_the_daemon(capsys):
+    main(["systemd-unit", "--allow-host", "box.tailnet.ts.net"])
+    assert "--allow-host box.tailnet.ts.net" in capsys.readouterr().out.split("ExecStart=")[1].splitlines()[0]

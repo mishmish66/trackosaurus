@@ -22,7 +22,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wai
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing.context import BaseContext
 from pathlib import Path
-from typing import Final, Literal, NamedTuple, TypedDict
+from typing import Final, Literal, NamedTuple, Self, TypedDict
 
 import numpy as np
 
@@ -167,7 +167,7 @@ class RunView(TypedDict):
     run: RunMeta
     media: list[MediaRecord]
 
-CACHE_VERSION: Final = 7  # bump whenever what the index stores changes; older caches are rebuilt
+CACHE_VERSION: Final = 8  # bump whenever what the index stores changes; older caches are rebuilt
 CRASH_AFTER = 300.0  # seconds without a heartbeat after which a running run shows as crashed
 POLL: Final = 1.0  # seconds between polls of known runs
 REWALK: Final = 3.0  # seconds between walks of the root for new and removed runs
@@ -195,6 +195,7 @@ TABLES: Final = {
     "tiles": "CREATE TABLE IF NOT EXISTS tiles(path TEXT, key TEXT, level INTEGER, idx INTEGER, top INTEGER, "
              "seq INTEGER, used REAL, data BLOB, PRIMARY KEY(path, key, level, idx))",
     "tiles_kind": "CREATE INDEX IF NOT EXISTS tiles_kind ON tiles(key, top)",
+    "tiles_used": "CREATE INDEX IF NOT EXISTS tiles_used ON tiles(top, used)",
 }
 
 
@@ -476,10 +477,36 @@ def _bytes_of(sig: Sig) -> int:
     return sig[1] + sig[3]
 
 
-class Explorer:
-    """Index of a runs directory, kept current by `poll_forever`."""
+class TileBudget:
+    """Bytes of cached finer tiles shared by Explorers; beyond `limit` (default TILE_CACHE_BYTES) the least recently
+    used across all of them are evicted to 90% of it."""
 
-    def __init__(self, root: str | os.PathLike[str], cache_root: str | os.PathLike[str], workers: int | None = None) -> None:
+    def __init__(self, limit: int | None = None) -> None:
+        self.limit = limit
+        self.members: "list[Explorer]" = []
+        self.lock = threading.Lock()
+
+    def used(self) -> int:
+        return sum(m._tile_bytes for m in list(self.members))
+
+    def enforce(self) -> None:
+        limit = self.limit if self.limit is not None else TILE_CACHE_BYTES
+        if self.used() <= limit:
+            return
+        with self.lock:
+            while (excess := self.used() - int(0.9 * limit)) > 0:
+                members = list(self.members)
+                oldest = sorted((t, i) for i, m in enumerate(members) if (t := m._oldest_cached()) is not None)
+                bound = oldest[1][0] if len(oldest) > 1 else math.inf
+                if not oldest or not members[oldest[0][1]]._evict(bound, excess):
+                    return
+
+
+class Explorer:
+    """Index of a runs directory, kept current by `start` (or `poll_forever`); `close` releases it."""
+
+    def __init__(self, root: str | os.PathLike[str], cache_root: str | os.PathLike[str], workers: int | None = None,
+                 budget: TileBudget | None = None) -> None:
         self.root = Path(root).resolve()
         self.workers = max(1, int(workers)) if workers is not None else default_workers()
         self.cache_dir = Path(cache_root) / hashlib.sha1(str(self.root).encode()).hexdigest()[:12]
@@ -510,7 +537,39 @@ class Explorer:
         self._tile_bytes: int = self._tile_w.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE top = ?",
                                                      (CACHED,)).fetchone()[0]
         self._stop = threading.Event()
+        self._poller: threading.Thread | None = None
+        self._closed = False
         self.ready = threading.Event()
+        self.budget = budget or TileBudget()
+        self.budget.members.append(self)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def start(self) -> Self:
+        """Poll in a background thread until `close`."""
+        self._poller = threading.Thread(target=self.poll_forever, name=f"trex-poll-{self.root.name}", daemon=True)
+        self._poller.start()
+        return self
+
+    def close(self) -> None:
+        """Stop polling, end subscriptions, leave the tile budget and close the index's connections."""
+        self.stop()
+        if self._poller is not None and self._poller is not threading.current_thread():
+            self._poller.join()
+        self.hub.close()
+        with self.budget.lock:
+            if self in self.budget.members:
+                self.budget.members.remove(self)
+        with self.lock, self._tile_lock:
+            self._closed = True
+            self.w.close()
+            self._tile_w.close()
+        while not self._readers.empty():
+            self._readers.get_nowait().close()
 
     def _connect(self) -> sqlite3.Connection:
         c = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None, timeout=60)
@@ -527,7 +586,10 @@ class Explorer:
             return self._connect()
 
     def release(self, c: sqlite3.Connection) -> None:
-        self._readers.put(c)
+        if self._closed:
+            c.close()
+        else:
+            self._readers.put(c)
 
     # ---- crawling ----
 
@@ -881,7 +943,7 @@ class Explorer:
         return tiles.build(s, v, t, level, idx), stop
 
     def _store(self, path: str, key: str, level: int, idx: int, seq: int, blob: bytes) -> None:
-        """Cache a built tile, evicting least recently used ones beyond TILE_CACHE_BYTES."""
+        """Cache a built tile within the tile budget."""
         with self._tile_lock:
             old = self._tile_w.execute("SELECT length(data), top FROM tiles WHERE path=? AND key=? AND level=? AND idx=?",
                                        (path, key, level, idx)).fetchone()
@@ -890,14 +952,27 @@ class Explorer:
             self._tile_w.execute("INSERT OR REPLACE INTO tiles VALUES (?,?,?,?,?,?,?,?)",
                                  (path, key, level, idx, CACHED, seq, time.time(), blob))
             self._tile_bytes += len(blob) - (old[0] if old else 0)
-            if self._tile_bytes > TILE_CACHE_BYTES:
-                target = TILE_CACHE_BYTES * 0.9
-                for p, k, lv, i, n in self._tile_w.execute(
-                    "SELECT path, key, level, idx, length(data) FROM tiles WHERE top=? ORDER BY used", (CACHED,)).fetchall():
-                    if self._tile_bytes <= target:
-                        break
-                    self._tile_w.execute("DELETE FROM tiles WHERE path=? AND key=? AND level=? AND idx=?", (p, k, lv, i))
-                    self._tile_bytes -= n
+        self.budget.enforce()
+
+    def _oldest_cached(self) -> float | None:
+        """When the least recently used cached tile was last used."""
+        with self._tile_lock:
+            return None if self._closed else self._tile_w.execute("SELECT min(used) FROM tiles WHERE top=?", (CACHED,)).fetchone()[0]
+
+    def _evict(self, before: float, nbytes: int) -> int:
+        """Evict cached tiles last used at or before `before`, oldest first, until `nbytes` are freed; how many."""
+        with self._tile_lock:
+            rows = self._tile_w.execute("SELECT path, key, level, idx, length(data) FROM tiles WHERE top=? AND used<=? "
+                                        "ORDER BY used LIMIT 512", (CACHED, before)).fetchall()
+            n = 0
+            for p, k, lv, i, size in rows:
+                if nbytes <= 0:
+                    break
+                self._tile_w.execute("DELETE FROM tiles WHERE path=? AND key=? AND level=? AND idx=?", (p, k, lv, i))
+                self._tile_bytes -= size
+                nbytes -= size
+                n += 1
+            return n
 
     def media_path(self, path: str, file: str) -> Path:
         """KeyError unless `file` is in the run's media/."""

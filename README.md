@@ -7,6 +7,10 @@ anywhere.
 
 Docs: <https://mishmish66.github.io/trackosaurus/>
 
+[![A sweep grouped by learning rate: median lines with 95% CI bands](docs/media/screenshot.png)](docs/media/tour.mp4)
+
+[Video tour](docs/media/tour.mp4) (30 s): hover values, a pinned tooltip, zoom, the run filter, folder navigation and live runs.
+
 ## Install
 
 ```bash
@@ -88,6 +92,11 @@ loginctl enable-linger "$USER"
 With `--source`, the UI's update button installs the newest trex and systemd restarts the daemon on
 it. A `git+ssh` source needs a key that works without ssh-agent.
 
+Directories on other machines are added as `host:path` (`trex serve helper:~/runs`, or the add box).
+The daemon starts the same trex there over ssh with `uvx` and passes the directory's requests to it,
+so live runs stream as they do locally and nothing is copied. The other machine needs only
+[uv](https://docs.astral.sh/uv/) and an ssh key that works without a prompt.
+
 ## CLI
 
 Every command reads run files directly (through the same `.trex_cache` index as the server) and
@@ -117,7 +126,9 @@ The docs are pdoc pages: `uv run python docs/build.py` writes them to `site/`, a
 
 - No auth. Bind to localhost or a private network such as Tailscale. `trex serve` refuses `/` and
   `$HOME` unless given `--force`. Anyone who can open the daemon's UI can add, remove and update
-  its directories and its trex.
+  its directories and its trex. Pages of other sites cannot: the server answers only requests
+  addressed to an IP address, `localhost` or this machine's name (add others with
+  `--allow-host NAME`), and refuses changes posted from another origin.
 - A run is identified by its path. Moving or renaming a run directory makes it a new run.
 - SQLite WAL needs readers and writer on one host. Rsynced copies read fine; reading a live run
   over NFS from another host is not supported.
