@@ -40,13 +40,14 @@ uv run pytest                                             # all suites, one work
 uv run pytest --cov                                       # the same with branch coverage, subprocesses included; fails below 94%
 uv run python docs/build.py                               # pdoc pages into site/
 node --test tests/*.test.mjs                              # JS kernel and complexity (node >= 18)
-uv run --with playwright python tests/browser_smoke.py    # headless UI on its own throwaway server
+uv run --with playwright python tests/browser_smoke.py    # headless UI on its own throwaway server; fails below 75% UI line coverage
 uv run python examples/demo.py /tmp/runs && uv run trex serve /tmp/runs
 ```
 
 Run pyright and the three suites after any change that touches their area. CI
-(`.github/workflows/test.yml`) runs pyright, `pytest --cov` and the node tests with coverage on
-Python 3.12; the smoke test stays local. The smoke test starts its own
+(`.github/workflows/test.yml`) runs pyright, `pytest --cov` and the node tests with coverage of `kernel.js` and `where.js` (95% of lines, 85% of
+branches) on Python 3.12; the smoke test stays local. It also measures which lines of the UI modules run (V8 coverage over every
+page it loads), fails below `UI_COVERAGE`, and writes the uncovered lines to `ui_coverage.txt` beside its screenshots. The smoke test starts its own
 `trex serve --standalone` and a `trex daemon` on a temporary directory, free ports and a private
 `TREX_DAEMON_DIR`. Never point tests at a server or daemon someone is using.
 

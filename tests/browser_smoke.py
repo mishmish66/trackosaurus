@@ -1,6 +1,7 @@
 """Headless-browser smoke test against a throwaway trex server on a temporary runs directory.
 
-Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, the filter box, console errors, and that a client dropping every 5th
+Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, the filter box, console errors,
+UI line coverage (at least UI_COVERAGE of the modules' code lines run), and that a client dropping every 5th
 stream event still converges to the run files: every row and media item, and top tiles whose
 bucket counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
 a directory with `trex serve -y`, the root view of both, making a workspace of them in the panel the trex
@@ -9,6 +10,7 @@ brand opens, and from that panel removing a directory and re-adding it from the 
     uv run --with playwright python tests/browser_smoke.py [screenshot_dir]
 """
 
+import functools
 import shutil
 import socket
 import subprocess
@@ -23,6 +25,7 @@ import math
 import os
 import urllib.request
 
+import numpy as np
 from playwright.sync_api import sync_playwright
 
 from trex import chunks
@@ -41,6 +44,60 @@ for step in range(300):
 for r in runs:
     r.finish()
 """
+
+
+class JsCoverage:
+    """Which lines of the UI's modules ran, from Chromium's V8 coverage. A page load discards the previous page's
+    counts, so `take` runs before every navigation (`watch` makes the page do so) and takes are merged per file."""
+
+    def __init__(self, page):
+        self.cdp = page.context.new_cdp_session(page)
+        self.cdp.send("Profiler.enable")
+        self.cdp.send("Profiler.startPreciseCoverage", {"callCount": True, "detailed": True})
+        self.ran = {}  # module -> per UTF-16 unit: whether it ran
+
+    def watch(self, page):
+        for name in ("goto", "go_back", "reload", "click"):
+            step = getattr(page, name)
+            setattr(page, name, lambda *a, step=step, **kw: (self.take(), step(*a, **kw))[1])
+
+    def take(self):
+        for script in self.cdp.send("Profiler.takePreciseCoverage")["result"]:
+            url = script["url"].split("?")[0]
+            name = url.rsplit("/", 1)[-1]
+            if "/static/" not in url or not (STATIC / name).is_file():
+                continue
+            ran = np.zeros(len(units(name)), bool)
+            # outer ranges first, so a nested block's count overrides its function's
+            for r in sorted((r for f in script["functions"] for r in f["ranges"]), key=lambda r: (r["startOffset"], -r["endOffset"])):
+                ran[r["startOffset"]:r["endOffset"]] = r["count"] > 0
+            self.ran[name] = self.ran.get(name, ran) | ran
+
+    def report(self):
+        """{module: (covered lines, lines with code, uncovered line numbers)}; a line is covered when any
+        non-blank character on it ran."""
+        out = {}
+        for name, ran in sorted(self.ran.items()):
+            line, blank = units(name).T
+            code = ~blank.astype(bool)
+            has = np.bincount(line[code], minlength=line.max() + 1) > 0
+            hit = np.bincount(line[code & ran], minlength=line.max() + 1) > 0
+            out[name] = (int(hit.sum()), int(has.sum()), [int(i) + 1 for i in np.flatnonzero(has & ~hit)])
+        return out
+
+
+STATIC = REPO / "trex/static"
+UI_COVERAGE = 0.75  # share of the UI modules' code lines the smoke test must run
+
+
+@functools.cache
+def units(name):
+    """(line, is blank) per UTF-16 code unit of a UI module, the unit V8 counts offsets in."""
+    out = []
+    for i, text in enumerate((STATIC / name).read_text().split("\n")):
+        for ch in text + "\n":
+            out.extend([(i, ch.isspace())] * (2 if ord(ch) > 0xFFFF else 1))
+    return np.array(out[:-1] if out else [(0, True)], np.int64)
 
 
 def free_port():
@@ -263,6 +320,8 @@ def main():
             exe = next(Path.home().glob(".cache/ms-playwright/chromium-*/chrome-linux64/chrome"), None)
             browser = p.chromium.launch(executable_path=str(exe) if exe else None)
             page = browser.new_page(viewport={"width": 1500, "height": 950})
+            coverage = JsCoverage(page)
+            coverage.watch(page)
             errors = []
             page.on("console", lambda m: m.type == "error" and errors.append(f"{m.type}: {m.text}"))
             page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
@@ -314,6 +373,13 @@ def main():
             print(f"dropped {client['dropped']} rows events; client {'converged' if ok else 'DIVERGED'}")
             server.terminate()
             ok &= daemon_smoke(page, runs, tmp, env, out, errors)
+            coverage.take()
+            lines = coverage.report()
+            covered, total = (sum(v[i] for v in lines.values()) for i in (0, 1))
+            (out / "ui_coverage.txt").write_text("".join(f"{k}: uncovered lines {miss}\n" for k, (_, _, miss) in lines.items()))
+            print("UI line coverage: " + ", ".join(f"{k} {c / n:.0%}" for k, (c, n, _) in lines.items())
+                  + f"; all {covered / total:.1%} (floor {UI_COVERAGE:.0%}; uncovered lines in ui_coverage.txt)")
+            ok &= covered / total >= UI_COVERAGE
             print("\n".join(errors) or "no console errors")
             ok &= not errors
             browser.close()
