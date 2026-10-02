@@ -140,9 +140,9 @@ summary { cursor:pointer; font-weight:600; padding:4px 0; color:var(--muted); }
 .pname { flex:1; overflow:hidden; text-overflow:ellipsis; }
 .gear, .full { border:0; background:transparent; color:var(--muted); padding:0 4px; font-size:13px; opacity:.5; }
 .panel:hover .full { opacity:1; }
-.pin { border:0; background:transparent; padding:0 2px; font-size:11px; opacity:0; filter:grayscale(1); margin-left:auto; }
-.panel:hover .pin { opacity:.6; }
-.pin.on { opacity:1 !important; filter:none; }
+.pin { border:0; background:transparent; padding:0 2px; font-size:11px; opacity:.5; filter:grayscale(1); margin-left:auto; }
+.panel:hover .pin { opacity:1; }
+.pin.on { opacity:1; filter:none; }
 #panels.focus { display:flex; flex-direction:column; }
 #panels.focus > :not(.focusview) { display:none; }
 .focusview { flex:1; min-height:0; display:flex; padding-top:4px; }
