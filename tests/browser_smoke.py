@@ -1,6 +1,6 @@
 """Headless-browser smoke test against a throwaway trex server on a temporary runs directory.
 
-Checks cold and warm loads, grouping, console errors, and that a client dropping every 5th
+Checks cold and warm loads, grouping, opening groups as path levels, console errors, and that a client dropping every 5th
 stream event still converges to the run files: every row and media item, and top tiles whose
 bucket counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
 a directory with `trex serve -y`, the root view of both, making a workspace of them in the panel the trex
@@ -63,9 +63,46 @@ READY = ("window.app && app.data.runs.size > 0 && app.charts.size > 0 && !app.da
          " && [...app.charts.values()].some((c) => c.view)")
 
 
+def group_levels_smoke(page, url):
+    """Whether opening a group makes it a path level showing its runs ungrouped, a grouping inside it opens a
+    deeper level, and the path bar and back button return to each level with the grouping it had."""
+    state = """() => [app.opts.focus.length, app.opts.group.join(), app.grouped, app.runList.filter((r) => r.shown).length,
+        [...document.querySelectorAll('#crumbPath .crumb')].map((e) => e.textContent)]"""
+    def ends(text):
+        page.wait_for_function(f"[...document.querySelectorAll('#crumbPath .crumb')].at(-1)?.textContent === {json.dumps(text)}")
+
+    page.goto(f"{url}/?levels#path=sweep&group=config.lr")
+    page.wait_for_function(READY, timeout=30000)
+    sizes = page.evaluate("Object.fromEntries([...app.groups].map(([k, g]) => [k, g.runs.length]))")
+    page.click("button.gfocus[title='open this group']")
+    page.wait_for_function("app.opts.focus.length === 1")
+    lr = page.evaluate("app.opts.focus[0][1]")
+    ends(f"lr: {lr}")
+    opened = page.evaluate(state)
+    page.evaluate("app.setGroup(['config.seed'])")
+    page.click("button.gfocus[title='open this group']")
+    page.wait_for_function("app.opts.focus.length === 2")
+    seed = page.evaluate("app.opts.focus[1][1]")
+    ends(f"seed: {seed}")
+    nested = page.evaluate(state)
+    both = page.evaluate(f"app.runList.filter((r) => String(r.meta.config.lr) === {json.dumps(lr)} && String(r.meta.config.seed) === {json.dumps(seed)}).length")
+    page.click(f"#crumbPath .crumb:text-is('lr: {lr}')")
+    up = page.evaluate(state)
+    page.go_back()
+    page.wait_for_function("app.opts.focus.length === 2")
+    back = page.evaluate(state)[:2]
+    page.click("#crumbPath .crumb:text-is('sweep')")
+    home = page.evaluate(state)[:3]
+    print(f"group levels: opened lr {lr} {opened}; nested seed {seed} {nested}; up {up}; back {back}; folder {home}")
+    return (opened[:4] == [1, "", False, sizes[lr]] and opened[4][-2:] == ["sweep", f"lr: {lr}"]
+            and nested[:4] == [2, "", False, both] and nested[4][-3:] == ["sweep", f"lr: {lr}", f"seed: {seed}"]
+            and up[:3] == [1, "config.seed", True] and back == [2, ""] and home == [0, "config.lr", True])
+
+
 def daemon_smoke(page, runs, tmp, env, out, errors):
-    """Whether the daemon's root shows every tracked directory, a workspace made in the panel (opened from the trex
-    brand) merges them, and the panel removes, adds and forgets directories. The refused add's 400 is taken out
+    """Whether the daemon's root shows every tracked directory (a folder in it as `/ name`), a workspace made in the panel (opened from the trex
+    brand) merges them and opens though its URL was visited before it existed, and the panel removes, adds and
+    forgets directories. The refused add's 400 is taken out
     of `errors`."""
     port = free_port()
     url = f"http://127.0.0.1:{port}"
@@ -77,9 +114,13 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         subprocess.run([sys.executable, "-m", "trex", "serve", str(runs / "live"), "-y"], check=True, env=env)
         with urllib.request.urlopen(f"{url}/r/sweep/api/runs") as r1, urllib.request.urlopen(f"{url}/r/live/api/runs") as r2:
             total = len(json.loads(r1.read())["runs"]) + len(json.loads(r2.read())["runs"])
+        page.goto(f"{url}/w/both/")
         page.goto(f"{url}/")
         page.wait_for_function(READY, timeout=30000)
         root = page.evaluate("[app.data.runs.size, app.rootName, [...new Set([...app.data.runs.values()].map((r) => r.id.split('/')[0]))].sort()]")
+        page.goto(f"{url}/#path=sweep")
+        page.wait_for_function("document.querySelector('#crumbPath .seg.current')?.textContent.startsWith('sweep')", timeout=30000)
+        crumbs = page.evaluate("[...document.querySelectorAll('#crumbPath > .seg > .crumb, #crumbPath > .sep')].map((e) => e.textContent)")
         page.click(".brand")
         page.click("#menu button:text-is('+ new workspace')")
         page.fill("#menu .madd input", "both")
@@ -125,10 +166,10 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         with urllib.request.urlopen(f"{url}/api/daemon") as r:
             d = json.loads(r.read())
         left, workspaces = [x["name"] for x in d["roots"]], [(w["name"], w["members"]) for w in d["workspaces"]]
-        print(f"daemon: root shows {root[0]}/{total} runs in {root[2]} as {root[1]!r}; workspace of both shows "
+        print(f"daemon: root shows {root[0]}/{total} runs in {root[2]} as {root[1]!r}, a folder in it as {crumbs}; workspace of both shows "
               f"{merged[0]}/{total}, dir field {merged[1]}; removed live, re-added it from history; tracking {left}, "
               f"workspaces {workspaces}, history {d['history']}, panel tidy {tidy}")
-        return (root == [total, "/", ["live", "sweep"]] and merged == [total, True] and sorted(left) == ["live", "sweep"]
+        return (root == [total, "/", ["live", "sweep"]] and crumbs == ["/", "sweep"] and merged == [total, True] and sorted(left) == ["live", "sweep"]
                 and workspaces == [("both", ["sweep"])] and not d["history"] and not recent_left and tidy)
     finally:
         daemon.terminate()
@@ -164,6 +205,7 @@ def main():
                 print(f"{label}: {page.inner_text('#status')}")
                 page.screenshot(path=str(out / f"{label}.png"))
 
+            ok &= group_levels_smoke(page, url)
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])
             deadline = time.time() + 20
             while not (runs / "live").exists() and time.time() < deadline:

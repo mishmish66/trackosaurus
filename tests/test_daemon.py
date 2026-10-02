@@ -275,6 +275,22 @@ def raw(url, method="GET", headers=None, body=None):
         conn.close()
 
 
+@pytest.mark.parametrize("path", ["/r/nope/", "/w/nope/", "/w/nope"])
+def test_unknown_directories_and_workspaces_redirect_home_without_being_cached(roots, http, path):
+    parts = urllib.parse.urlsplit(http)
+    conn = http_client.HTTPConnection(parts.hostname, parts.port)
+    try:
+        conn.request("GET", path)
+        r = conn.getresponse()
+        r.read()
+        assert (r.status, r.getheader("Location")) in {(302, "/"), (303, "/"), (307, "/")}
+        assert "no-store" in (r.getheader("Cache-Control") or "")
+    finally:
+        conn.close()
+    roots.set_workspace("nope", [])
+    assert get(f"{http}/w/nope/")[1] == f"{http}/w/nope/"
+
+
 @pytest.mark.parametrize("host", ["evil.example.com", "evil.example.com:80", "localhost.evil.example.com"])
 def test_requests_addressed_to_unknown_host_names_are_refused(http, host):
     status, body = raw(f"{http}/api/daemon", headers={"Host": host})

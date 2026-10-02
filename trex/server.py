@@ -147,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
             entry = self.srv.roots.get(name) if kind == "r" else self.srv.roots.workspace(name)
         except KeyError:
             if rest in (None, "/"):
-                return self.redirect("/")
+                return self.redirect("/", permanent=False)
             raise
         if rest is None:
             return self.redirect(path + "/" + (f"?{query}" if query else ""))
@@ -192,9 +192,12 @@ class Handler(BaseHTTPRequestHandler):
                 f'<p><a href="/">back</a></p>').encode()
         self.send(body, "text/html; charset=utf-8", 503, {"Cache-Control": "no-store"})
 
-    def redirect(self, location: str) -> None:
-        self.send_response(301)
+    def redirect(self, location: str, permanent: bool = True) -> None:
+        """A 301, or a 302 that browsers must not cache."""
+        self.send_response(301 if permanent else 302)
         self.send_header("Location", location)
+        if not permanent:
+            self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", "0")
         self.end_headers()
 

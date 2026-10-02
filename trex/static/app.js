@@ -147,13 +147,18 @@ function searchText(m) {
   return [m.name, m.id, ...(m.dir ? [`dir=${m.dir}`] : []), ...(m.tags || []), ...cfg].join(" ");
 }
 
+/** Open page `url` after refetching it past the browser's HTTP cache, so a cached redirect cannot divert it. */
+function openPage(url) {
+  fetch(url, { cache: "reload" }).catch(() => null).finally(() => (location.href = url));
+}
+
 /** Page options from the URL hash. */
 function hashOpts(q) {
   return {
     path: q.get("path") || "",
     filter: q.get("filter") || "",
-    group: (q.get("group") || "").split(",").filter(Boolean),
-    fgroup: q.get("fgroup") || "",
+    group: q.get("fgroup") ? [] : (q.get("group") || "").split(",").filter(Boolean),
+    focus: focusOpt(q),
     chart: q.get("chart") || "",
     center: q.get("center") || "median",
     band: q.get("band") || "ci",
@@ -162,7 +167,19 @@ function hashOpts(q) {
     dir: q.get("dir") || "desc",
   };
 }
-const NAV_OPTS = ["path", "fgroup", "chart", "group"]; // changed by navigation, restored by back/forward
+const NAV_OPTS = ["path", "focus", "chart", "group"]; // changed by navigation, restored by back/forward
+
+/** Opened groups, outermost first: [[group-by fields, value], …] from `focus` (JSON), or a single `fgroup` of
+ * `group`. */
+function focusOpt(q) {
+  if (q.get("fgroup")) return [[(q.get("group") || "").split(",").filter(Boolean), q.get("fgroup")]];
+  try {
+    const f = JSON.parse(q.get("focus") || "[]");
+    return Array.isArray(f) ? f.filter((l) => Array.isArray(l?.[0]) && typeof l[1] === "string") : [];
+  } catch {
+    return [];
+  }
+}
 
 const cmpNames = (a, b) => a.localeCompare(b, undefined, { numeric: true });
 function hashStr(s) {
@@ -276,7 +293,7 @@ class App {
     const q = new URLSearchParams(location.hash.slice(1));
     this.opts = hashOpts(q);
     this.panelCfg = {};
-    this.groupFromHash = q.has("group");
+    this.groupFromHash = q.has("group") || q.has("fgroup");
     this.groupSource = null;
     this.data = new Data({
       runs: throttle(() => this.onRuns(), 300),
@@ -399,7 +416,7 @@ class App {
 
   workspaceRows(d, refresh, edit) {
     return d.workspaces.map((w) => h("div", { className: "mrow" },
-      h("button", { className: "mitem" + (w.url === `${BASE}/` ? " active" : ""), onclick: () => (location.href = w.url) },
+      h("button", { className: "mitem" + (w.url === `${BASE}/` ? " active" : ""), onclick: () => openPage(w.url) },
         h("span", { className: "ml", textContent: w.name }), h("span", { className: "ms", textContent: w.members.join(" · ") || "empty" })),
       h("button", { className: "chev", textContent: "✎", title: "edit this workspace", onclick: () => edit(w) }),
       h("button", { className: "chev", textContent: "×", title: "delete this workspace (its directories stay tracked)",
@@ -415,7 +432,7 @@ class App {
       const body = { name: name.value, members: boxes.filter((b) => b.checked).map((b) => b.value), old: ws?.name };
       const r = await fetch("/api/daemon/workspace", { method: "POST", body: JSON.stringify(body) });
       const j = await r.json();
-      if (r.ok) location.href = j.url;
+      if (r.ok) openPage(j.url);
       else err.textContent = j.error;
     };
     return h("div", {}, h("div", { className: "mtitle", textContent: ws ? `edit ${ws.name}` : "new workspace" }),
@@ -428,7 +445,7 @@ class App {
   async deleteWorkspace(w, refresh) {
     if (!confirm(`Delete workspace ${w.name}? Its directories stay tracked.`)) return;
     await fetch("/api/daemon/workspace/delete", { method: "POST", body: JSON.stringify({ name: w.name }) });
-    if (w.url === `${BASE}/`) location.href = "/";
+    if (w.url === `${BASE}/`) openPage("/");
     else refresh();
   }
 
@@ -441,13 +458,13 @@ class App {
       const r = await fetch("/api/daemon/add", { method: "POST", body: JSON.stringify({ path: path.trim() }) });
       const j = await r.json();
       note.textContent = "";
-      if (r.ok) location.href = j.url;
+      if (r.ok) openPage(j.url);
       else err.textContent = j.error;
     };
     const input = h("input", { type: "text", placeholder: "/path/to/runs, ~/runs or host:path", spellcheck: false,
       onkeydown: (e) => e.key === "Enter" && add(input.value) });
     const served = d.roots.map((r) => h("div", { className: "mrow" },
-      h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || r.root, onclick: () => (location.href = r.url) },
+      h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || r.root, onclick: () => openPage(r.url) },
         h("span", { className: "ml", textContent: r.name }),
         h("span", { className: "ms", textContent: tailOf(r.root, 36) + (r.state === "local" || r.state === "connected" ? "" : ` · ${r.state}`) })),
       h("button", { className: "chev", textContent: "×", title: "stop tracking this directory (its files are kept)",
@@ -499,7 +516,7 @@ class App {
   async removeRoot(r, refresh) {
     if (!confirm(`Stop serving ${r.root}? Its run files are kept.`)) return;
     await fetch("/api/daemon/remove", { method: "POST", body: JSON.stringify({ name: r.name }) });
-    if (r.url === `${BASE}/`) location.href = "/";
+    if (r.url === `${BASE}/`) openPage("/");
     else refresh();
   }
 
@@ -511,7 +528,7 @@ class App {
   async setPath(path) {
     menu.close();
     this.opts.path = path;
-    this.opts.fgroup = "";
+    this.opts.focus = [];
     this.saveHash(true);
     await this.loadScope();
   }
@@ -557,8 +574,8 @@ class App {
     const q = new URLSearchParams();
     const defaults = { center: "median", band: "ci", x: "step", sort: "created", dir: "desc" };
     for (const [k, v] of Object.entries(this.opts)) {
-      const s = Array.isArray(v) ? v.join(",") : v === true ? "1" : v;
-      if (s && defaults[k] !== s) q.set(k, s);
+      const s = k === "focus" ? (v.length ? JSON.stringify(v) : "") : Array.isArray(v) ? v.join(",") : v === true ? "1" : v;
+      if ((s && defaults[k] !== s) || (k === "group" && this.opts.focus.length)) q.set(k, s);
     }
     const url = "#" + q.toString();
     if (push && url !== location.hash) history.pushState(null, "", url);
@@ -574,12 +591,14 @@ class App {
     menu.close();
     this.unpinTip();
     if (next.path !== this.opts.path) {
-      Object.assign(this.opts, { path: next.path, fgroup: next.fgroup, chart: next.chart });
+      Object.assign(this.opts, { path: next.path, focus: next.focus, chart: next.chart });
       if (q.has("group")) (this.opts.group = next.group), (this.groupFromHash = true);
       return this.loadScope();
     }
-    if (next.fgroup !== this.opts.fgroup) {
-      this.opts.fgroup = next.fgroup;
+    if (differs("focus") || (q.has("group") && differs("group"))) {
+      this.opts.focus = next.focus;
+      if (q.has("group")) this.opts.group = next.group;
+      else [this.opts.group, this.groupSource] = this.resolveGroup(this.opts.path);
       this.onRuns();
     }
     if (next.chart !== this.opts.chart) {
@@ -675,11 +694,14 @@ class App {
 
   /** Path bar: clicking a segment opens that folder; ▾ switches to a sibling; › opens a child. */
   renderCrumbs() {
-    const o = this.opts;
+    const o = this.opts, depth = o.focus.length;
     const parts = o.path ? o.path.split("/") : [];
     const path = [];
+    const sep = () => {
+      if (path.length && !(path.length === 1 && this.rootName === "/")) path.push(h("span", { className: "sep", textContent: "/" }));
+    };
     const seg = (text, target, { current, siblingsOf, cls }) => {
-      const open = target === o.path && !o.fgroup ? () => this.focusChart("") : () => this.setPath(target);
+      const open = target !== o.path ? () => this.setPath(target) : depth ? () => this.focusLevel(0) : () => this.focusChart("");
       const s = h("span", { className: "seg" + (current ? " current" : "") + (cls ? ` ${cls}` : "") },
         h("button", { className: "crumb", title: target || "/", onclick: current ? null : open }, text));
       if (siblingsOf != null) s.append(h("button", { className: "chev", textContent: "▾", title: "switch to a sibling",
@@ -688,27 +710,27 @@ class App {
           await this.refreshTree();
           this.childMenu(a, siblingsOf, siblingsOf || this.data.info.name);
         } }));
-      if (path.length) path.push(h("span", { className: "sep", textContent: "/" }));
+      sep();
       path.push(s);
     };
     const chart = o.chart && this.charts.has(o.chart);
-    seg(this.rootName, "", { current: !parts.length && !o.fgroup && !chart, cls: "rootseg" });
+    seg(this.rootName, "", { current: !parts.length && !depth && !chart, cls: "rootseg" });
     if (this.daemon && BASE) path.unshift(h("span", { className: "seg" }, h("button", { className: "crumb", textContent: "/",
-      title: "every tracked directory", onclick: () => (location.href = "/") })));
+      title: "every tracked directory", onclick: () => openPage("/") })));
     parts.forEach((p, i) => seg(p, parts.slice(0, i + 1).join("/"),
-      { current: i === parts.length - 1 && !o.fgroup && !chart, siblingsOf: parts.slice(0, i).join("/") }));
-    if (o.fgroup) {
-      path.push(h("span", { className: "sep", textContent: "·" }),
-        h("span", { className: "seg" + (chart ? "" : " current") + " fchip" },
-          h("button", { className: "crumb", onclick: chart ? () => this.focusChart("") : null }, `${this.groupFieldLabel()}: ${o.fgroup}`),
-          h("button", { className: "chev", textContent: "×", title: "show all groups", onclick: () => this.focusGroup("") })));
-    }
+      { current: i === parts.length - 1 && !depth && !chart, siblingsOf: parts.slice(0, i).join("/") }));
+    o.focus.forEach((level, i) => {
+      const current = i === depth - 1 && !chart, open = i === depth - 1 ? () => this.focusChart("") : () => this.focusLevel(i + 1);
+      sep();
+      path.push(h("span", { className: "seg fchip" + (current ? " current" : "") },
+        h("button", { className: "crumb", title: "an opened group", onclick: current ? null : open }, this.focusLabel(level))));
+    });
     if (chart) {
       path.push(h("span", { className: "sep", textContent: "›" }),
         h("span", { className: "seg current fchip" }, h("span", { className: "crumb" }, `chart: ${o.chart}`),
           h("button", { className: "chev", textContent: "×", title: "back to all charts (Esc)", onclick: () => this.focusChart("") })));
-    } else if (o.fgroup) {
-      // a focused group has no children to open
+    } else if (depth) {
+      // an opened group has no children to open
     } else if (!this.scopeIsRun && this.children(o.path).length) {
       path.push(h("button", { className: "chev drill", textContent: "›", title: "open a child folder or run",
         onclick: async (e) => {
@@ -752,8 +774,9 @@ class App {
   scopeInfo() {
     const o = this.opts, members = this.runList.filter((r) => r.match && r.inFocus);
     const where = o.path || this.data.info?.name || "root";
-    const header = [h("b", { textContent: o.fgroup ? `${this.groupFieldLabel()}: ${o.fgroup}` : where }),
-      h("span", { className: "muted", textContent: `${o.fgroup ? `group in ${where} · ` : ""}${members.length} runs` })];
+    const outer = [where, ...o.focus.slice(0, -1).map((l) => this.focusLabel(l))].join(" / ");
+    const header = [h("b", { textContent: o.focus.length ? this.focusLabel(o.focus.at(-1)) : where }),
+      h("span", { className: "muted", textContent: `${o.focus.length ? `group in ${outer} · ` : ""}${members.length} runs` })];
     const parts = o.path ? o.path.split("/") : [];
     const sections = parts.map((_, i) => parts.slice(0, i).join("/")).concat(o.path)
       .filter((p) => this.data.folders[p])
@@ -773,19 +796,33 @@ class App {
   }
 
 
-  /** Open a group: grouping by subfolder alone makes each group a folder (or run), so open that path; otherwise filter. */
+  /** Open a group: grouping by subfolder or parent folder alone makes it a folder (or run), so open that path;
+   * otherwise it becomes a level of the path, showing its runs ungrouped. */
   openGroup(name) {
-    if (this.opts.group.length === 1 && this.opts.group[0] === "subfolder") {
-      return this.setPath(this.opts.path ? `${this.opts.path}/${name}` : name);
-    }
-    this.focusGroup(name);
-  }
-
-  focusGroup(name) {
+    const [only, more] = this.opts.group, sub = this.opts.path ? `${this.opts.path}/${name}` : name;
+    if (!more && only === "subfolder") return this.setPath(sub);
+    if (!more && only === "parent" && name !== "." && name !== "∅") return this.setPath(sub);
     menu.close();
-    this.opts.fgroup = name;
+    this.opts.focus = [...this.opts.focus, [this.opts.group, name]];
+    [this.opts.group, this.groupSource] = [[], null];
     this.saveHash(true);
     this.onRuns();
+  }
+
+  /** Go back to the first `depth` opened groups (0: the folder), with the grouping that was on there. */
+  focusLevel(depth) {
+    menu.close();
+    const o = this.opts, inner = o.focus[depth];
+    if (inner) {
+      o.group = inner[0];
+      const [fields, src] = depth ? [null, null] : this.resolveGroup(o.path);
+      this.groupSource = JSON.stringify(fields) === JSON.stringify(o.group) ? src : null;
+    }
+    o.focus = o.focus.slice(0, depth);
+    o.chart = "";
+    this.saveHash(true);
+    this.onRuns();
+    this.renderPanels();
   }
 
   // ---- group by ----
@@ -823,8 +860,13 @@ class App {
     return this.rel(r.id).split("/")[0];
   }
 
-  groupFieldLabel() {
-    return this.opts.group.map((f) => this.fieldLabel(f)).join(" · ");
+  groupFieldLabel(fields = this.opts.group) {
+    return fields.map((f) => this.fieldLabel(f)).join(" · ");
+  }
+
+  /** "fields: value" of an opened group. */
+  focusLabel([fields, value]) {
+    return `${this.groupFieldLabel(fields)}: ${value}`;
   }
 
   groupByMenu(anchor) {
@@ -841,15 +883,20 @@ class App {
     });
   }
 
-  /** Set and remember the group-by for the current folder (and, by inheritance, its subfolders). */
+  /** Set the group-by: inside an opened group for this view only, else remembered for the current folder (and, by
+   * inheritance, its subfolders). */
   setGroup(fields) {
+    if (this.opts.focus.length) {
+      [this.opts.group, this.groupSource] = [fields, null];
+      this.saveHash();
+      return this.onRuns();
+    }
     const key = `groupby:${this.data.rootKey}`;
     const saved = store.get(key, {});
     saved[this.opts.path] = fields;
     store.set(key, saved);
     this.opts.group = fields;
     this.groupSource = { kind: "saved", path: this.opts.path };
-    this.opts.fgroup = "";
     this.saveHash();
     this.onRuns();
   }
@@ -861,7 +908,6 @@ class App {
     delete saved[this.opts.path];
     store.set(key, saved);
     [this.opts.group, this.groupSource] = this.resolveGroup(this.opts.path);
-    this.opts.fgroup = "";
     this.saveHash();
     this.onRuns();
   }
@@ -882,10 +928,10 @@ class App {
     ].filter(Boolean)));
   }
 
-  groupValue(r) {
-    if (!this.opts.group.length) return null;
+  groupValue(r, fields = this.opts.group) {
+    if (!fields.length) return null;
     const m = r.meta;
-    return this.opts.group.map((f) => {
+    return fields.map((f) => {
       const v = f === "subfolder" ? this.subfolder(r) : f === "parent" ? this.rel(m.parent) : f === "dir" ? m.dir : m.config?.[f.slice(7)];
       return v == null ? "∅" : typeof v === "object" ? JSON.stringify(v) : String(v);
     }).join(" · ");
@@ -913,10 +959,11 @@ class App {
       if (r.searchOf !== r.meta) (r.searchOf = r.meta), (r.search = searchText(r.meta));
       r.match = match(r);
       r.gval = this.groupValue(r);
+      r.focused = o.focus.every(([fields, value]) => this.groupValue(r, fields) === value);
     }
-    if (o.fgroup && !runs.some((r) => r.gval === o.fgroup)) o.fgroup = "";
+    if (o.focus.length && runs.length && !runs.some((r) => r.focused)) o.focus = [];
     for (const r of runs) {
-      r.inFocus = r.match && (!o.fgroup || r.gval === o.fgroup);
+      r.inFocus = r.match && r.focused;
       r.shown = r.inFocus && (!this.hidden.has(r.id) || this.scopeIsRun);
     }
     runs.sort((a, b) => this.compare(this.sortValue(a), this.sortValue(b)) || (b.meta.created || 0) - (a.meta.created || 0));
@@ -1134,7 +1181,7 @@ class App {
         const open = !this.collapsed.has(key);
         heads.push(key);
         rows.push(Object.assign(() => headRow({ key, label: g.name, members, color: g.color, depth: 0, open,
-          openTitle: "show only this group", onOpen: () => this.openGroup(g.name) }), { id: key }));
+          openTitle: "open this group", onOpen: () => this.openGroup(g.name) }), { id: key }));
         if (open) for (const r of members) rows.push(Object.assign(() => runRow(r, 0), { id: r.id }));
       }
     } else {
