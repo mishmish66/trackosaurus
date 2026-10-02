@@ -28,7 +28,8 @@ const BUNDLE_MIN = 64; // runs of a chart missing a tier above which one bundle 
 const BUNDLE_SHARE = 4; // ...when they are also at least 1 / BUNDLE_SHARE of the chart's runs
 const FINE_HOLD_MS = 10000; // tail rows a refetched finer tile needs are kept this long while it is fetched
 const LINE_PX_PER_BUCKET = 2; // chart width per bucket a line needs
-const DENSITY_PX_PER_BUCKET = 8; // the same in a density heatmap, where many lines overlap
+const DENSITY_PX_PER_BUCKET = 8; // the same in a density heatmap or group statistics of many runs
+const FINE_TILES = 2048; // finer tiles one chart may need
 const NO_TAIL = Object.freeze({ s: [], v: [], t: [], n: 0, s0: Infinity });
 const NO_FINE = Object.freeze({ s: [], v: [], t: [], n: 0 });
 
@@ -378,7 +379,8 @@ export class Data {
   // ---- planning ----
 
   /** Replace the request queue for what the visible charts show:
-   * [{key, runs (by priority), xmode, zoomed, x0, x1, pw, densityAbove (lines above which a heatmap)}]. */
+   * [{key, runs (by priority), xmode, zoomed, x0, x1, pw, coarseAbove (runs above which each needs only coarse
+   * buckets)}]. */
   plan(demands) {
     const tiers = [[], [], []];
     for (const d of demands) this.planChart(d, tiers);
@@ -398,12 +400,14 @@ export class Data {
     let overlap = 0, lo = Infinity, hi = -Infinity;
     for (const g of ranges) if (g) (overlap += g[1] - g[0]), (lo = Math.min(lo, g[0])), (hi = Math.max(hi, g[1]));
     const span = d.zoomed && d.xmode === 0 ? d.x1 - d.x0 : hi - lo; // steps across the chart
-    const pxPerBucket = runs.length > d.densityAbove ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET;
+    const pxPerBucket = runs.length > d.coarseAbove ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET;
     const chart = {
       d, span, ovNeed: [], topNeed: [], fineQ: tiers[2], probed: this.probed(d.key), overview: runs.length > OVERVIEW_MIN_RUNS,
+      coarse: runs.length > d.coarseAbove, // merging stays at the budget's, whatever the zoom
       up: Math.max(0, Math.ceil(Math.log2((runs.length * TOP_BUCKETS) / POINT_BUDGET))), // local merging the budget needs
-      // the level a run needs: buckets about pxPerBucket of chart width, within the point budget
-      level: Math.max(MIN_LEVEL, Math.floor(Math.log2(Math.max(span / Math.max(d.pw / pxPerBucket, 1), overlap / POINT_BUDGET, 2 ** MIN_LEVEL)))),
+      // the level a run needs: buckets about pxPerBucket of chart width, within the point and finer-tile budgets
+      level: Math.max(MIN_LEVEL, Math.floor(Math.log2(Math.max(span / Math.max(d.pw / pxPerBucket, 1), overlap / POINT_BUDGET,
+                                                            (runs.length * span) / (TILE * FINE_TILES), 2 ** MIN_LEVEL)))),
     };
     runs.forEach((r, i) => this.planRun(r, ranges[i], chart));
     // many runs missing a tier: one bundle for the whole chart, else per-run requests
@@ -423,7 +427,7 @@ export class Data {
     const L = g && e.level !== null && chart.span > 0 ? chart.level : null;
     if (chart.probed) this.needKept(r, e, L, chart);
     const wasUp = e.up;
-    e.up = L === null ? chart.up : Math.min(chart.up, Math.max(0, L - e.level));
+    e.up = L === null || chart.coarse ? chart.up : Math.min(chart.up, Math.max(0, L - e.level));
     e.want = L !== null && L < e.level && (d.zoomed || d.pw > 2 * TOP_BUCKETS) ? L : null;
     e.need = [];
     if (e.want !== null) this.needFine(r, e, g, chart);
@@ -448,9 +452,11 @@ export class Data {
     return true;
   }
 
-  /** Many-run charts start from overview tiles, fetching top tiles only where those are too coarse. */
+  /** Many-run charts start from overview tiles, fetching top tiles only where those are too coarse: by any level for
+   * a line, by two for coarse buckets (a heatmap's or group statistics'). */
   needKept(r, e, L, chart) {
-    const ts = r.meta.tiles_seq, wantTop = !chart.overview || !!e.top || (L !== null && L < e.level + OVERVIEW_UP);
+    const slack = chart.coarse ? 1 : 0;
+    const ts = r.meta.tiles_seq, wantTop = !chart.overview || !!e.top || (L !== null && L < e.level + OVERVIEW_UP - slack);
     if (wantTop && (!e.top || e.topSeq !== ts)) chart.topNeed.push(r);
     else if (!wantTop && (!e.ov || e.ovSeq !== ts)) chart.ovNeed.push(r);
   }

@@ -96,7 +96,10 @@ them WebGL falls back to software and timings mean nothing.
 - **Browser** (`data.js`): visible charts state what they show (`plan`). Each run needs buckets
   about `LINE_PX_PER_BUCKET` wide on screen (`DENSITY_PX_PER_BUCKET` in a density heatmap),
   within a point budget per chart. Charts with many runs start from overview tiles and fetch top
-  tiles only where those are too coarse; zooming fetches finer tiles. When many runs of a chart
+  tiles only where those are too coarse; zooming fetches finer tiles, at most `FINE_TILES` per chart. A chart
+  of more than `DENSITY_AUTO` runs (a heatmap, or group statistics) plans coarse buckets
+  (`DENSITY_PX_PER_BUCKET`), keeps its bucket merging whatever the zoom, and takes overview tiles until they
+  are two levels too coarse. When many runs of a chart
   need a tier, one bundle request fetches it. Buckets are merged locally (`Entry.up`) when that is
   enough. Each (run, metric) column is rebuilt from its best tiles plus the raw rows streamed since
   its kept tiles were built. Top tiles of finished runs are cached in IndexedDB, keyed by metric so
@@ -149,7 +152,9 @@ The 10k-run view is the benchmark; interactions should reach the next painted fr
 - Per-draw work is proportional to pixels, not points (`prep` decimates per pixel).
 - Charts draw first. Sidebar, path bar and info panel update after the frame paints
   (`App.afterPaint`), one task each. Chart drawing stops at `FRAME_BUDGET_MS` per frame and
-  continues on the next.
+  continues on the next. Redraws for streamed data come at most 4 times a second, less often when the
+  visible charts are expensive to draw, and at once when loading finishes.
+- Group statistics (`agg`) never sort a bin: order statistics come from histogram selection, exact.
 - Work over all runs is sliced (`Data.rebuildSoon`) or indexed (`ConfigIndex`); nothing that
   touches every run × every key runs on an interaction.
 - The sidebar builds only the rows near its scroll position. Off-screen panels skip layout

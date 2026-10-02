@@ -178,3 +178,29 @@ test("an adopted column equals one built by push, and keeps growing", () => {
   assert.deepEqual(a.ext, b.ext);
   for (const k of ["s", "v", "t"]) assert.deepEqual([...a[k].subarray(0, a.n)], [...b[k].subarray(0, b.n)]);
 });
+
+test("agg's order statistics equal a full sort's for large groups with ties, clusters, outliers and gaps", () => {
+  const R = 3000, bins = 24, rnd = ((s) => () => ((s = (s * 1103515245 + 12345) % 2147483648) / 2147483648))(7);
+  const shapes = [() => rnd(), () => Math.round(rnd() * 5), () => (rnd() < 0.97 ? 1e-9 * rnd() : 1e9 * rnd()), () => 4.25,
+                  () => (rnd() < 0.5 ? -rnd() * 1e-300 : 1e300 * rnd())];
+  const cols = [], perBin = Array.from({ length: bins }, () => []);
+  for (let r = 0; r < R; r++) {
+    const xs = [], ys = [];
+    for (let b = 0; b < bins; b++) {
+      if (r % 7 === 0 && (b === 0 || b === bins - 1)) continue; // runs that start late or end early
+      const y = shapes[b % shapes.length]();
+      xs.push(b + 0.5), ys.push(y), perBin[b].push(y);
+    }
+    cols.push(column(xs, ys));
+  }
+  const s = aggOf(cols, 0, bins, bins);
+  for (let b = 0; b < bins; b++) {
+    const v = Float64Array.from(perBin[b]).sort(), m = v.length, k = K.medianCiRank(m);
+    const q = (p) => { const h = (m - 1) * p, i = Math.floor(h), f = h - i; return i + 1 < m ? v[i] * (1 - f) + v[i + 1] * f : v[i]; };
+    const mean = v.reduce((a, x) => a + x, 0) / m, sd = Math.sqrt(v.reduce((a, x) => a + (x - mean) ** 2, 0) / (m - 1));
+    assert.deepEqual([s.n[b], s.min[b], s.max[b], s.median[b], s.q25[b], s.q75[b], s.medlo[b], s.medhi[b]],
+                     [m, v[0], v[m - 1], q(0.5), q(0.25), q(0.75), v[k - 1], v[m - k]], `bin ${b}`);
+    const close = (a, e) => Math.abs(a - e) <= 1e-9 * Math.max(Math.abs(e), 1e-300) || a === e;
+    assert.ok(close(s.mean[b], mean) && close(s.std[b], sd), `bin ${b}: mean ${s.mean[b]} vs ${mean}, std ${s.std[b]} vs ${sd}`);
+  }
+});

@@ -566,6 +566,7 @@ class App {
     this.xrange = null;
     for (const c of this.charts.values()) c.el.remove(), c.dispose();
     this.charts.clear();
+    this.round = null;
     for (const m of this.mediaPanels.values()) m.el.remove();
     this.mediaPanels.clear();
     this.saveHash();
@@ -1521,7 +1522,8 @@ class App {
         if ((c.visible || c.full) && !c.view?.lines.length) first = true;
       }
     }
-    this.schedule(first);
+    const d = this.data, settled = !d.queue.length && !d.inflight.size && !d.posts; // the last of a load draws now
+    this.schedule(first || settled);
   }
 
   redrawAll() {
@@ -1529,34 +1531,45 @@ class App {
     this.schedule(true);
   }
 
-  /** Draw dirty visible charts on the next frame; streamed updates are coalesced to 4 Hz. */
+  /** Draw dirty visible charts on the next frame; streamed updates are coalesced to 4 Hz, or less often when
+   * drawing the visible charts takes more than a sixteenth of that. */
   schedule(now) {
     if (now) {
       if (!this.raf) this.raf = requestAnimationFrame(() => this.drawDirty());
     } else if (!this.slow) {
+      let cost = 0;
+      for (const c of this.charts.values()) if (c.visible || c.full) cost += c.drawMs || 0;
       this.slow = setTimeout(() => {
         this.slow = null;
         this.schedule(true);
-      }, 250);
+      }, Math.min(2000, Math.max(250, 16 * cost)));
     }
   }
 
+  /** Draw the dirty visible charts all in one frame: a round prepares the charts dirty when it began,
+   * FRAME_BUDGET_MS of them per frame, then draws them together. Charts dirtied meanwhile draw what they have,
+   * and are prepared again in the next round. */
   drawDirty() {
     this.raf = null;
     if (!this.runList) return;
-    let drew = false;
+    this.round ||= [...this.charts.values()].filter((c) => (c.visible || c.full) && c.dirty);
     const t0 = performance.now();
-    for (const c of this.charts.values()) {
-      if (!(c.visible || c.full) || !c.dirty) continue;
-      // past the frame budget, the remaining charts draw on the next frame
-      if (drew && performance.now() - t0 > FRAME_BUDGET_MS) {
-        this.schedule(true);
-        break;
-      }
-      c.draw();
-      drew = true;
+    let n = 0;
+    for (const c of this.round) {
+      if (c.prepared) continue;
+      if (n && performance.now() - t0 > FRAME_BUDGET_MS) return this.schedule(true);
+      const t = performance.now();
+      c.prepare();
+      c.drawMs = performance.now() - t;
+      n++;
     }
+    if (n && performance.now() - t0 > FRAME_BUDGET_MS / 2) return this.schedule(true); // drawing gets a frame of its own
+    const drew = this.round.length > 0, t1 = performance.now();
+    for (const c of this.round) c.draw();
+    this.presentMs = performance.now() - t1;
+    this.round = null;
     if (drew) this.replan();
+    if ([...this.charts.values()].some((c) => (c.visible || c.full) && c.dirty)) this.schedule(false);
   }
 
   /** What chart c shows, for `Data.plan`. */
@@ -1564,12 +1577,14 @@ class App {
     const o = this.panelOpts(c.key), zoom = this.xrange && this.xrange[2] === o.xmode ? this.xrange : null;
     const x0 = o.xmin ?? zoom?.[0] ?? null, x1 = o.xmax ?? zoom?.[1] ?? null;
     return { key: c.key, runs, xmode: o.xmode, zoomed: x0 !== null || x1 !== null, x0: x0 ?? -Infinity, x1: x1 ?? Infinity,
-             pw: c.w ? c.pw : 600, densityAbove: this.densityAbove(o) };
+             pw: c.w ? c.pw : 600, coarseAbove: this.coarseAbove(o) };
   }
 
-  /** Line count above which a chart with options `o` draws a density heatmap. */
-  densityAbove(o) {
-    if (!USE_GL || this.grouped) return Infinity;
+  /** Runs above which each run of a chart with options `o` needs only coarse buckets: for group statistics, or
+   * a density heatmap. */
+  coarseAbove(o) {
+    if (this.grouped) return DENSITY_AUTO;
+    if (!USE_GL) return Infinity;
     return o.render === "density" ? 0 : o.render === "auto" ? DENSITY_AUTO : Infinity;
   }
 

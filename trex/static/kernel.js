@@ -266,8 +266,16 @@ export function yrange(cols, xmode, x0, x1, flags, alpha, scale, qlo, qhi) {
   return [select(vals, n, rank(qlo)), select(vals, n, rank(qhi))];
 }
 
+const ciRanks = new Map();
+
 /** Largest lower rank k (1-based) with [x_(k), x_(n-k+1)] covering the median with prob >= 0.95; 1 if none. */
 export function medianCiRank(n) {
+  let k = ciRanks.get(n);
+  if (k === undefined) ciRanks.set(n, (k = ciRankOf(n)));
+  return k;
+}
+
+function ciRankOf(n) {
   let k = 1, cdf = 0, logc = 0;
   const lnHalfN = n * Math.log(0.5);
   for (let j = 0; j < Math.floor(n / 2); j++) {
@@ -307,29 +315,20 @@ export function binGrid(x0, x1, most) {
 export function agg(cols, xmode, x0, x1, bins, flags, alpha, scale) {
   const raw = (flags & RAW) !== 0, logx = (flags & LOGX) !== 0;
   const R = cols.length, out = new Float64Array(NSTAT * bins);
-  const buf = scratchOf(R * bins + 2 * bins + R);
-  const vals = buf.subarray(0, R * bins).fill(NaN);
+  const buf = scratchOf(R * bins + 2 * bins);
+  const vals = buf.subarray(0, R * bins).fill(NaN); // bin-major: bin b's values are vals[b * R, (b + 1) * R)
   const acc = { sum: buf.subarray(R * bins, R * bins + bins), cnt: buf.subarray(R * bins + bins, R * bins + 2 * bins) };
-  const tmp = buf.subarray(R * bins + 2 * bins, R * bins + 2 * bins + R);
   for (let r = 0; r < R; r++) {
     cols[r].ensureSmooth(alpha, scale, xmode);
-    binColumn(cols[r], xmode, cols[r].ys(alpha, raw), x0, x1, bins, logx, acc, vals.subarray(r * bins, (r + 1) * bins));
+    binColumn(cols[r], xmode, cols[r].ys(alpha, raw), x0, x1, bins, logx, acc, vals, r, R);
   }
-  const ranks = new Int32Array(R + 1);
-  for (let m = 1; m <= R; m++) ranks[m] = medianCiRank(m);
-  for (let b = 0; b < bins; b++) {
-    let m = 0;
-    for (let r = 0; r < R; r++) {
-      const v = vals[r * bins + b];
-      if (Number.isFinite(v)) tmp[m++] = v;
-    }
-    binStats(tmp.subarray(0, m).sort(), ranks[m], out, bins, b);
-  }
+  for (let b = 0; b < bins; b++) binStats(vals.subarray(b * R, (b + 1) * R), out, bins, b);
   return out;
 }
 
-/** Per-bin means of column c's values in [x0, x1] into `row`, interpolated across empty bins between full ones. */
-function binColumn(c, xmode, ys, x0, x1, bins, logx, { sum, cnt }, row) {
+/** Per-bin means of column c's values in [x0, x1] into vals[b * R + r], interpolated across empty bins between full
+ * ones. */
+function binColumn(c, xmode, ys, x0, x1, bins, logx, { sum, cnt }, vals, r, R) {
   const xs = c.xs(xmode), [lo, hi] = visibleRange(c, xmode, x0, x1, logx), per = bins / (x1 - x0);
   sum.fill(0);
   cnt.fill(0);
@@ -340,39 +339,149 @@ function binColumn(c, xmode, ys, x0, x1, bins, logx, { sum, cnt }, row) {
     sum[b] += y;
     cnt[b] += 1;
   }
-  let prev = -1;
+  let prev = -1, pv = 0;
   for (let b = 0; b < bins; b++) {
     if (!cnt[b]) continue;
-    row[b] = sum[b] / cnt[b];
+    const v = sum[b] / cnt[b];
+    vals[b * R + r] = v;
     for (let k = prev + 1; prev >= 0 && k < b; k++) {
       const w = (k - prev) / (b - prev);
-      row[k] = row[prev] * (1 - w) + row[b] * w;
+      vals[k * R + r] = pv * (1 - w) + v * w;
     }
     prev = b;
+    pv = v;
   }
 }
 
-/** STATS of the sorted values `s` into bin b of `out`; k is the median CI rank for s.length. */
-function binStats(s, k, out, bins, b) {
-  const m = s.length;
+/** STATS of the values in `s` (NaN: no value; reordered) into bin b of `out`. */
+function binStats(s, out, bins, b) {
+  let m = 0, sum = 0, lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < s.length; i++) {
+    const v = s[i];
+    if (v !== v) continue;
+    s[m++] = v;
+    sum += v;
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
   out[2 * bins + b] = m;
   if (!m) {
     for (const j of [0, 1, 3, 4, 5, 6, 7, 8, 9]) out[j * bins + b] = NaN;
     return;
   }
-  let mean = 0, v2 = 0;
-  for (let i = 0; i < m; i++) mean += s[i];
-  mean /= m;
+  const mean = sum / m;
+  let v2 = 0;
   for (let i = 0; i < m; i++) v2 += (s[i] - mean) ** 2;
   out[b] = mean;
   out[bins + b] = m > 1 ? Math.sqrt(v2 / (m - 1)) : 0;
-  out[3 * bins + b] = s[0];
-  out[4 * bins + b] = s[m - 1];
-  out[5 * bins + b] = quantile(s, m, 0.5);
-  out[6 * bins + b] = quantile(s, m, 0.25);
-  out[7 * bins + b] = quantile(s, m, 0.75);
-  out[8 * bins + b] = s[k - 1];
-  out[9 * bins + b] = s[m - k];
+  out[3 * bins + b] = lo;
+  out[4 * bins + b] = hi;
+  const k = medianCiRank(m), h50 = (m - 1) * 0.5, h25 = (m - 1) * 0.25, h75 = (m - 1) * 0.75;
+  const n = wantRanks(m, [k - 1, m - k, h50, h50 + 1, h25, h25 + 1, h75, h75 + 1]);
+  orderStats(s, m, lo, hi, 0, 0, n, 0);
+  out[5 * bins + b] = quantileOf(h50, m);
+  out[6 * bins + b] = quantileOf(h25, m);
+  out[7 * bins + b] = quantileOf(h75, m);
+  out[8 * bins + b] = rankValue(k - 1);
+  out[9 * bins + b] = rankValue(m - k);
+}
+
+const want = new Int32Array(8), got = new Float64Array(8); // the ranks orderStats resolves, and their values
+
+/** Fill `want` with the distinct ranks (floors of `hs`, below m), ascending; their count. */
+function wantRanks(m, hs) {
+  let n = 0;
+  for (const h of hs) {
+    const r = Math.min(m - 1, Math.floor(h));
+    let i = n;
+    while (i > 0 && want[i - 1] > r) i--;
+    if (i > 0 && want[i - 1] === r) continue;
+    want.copyWithin(i + 1, i, n);
+    want[i] = r;
+    n++;
+  }
+  return n;
+}
+
+function rankValue(r) {
+  let i = 0;
+  while (want[i] !== r) i++;
+  return got[i];
+}
+
+/** The interpolated quantile at fractional rank h of m sorted values, from the resolved ranks. */
+function quantileOf(h, m) {
+  const i = Math.floor(h), f = h - i;
+  return i + 1 < m ? rankValue(i) * (1 - f) + rankValue(i + 1) * f : rankValue(i);
+}
+
+const HIST = 1024; // buckets per histogram pass of orderStats
+const SMALL_SORT = 64; // at most this many values are sorted outright
+const hist = new Int32Array(HIST), slotOf = new Int32Array(HIST).fill(-1);
+const gathered = [];
+let sortBuf = new Float64Array(SMALL_SORT);
+
+/** The values at the ranks want[w0, w1) (ascending, of the whole set) into got[w0, w1): a holds n values within
+ * [lo, hi], of ranks base onward, in any order. Exact: a histogram over [lo, hi] finds the buckets holding the
+ * wanted ranks, and only their values are gathered and resolved, by sorting when few. */
+function orderStats(a, n, lo, hi, base, w0, w1, depth) {
+  if (lo === hi) return got.fill(lo, w0, w1);
+  const scale = HIST / (hi - lo);
+  if (n <= SMALL_SORT || depth > 6 || !(scale < Infinity)) return sortedRanks(a, n, base, w0, w1);
+  histogram(a, n, lo, scale);
+  const groups = wantedBuckets(base, w0, w1);
+  const { buf, start, end } = gather(a, n, lo, scale, groups, depth);
+  for (let g = 0; g < groups.k.length; g++) {
+    const sub = buf.subarray(start[g], end[g]);
+    let l = Infinity, h = -Infinity;
+    for (let i = 0; i < sub.length; i++) {
+      if (sub[i] < l) l = sub[i];
+      if (sub[i] > h) h = sub[i];
+    }
+    orderStats(sub, sub.length, l, h, groups.first[g], groups.w[2 * g], groups.w[2 * g + 1], depth + 1);
+  }
+}
+
+function histogram(a, n, lo, scale) {
+  hist.fill(0);
+  for (let i = 0; i < n; i++) {
+    const k = ((a[i] - lo) * scale) | 0;
+    hist[k < HIST ? k : HIST - 1]++;
+  }
+}
+
+/** The histogram buckets holding want[w0, w1): {k (bucket), first (its first rank), w (want ranges, in pairs)}. */
+function wantedBuckets(base, w0, w1) {
+  const groups = { k: [], first: [], w: [] };
+  let cum = base, w = w0;
+  for (let k = 0; k < HIST && w < w1; k++) {
+    const from = w;
+    while (w < w1 && want[w] < cum + hist[k]) w++;
+    if (w > from) groups.k.push(k), groups.first.push(cum), groups.w.push(from, w);
+    cum += hist[k];
+  }
+  return groups;
+}
+
+/** The values of a in the wanted buckets, each bucket's together: {buf, start, end} per bucket. */
+function gather(a, n, lo, scale, groups, depth) {
+  let total = 0;
+  const start = groups.k.map((k, g) => ((slotOf[k] = g), (total += hist[k]), total - hist[k])), end = start.slice();
+  const buf = (gathered[depth] = gathered[depth]?.length >= total ? gathered[depth] : new Float64Array(Math.max(total, 64)));
+  for (let i = 0; i < n; i++) {
+    const k = ((a[i] - lo) * scale) | 0, g = slotOf[k < HIST ? k : HIST - 1];
+    if (g >= 0) buf[end[g]++] = a[i];
+  }
+  for (const k of groups.k) slotOf[k] = -1;
+  return { buf, start, end };
+}
+
+function sortedRanks(a, n, base, w0, w1) {
+  if (sortBuf.length < n) sortBuf = new Float64Array(n);
+  const t = sortBuf.subarray(0, n);
+  t.set(a.subarray(0, n));
+  t.sort();
+  for (let w = w0; w < w1; w++) got[w] = t[want[w] - base];
 }
 
 /** Point nearest to data-space x: {i, x, y (smoothed), raw}; null if empty. */

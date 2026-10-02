@@ -695,16 +695,25 @@ export class Chart {
     return v.logx ? 10 ** fx : fx;
   }
 
-  draw() {
+  /** Compute what the chart shows next (the costly part), for `draw` to present. */
+  prepare() {
     this.dirty = false;
     this.uploadMs = 0;
+    this.next = this.w ? this.compute() : null;
+    this.prepared = true;
+  }
+
+  /** Present the prepared view, preparing it first if it is not. */
+  draw() {
+    if (!this.prepared) this.prepare();
+    this.prepared = false;
     this.gear.classList.toggle("on", this.app.hasPanelOverrides(this.key));
     if (!this.w) return;
     this.fitCanvases();
     const dpr = devicePixelRatio || 1, ctx = this.cv.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.w, this.h);
-    const view = (this.view = this.compute());
+    const view = (this.view = this.next);
     const css = getComputedStyle(document.documentElement);
     ctx.font = "10px system-ui, sans-serif";
     ctx.fillStyle = css.getPropertyValue("--muted");
