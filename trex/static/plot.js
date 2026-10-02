@@ -1,7 +1,7 @@
 // Line charts. Canvas 2D: each draw asks the kernel for a smoothed, pixel-decimated polyline (or
 // group aggregate) of just the visible x-range. WebGL (gl.js): every run's line stays on the GPU
 // and zoom is a transform; axes, labels and the hover overlay stay Canvas 2D.
-import { LOGX, LOGY, NSTAT, RAW, STATS, agg as kagg, medianCiCoverage, nearest, prep as kprep, yrange } from "./kernel.js";
+import { LOGX, LOGY, NSTAT, RAW, STATS, agg as kagg, binGrid, medianCiCoverage, nearest, prep as kprep, yrange } from "./kernel.js";
 import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
 
 /** Renderer choice: WebGL where available; `?gl=0` selects Canvas 2D. */
@@ -85,7 +85,7 @@ function durTicks(lo, hi, n) {
 /** Smoothing reference width (x units per EMA step), quantized so streaming growth rarely invalidates caches. */
 function smoothScale(span) {
   const s = span > 0 ? span / 1000 : 1;
-  return 2 ** (Math.round(Math.log2(s) * 4) / 4);
+  return 2 ** Math.round(Math.log2(s));
 }
 
 /** [lo, hi] per bin: order-statistic CI for the median, Student t for the mean; none for one run. */
@@ -556,15 +556,15 @@ export class Chart {
   linesGrouped(groups, allCols, v, o, yr) {
     let dens = 0;
     for (const c of allCols) dens = Math.max(dens, c.len);
-    const bins = Math.max(8, Math.min(600, Math.floor(this.pw / 2), dens)), dx = (v.x1 - v.x0) / bins;
+    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / 2), dens)));
     const stats = (cols, raw) => {
-      const a = kagg(cols, v.xmode, v.x0, v.x1, bins, (v.logx ? LOGX : 0) | (raw ? RAW : 0), v.alpha, v.scale);
+      const a = kagg(cols, v.xmode, g0, g0 + bins * dx, bins, (v.logx ? LOGX : 0) | (raw ? RAW : 0), v.alpha, v.scale);
       return Object.fromEntries(STATS.map((k, i) => [k, a.subarray(i * bins, (i + 1) * bins)]));
     };
     const centerXY = (center) => {
       const xy = new Float64Array(2 * bins);
       for (let i = 0; i < bins; i++) {
-        const kx = v.x0 + (i + 0.5) * dx;
+        const kx = Math.min(v.ex1, g0 + (i + 0.5) * dx);
         xy[2 * i] = v.logx ? 10 ** kx : kx;
         xy[2 * i + 1] = v.logy && !(center[i] > 0) ? NaN : center[i];
       }
@@ -584,7 +584,7 @@ export class Chart {
         rc.forEach((y) => yr.add(y));
         raw = centerXY(rc);
       }
-      return { ...g, xy: centerXY(center), raw, lo, hi, center, cnt: st.n, dx };
+      return { ...g, xy: centerXY(center), raw, lo, hi, center, cnt: st.n, g0, dx };
     });
   }
 
@@ -857,7 +857,7 @@ export class Chart {
   /** Tooltip row of a group line at x: its center, band and count in that bin. */
   groupRow(ln, x) {
     const v = this.view, fx = v.logx ? Math.log10(x) : x;
-    const i = Math.min(ln.center.length - 1, Math.max(0, Math.floor((fx - v.x0) / ln.dx))), val = ln.center[i];
+    const i = Math.min(ln.center.length - 1, Math.max(0, Math.floor((fx - ln.g0) / ln.dx))), val = ln.center[i];
     if (!Number.isFinite(val)) return null;
     let extra = v.o.band !== "none" ? ` ${bandLabel(v.o.band, v.o.center, ln.cnt[i])} [${fmt(ln.lo[i])}, ${fmt(ln.hi[i])}]` : "";
     extra += ` n=${ln.cnt[i]}`;

@@ -295,6 +295,13 @@ function quantile(s, n, q) {
   return i + 1 < n ? s[i] * (1 - f) + s[i + 1] * f : s[i];
 }
 
+/** Bins of width a power of two at whole multiples of it, covering [x0, x1] with at most `most` + 2 bins:
+ * {g0 (first edge), dx (width), bins}. Edges do not move as the range grows. */
+export function binGrid(x0, x1, most) {
+  const dx = 2 ** Math.ceil(Math.log2((x1 - x0) / most)), b0 = Math.floor(x0 / dx);
+  return { g0: b0 * dx, dx, bins: Math.max(1, Math.floor(x1 / dx) + 1 - b0) };
+}
+
 /** Group statistics over `bins` x-bins of [x0, x1]: each column is averaged per bin and interpolated
  * across its gaps, then summarized. Returns NSTAT * bins values, stat-major (NaN where n = 0). */
 export function agg(cols, xmode, x0, x1, bins, flags, alpha, scale) {

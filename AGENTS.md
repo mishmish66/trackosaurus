@@ -122,7 +122,7 @@ them WebGL falls back to software and timings mean nothing.
   - tile response framing: `post_tiles` in `server.py` and `unframe` in `static/data.js`;
   - local bucket merging: `tiles.coarsen` and `Data.rebuild` (count-weighted means). Points are drawn
     at their bucket's mean step, never the bucket center;
-  - smoothing (time-weighted EMA, scale = span/1000 quantized to quarter octaves): `kernel.js`
+  - smoothing (time-weighted EMA, scale = span/1000 rounded to a power of two): `kernel.js`
     `Col.ensureSmooth`, `plot.js` `smoothScale`, `query.py` `twema`/`smooth_scale`;
   - group statistics (order-statistic median CI, Student-t mean CI): `kernel.js` `agg` /
     `medianCiRank`, `plot.js` `bandOf`, `query.py` `stats`.

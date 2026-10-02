@@ -26,6 +26,7 @@ const OVERVIEW_UP = 2; // levels the server's overview tiles sit above the top t
 const OVERVIEW_MIN_RUNS = 300; // charts with more runs load overview tiles before top tiles
 const BUNDLE_MIN = 64; // runs of a chart missing a tier above which one bundle request fetches it...
 const BUNDLE_SHARE = 4; // ...when they are also at least 1 / BUNDLE_SHARE of the chart's runs
+const FINE_HOLD_MS = 10000; // tail rows a refetched finer tile needs are kept this long while it is fetched
 const LINE_PX_PER_BUCKET = 2; // chart width per bucket a line needs
 const DENSITY_PX_PER_BUCKET = 8; // the same in a density heatmap, where many lines overlap
 const NO_TAIL = Object.freeze({ s: [], v: [], t: [], n: 0, s0: Infinity });
@@ -265,7 +266,10 @@ class Entry {
     this.span = null; // [lo, hi] steps of this metric
     this.fine = new Map(); // "level|index" -> {tile, seq, used}
     this.want = null; // finer level the current view asks for
-    this.sig = null; // inputs of the column last built: [topSeq, up, want, fine tiles, tail rows, tail start]
+    this.need = []; // keys of the tiles at `want` the view needs
+    this.empty = new Set(); // keys answered with no tile
+    this.shown = null; // finer level the column shows: `want` once all of `need` has arrived
+    this.sig = null; // inputs of the column last built: [topSeq, up, shown, fine tiles, tail rows, tail start]
   }
 }
 
@@ -418,19 +422,30 @@ export class Data {
     if (!e) r.tiles.set(d.key, (e = new Entry()));
     const L = g && e.level !== null && chart.span > 0 ? chart.level : null;
     if (chart.probed) this.needKept(r, e, L, chart);
-    const was = e.want, wasUp = e.up;
+    const wasUp = e.up;
     e.up = L === null ? chart.up : Math.min(chart.up, Math.max(0, L - e.level));
     e.want = L !== null && L < e.level && (d.zoomed || d.pw > 2 * TOP_BUCKETS) ? L : null;
-    if (e.want !== was || e.up !== wasUp) this.rebuildSoon(r, d.key);
+    e.need = [];
     if (e.want !== null) this.needFine(r, e, g, chart);
+    if (this.showFine(e) || e.up !== wasUp) this.rebuildSoon(r, d.key);
   }
 
   needFine(r, e, g, chart) {
     const W = 2 ** e.want * TILE;
     for (let k = Math.floor(g[0] / W); k <= Math.floor(g[1] / W); k++) {
-      const f = e.fine.get(`${e.want}|${k}`);
-      if (!f || f.seq < r.tailSeq0) chart.fineQ.push([r, chart.d.key, e.want, k]);
+      const key = `${e.want}|${k}`, f = e.fine.get(key);
+      e.need.push(key);
+      if (f && f.seq >= r.meta.tiles_seq) continue;
+      if (f) f.hold = performance.now() + FINE_HOLD_MS;
+      chart.fineQ.push([r, chart.d.key, e.want, k]);
     }
+  }
+
+  /** Show the wanted finer level once every tile the view needs at it has arrived; whether that changed. */
+  showFine(e) {
+    if (e.shown === e.want || !e.need.every((k) => e.fine.has(k) || e.empty.has(k))) return false;
+    e.shown = e.want;
+    return true;
   }
 
   /** Many-run charts start from overview tiles, fetching top tiles only where those are too coarse. */
@@ -644,7 +659,11 @@ export class Data {
     }
     const changed = a === "top" ? this.setTop(r, e, tiles, seq) : a === "overview" ? this.setOverview(r, e, tiles, seq)
       : this.setFine(e, `${a}|${b}`, tiles, seq);
-    if (changed) this.rebuild(r, key);
+    if (typeof a !== "string" && (changed || !tiles.length)) {
+      if (!tiles.length) e.empty.add(`${a}|${b}`);
+      this.pruneTail(r);
+      if (this.showFine(e) || changed) this.rebuild(r, key);
+    } else if (changed) this.rebuild(r, key);
   }
 
   setTop(r, e, tiles, seq) {
@@ -666,7 +685,7 @@ export class Data {
   setFine(e, k, tiles, seq) {
     const old = e.fine.get(k);
     if (old) this.fineBytes -= old.tile.bytes;
-    if (!tiles.length) return false;
+    if (!tiles.length) return e.fine.delete(k);
     e.fine.set(k, { tile: tiles[0], seq, used: performance.now() });
     this.fineBytes += tiles[0].bytes;
     if (this.fineBytes > FINE_BYTES) this.evictFine();
@@ -694,10 +713,10 @@ export class Data {
     if (!e || !(e.top || e.ov)) return;
     const srcUp = e.top ? 0 : OVERVIEW_UP; // overview tiles sit OVERVIEW_UP levels above the top level
     // a finer tile holds rows [0, f.seq); rows from tailSeq0 on come from the tail
-    const fine = e.want === null ? [] : [...e.fine.values()].filter((f) => f.tile.level === e.want && f.seq >= r.tailSeq0);
+    const fine = e.shown === null ? [] : [...e.fine.values()].filter((f) => f.tile.level === e.shown && f.seq >= r.tailSeq0);
     fine.sort((a, b) => a.tile.index - b.tile.index);
     const tail = this.tailOf(r, key);
-    const sig = [e.top ? e.topSeq : e.ovSeq, e.up, e.want, fine.map((f) => `${f.tile.index}@${f.seq}`).join(), tail.n, tail.s0, srcUp];
+    const sig = [e.top ? e.topSeq : e.ovSeq, e.up, e.shown, fine.map((f) => `${f.tile.index}@${f.seq}`).join(), tail.n, tail.s0, srcUp];
     if (r.cols.has(key) && e.sig && sig.every((x, i) => x === e.sig[i])) return;
     e.sig = sig;
     const now = performance.now();
@@ -727,10 +746,14 @@ export class Data {
   }
 
 
-  /** Drop tail rows that every metric's top tiles already hold. */
+  /** Drop tail rows that every metric's top tiles already hold, and that no finer tile being refetched needs. */
   pruneTail(r) {
     let keep = r.meta.tiles_seq;
-    for (const e of r.tiles.values()) if (e.top || e.ov) keep = Math.min(keep, e.top ? e.topSeq : e.ovSeq);
+    const now = performance.now();
+    for (const e of r.tiles.values()) {
+      if (e.top || e.ov) keep = Math.min(keep, e.top ? e.topSeq : e.ovSeq);
+      for (const f of e.fine.values()) if (f.hold > now && f.seq >= r.tailSeq0) keep = Math.min(keep, f.seq);
+    }
     const drop = Math.min(r.tail.length, keep - r.tailSeq0);
     if (drop > 0) {
       r.tail.splice(0, drop);

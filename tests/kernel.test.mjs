@@ -131,6 +131,26 @@ test("agg interpolates a sparse column across empty bins", () => {
   assert.deepEqual(aggOf([column([0, 10], [0, 10])], 0, 10, 5).mean, [0, 2.5, 5, 7.5, 10]);
 });
 
+test("binGrid edges are multiples of a power-of-two width that a growing range keeps", () => {
+  const grids = [1000, 1100, 1500, 1600].map((x1) => K.binGrid(3, x1, 400));
+  for (const g of grids) assert.ok(g.dx === 4 && g.g0 === 0 && g.g0 + g.bins * g.dx > 3, JSON.stringify(g));
+  assert.deepEqual(grids.map((g) => g.bins), [251, 276, 376, 401]);
+  for (const most of [8, 100, 600]) for (const x1 of [7, 1000, 12345.5]) assert.ok(K.binGrid(0, x1, most).bins <= most + 2);
+  assert.equal(K.binGrid(0, 2001, 400).dx, 8);
+});
+
+test("agg over a growing binGrid range leaves every earlier bin unchanged", () => {
+  const xs = Array.from({ length: 2000 }, (_, i) => i), noise = (i, k) => (Math.sin(i * 12.9898 + k * 78.233) * 43758.5453) % 1;
+  const at = (n) => {
+    const cols = [0, 1, 2].map((k) => column(xs.slice(0, n), xs.slice(0, n).map((i) => noise(i, k))));
+    const g = K.binGrid(0, n - 1, 400);
+    return { g, s: aggOf(cols, g.g0, g.g0 + g.bins * g.dx, g.bins) };
+  };
+  const a = at(1000), b = at(1500);
+  assert.equal(a.g.dx, b.g.dx);
+  for (const k of ["mean", "median", "medlo", "medhi"]) assert.deepEqual(b.s[k].slice(0, a.g.bins - 1), a.s[k].slice(0, a.g.bins - 1), k);
+});
+
 test("prep and agg bin in log10 x when LOGX is set", () => {
   const xs = [1, 10, 100, 1000], c = column(xs, [1, 2, 3, 4]);
   const out = new Float64Array(128);

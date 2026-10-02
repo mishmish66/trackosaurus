@@ -398,9 +398,9 @@ def folder_infos(path: PathLike, root: PathLike | None = None) -> list[tuple[str
 # ---- series ----
 
 def smooth_scale(span: float) -> float:
-    """span / 1000 quantized to quarter octaves, as in the browser."""
+    """span / 1000 rounded to a power of two, as in the browser."""
     s = span / 1000 if span > 0 else 1.0
-    return 2 ** (round(math.log2(s) * 4) / 4)
+    return 2.0 ** round(math.log2(s))
 
 
 def twema(xs: Sequence[float], ys: Sequence[float | None], alpha: float, scale: float) -> list[float | None]:
