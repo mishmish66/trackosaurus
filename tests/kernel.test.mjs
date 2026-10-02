@@ -204,3 +204,36 @@ test("agg's order statistics equal a full sort's for large groups with ties, clu
     assert.ok(close(s.mean[b], mean) && close(s.std[b], sd), `bin ${b}: mean ${s.mean[b]} vs ${mean}, std ${s.std[b]} vs ${sd}`);
   }
 });
+
+test("agg's interquartile mean and Yuen standard error match a sort's, ties and gaps included", () => {
+  const rnd = ((s) => () => ((s = (s * 1103515245 + 12345) % 2147483648) / 2147483648))(11);
+  const shapes = [() => rnd(), () => Math.round(rnd() * 3), () => (rnd() < 0.9 ? 1 : 100 * rnd()), () => 7];
+  for (const R of [1, 2, 3, 5, 17, 400, 2501]) {
+    const perBin = shapes.map(() => []), cols = [];
+    for (let r = 0; r < R; r++) {
+      const xs = [], ys = [];
+      shapes.forEach((f, b) => {
+        if (r % 9 === 4 && b === 0) return; // runs that start late (agg interpolates gaps inside a run)
+        const y = f();
+        xs.push(b + 0.5), ys.push(y), perBin[b].push(y);
+      });
+      cols.push(column(xs, ys));
+    }
+    const s = stats(K.agg(cols, 0, 0, shapes.length, shapes.length, K.IQM, 0, 1), shapes.length);
+    perBin.forEach((vals, b) => {
+      const v = Float64Array.from(vals).sort(), m = v.length, g = Math.floor(m / 4), h = m - 2 * g;
+      const iqm = v.slice(g, m - g).reduce((a, x) => a + x, 0) / h;
+      const w = Array.from(v, (x) => Math.min(Math.max(x, v[g]), v[m - g - 1])), wm = w.reduce((a, x) => a + x, 0) / m;
+      const se = h > 1 ? Math.sqrt(w.reduce((a, x) => a + (x - wm) ** 2, 0) / (h * (h - 1))) : 0;
+      const close = (a, e) => Math.abs(a - e) <= 1e-9 * Math.max(Math.abs(e), 1);
+      assert.ok(close(s.iqm[b], iqm) && close(s.iqmse[b], se) && s.iqmh[b] === h, `R=${R} bin ${b}: ${s.iqm[b]} ${s.iqmse[b]} ${s.iqmh[b]} vs ${iqm} ${se} ${h}`);
+    });
+  }
+  assert.ok(Number.isNaN(aggOf([column([0.5], [1])], 0, 1, 1).iqm[0]), "computed only on request");
+});
+
+test("agg's interquartile mean agrees with the CLI's on a hand-checked group", () => {
+  const s = stats(K.agg([1, 2, 3, 4, 5, 6, 7, 8, 100].map((y) => column([0.5], [y])), 0, 0, 1, 1, K.IQM, 0, 1), 1);
+  assert.deepEqual([s.iqm[0], s.iqmh[0]], [5, 5]);
+  assert.ok(Math.abs(s.iqmse[0] - Math.sqrt(26 / 20)) < 1e-12);
+});

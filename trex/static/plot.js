@@ -1,7 +1,7 @@
 // Line charts. Canvas 2D: each draw asks the kernel for a smoothed, pixel-decimated polyline (or
 // group aggregate) of just the visible x-range. WebGL (gl.js): every run's line stays on the GPU
 // and zoom is a transform; axes, labels and the hover overlay stay Canvas 2D.
-import { LOGX, LOGY, NSTAT, RAW, STATS, agg as kagg, binGrid, medianCiCoverage, nearest, prep as kprep, yrange } from "./kernel.js";
+import { IQM, LOGX, LOGY, NSTAT, RAW, STATS, agg as kagg, binGrid, medianCiCoverage, nearest, prep as kprep, yrange } from "./kernel.js";
 import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
 
 /** Renderer choice: WebGL where available; `?gl=0` selects Canvas 2D. */
@@ -90,13 +90,13 @@ function smoothScale(span) {
 /** [lo, hi] per bin: order-statistic CI for the median, Student t for the mean; none for one run. */
 function bandOf(st, center, band, bins) {
   const lo = new Float64Array(bins), hi = new Float64Array(bins);
-  const c = center === "mean" ? st.mean : st.median;
+  const c = st[center];
   for (let i = 0; i < bins; i++) {
-    const n = st.n[i], m = c[i], se = st.std[i] / Math.sqrt(n);
+    const n = st.n[i], m = c[i], se = center === "iqm" ? st.iqmse[i] : st.std[i] / Math.sqrt(n);
     let a = m, b = m;
     if (n > 1) {
-      if (band === "ci" && center === "mean") {
-        const t = n - 1 <= 30 ? T95[n - 2] : 1.96;
+      if (band === "ci" && center !== "median") {
+        const df = center === "iqm" ? st.iqmh[i] - 1 : n - 1, t = df <= 30 ? T95[df - 1] ?? 0 : 1.96;
         (a = m - t * se), (b = m + t * se);
       } else if (band === "ci") (a = st.medlo[i]), (b = st.medhi[i]);
       else if (band === "iqr") (a = st.q25[i]), (b = st.q75[i]);
@@ -111,7 +111,7 @@ function bandOf(st, center, band, bins) {
 
 /** Band name for the tooltip; the median CI states its exact coverage when 95% is unreachable. */
 function bandLabel(band, center, n) {
-  if (band !== "ci" || center === "mean") return BAND_LABEL[band];
+  if (band !== "ci" || center !== "median") return BAND_LABEL[band];
   const cov = medianCiCoverage(n);
   return cov >= 0.95 ? "95% CI" : `${(cov * 100).toFixed(1)}% CI (min–max)`;
 }
@@ -216,7 +216,18 @@ class YRange {
   add(v) {
     if (Number.isFinite(v) && (!this.logy || v > 0)) (this.lo = Math.min(this.lo, v)), (this.hi = Math.max(this.hi, v));
   }
+
+  /** Grow toward range `b`, by at most `reach` of this range's span (log span on a log axis) on either side. */
+  widen(b, reach) {
+    if (!(b.lo <= b.hi) || !(this.lo <= this.hi)) return;
+    const t = (y) => (this.logy ? Math.log10(y) : y), u = (y) => (this.logy ? 10 ** y : y);
+    const lo = t(this.lo), hi = t(this.hi), pad = reach * (hi - lo || Math.abs(hi) || 1);
+    this.lo = Math.min(this.lo, Math.max(b.lo, u(lo - pad)));
+    this.hi = Math.max(this.hi, Math.min(b.hi, u(hi + pad)));
+  }
 }
+
+const BAND_REACH = 0.25; // share of the group lines' y span a band may add to the axis on either side
 
 /** [x0, x1] in data units: the settings, else the zoom, else the extent (from its smallest positive x on log axes). */
 function xRange(o, zoom, e0, e1, epos) {
@@ -550,13 +561,14 @@ export class Chart {
     return groups.map((g) => ({ ...g, raw: v.alpha > 0 ? prep(g.cols[0], true) : null, xy: prep(g.cols[0], false) }));
   }
 
-  /** One center line with its band per group, from per-bin group statistics. */
+  /** One center line with its band per group, from per-bin group statistics; they set the y range, which a band
+   * widens by at most BAND_REACH of it. */
   linesGrouped(groups, allCols, v, o, yr) {
     let dens = 0;
     for (const c of allCols) dens = Math.max(dens, c.len);
     const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / 2), dens)));
     const stats = (cols, raw) => {
-      const a = kagg(cols, v.xmode, g0, g0 + bins * dx, bins, (v.logx ? LOGX : 0) | (raw ? RAW : 0), v.alpha, v.scale);
+      const a = kagg(cols, v.xmode, g0, g0 + bins * dx, bins, (v.logx ? LOGX : 0) | (raw ? RAW : 0) | (o.center === "iqm" ? IQM : 0), v.alpha, v.scale);
       return Object.fromEntries(STATS.map((k, i) => [k, a.subarray(i * bins, (i + 1) * bins)]));
     };
     const centerXY = (center) => {
@@ -568,22 +580,25 @@ export class Chart {
       }
       return xy;
     };
-    return groups.map((g) => {
-      const st = stats(g.cols, false), center = o.center === "mean" ? st.mean : st.median;
+    const bands = new YRange(v.logy);
+    const lines = groups.map((g) => {
+      const st = stats(g.cols, false), center = st[o.center];
       const [lo, hi] = bandOf(st, o.center, o.band, bins);
       for (let i = 0; i < bins; i++) {
         if (v.logy && !(lo[i] > 0)) lo[i] = center[i];
         yr.add(center[i]);
-        if (o.band !== "none") yr.add(lo[i]), yr.add(hi[i]);
+        if (o.band !== "none") bands.add(lo[i]), bands.add(hi[i]);
       }
       let raw = null;
       if (v.alpha > 0) {
-        const rs = stats(g.cols, true), rc = o.center === "mean" ? rs.mean : rs.median;
+        const rs = stats(g.cols, true), rc = rs[o.center];
         rc.forEach((y) => yr.add(y));
         raw = centerXY(rc);
       }
       return { ...g, xy: centerXY(center), raw, lo, hi, center, cnt: st.n, g0, dx };
     });
+    yr.widen(bands, BAND_REACH); // the axis follows the lines; a wide band does not stretch it
+    return lines;
   }
 
   /** [y0, y1] in data units: the lines' range or outlier quantiles, overridden by settings, then the box zoom. */

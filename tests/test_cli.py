@@ -398,3 +398,11 @@ def test_systemd_unit_passes_allowed_host_names_to_the_daemon(capsys):
 def test_table_columns_include_dotted_fields_a_where_clause_or_sort_reads():
     assert field_columns(["config.lr = 1 and state = running or summary.loss < 2"], "-summary.acc,path") == [
         "config.lr", "summary.loss", "summary.acc"]
+
+
+def test_iqm_is_the_mean_of_the_middle_half_with_yuens_ci():
+    st = Q.stats([1, 2, 3, 4, 5, 6, 7, 8, 100, None], center="iqm")
+    half = 2.776 * math.sqrt(26 / (5 * 4))  # winsorized deviations 26, 5 kept, t(0.975, 4)
+    assert st.get("iqm") == 5 and st.get("ci_lo") == pytest.approx(5 - half) and st.get("ci_hi") == pytest.approx(5 + half)
+    assert Q.stats([3.0], center="iqm").get("iqm") == 3.0 and "ci_lo" not in Q.stats([3.0], center="iqm")
+    assert Q.stats([1, 1, 1, 9], center="iqm").get("iqm") == 1

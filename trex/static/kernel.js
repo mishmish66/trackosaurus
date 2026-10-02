@@ -1,11 +1,11 @@
 // Numeric kernel for the UI: resident metric columns, CRC-32, time-weighted EMA smoothing,
 // per-pixel decimation, group aggregation, and axis quantiles. Pure JS on typed arrays.
 
-/** `flags` bits accepted by prep, agg and yrange. */
-export const LOGY = 1, RAW = 2, LOGX = 4;
+/** `flags` bits accepted by prep, agg and yrange; IQM (agg only) adds the interquartile mean. */
+export const LOGY = 1, RAW = 2, LOGX = 4, IQM = 8;
 
 /** Per-bin statistics returned by agg, in output order (stat-major). */
-export const STATS = ["mean", "std", "n", "min", "max", "median", "q25", "q75", "medlo", "medhi"];
+export const STATS = ["mean", "std", "n", "min", "max", "median", "q25", "q75", "medlo", "medhi", "iqm", "iqmse", "iqmh"];
 export const NSTAT = STATS.length;
 
 /** One metric of one run: points (step, value, runtime) in sequence order. */
@@ -322,7 +322,8 @@ export function agg(cols, xmode, x0, x1, bins, flags, alpha, scale) {
     cols[r].ensureSmooth(alpha, scale, xmode);
     binColumn(cols[r], xmode, cols[r].ys(alpha, raw), x0, x1, bins, logx, acc, vals, r, R);
   }
-  for (let b = 0; b < bins; b++) binStats(vals.subarray(b * R, (b + 1) * R), out, bins, b);
+  const iqm = (flags & IQM) !== 0;
+  for (let b = 0; b < bins; b++) binStats(vals.subarray(b * R, (b + 1) * R), out, bins, b, iqm);
   return out;
 }
 
@@ -353,8 +354,8 @@ function binColumn(c, xmode, ys, x0, x1, bins, logx, { sum, cnt }, vals, r, R) {
   }
 }
 
-/** STATS of the values in `s` (NaN: no value; reordered) into bin b of `out`. */
-function binStats(s, out, bins, b) {
+/** STATS of the values in `s` (NaN: no value; reordered) into bin b of `out`; the IQM's only when `iqm`. */
+function binStats(s, out, bins, b, iqm) {
   let m = 0, sum = 0, lo = Infinity, hi = -Infinity;
   for (let i = 0; i < s.length; i++) {
     const v = s[i];
@@ -365,6 +366,7 @@ function binStats(s, out, bins, b) {
     if (v > hi) hi = v;
   }
   out[2 * bins + b] = m;
+  if (!m || !iqm) for (let j = 10; j < NSTAT; j++) out[j * bins + b] = NaN;
   if (!m) {
     for (const j of [0, 1, 3, 4, 5, 6, 7, 8, 9]) out[j * bins + b] = NaN;
     return;
@@ -376,17 +378,40 @@ function binStats(s, out, bins, b) {
   out[bins + b] = m > 1 ? Math.sqrt(v2 / (m - 1)) : 0;
   out[3 * bins + b] = lo;
   out[4 * bins + b] = hi;
-  const k = medianCiRank(m), h50 = (m - 1) * 0.5, h25 = (m - 1) * 0.25, h75 = (m - 1) * 0.75;
-  const n = wantRanks(m, [k - 1, m - k, h50, h50 + 1, h25, h25 + 1, h75, h75 + 1]);
+  const k = medianCiRank(m), h50 = (m - 1) * 0.5, h25 = (m - 1) * 0.25, h75 = (m - 1) * 0.75, g = Math.floor(m / 4);
+  const n = wantRanks(m, [k - 1, m - k, h50, h50 + 1, h25, h25 + 1, h75, h75 + 1, g, m - g - 1]);
   orderStats(s, m, lo, hi, 0, 0, n, 0);
   out[5 * bins + b] = quantileOf(h50, m);
   out[6 * bins + b] = quantileOf(h25, m);
   out[7 * bins + b] = quantileOf(h75, m);
   out[8 * bins + b] = rankValue(k - 1);
   out[9 * bins + b] = rankValue(m - k);
+  if (iqm) iqmStats(s, m, g, rankValue(g), rankValue(m - g - 1), out, bins, b);
 }
 
-const want = new Int32Array(8), got = new Float64Array(8); // the ranks orderStats resolves, and their values
+/** Interquartile mean of the m values in `s` (the mean of ranks [g, m - g), g = floor(m / 4)), whose values at
+ * ranks g and m - g - 1 are lo and hi; with Yuen's standard error (from the winsorized variance) and the count h
+ * it keeps, whose t quantile on h - 1 degrees of freedom gives its 95% CI. */
+function iqmStats(s, m, g, lo, hi, out, bins, b) {
+  const h = m - 2 * g;
+  let le = 0, mid = 0, nmid = 0, wsum = 0;
+  for (let i = 0; i < m; i++) {
+    const v = s[i];
+    if (v <= lo) le++;
+    else if (v < hi) (mid += v), nmid++;
+    wsum += v < lo ? lo : v > hi ? hi : v;
+  }
+  const nlo = lo === hi ? h : le - g; // copies of lo, then of hi, fill what is left of the window
+  const iqm = lo === hi ? lo : (mid + lo * nlo + hi * (h - nmid - nlo)) / h;
+  const wmean = wsum / m;
+  let w2 = 0;
+  for (let i = 0; i < m; i++) w2 += ((s[i] < lo ? lo : s[i] > hi ? hi : s[i]) - wmean) ** 2;
+  out[10 * bins + b] = iqm;
+  out[11 * bins + b] = h > 1 ? Math.sqrt(w2 / (h * (h - 1))) : 0;
+  out[12 * bins + b] = h;
+}
+
+const want = new Int32Array(10), got = new Float64Array(10); // the ranks orderStats resolves, and their values
 
 /** Fill `want` with the distinct ranks (floors of `hs`, below m), ascending; their count. */
 function wantRanks(m, hs) {

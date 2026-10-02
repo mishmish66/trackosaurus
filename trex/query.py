@@ -17,7 +17,7 @@ from .format import (DB, INFO_FILE, JSONValue, MediaKind, RunState, as_dict, as_
 from .index import Explorer
 
 type PathLike = str | os.PathLike[str]
-type Center = Literal["median", "mean"]
+type Center = Literal["median", "mean", "iqm"]
 type Reduce = Literal["last", "first", "max", "min", "mean"]
 
 
@@ -47,6 +47,7 @@ class Stats(TypedDict):
     mean: NotRequired[float]
     std: NotRequired[float]
     median: NotRequired[float]
+    iqm: NotRequired[float]  # interquartile mean: the mean of the middle half
     min: NotRequired[float]
     max: NotRequired[float]
     ci_lo: NotRequired[float]
@@ -216,7 +217,8 @@ def median_ci_coverage(n: int) -> float:
 
 
 def stats(values: Iterable[float | None], center: Center = "median") -> Stats:
-    """With a 95% CI for `center`: order-statistic for the median, Student t for the mean."""
+    """With a 95% CI for `center`: order-statistic for the median, Student t for the mean, Yuen's (trimmed-mean t, from
+    the winsorized variance) for the interquartile mean."""
     xs = sorted(v for v in values if v is not None and not math.isnan(v))
     n = len(xs)
     if not n:
@@ -225,16 +227,30 @@ def stats(values: Iterable[float | None], center: Center = "median") -> Stats:
     std = math.sqrt(sum((x - mean) ** 2 for x in xs) / (n - 1)) if n > 1 else 0.0
     h = (n - 1) / 2
     median = (xs[math.floor(h)] + xs[math.ceil(h)]) / 2
-    out: Stats = {"n": n, "mean": mean, "std": std, "median": median, "min": xs[0], "max": xs[-1]}
+    iqm, iqm_se, kept = _iqm(xs)
+    out: Stats = {"n": n, "mean": mean, "std": std, "median": median, "iqm": iqm, "min": xs[0], "max": xs[-1]}
     if n > 1:
-        if center == "mean":
-            t = T95[n - 2] if n - 1 <= 30 else 1.96
-            se = std / math.sqrt(n)
-            out.update(ci_lo=mean - t * se, ci_hi=mean + t * se, ci_coverage=0.95)
+        if center in ("mean", "iqm"):
+            m, se, df = (mean, std / math.sqrt(n), n - 1) if center == "mean" else (iqm, iqm_se, kept - 1)
+            t = (T95[df - 1] if df >= 1 else 0.0) if df <= 30 else 1.96
+            out.update(ci_lo=m - t * se, ci_hi=m + t * se, ci_coverage=0.95)
         else:
             k = median_ci_rank(n)
             out.update(ci_lo=xs[k - 1], ci_hi=xs[n - k], ci_coverage=median_ci_coverage(n))
     return out
+
+
+def _iqm(xs: Sequence[float]) -> tuple[float, float, int]:
+    """(interquartile mean, Yuen's standard error, values kept) of sorted xs: the mean of ranks [g, n - g),
+    g = floor(n / 4), and the winsorized variance's error."""
+    n = len(xs)
+    g = n // 4
+    kept = n - 2 * g
+    iqm = sum(xs[g:n - g]) / kept
+    w = [min(max(x, xs[g]), xs[n - g - 1]) for x in xs]
+    wm = sum(w) / n
+    se = math.sqrt(sum((x - wm) ** 2 for x in w) / (kept * (kept - 1))) if kept > 1 else 0.0
+    return iqm, se, kept
 
 
 # ---- single runs (read straight from the run file) ----

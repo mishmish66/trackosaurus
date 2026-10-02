@@ -601,7 +601,7 @@ def groups_cmd(group_by: Annotated[list[str], typer.Option("--group-by", "-g", s
                metric: Annotated[list[str] | None, typer.Option("--metric", "-m", help="Metric keys to aggregate (repeatable).")] = None,
                reduce: Annotated[Literal["last", "first", "max", "min", "mean"], typer.Option("--reduce", "-r", help="How each run's series becomes one value.")] = "last",
                at: Annotated[float | None, typer.Option(help="Use each run's value at the last x <= AT instead of --reduce.")] = None,
-               x: X = "step", center: Annotated[Literal["median", "mean"], typer.Option(help="Group center.")] = "median",
+               x: X = "step", center: Annotated[Literal["median", "mean", "iqm"], typer.Option(help="Group center (iqm: the mean of the middle half).")] = "median",
                sort: Annotated[str | None, typer.Option("--sort", "-s", help="Columns to sort by; default the first metric, descending.")] = None,
                limit: Limit = None, fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Aggregate runs into groups with a median or mean and its 95% CI."""

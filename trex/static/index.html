@@ -93,7 +93,9 @@ table.kv details > summary { cursor:pointer; }
 table.kv table.kv { margin:2px 0 2px 4px; width:100%; }
 table.kv .long { white-space:pre-wrap; }
 body { display:flex; flex-direction:column; }
-main { display:grid; grid-template-columns: minmax(320px, 25%) 1fr; flex:1; min-height:0; }
+main { display:grid; grid-template-columns: var(--side-w, minmax(320px, 25%)) 5px 1fr; flex:1; min-height:0; }
+#sideGrip { cursor:col-resize; margin-left:-3px; z-index:2; }
+#sideGrip:hover, #sideGrip.drag { background:var(--accent); opacity:.35; }
 aside { overflow:auto; border-right:1px solid var(--line); }
 #sideHead { position:sticky; top:0; z-index:2; background:var(--bg); border-bottom:1px solid var(--line); padding:4px 8px; }
 #runCount { color:var(--muted); font-size:12px; }
@@ -178,7 +180,11 @@ figure iframe { width:100%; height:320px; border:1px solid var(--line); backgrou
        border-radius:4px; padding:4px 6px; font-size:12px; box-shadow:0 2px 8px rgba(0,0,0,.15); max-width:600px; }
 #tip .th { color:var(--muted); margin-bottom:2px; }
 #tip .trow.near { background:var(--grid); font-weight:600; }
-#tip .tmore { color:var(--muted); font-size:11px; }
+#tip .tlist { overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; }
+#tip .tlist.up { mask-image:linear-gradient(to bottom, transparent, #000 16px); }
+#tip .tlist.down { mask-image:linear-gradient(to top, transparent, #000 16px); }
+#tip .tlist.up.down { mask-image:linear-gradient(to bottom, transparent, #000 16px, #000 calc(100% - 16px), transparent); }
+#tip .trow { height:18px; line-height:18px; box-sizing:border-box; }
 #tip .tf { color:var(--muted); font-size:11px; margin-top:3px; padding-top:2px; border-top:1px solid var(--grid); }
 #tip.pinned { pointer-events:auto; box-shadow:0 2px 10px rgba(0,0,0,.25); }
 #tip.pinned .trow { cursor:pointer; border-radius:3px; }
@@ -193,7 +199,7 @@ table.kv { border-collapse:collapse; width:100%; font-size:12px; }
 table.kv td { border-bottom:1px solid var(--grid); padding:2px 6px; vertical-align:top; word-break:break-all; }
 table.kv td:first-child { color:var(--muted); white-space:nowrap; width:1%; }
 .actions { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
-@media (max-width: 800px) { main { grid-template-columns:1fr; grid-template-rows:35% 65%; } aside { border-right:0; border-bottom:1px solid var(--line); } }
+@media (max-width: 800px) { main { grid-template-columns:1fr; grid-template-rows:35% 65%; } aside { border-right:0; border-bottom:1px solid var(--line); } #sideGrip { display:none; } }
 </style>
 </head>
 <body>
@@ -207,7 +213,7 @@ table.kv td:first-child { color:var(--muted); white-space:nowrap; width:1%; }
   <div id="toolbar">
     <input id="runFilter" type="search" placeholder="filter: name, or lr = 0.001 and …" size="28" spellcheck="false">
     <span class="tgroup"><span class="lbl">group by</span><span id="groupChips"></span><button id="groupAdd" class="add">+ add field</button><span id="groupSource" class="muted"></span></span>
-    <label>line <select id="center"><option value="median">median</option><option value="mean">mean</option></select></label>
+    <label>line <select id="center" title="group line: median, mean, or interquartile mean (the mean of the middle half of runs)"><option value="median">median</option><option value="mean">mean</option><option value="iqm">IQM</option></select></label>
     <label>band <select id="band"><option value="ci">95% CI</option><option value="iqr">IQR</option><option value="minmax">min/max</option><option value="std">±std</option><option value="stderr">±stderr</option><option value="none">none</option></select></label>
     <input id="keyFilter" type="search" placeholder="filter charts (regex)" size="16">
     <button id="resetZoom" hidden>reset zoom</button>
@@ -222,6 +228,7 @@ table.kv td:first-child { color:var(--muted); white-space:nowrap; width:1%; }
     </div>
     <table id="runTable"><colgroup><col style="width:20px"><col style="width:22px"><col style="width:26px"><col><col style="width:14px"><col style="width:46px"><col style="width:64px"></colgroup><tbody></tbody></table>
   </aside>
+  <div id="sideGrip" title="drag to resize the sidebar · double-click to reset"></div>
   <section id="panels"><div id="infoPanel" hidden></div></section>
 </main>
 <div id="tip" hidden></div>

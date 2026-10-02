@@ -129,8 +129,9 @@ them WebGL falls back to software and timings mean nothing.
     at their bucket's mean step, never the bucket center;
   - smoothing (time-weighted EMA, scale = span/1000 rounded to a power of two): `kernel.js`
     `Col.ensureSmooth`, `plot.js` `smoothScale`, `query.py` `twema`/`smooth_scale`;
-  - group statistics (order-statistic median CI, Student-t mean CI): `kernel.js` `agg` /
-    `medianCiRank`, `plot.js` `bandOf`, `query.py` `stats`;
+  - group statistics (order-statistic median CI, Student-t mean CI, interquartile mean of ranks
+    [floor(n/4), n - floor(n/4)) with Yuen's CI): `kernel.js` `agg` / `medianCiRank` / `iqmStats`, `plot.js` `bandOf`,
+    `query.py` `stats` / `_iqm`;
   - run filters and field names: `where.py` and `static/where.js` (`compileWhere`, `runField`), `query.py` `get`;
     both suites run the cases in `tests/where_cases.json`.
 - **Other sites cannot use the server.** `Handler._refusal` answers only requests whose Host is an

@@ -5,7 +5,8 @@ import { BAND_LABEL, Chart, DENSITY_AUTO, USE_GL, fmt, fmtDur, fmtSI } from "./p
 const PALETTE = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
                  "#9c755f", "#bab0ac", "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#17becf", "#bcbd22"];
 const SIDE_ROW = 24; // px height of a sidebar row
-const TIP_ROWS = 14; // value rows shown in the tooltip
+const TIP_ROWS = 14; // value rows in view in the tooltip
+const TIP_ROW_PX = 18; // height of one (#tip .trow in index.html)
 const PINNED = "\0pinned"; // section of pinned charts
 const SPREAD_SHOWN = 8; // values listed per config key that varies
 const FRAME_BUDGET_MS = 12; // chart drawing per frame
@@ -188,7 +189,7 @@ function hashOpts(q) {
     group: q.get("fgroup") ? [] : (q.get("group") || "").split(",").filter(Boolean),
     focus: focusOpt(q),
     chart: q.get("chart") || "",
-    center: q.get("center") || "median",
+    center: ["mean", "iqm"].includes(q.get("center")) ? q.get("center") : "median",
     band: q.get("band") || "ci",
     keys: q.get("keys") || "",
     sort: q.get("sort") || "created",
@@ -652,7 +653,32 @@ class App {
     store.set(`collapsed:${this.data.rootKey}`, [...this.collapsed]);
   }
 
+  /** The grip between sidebar and charts: dragging sets the sidebar's width (remembered), double-clicking resets it. */
+  bindSideGrip() {
+    const grip = $("#sideGrip"), main = $("main");
+    const set = (w) => w && main.style.setProperty("--side-w", `${Math.round(Math.max(200, Math.min(0.7 * innerWidth, w)))}px`);
+    set(store.get("sideWidth", 0));
+    grip.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      grip.setPointerCapture(e.pointerId);
+      grip.classList.add("drag");
+      const x0 = e.clientX, w0 = $("aside").offsetWidth;
+      const move = (ev) => set(w0 + ev.clientX - x0);
+      grip.addEventListener("pointermove", move);
+      grip.addEventListener("pointerup", () => {
+        grip.removeEventListener("pointermove", move);
+        grip.classList.remove("drag");
+        store.set("sideWidth", $("aside").offsetWidth);
+      }, { once: true });
+    });
+    grip.addEventListener("dblclick", () => {
+      main.style.removeProperty("--side-w");
+      store.set("sideWidth", 0);
+    });
+  }
+
   bindControls() {
+    this.bindSideGrip();
     let sideRaf = 0;
     const side = () => {
       sideRaf = 0;
@@ -1358,7 +1384,7 @@ class App {
       row("y scale", sel("logy", "linear", [[false, "linear"], [true, "log"]])),
       row("y range", num("ymin"), h("span", { textContent: "to" }), num("ymax")),
       row("ignore outliers", sel("outliers", "off", OUTLIERS)),
-      row("group line", sel("center", o.center, [["median", "median"], ["mean", "mean"]])),
+      row("group line", sel("center", o.center, [["median", "median"], ["mean", "mean"], ["iqm", "IQM (mean of the middle half)"]])),
       row("group band", sel("band", BAND_LABEL[o.band], Object.entries(BAND_LABEL))),
       row("lines", sel("render", "auto", [["lines", "lines"], ["density", "density"]])),
       h("div", { className: "actions" },
@@ -1627,32 +1653,26 @@ class App {
     this.setXRange(null);
   }
 
-  /** Value tooltip: rows by value, the TIP_ROWS around `near` (the line nearest the pointer). */
+  /** Value tooltip: every row by value, in a list TIP_ROWS tall centred on `near` (the line nearest the pointer). */
   tip(e, chart, xs, rows, near = -1) {
     if (!e) return ($("#tip").hidden = true);
-    this.tipView = { e, chart, xs, rows, near, start: near < 0 ? 0 : near - (TIP_ROWS >> 1) };
+    this.tipView = { e, chart, xs, rows, near };
     this.renderTip();
   }
 
-  /** The tooltip's TIP_ROWS rows from `tipView.start`, beside the pointer. */
+  /** The tooltip beside the pointer: a heading, the scrolling list of rows, and a hint. */
   renderTip() {
     const t = $("#tip"), v = this.tipView, { e, chart, xs, rows, near } = v;
-    const a = (v.start = Math.max(0, Math.min(v.start, rows.length - TIP_ROWS))), b = Math.min(rows.length, a + TIP_ROWS);
-    const more = (n, where) => n > 0 && h("div", { className: "tmore", textContent: `${n} more ${where}` });
-    t.replaceChildren(...[
-      h("div", { className: "th", textContent: `${chart?.key} · ${xs}` }),
-      more(a, "above"),
-      ...rows.slice(a, b).map(({ ln, val, extra }, i) =>
-        h("div", { className: "trow" + (a + i === near ? " near" : ""), onmouseenter: () => this.tipRowEnter(chart, ln),
-                   onclick: () => this.tipRowOpen(ln) },
-          h("span", { className: "sw", style: `background:${ln.color}` }),
-          h("span", { className: "tl", textContent: ln.label }), h("b", { textContent: fmt(val) }),
-          h("span", { className: "muted", textContent: extra }))),
-      more(rows.length - b, "below"),
-      h("div", { className: "tf" }),
-    ].filter(Boolean));
+    v.body = h("div", {});
+    v.list = h("div", { className: "tlist", style: `height:${Math.min(rows.length, TIP_ROWS) * TIP_ROW_PX}px`, onscroll: () => this.tipWindow() }, v.body);
+    v.a = v.b = -1;
+    t.replaceChildren(h("div", { className: "th", textContent: `${chart?.key} · ${xs}` }), v.list, h("div", { className: "tf" }));
     this.tipFooter();
     t.hidden = false;
+    v.body.style.paddingBottom = `${rows.length * TIP_ROW_PX}px`; // the list's full height, so it can scroll to `near`
+    v.list.scrollTop = Math.max(0, (near - (TIP_ROWS >> 1)) * TIP_ROW_PX);
+    this.tipWindow();
+    v.list.style.minWidth = `${v.body.offsetWidth}px`;
     const W = t.offsetWidth, H = t.offsetHeight;
     let x = e.clientX + 16, y = e.clientY + 12;
     if (x + W > innerWidth) x = e.clientX - W - 16;
@@ -1660,14 +1680,31 @@ class App {
     t.style.transform = `translate(${x}px, ${y}px)`;
   }
 
-  /** While the tooltip is pinned, the wheel (vertical, or horizontal as Shift makes it) moves its rows. */
+  /** The rows in view of the tooltip's list (and a few beyond), between spacers standing for the rest. */
+  tipWindow() {
+    const v = this.tipView, { list, body, rows, near, chart } = v, top = list.scrollTop;
+    list.classList.toggle("up", top > 0);
+    list.classList.toggle("down", top + list.clientHeight < list.scrollHeight - 1);
+    const a = Math.max(0, Math.floor(top / TIP_ROW_PX) - 3), b = Math.min(rows.length, a + TIP_ROWS + 6);
+    if (a === v.a && b === v.b) return;
+    [v.a, v.b] = [a, b];
+    body.style.paddingTop = `${a * TIP_ROW_PX}px`;
+    body.style.paddingBottom = `${(rows.length - b) * TIP_ROW_PX}px`;
+    body.replaceChildren(...rows.slice(a, b).map(({ ln, val, extra }, i) =>
+      h("div", { className: "trow" + (a + i === near ? " near" : ""), onmouseenter: () => this.tipRowEnter(chart, ln),
+                 onclick: () => this.tipRowOpen(ln) },
+        h("span", { className: "sw", style: `background:${ln.color}` }),
+        h("span", { className: "tl", textContent: ln.label }), h("b", { textContent: fmt(val) }),
+        h("span", { className: "muted", textContent: extra }))));
+  }
+
+  /** While the tooltip is pinned, the wheel (vertical, or horizontal as Shift makes it) scrolls its list:
+   * smoothly by a wheel notch, directly by a touchpad's small steps. */
   scrollTip(e) {
-    if (!this.tipPinned || !this.tipView || $("#tip").hidden) return;
+    if (!this.tipPinned || !this.tipView?.list || $("#tip").hidden) return;
     e.preventDefault();
-    const d = e.deltaY || e.deltaX;
-    if (!d) return;
-    this.tipView.start += Math.sign(d) * 3;
-    this.renderTip();
+    const d = (e.deltaY || e.deltaX) * (e.deltaMode === 1 ? TIP_ROW_PX : e.deltaMode === 2 ? TIP_ROWS * TIP_ROW_PX : 1);
+    if (d) this.tipView.list.scrollBy({ top: d, behavior: Math.abs(d) >= 40 ? "smooth" : "instant" });
   }
 
   tipFooter() {
@@ -1733,7 +1770,7 @@ class App {
   revealSide(id, rebuild = false) {
     if (this.sideMark === id && !rebuild) return;
     this.sideMark = id;
-    this.renderRunTable();
+    if (rebuild || !this.sideRows) this.renderRunTable();
     const i = (this.sideRows || []).findIndex((f) => f.id === id);
     if (i < 0) return;
     const aside = $("aside"), table = $("#runTable");

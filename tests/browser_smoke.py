@@ -281,12 +281,14 @@ def interactions_smoke(page, url):
     checks["the media slider steps back"] = page.evaluate("[...app.mediaPanels.values()].some((m) => !m.follow)")
 
     hover(plot())
+    checks["the tooltip opens at the line nearest the cursor"] = page.evaluate("!!document.querySelector('#tip .trow.near')")
     page.keyboard.down("Shift")
     checks["shift pins the tooltip"] = page.evaluate("document.querySelector('#tip').classList.contains('pinned')")
-    first = "document.querySelector('#tip .trow .tl')?.textContent"
-    top, down = page.evaluate(first), page.locator("#tip .tmore", has_text="below").count() > 0
-    page.mouse.wheel(0, 300 if down else -300)
-    checks["the wheel scrolls a pinned tooltip"] = soon(f"{first} !== {json.dumps(top)} && !!document.querySelector('#tip .tmore')")
+    checks["a pinned tooltip lists every line"] = page.evaluate("app.tipView.rows.length === app.runList.filter((r) => r.shown).length")
+    scroll = "document.querySelector('#tip .tlist').scrollTop"
+    top, room = page.evaluate(f"[{scroll}, document.querySelector('#tip .tlist').scrollHeight - document.querySelector('#tip .tlist').clientHeight]")
+    page.mouse.wheel(0, 100 if top < room else -100)
+    checks["the wheel scrolls a pinned tooltip smoothly"] = soon(f"Math.abs({scroll} - {top}) >= 18")
     tip_row = page.locator("#tip .trow").first
     tip_row.hover()
     checks["a pinned row marks its run in the sidebar"] = page.evaluate("!!app.sideMark")
@@ -300,6 +302,30 @@ def interactions_smoke(page, url):
     page.go_forward()
     page.wait_for_function("app.scopeIsRun", timeout=30000)
 
+    width = "document.querySelector('aside').offsetWidth"
+    w0, g = page.evaluate(width), page.locator("#sideGrip").bounding_box()
+    page.mouse.move(g["x"] + g["width"] / 2, g["y"] + 300)
+    page.mouse.down()
+    page.mouse.move(g["x"] + g["width"] / 2 + 120, g["y"] + 300, steps=8)
+    page.mouse.up()
+    checks["dragging the grip widens the sidebar"] = page.evaluate(width) >= w0 + 100
+    page.reload()
+    page.wait_for_function(READY, timeout=30000)
+    checks["the sidebar keeps its width after a reload"] = page.evaluate(width) >= w0 + 100
+    page.dblclick("#sideGrip")
+    checks["double-clicking the grip resets the width"] = soon(f"{width} === {w0}")
+    page.goto(f"{url}/?iqm#path=sweep&group=config.lr&center=iqm")
+    page.wait_for_function(READY, timeout=30000)
+    plot()
+    checks["IQM draws each group's interquartile mean with a CI band"] = soon(
+        f"(() => {{ const v = {chart}.view, k = v?.lines[0]; return document.querySelector('#center').value === 'iqm' && !!k"
+        " && k.center.some((c, i) => c > k.lo[i] && c < k.hi[i]); })()", timeout=10000)
+    span = page.evaluate(f"""(() => {{ const v = {chart}.view, c = v.lines.flatMap((l) => [...l.center].filter(Number.isFinite));
+        return [Math.min(...c), Math.max(...c), v.y0, v.y1]; }})()""")
+    reach = (span[1] - span[0]) * 0.25
+    checks["the y axis follows the group lines; a band widens it by at most a quarter"] = (
+        span[2] <= span[0] and span[3] >= span[1] and span[2] >= span[0] - reach - 0.05 * (span[1] - span[0] + 2 * reach)
+        and span[3] <= span[1] + reach + 0.05 * (span[1] - span[0] + 2 * reach))
     page.goto(f"{url}/?gl=0#path=sweep&group=config.lr")
     page.wait_for_function(READY, timeout=30000)
     hover(plot())
