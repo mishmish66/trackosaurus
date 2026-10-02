@@ -157,3 +157,9 @@ def test_tool_env_is_a_plain_path_even_when_color_is_forced(tmp_path, monkeypatc
         assert update.tool_env() == (tmp_path / "tools").resolve() / "trex"
     finally:
         update.tool_env.cache_clear()
+
+
+def test_this_processes_trex_is_found_where_it_is_imported_from_when_its_prefix_has_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(update.sys, "prefix", str(tmp_path))
+    found = update.installed()
+    assert found["version"] != "unknown" and found["version"] == __import__("importlib.metadata").metadata.version("trex")

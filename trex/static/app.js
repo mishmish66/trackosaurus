@@ -354,18 +354,22 @@ class App {
     setInterval(() => this.refreshTree().then(() => this.renderCrumbs()), 15000);
   }
 
-  /** Under the daemon, its state (else null). False when the page is the daemon's root (/), after opening its only
-   * tracked directory, or else showing the root page. */
+  /** Under the daemon, its state (else null), and the trex brand opening its panel. False when it tracks nothing,
+   * after showing the panel in place of the page. */
   async enterDaemon() {
     const d = await daemonInfo();
     this.daemon = d.daemon ? d : null;
-    if (!d.daemon || BASE) return true;
-    if (d.roots.length === 1 && !d.workspaces.length) location.replace(d.roots[0].url);
-    else this.daemonHome(d);
+    if (!d.daemon) return true;
+    const brand = $(".brand");
+    brand.classList.add("brandlink");
+    brand.title = "workspaces and tracked directories";
+    brand.onclick = (e) => this.rootMenu(e.currentTarget);
+    if (BASE || d.roots.length) return true;
+    this.daemonHome(d);
     return false;
   }
 
-  /** The daemon's root page (/): its workspaces and tracked directories, to open or change. */
+  /** The page of a daemon that tracks nothing: its panel, to add a directory. */
   daemonHome(d) {
     $("#status").textContent = "";
     $("#crumbPath").replaceChildren(h("span", { className: "seg current rootseg" }, h("span", { className: "crumb", textContent: "/" })));
@@ -383,7 +387,7 @@ class App {
   daemonPanel(d, refresh) {
     const err = h("div", { className: "merr" });
     const panel = h("div", { className: "dpanel" });
-    const show = (...kids) => panel.replaceChildren(...kids);
+    const show = (...kids) => panel.replaceChildren(...kids.filter((k) => k != null));
     const home = () => show(h("div", { className: "mtitle", textContent: "workspaces" }), ...this.workspaceRows(d, refresh, edit),
       h("button", { className: "mclear", textContent: "+ new workspace", onclick: () => edit(null) }),
       h("div", { className: "mtitle msec", textContent: "tracked directories" }), ...this.trackedRows(d, refresh, err), err,
@@ -664,6 +668,7 @@ class App {
   }
 
   get rootName() {
+    if (this.daemon && !BASE) return "/";
     const here = [...(this.daemon?.workspaces || []), ...(this.daemon?.roots || [])].find((r) => r.url === `${BASE}/`);
     return here?.name || this.data.info?.name || "runs";
   }
@@ -688,10 +693,8 @@ class App {
     };
     const chart = o.chart && this.charts.has(o.chart);
     seg(this.rootName, "", { current: !parts.length && !o.fgroup && !chart, cls: "rootseg" });
-    if (this.daemon) path.unshift(h("span", { className: "seg" }, h("button", { className: "crumb", textContent: "/",
-      title: "the daemon's workspaces and tracked directories", onclick: () => (location.href = "/") })));
-    if (this.daemon) path.push(h("button", { className: "chev", textContent: "▾", title: "switch workspace or directory",
-      onclick: (e) => this.rootMenu(e.currentTarget) }));
+    if (this.daemon && BASE) path.unshift(h("span", { className: "seg" }, h("button", { className: "crumb", textContent: "/",
+      title: "every tracked directory", onclick: () => (location.href = "/") })));
     parts.forEach((p, i) => seg(p, parts.slice(0, i + 1).join("/"),
       { current: i === parts.length - 1 && !o.fgroup && !chart, siblingsOf: parts.slice(0, i).join("/") }));
     if (o.fgroup) {

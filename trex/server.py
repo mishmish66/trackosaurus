@@ -132,11 +132,15 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def _scope(self, path: str, query: str) -> str | None:
-        """Choose the directory the request is for and return the path within it, or None after redirecting
-        a daemon page that names no served directory, or lacks its trailing slash."""
+        """Choose what the request is for and return the path within it, or None after redirecting a daemon page
+        that names no tracked directory or workspace, or lacks its trailing slash. The daemon's own root is the
+        view of every tracked directory."""
         self._ex = self.srv.explorer
         pm = ROOT_PREFIX.fullmatch(path) if self.srv.roots is not None else None
-        if self.srv.roots is None or pm is None:
+        if self.srv.roots is None:
+            return path
+        if pm is None:
+            self._ex = self.srv.roots.everything()
             return path
         kind, name, rest = pm[1], unquote(pm[2]), pm[3]
         try:

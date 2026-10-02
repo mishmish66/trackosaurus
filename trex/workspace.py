@@ -1,7 +1,8 @@
-"""Workspaces: named sets of tracked directories, local or remote, shown as one merged folder tree.
+"""Workspaces: sets of tracked directories, local or remote, shown as one folder tree.
 
-A run keeps its path within its tracked directory; a path that two members hold is shown bare for the first
-member that has it and as `path<member>` for the others. Every run gets a `dir` field: its member's name.
+Merged (a named workspace), a run keeps its path within its tracked directory; a path that two members hold
+is shown bare for the first member that has it and as `path<member>` for the others. Nested (the daemon's
+root view), each member is a top-level folder named for it. Every run gets a `dir` field: its member's name.
 A workspace answers the same requests as an Explorer (`runs`, `tiles`, ...), by asking each member.
 """
 
@@ -200,8 +201,8 @@ def unframe_bundle(buf: bytes) -> list[tuple[str, list[bytes]]]:
 
 
 class Workspace:
-    def __init__(self, name: str, members: Sequence[Member]) -> None:
-        self.name = name
+    def __init__(self, name: str, members: Sequence[Member], nested: bool = False) -> None:
+        self.name, self.nested = name, nested
         self.members = list(members)
         self._lock = threading.Lock()
         self._owners: dict[str, list[str]] = {}  # path -> names of the members holding it, in member order
@@ -211,7 +212,7 @@ class Workspace:
     # ---- run ids ----
 
     def _refresh(self, force: bool = False) -> None:
-        if not force and time.time() - self._owners_at < OWNERS_TTL:
+        if self.nested or (not force and time.time() - self._owners_at < OWNERS_TTL):
             return
         owners: dict[str, list[str]] = {}
         for m, paths in zip(self.members, self._each(lambda m: m.paths()), strict=True):
@@ -221,6 +222,8 @@ class Workspace:
             self._owners, self._owners_at = owners, time.time()
 
     def ws_id(self, m: Member, path: str) -> str:
+        if self.nested:
+            return f"{m.name}/{path}"
         with self._lock:
             owners = self._owners.setdefault(path, [m.name])
             if m.name not in owners:
@@ -229,6 +232,11 @@ class Workspace:
 
     def resolve(self, run: str) -> tuple[Member, str]:
         """(member, path within it) of a workspace run id."""
+        if self.nested:
+            for m in sorted(self.members, key=lambda m: -len(m.name)):
+                if run.startswith(m.name + "/"):
+                    return m, run[len(m.name) + 1:]
+            raise KeyError(run)
         for attempt in range(2):
             for m in self.members:
                 suffix = f"<{m.name}>"
@@ -256,6 +264,11 @@ class Workspace:
         """The members and their prefixes that a workspace folder or run covers."""
         if not prefix:
             return [(m, "") for m in self.members]
+        if self.nested:
+            for m in sorted(self.members, key=lambda m: -len(m.name)):
+                if prefix == m.name or prefix.startswith(m.name + "/"):
+                    return [(m, prefix[len(m.name) + 1:])]
+            return []
         try:
             m, path = self.resolve(prefix)
             if path != prefix:
@@ -264,13 +277,17 @@ class Workspace:
             pass
         return [(m, prefix) for m in self.members]
 
+    def _folder(self, m: Member, path: str) -> str:
+        return (f"{m.name}/{path}" if path else m.name) if self.nested else path
+
     def _rename(self, m: Member, meta: dict[str, Any]) -> dict[str, Any]:
         return {**meta, "id": self.ws_id(m, str(meta["id"])), "dir": m.name}
 
     # ---- the Explorer interface ----
 
     def info(self) -> dict[str, Any]:
-        return {"root": f"workspace:{self.name}", "name": self.name, "cache": "", "workspace": [m.name for m in self.members]}
+        root = "daemon:/" if self.nested else f"workspace:{self.name}"
+        return {"root": root, "name": self.name, "cache": "", "workspace": [m.name for m in self.members]}
 
     def tree(self) -> list[list[str]]:
         self._refresh(force=True)
@@ -285,13 +302,14 @@ class Workspace:
         bodies = list(self._pool.map(lambda mp: _try(lambda: mp[0].runs(mp[1])), scope))
         runs: list[object] = []
         media: list[object] = []
-        folders: dict[str, object] = {}
+        folders: dict[str, Any] = {}
         for (m, _), body in zip(scope, bodies, strict=True):
             if body is None:
                 continue
             runs += [self._rename(m, meta) for meta in body["runs"]]
             media += [[self.ws_id(m, str(r[0])), *r[1:]] for r in body["media"]]
             for p, info in body["folders"].items():
+                p = self._folder(m, p)
                 folders[p] = {**folders.get(p, {}), **info} if isinstance(info, dict) else info
         return {"runs": runs, "media": media, "folders": folders}
 
@@ -365,7 +383,8 @@ class Workspace:
             path = json.loads(data[:data.index(',"seq0"')] + "}")["run"]
             return _with_run(data, path, self.ws_id(m, path))
         if kind == "folder":
-            return data
+            ev = json.loads(data)
+            return dumps({**ev, "path": self._folder(m, ev["path"])}) if self.nested else data
         if kind == "hb":
             return dumps({self.ws_id(m, p): v for p, v in json.loads(data).items()})
         ev = json.loads(data)

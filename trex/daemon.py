@@ -10,8 +10,9 @@ As a systemd user service:
 
 With `--source`, the UI's update button installs the newest trex and systemd restarts the daemon on it.
 
-The page at / lists the tracked directories and workspaces: named sets of directories whose folder trees are
-merged, so runs from several machines can be compared side by side (group by `dir`).
+/ shows every tracked directory, each as a top-level folder; clicking trex (top left) opens the panel that
+switches and manages them, and workspaces: named sets of directories whose folder trees are merged, so runs
+from several machines can be compared side by side (group by `dir`).
 
 A directory added as `host:path` (in the UI or with `trex serve host:path`) is served from that machine
 over ssh: the daemon runs this trex there with uvx (`trex.remote`), so the machine needs only uv and an
@@ -238,13 +239,20 @@ class Roots:
         with self.lock:
             view = self._views.get(name)
             if view is None:
-                names = self.names()
-                members: list[Local | Far] = []
-                for spec in self.workspaces[name]:
-                    e = self.entries[spec]
-                    members.append(Far(names[spec], e) if isinstance(e, Remote) else Local(names[spec], e))
-                view = self._views[name] = Workspace(name, members)
+                view = self._views[name] = Workspace(name, self._members(self.workspaces[name]))
             return view
+
+    def everything(self) -> Workspace:
+        """The root view: every tracked directory, each a top-level folder."""
+        with self.lock:
+            view = self._views.get("")
+            if view is None:
+                view = self._views[""] = Workspace("/", self._members(list(self.entries)), nested=True)
+            return view
+
+    def _members(self, specs: Sequence[str]) -> list[Local | Far]:
+        names = self.names()
+        return [Far(names[s], e) if isinstance(e := self.entries[s], Remote) else Local(names[s], e) for s in specs]
 
     def workspace_list(self) -> list[dict[str, object]]:
         with self.lock:

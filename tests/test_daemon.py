@@ -120,9 +120,7 @@ def test_daemon_serves_each_directory_under_its_prefix(roots, dirs, http):
         assert [r["id"] for r in json.loads(get(f"{http}/r/{urllib.parse.quote(n)}/api/runs")[2])["runs"]] == ["r1"]
     assert get(f"{http}/r/runs%3Ca%3E")[1] == f"{http}/r/runs%3Ca%3E/"
     assert get(f"{http}/r/nope/")[1] == f"{http}/"
-    with pytest.raises(urllib.error.HTTPError) as e:
-        get(f"{http}/api/runs")
-    assert e.value.code == 404
+    assert sorted(r["id"] for r in json.loads(get(f"{http}/api/runs")[2])["runs"]) == ["runs<a>/r1", "runs<b>/r1"]
 
 
 def test_removing_a_directory_stops_serving_it_without_touching_its_files(roots, dirs, http, state):

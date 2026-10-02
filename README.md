@@ -34,7 +34,8 @@ run.finish()                                    # also at exit; an uncaught exce
 
 ## Daemon
 
-- `trex daemon` tracks many directories on one port; `trex serve DIR` adds to it, and `/` lists them.
+- `trex daemon` tracks many directories on one port, all shown at `/`; `trex serve DIR` adds one.
+- Click `trex` (top left) to switch to or manage tracked directories and workspaces.
 - A workspace merges chosen directories, local or remote, into one tree; group by `dir` to compare them.
 - Add `host:path` for another machine: trex runs there over ssh with `uvx`, so it needs only uv.
 - On a cluster, use a data-transfer node (`xfer:/scratch/me/runs`); jobs on any node stream live.

@@ -76,7 +76,8 @@ them WebGL falls back to software and timings mean nothing.
   of a folder in one indexed read.
 - **Daemon**: one server, one `Explorer` (or `Remote`) per tracked directory. A directory's URLs are its
   standalone URLs under `/r/<name>/`, a workspace's under `/w/<name>/`, and the UI prefixes every request
-  with that (`BASE` in `data.js`); `/` is the root page. Names follow Emacs's uniquify (`runs<chush>`)
+  with that (`BASE` in `data.js`); `/` is the root view, every tracked directory as a top-level folder
+  (`Roots.everything`, a nested `Workspace`), and the trex brand opens the panel that manages them. Names follow Emacs's uniquify (`runs<chush>`)
   and change when a collision appears or ends; specs (paths, `host:path`) are the stable keys.
 - **Workspace**: answers the Explorer interface by asking its members in parallel. A run id is the
   member's path, or `path<member>` when an earlier member holds the same path; `resolve` maps it back.

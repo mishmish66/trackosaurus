@@ -1,6 +1,7 @@
 """Updating the daemon's trex from $TREX_SOURCE: `uv tool install $TREX_SOURCE`, then systemd restarts it."""
 
 import functools
+import importlib.metadata
 import json
 import os
 import shutil
@@ -31,13 +32,22 @@ class UpdateError(Exception):
 
 
 def installed(prefix: Path | None = None) -> Install:
-    """The trex installed in the environment at `prefix` (default: this one), read fresh from disk."""
-    prefix = prefix or Path(sys.prefix)
-    dist = next(iter(sorted(prefix.glob("lib/python*/site-packages/trex-*.dist-info"))), None)
-    commit = None
-    if dist and (dist / "direct_url.json").is_file():
-        commit = (json.loads((dist / "direct_url.json").read_text()).get("vcs_info") or {}).get("commit_id")
-    return {"version": dist.name.removeprefix("trex-").removesuffix(".dist-info") if dist else "unknown", "commit": commit}
+    """The trex installed in the environment at `prefix` (default: this one, or wherever this process imports it
+    from), read fresh from disk."""
+    found = next(iter(sorted((prefix or Path(sys.prefix)).glob("lib/python*/site-packages/trex-*.dist-info"))), None)
+    if found is None and prefix is None:
+        try:
+            dist = importlib.metadata.distribution("trex")
+        except importlib.metadata.PackageNotFoundError:
+            return {"version": "unknown", "commit": None}
+        version, direct = dist.version, dist.read_text("direct_url.json")
+    elif found is None:
+        return {"version": "unknown", "commit": None}
+    else:
+        version = found.name.removeprefix("trex-").removesuffix(".dist-info")
+        direct = (found / "direct_url.json").read_text() if (found / "direct_url.json").is_file() else None
+    commit = (json.loads(direct).get("vcs_info") or {}).get("commit_id") if direct else None
+    return {"version": version, "commit": commit}
 
 
 RUNNING: Final = installed()  # the trex this process runs, as installed when it started

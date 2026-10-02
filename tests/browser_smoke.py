@@ -3,8 +3,8 @@
 Checks cold and warm loads, grouping, console errors, and that a client dropping every 5th
 stream event still converges to the run files: every row and media item, and top tiles whose
 bucket counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
-a directory with `trex serve -y`, making a workspace of two directories on the root page, and from the
-path bar menu removing a directory, re-adding it from the remembered ones, and clearing them.
+a directory with `trex serve -y`, the root view of both, making a workspace of them in the panel the trex
+brand opens, and from that panel removing a directory and re-adding it from the remembered ones.
 
     uv run --with playwright python tests/browser_smoke.py [screenshot_dir]
 """
@@ -64,42 +64,47 @@ READY = ("window.app && app.data.runs.size > 0 && app.charts.size > 0 && !app.da
 
 
 def daemon_smoke(page, runs, tmp, env, out, errors):
-    """Whether the daemon's root page lists its directories, a workspace made in its editor merges them, and its
-    menu removes, adds and forgets directories. The refused add's 400 is taken out of `errors`."""
+    """Whether the daemon's root shows every tracked directory, a workspace made in the panel (opened from the trex
+    brand) merges them, and the panel removes, adds and forgets directories. The refused add's 400 is taken out
+    of `errors`."""
     port = free_port()
     url = f"http://127.0.0.1:{port}"
     daemon = subprocess.Popen([sys.executable, "-m", "trex", "daemon", str(runs / "sweep"), "--port", str(port),
                                "--cache", str(tmp / "cache")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-    menu, row = "#crumbPath button[title='switch workspace or directory']", "#menu .mrow:has(.ml:text-is('{}'))"
+    row = "#menu .mrow:has(.ml:text-is('{}'))"
     try:
         daemon.stdout.readline()
         subprocess.run([sys.executable, "-m", "trex", "serve", str(runs / "live"), "-y"], check=True, env=env)
-        page.goto(f"{url}/")
-        page.wait_for_selector(".dhome .mrow:has(.ml:text-is('live'))")
-        page.click(".dhome button:text-is('+ new workspace')")
-        page.fill(".dhome .madd input", "both")
-        for box in page.query_selector_all(".dhome .mcheck input"):
-            box.check()
-        page.click(".dhome button:text-is('save')")
-        page.wait_for_url(f"{url}/w/both/")
-        page.wait_for_function(READY, timeout=30000)
         with urllib.request.urlopen(f"{url}/r/sweep/api/runs") as r1, urllib.request.urlopen(f"{url}/r/live/api/runs") as r2:
             total = len(json.loads(r1.read())["runs"]) + len(json.loads(r2.read())["runs"])
+        page.goto(f"{url}/")
+        page.wait_for_function(READY, timeout=30000)
+        root = page.evaluate("[app.data.runs.size, app.rootName, [...new Set([...app.data.runs.values()].map((r) => r.id.split('/')[0]))].sort()]")
+        page.click(".brand")
+        page.click("#menu button:text-is('+ new workspace')")
+        page.fill("#menu .madd input", "both")
+        for box in page.query_selector_all("#menu .mcheck input"):
+            box.check()
+        page.click("#menu button:text-is('save')")
+        page.wait_for_url(f"{url}/w/both/")
+        page.wait_for_function(READY, timeout=30000)
         merged = page.evaluate("[app.data.runs.size, app.groupFields().some((f) => f.id === 'dir')]")
         page.screenshot(path=str(out / "workspace.png"))
         page.click("#crumbPath .crumb:text-is('/')")
         page.wait_for_url(f"{url}/")
-        page.wait_for_selector(".dhome")
-        page.click(".dhome .mrow:has(.ml:text-is('live')) .mitem")
+        page.wait_for_function(READY, timeout=30000)
+        page.click(".brand")
+        page.click(row.format("live") + " .mitem")
         page.wait_for_url(f"{url}/r/live/")
         page.wait_for_function(READY, timeout=30000)
         page.once("dialog", lambda d: d.accept())
-        page.click(menu)
+        page.click(".brand")
         page.click(row.format("live") + " .chev")
         page.wait_for_url(f"{url}/")
+        page.wait_for_function(READY, timeout=30000)
         page.goto(f"{url}/r/sweep/")
         page.wait_for_function(READY, timeout=30000)
-        page.click(menu)
+        page.click(".brand")
         page.fill("#menu .madd input", str(tmp / "no-such-dir"))
         before = len(errors)
         page.click("#menu .madd button")
@@ -111,17 +116,20 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         page.click("#menu .mrecent .mitem")
         page.wait_for_url(f"{url}/r/live/")
         page.wait_for_function(READY, timeout=30000)
-        page.click(menu)
+        page.click(".brand")
         page.wait_for_selector("#menu .mrow")
         page.screenshot(path=str(out / "daemon_menu.png"))
         recent_left = page.query_selector("#menu .mrecent") is not None
+        panel_text = page.inner_text("#menu")
+        tidy = "null" not in panel_text.split() and "unknown" not in panel_text
         with urllib.request.urlopen(f"{url}/api/daemon") as r:
             d = json.loads(r.read())
         left, workspaces = [x["name"] for x in d["roots"]], [(w["name"], w["members"]) for w in d["workspaces"]]
-        print(f"daemon: workspace of both dirs shows {merged[0]}/{total} runs, dir field {merged[1]}; removed live, "
-              f"re-added it from history; tracking {left}, workspaces {workspaces}, history {d['history']}")
-        return (merged == [total, True] and sorted(left) == ["live", "sweep"] and workspaces == [("both", ["sweep"])]
-                and not d["history"] and not recent_left)
+        print(f"daemon: root shows {root[0]}/{total} runs in {root[2]} as {root[1]!r}; workspace of both shows "
+              f"{merged[0]}/{total}, dir field {merged[1]}; removed live, re-added it from history; tracking {left}, "
+              f"workspaces {workspaces}, history {d['history']}, panel tidy {tidy}")
+        return (root == [total, "/", ["live", "sweep"]] and merged == [total, True] and sorted(left) == ["live", "sweep"]
+                and workspaces == [("both", ["sweep"])] and not d["history"] and not recent_left and tidy)
     finally:
         daemon.terminate()
         daemon.wait()

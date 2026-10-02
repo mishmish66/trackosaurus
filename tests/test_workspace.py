@@ -250,3 +250,26 @@ def test_the_daemon_root_serves_the_page(roots, dirs, http):
     tracked(roots, *dirs)
     assert b'/static/app.js' in get(f"{http}/")
     assert get(f"{http}/w/nope/") == get(f"{http}/")
+
+
+def test_the_daemon_root_shows_every_tracked_directory_as_a_top_level_folder(roots, tmp_path, http):
+    a, b = tmp_path / "x" / "a" / "runs", tmp_path / "y" / "a" / "runs"
+    write_run(a / "sac" / "r1", image=True)
+    write_run(b / "sac" / "r1")
+    trex.folder_info(a / "sac", note="from x")
+    names = tracked(roots, a, b)
+    assert names == ["runs<x/a>", "runs<y/a>"]
+    body = json.loads(get(f"{http}/api/runs"))
+    assert sorted((r["id"], r["dir"]) for r in body["runs"]) == [("runs<x/a>/sac/r1", "runs<x/a>"), ("runs<y/a>/sac/r1", "runs<y/a>")]
+    assert body["folders"]["runs<x/a>/sac"] == {"note": "from x"}
+    assert [r["id"] for r in json.loads(get(f"{http}/api/runs?path={urllib.parse.quote('runs<y/a>')}"))["runs"]] == ["runs<y/a>/sac/r1"]
+    assert json.loads(get(f"{http}/api/runs?path=elsewhere"))["runs"] == []
+    _, buf = post(f"{http}/api/tiles", [["runs<y/a>/sac/r1", "loss", "top"], ["runs<x/a>/sac/r1", "loss", "top"]], raw=True)
+    assert all(unframe_tiles(buf, 2))
+    media = body["media"][0]
+    assert get(f"{http}/m/{urllib.parse.quote(media[0], safe='')}/{media[5]}") == b"\x89PNG\r\n\x1a\n" + bytes(range(16))
+    assert json.loads(get(f"{http}/api/info"))["root"] == "daemon:/"
+
+
+def test_an_empty_daemon_root_has_no_runs(roots, http):
+    assert json.loads(get(f"{http}/api/runs")) == {"runs": [], "media": [], "folders": {}}
