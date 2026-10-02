@@ -146,6 +146,13 @@ class Roots:
             self._save()
         threading.Thread(target=entry.close, name=f"trex-close-{name}", daemon=True).start()
 
+    def close(self) -> None:
+        """Stop serving every directory (they stay saved)."""
+        with self.lock:
+            entries, self.entries = list(self.entries.values()), {}
+        for entry in entries:
+            entry.close()
+
     def get(self, name: str) -> Explorer | Remote:
         with self.lock:
             return self.entries[name]

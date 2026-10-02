@@ -436,6 +436,7 @@ def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]..
     finally:
         control.shutdown()
         control.server_close()
+        roots.close()
     if restarting.is_set():
         typer.echo(f"trex daemon: updated; exiting with status {update.RESTART_STATUS} for systemd to restart it")
         sys.exit(update.RESTART_STATUS)

@@ -1,3 +1,4 @@
+import http.client as http_client
 import json
 import os
 import signal
@@ -252,3 +253,25 @@ def test_serve_hands_remote_addresses_to_the_daemon(roots, runs, capsys):
 def test_serving_a_remote_address_needs_a_daemon(home):
     with pytest.raises(SystemExit, match="trex daemon"):
         main(["serve", "box:/runs"])
+
+
+def test_passed_through_answers_keep_the_connection_usable(roots, runs, http):
+    name = urllib.parse.quote(roots.add_remote(f"box:{runs}"))
+    parts = urllib.parse.urlsplit(http)
+    conn = http_client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    try:
+        for path in ("/api/info", "/", "/api/tree"):
+            conn.request("GET", f"/r/{name}{path}")
+            r = conn.getresponse()
+            assert r.status == 200 and int(r.headers["Content-Length"]) == len(r.read())
+    finally:
+        conn.close()
+
+
+def test_closing_the_daemons_directories_ends_remote_sessions_and_keeps_them_saved(roots, runs, home, tmp_path):
+    entry = roots.get(roots.add_remote(f"box:{runs}"))
+    assert isinstance(entry, Remote)
+    (_, sock), = sessions(home)
+    roots.close()
+    assert not entry.local.exists() and wait_for(lambda: not Path(sock).exists()) and roots.served() == []
+    assert [e["root"] for e in json.loads((tmp_path / "state" / "roots.json").read_text())] == [f"box:{runs}"]

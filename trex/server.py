@@ -33,7 +33,7 @@ STATIC: Final = Path(__file__).parent / "static"
 DEFAULT_PORT: Final = 13898
 PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
 HOP_HEADERS: Final = frozenset({"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
-                                "proxy-authorization", "proxy-authenticate", "content-length"})
+                                "proxy-authorization", "proxy-authenticate"})
 ROOT_PREFIX: Final = re.compile(r"/r/([^/]+)(/.*)?")  # a daemon directory's URLs
 HB_INTERVAL: Final = 10.0  # seconds of stream silence after which a heartbeat is sent
 MAX_TILE_REQUESTS: Final = 4096
@@ -155,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._unavailable(remote, target)
         conn = remote.connection()
         try:
-            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS | {"host", "origin"}}
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS | {"host", "origin", "content-length"}}
             try:
                 conn.request(self.command, target, body=self._body or None, headers={**headers, "Host": "localhost"})
                 resp = conn.getresponse()
