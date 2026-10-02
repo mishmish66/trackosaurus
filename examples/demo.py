@@ -17,6 +17,22 @@ import numpy as np
 import trex
 
 
+REPORT_STYLE = """<style>
+body { font: 13px/1.45 system-ui, sans-serif; color: #24292f; margin: 10px 12px; }
+h3 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { padding: 3px 14px 3px 0; border-bottom: 1px solid #eaeef2; text-align: left; }
+th { color: #57606a; font-weight: 500; }
+td { text-align: right; }
+</style>"""
+
+
+def report(lr, seed, step, values):
+    """A small HTML summary of a run at `step`."""
+    rows = "".join(f"<tr><th>{k}</th><td>{v:.3g}</td></tr>" for k, v in values.items())
+    return f"{REPORT_STYLE}<h3>lr {lr} · seed {seed} · step {step}</h3><table>{rows}</table>"
+
+
 def fake_run(dest, lr, seed, steps, delay, media_every, width):
     rng = random.Random(seed * 1000 + int(lr * 1e5))
     run = trex.init(dest, config={"lr": lr, "seed": seed, "model": {"width": width, "depth": 4}}, tags=["demo"],
@@ -34,8 +50,8 @@ def fake_run(dest, lr, seed, steps, delay, media_every, width):
             y, x = np.mgrid[0:64, 0:64]
             img = np.stack([np.sin(x / 8 + step / 200 + seed), np.cos(y / 8 * lr * 10), np.sin((x + y) / 16)], -1)
             run.log_image("samples/heatmap", (img + 1) / 2, step=step)
-            run.log_html("reports/table", f"<h3>lr {lr} seed {seed} @ {step}</h3><table border=1>" + "".join(
-                f"<tr><td>{i}</td><td>{rng.random():.4f}</td></tr>" for i in range(50)) + "</table>", step=step)
+            run.log_html("reports/table", report(lr, seed, step, {"train/loss": loss, "train/acc": 1 - math.exp(-step * lr * 0.3),
+                                                                  "lr": lr * 0.5 * (1 + math.cos(math.pi * step / steps))}), step=step)
             if shutil.which("ffmpeg") and step % (media_every * 2) == 0:
                 t = np.arange(24)[:, None, None]
                 frames = (np.sin(x[None] / 6 + t / 3 + seed + step / 500) * 127 + 128).astype(np.uint8)

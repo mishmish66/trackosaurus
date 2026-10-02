@@ -274,7 +274,7 @@ class Renderer {
   constructor() {
     this.canvas = document.createElement("canvas");
     this.canvas.width = this.canvas.height = 1;
-    const gl = this.canvas.getContext("webgl2", { antialias: true, depth: true, stencil: false, alpha: true,
+    const gl = this.canvas.getContext("webgl2", { antialias: false, depth: true, stencil: false, alpha: true,
       premultipliedAlpha: true, preserveDrawingBuffer: false, powerPreference: "high-performance" });
     if (!gl) throw new Error("WebGL2 unavailable");
     this.gl = gl;
