@@ -7,9 +7,7 @@ anywhere.
 
 Docs: <https://mishmish66.github.io/trackosaurus/>
 
-[![A sweep grouped by learning rate: median lines with 95% CI bands](docs/media/screenshot.png)](docs/media/tour.mp4)
-
-[Video tour](docs/media/tour.mp4) (30 s): hover values, a pinned tooltip, zoom, the run filter, folder navigation and live runs.
+https://github.com/user-attachments/assets/cb4b3ee9-cae3-432a-80b8-22090237e8ef
 
 ## Install
 
