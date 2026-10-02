@@ -17,7 +17,6 @@ from .format import (DB, INFO_FILE, JSONValue, MediaKind, RunState, as_dict, as_
 from .index import Explorer
 
 type PathLike = str | os.PathLike[str]
-type Predicate = Callable[["Record"], bool]
 type Center = Literal["median", "mean"]
 type Reduce = Literal["last", "first", "max", "min", "mean"]
 
@@ -167,69 +166,8 @@ def get(rec: Record, field: str) -> object:
     return None
 
 
-# ---- filters ----
-
-OPS: Final = (">=", "<=", "!=", "!~", "==", "=", ">", "<", "~")
-_FILTER = re.compile(r"^(.+?)(>=|<=|!=|!~|==|=|>|<|~)(.*)$")
-
-
-def parse_value(s: str) -> bool | float | str | None:
-    low = s.strip().lower()
-    if low in ("true", "false"):
-        return low == "true"
-    if low in ("null", "none"):
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return s
-
-
-def parse_filter(expr: str) -> Predicate:
-    """Predicate for `FIELD OP VALUE` (= == != > >= < <= ~ !~), `has:FIELD` or `!has:FIELD`."""
-    expr = expr.strip()
-    m = re.fullmatch(r"(!?)has:(.+)", expr)
-    if m:
-        neg, field = m[1] == "!", m[2].strip()
-        return lambda r: (get(r, field) is not None) != neg
-    m = _FILTER.match(expr)
-    if not m:
-        raise ValueError(f"bad filter {expr!r}; expected FIELD OP VALUE with OP in {' '.join(OPS)}")
-    field, op, raw = m[1].strip(), m[2], m[3].strip()
-    if op in ("~", "!~"):
-        rx = re.compile(raw)
-        return lambda r: (get(r, field) is not None and bool(rx.search(_text(get(r, field))))) != (op == "!~")
-    want = parse_value(raw)
-
-    def pred(r: Record) -> bool:
-        v = get(r, field)
-        if op == "!=":
-            return not _equal(v, want, raw)
-        if op in ("=", "=="):
-            return _equal(v, want, raw)
-        a, b = num(v), num(want)
-        if a is None or b is None or math.isnan(a):
-            if isinstance(v, str) and isinstance(want, str):
-                return {"<": v < want, "<=": v <= want, ">": v > want, ">=": v >= want}[op]
-            return False
-        return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op]
-
-    return pred
-
-
 def _text(v: object) -> str:
     return v if isinstance(v, str) else json.dumps(v)
-
-
-def _equal(v: object, want: object, raw: str) -> bool:
-    if v is None or want is None:
-        return v is None and want is None
-    if isinstance(v, bool) or isinstance(want, bool):
-        return v == want or _text(v).lower() == raw.lower()
-    a, b = num(v), num(want)
-    if a is not None and b is not None:
-        return a == b or abs(a - b) <= 1e-12 * max(abs(a), abs(b))
-    return _text(v) == raw
 
 
 # ---- sorting ----

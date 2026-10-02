@@ -1,6 +1,6 @@
 """Headless-browser smoke test against a throwaway trex server on a temporary runs directory.
 
-Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, console errors, and that a client dropping every 5th
+Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, the filter box, console errors, and that a client dropping every 5th
 stream event still converges to the run files: every row and media item, and top tiles whose
 bucket counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
 a directory with `trex serve -y`, the root view of both, making a workspace of them in the panel the trex
@@ -185,6 +185,25 @@ r.finish()
 """
 
 
+def filter_smoke(page, url):
+    """Whether the filter box keeps the runs a WHERE clause or a name search selects, and marks a clause that does
+    not parse while filtering nothing."""
+    page.goto(f"{url}/?filter#path=sweep")
+    page.wait_for_function(READY, timeout=30000)
+    shown = "app.runList.filter((r) => r.shown).map((r) => r.id).sort()"
+    every = page.evaluate(shown)
+    want = page.evaluate("app.runList.filter((r) => r.meta.config.lr === 0.001 && r.meta.config.seed === 1).map((r) => r.id).sort()")
+    results = {}
+    for text in ["lr = 0.001 and seed = 1", "lr = 0.00", "seed1", "lr ="]:
+        page.fill("#runFilter", text)
+        page.wait_for_timeout(600)
+        results[text] = [page.evaluate(shown), page.evaluate("document.querySelector('#runFilter').classList.contains('bad')")]
+    page.fill("#runFilter", "")
+    print(f"filter: of {len(every)} runs, " + "; ".join(f"{t!r} keeps {len(v[0])}{' (marked bad)' if v[1] else ''}" for t, v in results.items()))
+    return (want and results["lr = 0.001 and seed = 1"] == [want, False] and results["lr = 0.00"] == [[], False]
+            and results["seed1"][0] == [r for r in every if "seed1" in r] and results["lr ="] == [every, True])
+
+
 def sections_smoke(page, url):
     """Whether chart sections nest by key path and fold one at a time, and a pinned chart shows in the pinned section
     while staying in its own."""
@@ -247,6 +266,7 @@ def main():
 
             ok &= group_levels_smoke(page, url)
             ok &= sections_smoke(page, url)
+            ok &= filter_smoke(page, url)
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])
             deadline = time.time() + 20
             while not (runs / "live").exists() and time.time() < deadline:

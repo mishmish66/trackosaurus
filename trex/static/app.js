@@ -1,4 +1,5 @@
 import { BASE, Data, clearCache, mediaURL } from "./data.js";
+import { compileWhere, runField } from "./where.js";
 import { BAND_LABEL, Chart, DENSITY_AUTO, USE_GL, fmt, fmtDur, fmtSI } from "./plot.js";
 
 const PALETTE = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
@@ -142,11 +143,7 @@ function grown(a, n) {
 }
 
 /** What the run filter matches: name, path, tags and key=value config entries. */
-function searchText(m) {
-  const cfg = Object.entries(m.config || {}).map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`);
-  return [m.name, m.id, ...(m.dir ? [`dir=${m.dir}`] : []), ...(m.tags || []), ...cfg].join(" ");
-}
-
+const FILTER_HINT = "name search, or a WHERE clause: lr = 0.001 and seed in (0, 1), algo like 'pp%', state = running";
 /** Sorted copy of a section and its subsections: panels by name, subsections by sectionCmp. */
 function orderSection(sec) {
   const byName = (a, b) => cmpNames(a[0], b[0]);
@@ -951,24 +948,24 @@ class App {
 
   // ---- runs ----
 
+  /** The filter box's test of a run (name search or WHERE clause); a clause that does not parse filters nothing
+   * and marks the box with its error. */
   runFilterFn() {
-    const f = this.opts.filter.trim();
-    if (!f) return () => true;
-    let rx;
+    const box = $("#runFilter");
+    let w = null, err = "";
     try {
-      rx = new RegExp(f, "i");
-    } catch {
-      const l = f.toLowerCase();
-      return (r) => r.search.toLowerCase().includes(l);
+      w = this.opts.filter.trim() ? compileWhere(this.opts.filter) : null;
+    } catch (e) {
+      err = e.message;
     }
-    return (r) => rx.test(r.search);
+    if (box) (box.title = err || FILTER_HINT), box.classList.toggle("bad", !!err);
+    return w ? (r) => w.test((f) => runField(r, f)) : () => true;
   }
 
   /** Runs in display order, with filter, group focus, visibility, group and color resolved. */
   computeRuns() {
     const o = this.opts, match = this.runFilterFn(), runs = [...this.data.runs.values()];
     for (const r of runs) {
-      if (r.searchOf !== r.meta) (r.searchOf = r.meta), (r.search = searchText(r.meta));
       r.match = match(r);
       r.gval = this.groupValue(r);
       r.focused = o.focus.every(([fields, value]) => this.groupValue(r, fields) === value);

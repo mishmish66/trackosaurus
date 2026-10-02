@@ -18,6 +18,10 @@ Explore in a browser or a terminal (`trex --help`); `trex.daemon` serves many di
     trex serve runs      # http://127.0.0.1:13898
     trex tree runs
     trex daemon
+
+The UI's filter box and `trex ls -w` take a name search or a SQL WHERE clause (`trex.where`):
+
+    trex ls runs -w "lr = 0.001 and seed in (0, 1)"
 """
 
 from .writer import FinalState, ImageInput, MetricValue, Metrics, Run, VideoInput, folder_info, init

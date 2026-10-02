@@ -16,7 +16,7 @@ import pytest
 import trex
 from trex import query as Q
 from trex import update
-from trex.cli import main
+from trex.cli import field_columns, main, where_test
 from trex.format import connect_ro
 
 
@@ -44,13 +44,14 @@ def run_json(capsys, *argv):
 
 
 def test_ls_filters_sorts_and_limits(runs, capsys):
-    out = run_json(capsys, "ls", runs, "-w", "config.lr=0.01", "-w", "summary.loss<0.4", "--sort", "summary.loss:desc")
+    out = run_json(capsys, "ls", runs, "-w", "config.lr = 0.01", "-w", "summary.loss < 0.4", "--sort", "summary.loss:desc")
     assert [r["path"] for r in out] == ["sweep/lr0.01/seed1", "sweep/lr0.01/seed2"]
     assert all(r["config"]["lr"] == 0.01 and r["summary"]["loss"] < 0.6 for r in out)
     out = run_json(capsys, "ls", runs, "--sort=-summary.loss", "-n", "1")
     assert out[0]["path"] == "sweep/lr0.001/seed0"
-    assert [r["path"] for r in run_json(capsys, "ls", runs, "-w", "has:info.notes")] == ["sweep/lr0.001/seed2", "sweep/lr0.01/seed2"]
-    assert len(run_json(capsys, "ls", runs, "-w", "path~seed[01]$", "-w", "config.opt/name=adam")) == 4
+    assert [r["path"] for r in run_json(capsys, "ls", runs, "-w", "info.notes is not null")] == ["sweep/lr0.001/seed2", "sweep/lr0.01/seed2"]
+    assert len(run_json(capsys, "ls", runs, "-w", "path ~ 'seed[01]$' and config.opt/name = adam")) == 4
+    assert len(run_json(capsys, "ls", runs, "-w", "seed0")) == 2
     assert run_json(capsys, "ls", runs / "sweep" / "lr0.01")[0]["path"] == "seed0"
 
 
@@ -122,21 +123,21 @@ def test_refuses_to_index_home(capsys):
         main(["ls", "~"])
 
 
-@pytest.mark.parametrize("expr,rec,want", [
-    ("config.lr>=0.01", {"config": {"lr": 0.01}}, True),
-    ("config.lr>0.01", {"config": {"lr": 0.01}}, False),
-    ("config.lr!=0.01", {"config": {}}, True),
-    ("config.lr=0.01", {"config": {}}, False),
-    ("config.flag=true", {"config": {"flag": True}}, True),
-    ("config.name~^ad", {"config": {"name": "adam"}}, True),
-    ("config.name!~^ad", {"config": {"name": "adam"}}, False),
-    ("summary.loss<1", {"summary": {"loss": "NaN"}}, False),
-    ("!has:info.notes", {"info": {}}, True),
-    ("state=running", {"state": "running"}, True),
+@pytest.mark.parametrize("clause,rec,want", [
+    ("config.lr >= 0.01", {"config": {"lr": 0.01}}, True),
+    ("config.lr > 0.01", {"config": {"lr": 0.01}}, False),
+    ("config.lr != 0.01", {"config": {}}, True),
+    ("config.lr = 0.01", {"config": {}}, False),
+    ("config.flag = true", {"config": {"flag": True}}, True),
+    ("config.name ~ '^ad'", {"config": {"name": "adam"}}, True),
+    ("config.name !~ '^ad'", {"config": {"name": "adam"}}, False),
+    ("summary.loss < 1", {"summary": {"loss": "NaN"}}, False),
+    ("info.notes is null", {"info": {}}, True),
+    ("state = running", {"state": "running"}, True),
 ])
-def test_filter_semantics(expr, rec, want):
+def test_where_clauses_read_run_fields(clause, rec, want):
     full = cast(Q.Record, {"config": {}, "summary": {}, "info": {}, **rec})
-    assert Q.parse_filter(expr)(full) is want
+    assert where_test(clause)(lambda f: Q.get(full, f)) is want
 
 
 def test_median_ci_rank_matches_exact_binomial_coverage():
@@ -296,8 +297,8 @@ def test_short_sort_flag_takes_a_descending_field(runs, capsys):
 
 
 @pytest.mark.parametrize("argv,message", [
-    (("ls", "{runs}", "-w", "config.lr"), "trex ls: bad filter"),
-    (("ls", "{runs}", "--name", "("), "trex ls:"),
+    (("ls", "{runs}", "-w", "config.lr ="), "trex ls: bad filter"),
+    (("ls", "{runs}", "-w", "name ~ '('"), "trex ls: bad filter"),
     (("series", "{run}"), "give --key"),
     (("series", "{runs}", "-k", "loss"), "not a run directory"),
     (("diff", "{run}"), "at least two runs"),
@@ -336,9 +337,9 @@ def test_summary_markers_are_numbers():
     assert str(Q.get(RECORD, "loss")) == "nan" and Q.num("-Infinity") == -math.inf and Q.num("abc") is None and Q.num(True) == 1.0
 
 
-@pytest.mark.parametrize("expr,want", [("name>q", True), ("name<q", False), ("name>=r", True), ("config.both<d", True)])
-def test_text_values_compare_lexically(expr, want):
-    assert Q.parse_filter(expr)(RECORD) is want
+@pytest.mark.parametrize("clause,want", [("name > q", True), ("name < q", False), ("name >= r", True), ("config.both < d", True)])
+def test_text_values_compare_lexically(clause, want):
+    assert where_test(clause)(lambda f: Q.get(RECORD, f)) is want
 
 
 def test_statistics_and_reductions_of_series_without_finite_values():
@@ -392,3 +393,8 @@ def test_version_names_the_installed_trex(capsys):
 def test_systemd_unit_passes_allowed_host_names_to_the_daemon(capsys):
     main(["systemd-unit", "--allow-host", "box.tailnet.ts.net"])
     assert "--allow-host box.tailnet.ts.net" in capsys.readouterr().out.split("ExecStart=")[1].splitlines()[0]
+
+
+def test_table_columns_include_dotted_fields_a_where_clause_or_sort_reads():
+    assert field_columns(["config.lr = 1 and state = running or summary.loss < 2"], "-summary.acc,path") == [
+        "config.lr", "summary.loss", "summary.acc"]

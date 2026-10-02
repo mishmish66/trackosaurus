@@ -22,6 +22,7 @@ import typer
 from . import query as Q
 from .format import JSONValue, as_dict, as_str
 from .server import DEFAULT_PORT
+from .where import compile_where
 
 if TYPE_CHECKING:
     from .daemon import Roots
@@ -127,12 +128,10 @@ def _table(rows: Sequence[OutRow], cols: Sequence[str], width: int | None, strea
 
 @dataclass(frozen=True)
 class Selection:
-    """The runs a run-set command works on: PATH (or --root) narrowed by --where, --state and --name."""
+    """The runs a run-set command works on: PATH (or --root) narrowed by --where."""
 
     path: str
     where: list[str]
-    state: str | None
-    name: str | None
     root: str | None
     cache: str | None
     force: bool
@@ -167,14 +166,8 @@ class Selection:
         return self.select(Q.records(ex, prefix)), ex, prefix
 
     def select(self, recs: Iterable[Q.Record]) -> list[Q.Record]:
-        preds = [Q.parse_filter(w) for w in self.where]
-        if self.state:
-            states = self.state.split(",")
-            preds.append(lambda r: r["state"] in states)
-        if self.name:
-            rx = re.compile(self.name)
-            preds.append(lambda r: bool(rx.search(r["name"] or "")) or bool(rx.search(r["path"])))
-        return [r for r in recs if all(p(r) for p in preds)]
+        tests = [where_test(w) for w in self.where]
+        return [r for r in recs if all(t(lambda f, r=r: Q.get(r, f)) for t in tests)]
 
 
 def cache_dir(cache: str | None) -> str:
@@ -190,16 +183,19 @@ def run_dirs(args: Iterable[str]) -> list[Path]:
     return [Path(p).expanduser() for p in paths]
 
 
-def field_columns(exprs: Iterable[str]) -> list[str]:
-    """Dotted fields mentioned in filter or sort expressions."""
-    cols: list[str] = []
-    for e in exprs:
-        for part in re.split(r"[,\s]", e):
-            part = re.sub(r":(desc|asc)$", "", re.sub(r"^!?has:", "", part.lstrip("-+")))
-            field = re.split(r"(>=|<=|!=|!~|==|=|>|<|~)", part)[0].strip()
-            if field and field not in cols and field not in Q.PLAIN_FIELDS and "." in field:
-                cols.append(field)
-    return cols
+def where_test(clause: str) -> Callable[[Callable[[str], object]], bool]:
+    """The test of a --where clause; ValueError naming the clause when it does not parse."""
+    try:
+        return compile_where(clause).test
+    except (ValueError, re.error) as e:
+        raise ValueError(f"bad filter {clause!r}: {e}") from e
+
+
+def field_columns(where: Iterable[str], sort: str) -> list[str]:
+    """Dotted fields that --where clauses read or --sort names."""
+    fields = [f for w in where for f in compile_where(w).fields]
+    fields += [re.sub(r":(desc|asc)$", "", part.strip().lstrip("-+")) for part in sort.split(",")]
+    return list(dict.fromkeys(f for f in fields if f and f not in Q.PLAIN_FIELDS and "." in f))
 
 
 def _csv(values: Iterable[str]) -> list[str]:
@@ -212,10 +208,9 @@ def _csv(values: Iterable[str]) -> list[str]:
 SELECT: Final = "Select runs"
 OUTPUT: Final = "Output"
 PathArg = Annotated[str, typer.Argument(metavar="PATH", help="Runs directory, a folder in it, or one run.", show_default=False)]
-Where = Annotated[list[str] | None, typer.Option("--where", "-w", metavar="EXPR", rich_help_panel=SELECT,
-                  help="Filter, repeatable (AND): FIELD OP VALUE with OP in = != > >= < <= ~ !~, or has:FIELD.")]
-State = Annotated[str | None, typer.Option(rich_help_panel=SELECT, help="Comma-separated states to keep: running,finished,failed,crashed.")]
-NameRx = Annotated[str | None, typer.Option("--name", rich_help_panel=SELECT, help="Regex on run name or path.")]
+Where = Annotated[list[str] | None, typer.Option("--where", "-w", metavar="CLAUSE", rich_help_panel=SELECT,
+                  help="SQL WHERE clause over run fields, e.g. \"lr = 0.001 and state = running\"; text with no "
+                       "comparison searches names and paths. Repeat for AND.")]
 Root = Annotated[str | None, typer.Option(rich_help_panel=SELECT, help="Index root, for paths relative to a larger tree and a shared cache.")]
 Cache = Annotated[str | None, typer.Option(rich_help_panel=SELECT, help="Cache directory (default $TREX_CACHE or ./.trex_cache).")]
 Force = Annotated[bool, typer.Option("--force", rich_help_panel=SELECT, help="Allow indexing / or $HOME.")]
@@ -248,18 +243,20 @@ non-finite numbers appear as the strings "NaN", "Infinity" and "-Infinity".
     info.A.B      nested info value
     KEY           bare key: config first, then summary
 
-**Filters**: `-w FIELD OP VALUE`, repeat for AND; OP is `= != > >= < <= ~ !~` (`~` is a regex), or `has:FIELD` /
-`!has:FIELD`. Numeric-looking values compare numerically; true/false/null are literals. Missing values fail every
-comparison except != and sort last.
+**Filters**: `-w CLAUSE`, a SQL WHERE clause over the fields above: `= != < <= > >=`, `in (…)`, `like` (`%`, `_`),
+`~` (regex search), `is [not] null`, `and or not` and parentheses; repeat `-w` for AND. Numbers compare as numbers
+(`lr = 0.001` matches 1e-3 but not 0.0015), a bare word is text, `like` and `~` ignore case, a list matches when
+any element does, and a missing value fails every comparison except the negated ones (`!=`, `!~`, `not …`). Text
+with no comparison searches names and paths. The UI's filter box takes the same clauses.
 
 **Examples**
 
     trex tree runs                     # folder tree, run counts by state, notes
     trex keys runs/sweep               # metric keys and spread of last values
-    trex ls runs -w config.lr=0.001 -s summary.eval/success:desc -n 10
+    trex ls runs -w "lr = 0.001 and seed in (0, 1)" -s summary.eval/success:desc -n 10
     trex groups runs -g config.lr -m eval/success    # median and 95% CI
     trex series RUN -k train/loss --points 50 --smooth 0.99
-    trex ls runs -w state=running --paths | trex series - -k loss --last 1
+    trex ls runs -w "state = running" --paths | trex series - -k loss --last 1
     trex media RUN --latest            # absolute paths of the newest media
 """
 
@@ -504,7 +501,7 @@ def systemd_unit_cmd(host: Hosts = None, port: Annotated[int, typer.Option(help=
 
 
 @command("ls", "find")
-def ls_cmd(path: PathArg = ".", where: Where = None, state: State = None, name: NameRx = None, root: Root = None,
+def ls_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
            cache: Cache = None, force: Force = False,
            sort: Annotated[str | None, typer.Option("--sort", "-s", help="Comma-separated fields; FIELD:desc or -FIELD descends.")] = None,
            limit: Limit = None,
@@ -512,7 +509,7 @@ def ls_cmd(path: PathArg = ".", where: Where = None, state: State = None, name: 
            paths: Annotated[bool, typer.Option("--paths", help="Print only absolute run directories (to pipe into series/diff -).")] = False,
            fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """List runs, with filters, sorting and chosen columns."""
-    recs, _, _ = Selection(path, where or [], state, name, root, cache, force).records()
+    recs, _, _ = Selection(path, where or [], root, cache, force).records()
     recs = Q.sort_records(recs, sort or "path")[:limit or None]
     fmt = out_format(fmt, as_json)
     if paths:
@@ -521,7 +518,7 @@ def ls_cmd(path: PathArg = ".", where: Where = None, state: State = None, name: 
         emit(recs, None, fmt)
     else:
         extra = _csv(columns or [])
-        cols = DEFAULT_COLUMNS + [c for c in field_columns([*(where or []), sort or ""]) + extra if c not in DEFAULT_COLUMNS]
+        cols = DEFAULT_COLUMNS + [c for c in field_columns(where or [], sort or "") + extra if c not in DEFAULT_COLUMNS]
         emit([{c: Q.get(r, c) for c in cols} for r in recs], cols, fmt, width=width(full))
 
 
@@ -599,7 +596,7 @@ def _bracketed(v: object) -> object:
 @command("groups", "compare")
 def groups_cmd(group_by: Annotated[list[str], typer.Option("--group-by", "-g", show_default=False,
                                    help="Fields, comma-separated: subfolder, parent, config.KEY, info.KEY, ...")],
-               path: PathArg = ".", where: Where = None, state: State = None, name: NameRx = None, root: Root = None,
+               path: PathArg = ".", where: Where = None, root: Root = None,
                cache: Cache = None, force: Force = False,
                metric: Annotated[list[str] | None, typer.Option("--metric", "-m", help="Metric keys to aggregate (repeatable).")] = None,
                reduce: Annotated[Literal["last", "first", "max", "min", "mean"], typer.Option("--reduce", "-r", help="How each run's series becomes one value.")] = "last",
@@ -608,7 +605,7 @@ def groups_cmd(group_by: Annotated[list[str], typer.Option("--group-by", "-g", s
                sort: Annotated[str | None, typer.Option("--sort", "-s", help="Columns to sort by; default the first metric, descending.")] = None,
                limit: Limit = None, fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Aggregate runs into groups with a median or mean and its 95% CI."""
-    recs, _, prefix = Selection(path, where or [], state, name, root, cache, force).records()
+    recs, _, prefix = Selection(path, where or [], root, cache, force).records()
     fmt, fields = out_format(fmt, as_json), _csv(group_by)
     spec = GroupSpec(_csv(metric or []), reduce, at, x, center, stats=fmt in ("json", "jsonl"))
     keys = [metric_key(m) for m in spec.metrics]
@@ -624,12 +621,12 @@ def groups_cmd(group_by: Annotated[list[str], typer.Option("--group-by", "-g", s
 
 
 @command("keys")
-def keys_cmd(path: PathArg = ".", where: Where = None, state: State = None, name: NameRx = None, root: Root = None,
+def keys_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
              cache: Cache = None, force: Force = False,
              pattern: Annotated[str | None, typer.Option("--pattern", "-p", help="Regex on key names.")] = None,
              fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Metric and media keys across runs, with the spread of last values."""
-    recs, ex, prefix = Selection(path, where or [], state, name, root, cache, force).records()
+    recs, ex, prefix = Selection(path, where or [], root, cache, force).records()
     rx = re.compile(pattern) if pattern else None
     last: dict[str, list[float | None]] = {}
     for r in recs:
@@ -682,13 +679,13 @@ def folder_tree(recs: Sequence[Q.Record], prefix: str, name: str) -> Folder:
 
 
 @command("tree")
-def tree_cmd(path: PathArg = ".", where: Where = None, state: State = None, name: NameRx = None, root: Root = None,
+def tree_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
              cache: Cache = None, force: Force = False,
              depth: Annotated[int, typer.Option("--depth", "-d", help="Folder levels to show.")] = 3,
              runs: Annotated[bool, typer.Option("--runs", help="Also list runs under each shown folder.")] = False,
              fmt: Fmt = "table", as_json: Json = False) -> None:
     """Folder tree with run counts by state and folder notes."""
-    sel = Selection(path, where or [], state, name, root, cache, force)
+    sel = Selection(path, where or [], root, cache, force)
     ex, index_root, prefix = sel.index()
     tree = folder_tree(sel.select(Q.records(ex, prefix)), prefix, prefix or index_root.name)
     notes = {p: v[1] for p, v in ex.folders.items()}
@@ -912,7 +909,7 @@ def index_cmd(path: PathArg = ".", root: Root = None, cache: Cache = None, force
               fmt: Fmt = "table", as_json: Json = False) -> None:
     """Build or refresh the cache for a runs directory and report counts."""
     t0 = time.time()
-    ex, index_root, prefix = Selection(path, [], None, None, root, cache, force).index()
+    ex, index_root, prefix = Selection(path, [], root, cache, force).index()
     recs = Q.records(ex, prefix)
     states: dict[str, int] = {}
     for r in recs:

@@ -19,9 +19,10 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/workspace.py` | workspaces: `Workspace` merges member directories (`Local`, `Far`) behind the Explorer interface, renaming run ids |
 | `trex/remote.py` | `host:path` directories: `parse`, the ssh + `uvx` command, `Remote` (one ssh session, reconnected with backoff) |
 | `trex/update.py` | the daemon's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd to restart it |
-| `trex/query.py` | read-side queries for the CLI: records, filters, sorting, statistics, series |
+| `trex/query.py` | read-side queries for the CLI: records, field access, sorting, statistics, series |
+| `trex/where.py` | run filters: a SQL WHERE clause (or a name search) compiled to a test over a field getter |
 | `trex/cli.py` | `trex` command (Typer): `serve daemon systemd-unit ls groups keys tree show series tail media diff index` |
-| `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (tile store, scheduler, IndexedDB, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (columns, smoothing, decimation, group stats, CRC-32); `index.html` |
+| `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (tile store, scheduler, IndexedDB, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (columns, smoothing, decimation, group stats, CRC-32), `where.js` (run filters, run fields); `index.html` |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/`; the user guide is the `trex` and `trex.daemon` docstrings (Markdown) |
 | `docs/media/` | the docs' video tour and its poster image (left out of the sdist); the README embeds the same video, uploaded to GitHub |
@@ -125,7 +126,9 @@ them WebGL falls back to software and timings mean nothing.
   - smoothing (time-weighted EMA, scale = span/1000 rounded to a power of two): `kernel.js`
     `Col.ensureSmooth`, `plot.js` `smoothScale`, `query.py` `twema`/`smooth_scale`;
   - group statistics (order-statistic median CI, Student-t mean CI): `kernel.js` `agg` /
-    `medianCiRank`, `plot.js` `bandOf`, `query.py` `stats`.
+    `medianCiRank`, `plot.js` `bandOf`, `query.py` `stats`;
+  - run filters and field names: `where.py` and `static/where.js` (`compileWhere`, `runField`), `query.py` `get`;
+    both suites run the cases in `tests/where_cases.json`.
 - **Other sites cannot use the server.** `Handler._refusal` answers only requests whose Host is an
   IP address, `localhost`, this machine's name or an `--allow-host` name (DNS rebinding), and
   refuses a POST whose Origin is not its Host. The UI sends no cross-origin requests.
