@@ -491,11 +491,12 @@ def systemd_unit(hosts: list[str], port: int, allow: list[str], cache: str | Non
 def systemd_unit_cmd(host: Hosts = None, port: Annotated[int, typer.Option(help="Port.")] = DEFAULT_PORT, allow_host: AllowHosts = None,
                      cache: Annotated[str | None, typer.Option(help="Cache directory (default ~/.cache/trex).")] = None,
                      source: Annotated[str | None, typer.Option(envvar="TREX_SOURCE", show_envvar=False,
-                                       help="What the UI's update button installs, e.g. git+https://github.com/mishmish66/trackosaurus "
-                                            "(default $TREX_SOURCE; none: no update button).")] = None) -> None:
+                                       help="What the UI's update button installs (default $TREX_SOURCE, else "
+                                            "git+https://github.com/mishmish66/trackosaurus; '' for no update button).")] = None) -> None:
     """Print a systemd user unit that runs `trex daemon` on this trex; its header says how to install it."""
     from . import update
 
+    source = update.DEFAULT_SOURCE if source is None else source or None
     typer.echo(systemd_unit(host or [], port, allow_host or [], cache, source), nl=False)
     if source and update.tool_env() != Path(sys.prefix).resolve():
         typer.echo(f"trex systemd-unit: this trex ({sys.prefix}) is not the uv tool install, so the update button will "

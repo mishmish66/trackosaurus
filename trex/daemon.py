@@ -4,11 +4,12 @@ As a systemd user service:
 
     uv tool install git+https://github.com/mishmish66/trackosaurus
     mkdir -p ~/.config/systemd/user
-    trex systemd-unit --source git+https://github.com/mishmish66/trackosaurus > ~/.config/systemd/user/trex.service
+    trex systemd-unit > ~/.config/systemd/user/trex.service
     systemctl --user daemon-reload && systemctl --user enable --now trex
     loginctl enable-linger "$USER"
 
-With `--source`, the UI's update button installs the newest trex and systemd restarts the daemon on it.
+The update button in the trex panel installs the newest trex from `--source` (default this repository), and
+systemd restarts the daemon on it.
 
 / shows every tracked directory, each as a top-level folder; clicking trex (top left) opens the panel that
 switches and manages them, and workspaces: named sets of directories whose folder trees are merged, so runs

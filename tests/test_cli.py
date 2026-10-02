@@ -15,6 +15,7 @@ import pytest
 
 import trex
 from trex import query as Q
+from trex import update
 from trex.cli import main
 from trex.format import connect_ro
 
@@ -370,9 +371,15 @@ def test_systemd_unit_runs_this_trex_and_restarts_it_after_an_update(capsys, tmp
         assert res.returncode == 0, res.stderr
 
 
-def test_systemd_unit_without_a_source_has_no_update_source(capsys, monkeypatch):
+def test_systemd_unit_updates_from_the_trex_repository_by_default(capsys, monkeypatch):
     monkeypatch.delenv("TREX_SOURCE", raising=False)
     main(["systemd-unit"])
+    assert f"Environment=TREX_SOURCE={update.DEFAULT_SOURCE}" in capsys.readouterr().out.split("[Unit]")[1].splitlines()
+
+
+def test_systemd_unit_with_an_empty_source_has_no_update_source(capsys, monkeypatch):
+    monkeypatch.setenv("TREX_SOURCE", "git+https://example.org/trex")
+    main(["systemd-unit", "--source", ""])
     assert "TREX_SOURCE" not in capsys.readouterr().out.split("[Unit]")[1]
 
 
