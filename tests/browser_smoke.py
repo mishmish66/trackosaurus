@@ -1,6 +1,6 @@
 """Headless-browser smoke test against a throwaway trex server on a temporary runs directory.
 
-Checks cold and warm loads, grouping, opening groups as path levels, console errors, and that a client dropping every 5th
+Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, console errors, and that a client dropping every 5th
 stream event still converges to the run files: every row and media item, and top tiles whose
 bucket counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
 a directory with `trex serve -y`, the root view of both, making a workspace of them in the panel the trex
@@ -175,6 +175,45 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         daemon.terminate()
         daemon.wait()
 
+NESTED_WRITER = """
+import sys, numpy as np, trex
+r = trex.init(f"{sys.argv[1]}/nested/r0")
+for step in range(50):
+    r.log({"eval/return/mean": step, "eval/return/std": 1.0, "eval/len": 10 + step, "loss": 1 / (step + 1)}, step=step)
+r.log_image("eval/video/frame", np.zeros((8, 8, 3), np.uint8), step=49)
+r.finish()
+"""
+
+
+def sections_smoke(page, url):
+    """Whether chart sections nest by key path and fold one at a time, and a pinned chart shows in the pinned section
+    while staying in its own."""
+    tree = """() => { const walk = (d) => [d.querySelector(':scope > summary').textContent, d.open,
+        [...d.querySelectorAll(':scope > .grid > .panel > .ptitle > span:first-child')].map((e) => e.textContent),
+        [...d.querySelectorAll(':scope > details.section')].map(walk)];
+        return [...document.querySelectorAll('#panels > details.section')].map(walk); }"""
+    page.goto(f"{url}/?sections#path=nested")
+    page.wait_for_function(READY, timeout=30000)
+    page.wait_for_selector("#panels details.section details.section")
+    nested = page.evaluate(tree)
+    page.click("#panels details.section details.section > summary:text-is('return (2)')")
+    folded = page.evaluate(tree)
+    page.click("#panels details.section details.section > summary:text-is('return (2)')")
+    page.hover(".panel:has(.pname:text-is('eval/return/mean')) .ptitle")
+    page.click(".panel:has(.pname:text-is('eval/return/mean')) .pin")
+    page.wait_for_function("document.querySelector('#panels > details.section > summary')?.textContent.startsWith('📌')")
+    pinned = page.evaluate(tree)
+    copies = page.evaluate("app.chartsOf('eval/return/mean').filter((c) => c.el.isConnected).length")
+    page.click("#panels > details.section:first-of-type .pin")
+    page.wait_for_function("!document.querySelector('#panels > details.section > summary')?.textContent.startsWith('📌')")
+    unpinned = [page.evaluate(tree)[0][0], page.evaluate("app.chartsOf('eval/return/mean').length")]
+    print(f"sections: {nested}; return folded {folded[1][3][0][1]}, eval open {folded[1][1]}; pinned {pinned[0]}, copies {copies}; unpinned {unpinned}")
+    eval_sec = ["eval (4)", True, ["eval/len"], [["return (2)", True, ["eval/return/mean", "eval/return/std"], []],
+                                                 ["video (1)", True, ["eval/video/frame"], []]]]
+    return (nested == [["charts (1)", True, ["loss"], []], eval_sec] and folded[1][1] and not folded[1][3][0][1] and folded[1][3][1][1]
+            and pinned[0] == ["📌 pinned (1)", True, ["eval/return/mean"], []] and pinned[2] == eval_sec and copies == 2
+            and unpinned == ["charts (1)", 1])
+
 
 def main():
     out = Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="trex-shots-"))
@@ -182,6 +221,7 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="trex-smoke-"))
     runs = tmp / "runs"
     subprocess.run([sys.executable, str(REPO / "examples/demo.py"), str(runs / "sweep"), "--seeds", "2", "--steps", "1500"], check=True)
+    subprocess.run([sys.executable, "-c", NESTED_WRITER, str(runs)], check=True)
     port = free_port()
     env = {**os.environ, "TREX_DAEMON_DIR": str(tmp / "daemon")}
     server = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs), "--standalone", "--port", str(port),
@@ -206,6 +246,7 @@ def main():
                 page.screenshot(path=str(out / f"{label}.png"))
 
             ok &= group_levels_smoke(page, url)
+            ok &= sections_smoke(page, url)
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])
             deadline = time.time() + 20
             while not (runs / "live").exists() and time.time() < deadline:

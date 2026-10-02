@@ -147,6 +147,18 @@ function searchText(m) {
   return [m.name, m.id, ...(m.dir ? [`dir=${m.dir}`] : []), ...(m.tags || []), ...cfg].join(" ");
 }
 
+/** Sorted copy of a section and its subsections: panels by name, subsections by sectionCmp. */
+function orderSection(sec) {
+  const byName = (a, b) => cmpNames(a[0], b[0]);
+  const children = [...sec.children.values()].map(orderSection).sort(sectionCmp);
+  return { ...sec, items: sec.items.sort(byName), children, media: sec.items.every(([, kind]) => kind === "media") && children.every((c) => c.media) };
+}
+
+/** Sections with charts before media-only ones, then by name. */
+function sectionCmp(a, b) {
+  return a.media - b.media || cmpNames(a.title, b.title);
+}
+
 /** Open page `url` after refetching it past the browser's HTTP cache, so a cached redirect cannot divert it. */
 function openPage(url) {
   fetch(url, { cache: "reload" }).catch(() => null).finally(() => (location.href = url));
@@ -1247,7 +1259,7 @@ class App {
       if (Object.keys(c).length) this.panelCfg[key] = c;
       else delete this.panelCfg[key];
       store.set(`panels:${this.data.rootKey}`, this.panelCfg);
-      chart.dirty = true;
+      for (const c of this.chartsOf(key)) c.dirty = true;
       this.schedule(true);
     };
     const num = (k) => h("input", { type: "number", step: "any", placeholder: "auto", value: cfg()[k] ?? "",
@@ -1281,7 +1293,7 @@ class App {
         h("button", { textContent: "reset chart", onclick: () => {
           delete this.panelCfg[key];
           store.set(`panels:${this.data.rootKey}`, this.panelCfg);
-          chart.dirty = true;
+          for (const c of this.chartsOf(key)) c.dirty = true;
           this.schedule(true);
           this.panelSettings(chart, anchor);
         } }),
@@ -1309,18 +1321,13 @@ class App {
   renderPanels() {
     const sections = this.panelSections(), root = $("#panels"), closed = store.get("closedSections", {});
     const sectionBtn = h("button", { className: "sectionsToggle" });
-    const count = [...sections.values()].reduce((n, s) => n + s.length, 0);
+    let nsec = 0;
+    const walk = (secs) => secs.forEach((x) => ((nsec += 1), walk(x.children)));
+    walk(sections);
+    const count = sections.filter((x) => x.id !== PINNED).reduce((n, x) => n + x.n, 0);
     const els = [$("#infoPanel"), h("div", { className: "panelbar" }, sectionBtn,
-      h("span", { className: "muted", textContent: `${sections.size} sections · ${count} panels` }))];
-    for (const [sec, items] of sections) {
-      const grid = h("div", { className: "grid" }, ...items.map(([key, kind]) => this.panelEl(key, kind)));
-      els.push(h("details", { className: "section", open: !closed[sec], ontoggle: (e) => {
-        const c = store.get("closedSections", {});
-        c[sec] = !e.target.open;
-        store.set("closedSections", c);
-        this.updateSectionsToggle();
-      } }, h("summary", { textContent: `${sec === PINNED ? "📌 pinned" : sec} (${items.length})` }), grid));
-    }
+      h("span", { className: "muted", textContent: `${nsec} sections · ${count} panels` }))];
+    els.push(...sections.map((x) => this.sectionEl(x, closed)));
     sectionBtn.addEventListener("click", () => {
       const open = [...root.querySelectorAll("details.section")].some((d) => d.open);
       for (const d of root.querySelectorAll("details.section")) d.open = !open;
@@ -1337,43 +1344,71 @@ class App {
     this.renderMedia();
   }
 
-  /** Section -> [[key, "metric" | "media"]] of the panels passing the chart filter, in display order: pinned
-   * first (in pin order), then "charts" (keys without a slash), then by prefix, media-only sections last. */
+  /** A foldable section: its panels, then its subsections; whether it is folded is remembered by its path. */
+  sectionEl(sec, closed) {
+    const grid = sec.items.length ? h("div", { className: "grid" }, ...sec.items.map(([key, kind, pinned]) => this.panelEl(key, kind, pinned))) : null;
+    return h("details", { className: "section", open: !closed[sec.id], ontoggle: (e) => {
+      const c = store.get("closedSections", {});
+      c[sec.id] = !e.target.open;
+      store.set("closedSections", c);
+      this.updateSectionsToggle();
+    } }, h("summary", { textContent: `${sec.title} (${sec.n})` }), ...[grid, ...sec.children.map((x) => this.sectionEl(x, closed))].filter(Boolean));
+  }
+
+  /** Sections of the panels passing the chart filter, in display order: pinned charts (in pin order; each also
+   * stays in its own section), "charts" (keys without a slash), then a section per key prefix, nested by path,
+   * media-only sections last at each level. A section is {id (its path), title, items: [[key, kind, pinned]],
+   * children, n (panels in it and below)}. */
   panelSections() {
-    const kf = this.keyFilterFn(), pinned = new Set(this.pins), sections = new Map();
+    const kf = this.keyFilterFn(), top = new Map(), pins = [];
+    const node = (id, title) => ({ id, title, items: [], children: new Map(), n: 0 });
     const add = (key, kind) => {
       if (!kf(key)) return;
-      const i = key.indexOf("/"), sec = pinned.has(key) ? PINNED : i > 0 ? key.slice(0, i) : "charts";
-      if (!sections.has(sec)) sections.set(sec, []);
-      sections.get(sec).push([key, kind]);
+      if (kind === "metric" && this.pins.includes(key)) pins.push([key, kind, true]);
+      const parts = key.split("/"), flat = parts.length === 1 || !parts[0], first = flat ? "charts" : parts[0];
+      let n = top.get(first) || top.set(first, node(first, first)).get(first);
+      n.n++;
+      for (let i = 1; !flat && i < parts.length - 1; i++) {
+        if (!n.children.has(parts[i])) n.children.set(parts[i], node(parts.slice(0, i + 1).join("/"), parts[i]));
+        n = n.children.get(parts[i]);
+        n.n++;
+      }
+      n.items.push([key, kind, false]);
     };
     for (const k of this.data.keys.keys()) if (!this.scopeKeys || this.scopeKeys.has(k)) add(k, "metric");
     for (const k of this.data.media.keys()) add(k, "media");
     const pinOrder = new Map(this.pins.map((k, i) => [k, i]));
-    const rank = (sec) => (sec === PINNED ? -1 : sec === "charts" ? 0 : sections.get(sec).every(([, kind]) => kind === "media") ? 2 : 1);
-    const byName = (a, b) => a[0].localeCompare(b[0], undefined, { numeric: true });
-    return new Map([...sections.keys()].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b)).map((sec) =>
-      [sec, sections.get(sec).sort(sec === PINNED ? (a, b) => pinOrder.get(a[0]) - pinOrder.get(b[0]) : byName)]));
+    pins.sort((a, b) => pinOrder.get(a[0]) - pinOrder.get(b[0]));
+    const sorted = [...top.values()].map(orderSection).sort((a, b) => (a.id !== "charts") - (b.id !== "charts") || sectionCmp(a, b));
+    return pins.length ? [{ id: PINNED, title: "📌 pinned", items: pins, children: [], n: pins.length }, ...sorted] : sorted;
   }
 
-  /** The chart or media panel of `key`, created on first use. */
-  panelEl(key, kind) {
+  /** The chart or media panel of `key` (the pinned section's own copy when `pinned`), created on first use. */
+  panelEl(key, kind, pinned = false) {
     const [map, Make] = kind === "metric" ? [this.charts, Chart] : [this.mediaPanels, MediaPanel];
-    let p = map.get(key);
+    const id = pinned ? PINNED + key : key;
+    let p = map.get(id);
     if (!p) {
-      map.set(key, (p = new Make(this, key)));
+      map.set(id, (p = new Make(this, key)));
       this.io.observe(p.el);
     }
     if (kind === "metric") p.setPinned(this.pins.includes(key));
     return p.el;
   }
 
+  /** The charts of metric `key`: its own and, when pinned, its copy in the pinned section. */
+  chartsOf(key) {
+    return [this.charts.get(key), this.charts.get(PINNED + key)].filter(Boolean);
+  }
 
-  /** Pin a chart to the pinned section at the top (in pin order), or unpin it back to its own section. */
+  /** Pin a chart to the pinned section at the top (in pin order; it stays in its own section too), or unpin it. */
   togglePin(key) {
     const i = this.pins.indexOf(key);
-    if (i >= 0) this.pins.splice(i, 1);
-    else this.pins.push(key);
+    if (i >= 0) {
+      this.pins.splice(i, 1);
+      const copy = this.charts.get(PINNED + key);
+      if (copy) this.io.unobserve(copy.el), copy.el.remove(), copy.dispose(), this.charts.delete(PINNED + key);
+    } else this.pins.push(key);
     store.set(`pins:${this.data.rootKey}`, this.pins);
     this.renderPanels();
   }
@@ -1401,10 +1436,10 @@ class App {
     if (r && !r.shown) return;
     let first = false; // a chart still showing nothing draws on the next frame
     for (const k of keys) {
-      const c = this.charts.get(k);
-      if (!c) continue;
-      c.dirty = true;
-      if ((c.visible || c.full) && !c.view?.lines.length) first = true;
+      for (const c of this.chartsOf(k)) {
+        c.dirty = true;
+        if ((c.visible || c.full) && !c.view?.lines.length) first = true;
+      }
     }
     this.schedule(first);
   }
@@ -1469,7 +1504,13 @@ class App {
       this.plannedAt = performance.now();
       if (!this.runList) return;
       if (this.shownFor !== this.runList) (this.shownFor = this.runList), (this.shown = this.runList.filter((r) => r.shown));
-      this.data.plan([...this.charts.values()].filter((c) => c.visible || c.full).map((c) => this.demand(c, this.shown)));
+      const demands = new Map(); // one per metric, from its widest visible chart
+      for (const c of this.charts.values()) {
+        if (!(c.visible || c.full)) continue;
+        const d = this.demand(c, this.shown), had = demands.get(d.key);
+        if (!had || d.pw > had.pw) demands.set(d.key, d);
+      }
+      this.data.plan([...demands.values()]);
     }, due - performance.now());
   }
 
@@ -1492,10 +1533,9 @@ class App {
   }
 
   /** Value tooltip: rows by value, the TIP_ROWS around `near` (the line nearest the pointer). */
-  tip(e, key, xs, rows, near = -1) {
-    const t = $("#tip");
+  tip(e, chart, xs, rows, near = -1) {
+    const t = $("#tip"), key = chart?.key;
     if (!e) return (t.hidden = true);
-    const chart = this.charts.get(key);
     const a = near < 0 ? 0 : Math.max(0, Math.min(near - (TIP_ROWS >> 1), rows.length - TIP_ROWS)), b = Math.min(rows.length, a + TIP_ROWS);
     const more = (n, where) => n > 0 && h("div", { className: "tmore", textContent: `${n} more ${where}` });
     t.replaceChildren(...[

@@ -836,7 +836,7 @@ export class Chart {
     }
     const near = this.nearestRow(rows, e.offsetY);
     rows.sort(byValue);
-    this.app.tip(e, this.key, xLabel(v, x), rows, rows.indexOf(near));
+    this.app.tip(e, this, xLabel(v, x), rows, rows.indexOf(near));
   }
 
   crosshair(ctx, px) {
@@ -906,7 +906,7 @@ export class Chart {
                                            px: this.px(r.x), py: this.py(r.y) }));
     const closest = this.nearestRow(rows, e.offsetY);
     rows.sort(byValue);
-    this.app.tip(e, this.key, `${xLabel(v, x)} · ${near.length} nearest of ${v.lines.length}`, rows, rows.indexOf(closest));
+    this.app.tip(e, this, `${xLabel(v, x)} · ${near.length} nearest of ${v.lines.length}`, rows, rows.indexOf(closest));
   }
 
   /** Stroke one line of the current view on the overlay: a run's own line, or a group's center. */
