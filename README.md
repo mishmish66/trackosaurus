@@ -2,7 +2,7 @@
 
 A fast, file-based experiment tracker: runs are directories, `trex serve` shows them live. [Docs](https://mishmish66.github.io/trackosaurus/)
 
-https://github.com/user-attachments/assets/cb4b3ee9-cae3-432a-80b8-22090237e8ef
+https://github.com/user-attachments/assets/f0a274ca-1a63-47a5-b6a2-08d15405b21e
 
 ## Install
 
