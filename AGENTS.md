@@ -40,7 +40,7 @@ uv run pytest                                             # all suites, one work
 uv run pytest --cov                                       # the same with branch coverage, subprocesses included; fails below 94%
 uv run python docs/build.py                               # pdoc pages into site/
 node --test tests/*.test.mjs                              # JS kernel and complexity (node >= 18)
-uv run --with playwright python tests/browser_smoke.py    # headless UI on its own throwaway server; fails below 75% UI line coverage
+uv run --with playwright python tests/browser_smoke.py    # headless UI on its own throwaway server; fails below 92% UI line coverage
 uv run python examples/demo.py /tmp/runs && uv run trex serve /tmp/runs
 ```
 

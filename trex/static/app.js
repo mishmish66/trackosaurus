@@ -597,13 +597,18 @@ class App {
     return [[], null];
   }
 
+  /** Whether the hash states the grouping: inside an opened group, or when it differs from the folder's default. */
+  groupInHash() {
+    return this.opts.focus.length > 0 || this.opts.group.join() !== this.resolveGroup(this.opts.path)[0].join();
+  }
+
   /** Write the options to the URL hash: a new history entry when `push` (navigation), else in place. */
   saveHash(push = false) {
     const q = new URLSearchParams();
     const defaults = { center: "median", band: "ci", x: "step", sort: "created", dir: "desc" };
     for (const [k, v] of Object.entries(this.opts)) {
       const s = k === "focus" ? (v.length ? JSON.stringify(v) : "") : Array.isArray(v) ? v.join(",") : v === true ? "1" : v;
-      if ((s && defaults[k] !== s) || (k === "group" && this.opts.focus.length)) q.set(k, s);
+      if ((s && defaults[k] !== s) || (k === "group" && this.groupInHash())) q.set(k, s);
     }
     const url = "#" + q.toString();
     if (push && url !== location.hash) history.pushState(null, "", url);

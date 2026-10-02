@@ -47,7 +47,7 @@ for r in runs:
 
 
 class JsCoverage:
-    """Which lines of the UI's modules ran, from Chromium's V8 coverage. A page load discards the previous page's
+    """Which lines of the UI's modules ran, from Chromium's V8 coverage and the node tests'. A page load discards the previous page's
     counts, so `take` runs before every navigation (`watch` makes the page do so) and takes are merged per file."""
 
     def __init__(self, page):
@@ -57,21 +57,34 @@ class JsCoverage:
         self.ran = {}  # module -> per UTF-16 unit: whether it ran
 
     def watch(self, page):
-        for name in ("goto", "go_back", "reload", "click"):
+        for name in ("goto", "go_back", "go_forward", "reload", "click"):
             step = getattr(page, name)
             setattr(page, name, lambda *a, step=step, **kw: (self.take(), step(*a, **kw))[1])
 
     def take(self):
         for script in self.cdp.send("Profiler.takePreciseCoverage")["result"]:
-            url = script["url"].split("?")[0]
-            name = url.rsplit("/", 1)[-1]
-            if "/static/" not in url or not (STATIC / name).is_file():
-                continue
-            ran = np.zeros(len(units(name)), bool)
-            # outer ranges first, so a nested block's count overrides its function's
-            for r in sorted((r for f in script["functions"] for r in f["ranges"]), key=lambda r: (r["startOffset"], -r["endOffset"])):
-                ran[r["startOffset"]:r["endOffset"]] = r["count"] > 0
-            self.ran[name] = self.ran.get(name, ran) | ran
+            self.merge(script)
+
+    def add_node_tests(self):
+        """Merge in the node tests' coverage of the same modules (V8's, through NODE_V8_COVERAGE)."""
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["node", "--test", *map(str, sorted((REPO / "tests").glob("*.test.mjs")))], cwd=REPO, check=True,
+                           capture_output=True, env={**os.environ, "NODE_V8_COVERAGE": d})
+            for f in Path(d).glob("*.json"):
+                for script in json.loads(f.read_text())["result"]:
+                    self.merge(script)
+
+    def merge(self, script):
+        """Add one script's V8 coverage, if it is a UI module."""
+        url = script["url"].split("?")[0]
+        name = url.rsplit("/", 1)[-1]
+        if "/static/" not in url or not (STATIC / name).is_file():
+            return
+        ran = np.zeros(len(units(name)), bool)
+        # outer ranges first, so a nested block's count overrides its function's
+        for r in sorted((r for f in script["functions"] for r in f["ranges"]), key=lambda r: (r["startOffset"], -r["endOffset"])):
+            ran[r["startOffset"]:r["endOffset"]] = r["count"] > 0
+        self.ran[name] = self.ran.get(name, ran) | ran
 
     def report(self):
         """{module: (covered lines, lines with code, uncovered line numbers)}; a line is covered when any
@@ -87,7 +100,7 @@ class JsCoverage:
 
 
 STATIC = REPO / "trex/static"
-UI_COVERAGE = 0.75  # share of the UI modules' code lines the smoke test must run
+UI_COVERAGE = 0.92  # share of the UI modules' code lines the smoke test must run
 
 
 @functools.cache
@@ -154,6 +167,128 @@ def group_levels_smoke(page, url):
     return (opened[:4] == [1, "", False, sizes[lr]] and opened[4][-2:] == ["sweep", f"lr: {lr}"]
             and nested[:4] == [2, "", False, both] and nested[4][-3:] == ["sweep", f"lr: {lr}", f"seed: {seed}"]
             and up[:3] == [1, "config.seed", True] and back == [2, ""] and home == [0, "config.lr", True])
+
+
+def interactions_smoke(page, url):
+    """Whether the chart controls do what they say: hover and Shift-pinned tooltips (whose rows reveal and open
+    runs), x and box zooms and their reset, the chart settings (smoothing, axes, outliers, density, reset), sidebar
+    sorting and hiding, group-by search, keyboard scrolling, the media slider, back/forward (back to the grouping
+    the folder had), and Canvas 2D drawing."""
+    key, checks = "train/loss", {}
+    sel = f".panel:has(.pname:text-is('{key}'))"
+    chart = f"app.charts.get({key!r})"
+
+    def plot():
+        page.locator(f"{sel} canvas").nth(1).scroll_into_view_if_needed()
+        b = page.locator(f"{sel} canvas").nth(1).bounding_box()
+        return lambda fx, fy: (b["x"] + b["width"] * fx, b["y"] + b["height"] * fy)
+
+    def soon(js, timeout=3000):
+        """Whether `js` becomes true within `timeout` ms."""
+        try:
+            page.wait_for_function(js, timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    def hover(at):
+        page.mouse.move(*at(0.5, 0.5))
+        page.mouse.move(*at(0.55, 0.45))
+        page.wait_for_function("!document.querySelector('#tip').hidden", timeout=5000)
+
+    page.goto(f"{url}/?ix#path=sweep&group=")
+    page.wait_for_function(READY, timeout=30000)
+    at = plot()
+    page.mouse.move(*at(0.2, 0.5))
+    page.mouse.down()
+    page.mouse.move(*at(0.6, 0.52), steps=6)
+    page.mouse.up()
+    checks["a drag zooms x"] = page.evaluate("!!app.xrange")
+    page.mouse.move(*at(0.3, 0.2))
+    page.mouse.down()
+    page.mouse.move(*at(0.5, 0.8), steps=6)
+    page.mouse.up()
+    checks["a box zooms y"] = page.evaluate(f"!!{chart}.yzoom")
+    page.click("#resetZoom")
+    checks["reset zoom clears both"] = page.evaluate(f"!app.xrange && !{chart}.yzoom")
+
+    page.click(f"{sel} .gear")
+    row = lambda label: f"#menu .srow:has(> label:text-is('{label}'))"
+    page.check(f"{row('smoothing')} input[type=checkbox]")
+    page.locator(f"{row('smoothing')} input[type=range]").fill("0.9")
+    page.select_option(f"{row('y scale')} select", "true")
+    page.select_option(f"{row('x axis')} select >> nth=0", '"runtime"')
+    page.select_option(f"{row('ignore outliers')} select", "0.01")
+    page.fill(f"{row('x range')} input >> nth=0", "0")
+    page.dispatch_event(f"{row('x range')} input >> nth=0", "change")
+    page.wait_for_timeout(600)
+    cfg = page.evaluate(f"app.panelCfg[{key!r}] || {{}}")
+    checks["settings are saved for the chart"] = {"smooth", "logy", "x", "outliers", "xmin"} <= set(cfg)
+    checks["settings change the view"] = soon(f"(() => {{ const v = {chart}.view; return !!v && v.logy && v.xmode === 1 && v.alpha > 0; }})()")
+    page.click("#menu button:text-is('reset chart')")
+    checks["reset chart drops its settings"] = page.evaluate(f"!app.panelCfg[{key!r}]")
+    page.select_option(f"{row('lines')} select", '"density"')
+    page.click("#menu button:text-is('close')")
+    page.wait_for_function(f"{chart}.view?.density", timeout=10000)
+    hover(plot())
+    checks["a density chart lists the nearest runs"] = "nearest" in page.inner_text("#tip")
+    page.mouse.move(5, 5)
+    page.click(f"{sel} .gear")
+    page.click("#menu button:text-is('reset chart')")
+    page.click("#menu button:text-is('close')")
+
+    order = lambda: page.evaluate("app.runList.map((r) => r.id).join()")
+    before = order()
+    page.select_option("#sortBy", index=1)
+    page.click("#sortDir")
+    checks["sorting reorders the runs"] = order() != before
+    page.select_option("#sortBy", "created")
+    page.click("#hideAll")
+    checks["hide all hides every run"] = soon("app.runList.every((r) => !r.shown)")
+    page.click("#hideAll")
+    soon("[...document.querySelectorAll('#runTable tr:has(td.name a) input[type=checkbox]')].every((c) => c.checked)")
+    page.locator("#runTable tr:has(td.name a) input[type=checkbox]").last.uncheck()
+    checks["a run's checkbox hides it"] = soon("app.runList.filter((r) => !r.shown).length === 1")
+    page.locator("#runTable tr:has(td.name a) input[type=checkbox]").last.check()
+    page.click("#groupAdd")
+    page.fill("#menu input[type=search]", "see")
+    checks["group-by search narrows the fields"] = page.locator("#menu .mitem").count() == 1
+    page.keyboard.press("Escape")
+    page.locator("#panels").click(position={"x": 5, "y": 5})
+    for k in ("End", "Home", "PageDown", "ArrowUp"):
+        page.keyboard.press(k)
+    slider = page.locator(".panel.media input[type=range]").first
+    slider.scroll_into_view_if_needed()
+    slider.fill("0")
+    checks["the media slider steps back"] = page.evaluate("[...app.mediaPanels.values()].some((m) => !m.follow)")
+
+    hover(plot())
+    page.keyboard.down("Shift")
+    checks["shift pins the tooltip"] = page.evaluate("document.querySelector('#tip').classList.contains('pinned')")
+    tip_row = page.locator("#tip .trow").first
+    tip_row.hover()
+    checks["a pinned row marks its run in the sidebar"] = page.evaluate("!!app.sideMark")
+    tip_row.click()
+    page.keyboard.up("Shift")
+    page.wait_for_function("app.scopeIsRun && app.data.runs.size === 1 && !!document.querySelector('#infoPanel .st')", timeout=10000)
+    checks["a pinned row opens its run"] = True
+    page.go_back()
+    page.wait_for_function(READY + " && !app.scopeIsRun", timeout=30000)
+    checks["back from a run restores the folder ungrouped, as it was"] = page.evaluate("!app.opts.group.length")
+    page.go_forward()
+    page.wait_for_function("app.scopeIsRun", timeout=30000)
+
+    page.goto(f"{url}/?gl=0#path=sweep&group=config.lr")
+    page.wait_for_function(READY, timeout=30000)
+    hover(plot())
+    page.goto(f"{url}/?gl=0#path=sweep&group=")
+    page.wait_for_function(READY, timeout=30000)
+    checks["Canvas 2D draws without WebGL"] = page.evaluate(f"!!{chart}.view && !{chart}.view.gl")
+    page.click("#clearCache")
+    page.wait_for_timeout(500)
+    failed = [k for k, v in checks.items() if not v]
+    print(f"interactions: {len(checks) - len(failed)}/{len(checks)} as intended" + (f"; not: {failed}" if failed else ""))
+    return not failed
 
 
 def daemon_smoke(page, runs, tmp, env, out, errors):
@@ -336,6 +471,7 @@ def main():
             ok &= group_levels_smoke(page, url)
             ok &= sections_smoke(page, url)
             ok &= filter_smoke(page, url)
+            ok &= interactions_smoke(page, url)
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])
             deadline = time.time() + 20
             while not (runs / "live").exists() and time.time() < deadline:
@@ -374,6 +510,7 @@ def main():
             server.terminate()
             ok &= daemon_smoke(page, runs, tmp, env, out, errors)
             coverage.take()
+            coverage.add_node_tests()
             lines = coverage.report()
             covered, total = (sum(v[i] for v in lines.values()) for i in (0, 1))
             (out / "ui_coverage.txt").write_text("".join(f"{k}: uncovered lines {miss}\n" for k, (_, _, miss) in lines.items()))
