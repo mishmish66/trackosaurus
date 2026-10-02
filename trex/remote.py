@@ -19,6 +19,7 @@ from . import update
 SPEC: Final = re.compile(r"(?P<host>(?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s\[\]]+)):(?P<path>.+)")
 ADD_TIMEOUT: Final = 120.0  # seconds an add waits for the first start (uvx may install trex first)
 BACKOFF_MAX: Final = 60.0  # seconds between reconnection attempts, at most
+CLOSE_TIMEOUT: Final = 15.0  # seconds `close` waits for the session to end
 PROXY_TIMEOUT: Final = 120.0  # seconds a passed-through request may wait for the remote server
 SSH_OPTIONS: Final = ["-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
                       "-o", "StreamLocalBindMask=0177", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
@@ -97,7 +98,7 @@ class Remote:
         if proc is not None:
             _end(proc)
         if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join()
+            self._thread.join(CLOSE_TIMEOUT)
 
     def connection(self) -> UnixHTTPConnection:
         return UnixHTTPConnection(self.local, PROXY_TIMEOUT)

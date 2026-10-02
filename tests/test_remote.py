@@ -105,7 +105,7 @@ def roots(tmp_path, home):
 @pytest.fixture
 def http(roots):
     srv = server.serve(None, "127.0.0.1", 0, roots)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
 
@@ -158,7 +158,7 @@ def test_remote_machines_run_this_trex_commit_from_the_source(monkeypatch, base,
 def test_remote_directories_are_served_through_the_daemon(roots, runs, http, home, monkeypatch):
     monkeypatch.setattr(update, "RUNNING", {"version": "0.1.0", "commit": "abc123"})
     name = roots.add_remote(f"box:{runs}")
-    assert name == "my runs@box" and roots.served()[0]["state"] == "connected"
+    assert name == "my runs" and roots.served()[0]["state"] == "connected"
     base = f"{http}/r/{urllib.parse.quote(name)}"
     assert "--from" in (args := (home / "uvx.args").read_text().split("\n")) and args[args.index("--from") + 1].endswith("@abc123")
     assert args[args.index("--no-build-package") + 1] == "numpy"
@@ -222,7 +222,7 @@ def test_a_remote_that_is_not_connected_answers_with_a_page_that_reloads(roots, 
 
 def test_the_add_menu_takes_remote_addresses(roots, runs, http):
     status, body = post(f"{http}/api/daemon/add", {"path": f"box:{runs}"})
-    assert status == 200 and body["url"] == f"/r/{urllib.parse.quote('my runs@box', safe='')}/"
+    assert status == 200 and body["url"] == f"/r/{urllib.parse.quote('my runs', safe='')}/"
     info = json.loads(get(f"{http}/api/daemon")[2])
     assert [(r["root"], r["state"]) for r in info["roots"]] == [(f"box:{runs}", "connected")]
     assert post(f"{http}/api/daemon/add", {"path": "nowhere:/x"})[0] == 400
@@ -233,7 +233,7 @@ def test_saved_remote_directories_reconnect_after_a_restart(roots, runs, tmp_pat
     again = Roots(tmp_path / "cache2", tmp_path / "state" / "roots.json")
     try:
         again.load()
-        entry = again.get("my runs@box")
+        entry = again.get("my runs")
         assert isinstance(entry, Remote) and wait_for(lambda: entry.state == "connected")
     finally:
         for name in list(again.entries):
@@ -242,10 +242,10 @@ def test_saved_remote_directories_reconnect_after_a_restart(roots, runs, tmp_pat
 
 def test_serve_hands_remote_addresses_to_the_daemon(roots, runs, capsys):
     control = ControlServer(daemon.socket_path(), roots, ["http://127.0.0.1:1/"])
-    threading.Thread(target=control.serve_forever, daemon=True).start()
+    threading.Thread(target=control.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         main(["serve", f"box:{runs}"])
-        assert "/r/my%20runs%40box/" in capsys.readouterr().out and roots.served()[0]["state"] == "connected"
+        assert "/r/my%20runs/" in capsys.readouterr().out and roots.served()[0]["state"] == "connected"
     finally:
         control.shutdown()
         control.server_close()
@@ -275,4 +275,4 @@ def test_closing_the_daemons_directories_ends_remote_sessions_and_keeps_them_sav
     (_, sock), = sessions(home)
     roots.close()
     assert not entry.local.exists() and wait_for(lambda: not Path(sock).exists()) and roots.served() == []
-    assert [e["root"] for e in json.loads((tmp_path / "state" / "roots.json").read_text())] == [f"box:{runs}"]
+    assert json.loads((tmp_path / "state" / "roots.json").read_text())["tracked"] == [f"box:{runs}"]

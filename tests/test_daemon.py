@@ -12,7 +12,7 @@ import pytest
 import trex
 from trex import daemon, server
 from trex.cli import main
-from trex.daemon import ControlServer, Roots
+from trex.daemon import ControlServer, Roots, unique_names
 from trex.index import Explorer
 
 
@@ -48,7 +48,7 @@ def roots(tmp_path, state):
 @pytest.fixture
 def http(roots):
     srv = server.serve(None, "127.0.0.1", 0, roots)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
 
@@ -56,7 +56,7 @@ def http(roots):
 @pytest.fixture
 def control(roots, state):
     c = ControlServer(daemon.socket_path(), roots, ["http://127.0.0.1:1/"])
-    threading.Thread(target=c.serve_forever, daemon=True).start()
+    threading.Thread(target=c.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     yield c
     c.shutdown()
     c.server_close()
@@ -76,12 +76,26 @@ def ready(roots, name):
     assert roots.get(name).ready.wait(10)
 
 
-def test_directories_are_named_by_basename_and_keep_their_names_across_restarts(roots, dirs, tmp_path, state):
-    assert [roots.add(d) for d in dirs] == ["runs", "runs-2"]
-    assert roots.add(dirs[1]) == "runs-2"
+def test_colliding_names_are_told_apart_by_their_parents_until_the_collision_ends(roots, dirs, tmp_path, state):
+    assert roots.add(dirs[0]) == "runs"
+    assert roots.add(dirs[1]) == "runs<b>" == roots.add(dirs[1])
+    assert [(r["name"], r["root"]) for r in roots.served()] == [("runs<a>", str(dirs[0])), ("runs<b>", str(dirs[1]))]
     again = Roots(tmp_path / "cache", state / "roots.json")
     again.load()
-    assert [(r["name"], r["root"]) for r in again.served()] == [("runs", str(dirs[0])), ("runs-2", str(dirs[1]))]
+    assert [r["name"] for r in again.served()] == ["runs<a>", "runs<b>"]
+    roots.remove("runs<a>")
+    assert [r["name"] for r in roots.served()] == ["runs"]
+
+
+@pytest.mark.parametrize("specs,want", [
+    (["/x/runs", "/y/runs"], ["runs<x>", "runs<y>"]),
+    (["/x/a/runs", "/y/a/runs"], ["runs<x/a>", "runs<y/a>"]),
+    (["/data/runs", "gpu-box:~/runs", "big.lan:/scratch/runs"], ["runs<data>", "runs<gpu-box>", "runs<big>"]),
+    (["/data/runs", "/data/sweeps"], ["runs", "sweeps"]),
+])
+def test_names_follow_emacs_uniquify(specs, want):
+    names = unique_names(specs)
+    assert [names[s] for s in specs] == want
 
 
 def test_saved_directories_that_no_longer_exist_are_skipped(roots, dirs, tmp_path, state):
@@ -94,15 +108,17 @@ def test_saved_directories_that_no_longer_exist_are_skipped(roots, dirs, tmp_pat
 
 
 def test_daemon_serves_each_directory_under_its_prefix(roots, dirs, http):
-    names = [roots.add(d) for d in dirs]
+    for d in dirs:
+        roots.add(d)
+    names = [r["name"] for r in roots.served()]
     for n in names:
         ready(roots, n)
     info = json.loads(get(f"{http}/api/daemon")[2])
-    assert info["daemon"] and [r["url"] for r in info["roots"]] == ["/r/runs/", "/r/runs-2/"]
+    assert info["daemon"] and [r["url"] for r in info["roots"]] == ["/r/runs%3Ca%3E/", "/r/runs%3Cb%3E/"]
     for n, d in zip(names, dirs, strict=True):
-        assert json.loads(get(f"{http}/r/{n}/api/info")[2])["root"] == str(d)
-        assert [r["id"] for r in json.loads(get(f"{http}/r/{n}/api/runs")[2])["runs"]] == ["r1"]
-    assert get(f"{http}/r/runs")[1] == f"{http}/r/runs/"
+        assert json.loads(get(f"{http}/r/{urllib.parse.quote(n)}/api/info")[2])["root"] == str(d)
+        assert [r["id"] for r in json.loads(get(f"{http}/r/{urllib.parse.quote(n)}/api/runs")[2])["runs"]] == ["r1"]
+    assert get(f"{http}/r/runs%3Ca%3E")[1] == f"{http}/r/runs%3Ca%3E/"
     assert get(f"{http}/r/nope/")[1] == f"{http}/"
     with pytest.raises(urllib.error.HTTPError) as e:
         get(f"{http}/api/runs")
@@ -117,17 +133,17 @@ def test_removing_a_directory_stops_serving_it_without_touching_its_files(roots,
     with pytest.raises(urllib.error.HTTPError) as e:
         get(f"{http}/r/{name}/api/runs")
     assert e.value.code == 404
-    assert json.loads((state / "roots.json").read_text()) == []
+    assert json.loads((state / "roots.json").read_text()) == {"tracked": [], "workspaces": []}
     assert sorted(p.relative_to(dirs[0]) for p in dirs[0].rglob("*")) == before
 
 
 def test_standalone_server_has_no_daemon_routes(tmp_path, dirs):
     ex = Explorer(dirs[0], tmp_path / "cache")
     srv = server.serve(ex, "127.0.0.1", 0)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_address[1]}"
     try:
-        assert json.loads(get(f"{url}/api/daemon")[2]) == {"daemon": False, "roots": [], "history": [], "install": None, "updates": None}
+        assert json.loads(get(f"{url}/api/daemon")[2]) == {"daemon": False, "roots": [], "workspaces": [], "history": [], "install": None, "updates": None}
         with pytest.raises(urllib.error.HTTPError):
             post(f"{url}/api/daemon/remove", {"name": "runs"})
     finally:
@@ -188,10 +204,11 @@ def post_status(url, body):
 
 
 def test_added_and_removed_directories_are_remembered_most_recent_first_across_restarts(roots, dirs, tmp_path, state):
-    a, b = (roots.add(d) for d in dirs)
-    roots.remove(a)
+    for d in dirs:
+        roots.add(d)
+    roots.remove("runs<a>")
     assert roots.history() == [str(dirs[0])]
-    roots.remove(b)
+    roots.remove("runs")
     assert Roots(tmp_path / "cache", state / "roots.json").history() == [str(dirs[1]), str(dirs[0])]
 
 
@@ -235,7 +252,7 @@ def test_http_add_refuses_relative_home_root_and_missing_paths(roots, http, path
 def test_standalone_server_refuses_daemon_changes(tmp_path, dirs):
     ex = Explorer(dirs[0], tmp_path / "cache")
     srv = server.serve(ex, "127.0.0.1", 0)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_address[1]}"
     try:
         for path, body in [("add", {"path": str(dirs[1])}), ("history/clear", {})]:
@@ -276,7 +293,7 @@ def test_requests_by_address_localhost_or_machine_name_are_served(http, host):
 
 def test_allowed_host_names_are_served(roots):
     srv = server.serve(None, "127.0.0.1", 0, roots, allow=["Box.Tailnet.ts.net"])
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         assert raw(f"http://127.0.0.1:{srv.server_address[1]}/api/daemon", headers={"Host": "box.tailnet.ts.net"})[0] == 200
     finally:
@@ -301,7 +318,7 @@ def test_changes_from_the_ui_itself_or_without_an_origin_are_allowed(roots, dirs
 def test_daemon_directories_share_one_tile_budget(roots, dirs):
     a, b = (roots.get(roots.add(d)) for d in dirs)
     assert a.budget is b.budget is roots.budget and roots.budget.members == [a, b]
-    roots.remove("runs")
+    roots.remove("runs<a>")
     assert wait_closed(a) and roots.budget.members == [b]
 
 

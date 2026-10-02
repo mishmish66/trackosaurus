@@ -54,7 +54,7 @@ def daemon_http(tmp_path, monkeypatch):
     restarts = []
     srv.restart = lambda: restarts.append(time.time())
     monkeypatch.setattr(update, "updates", lambda: {"source": "git+https://x", "available": True, "reason": ""})
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_address[1]}", restarts
     srv.shutdown()
 
@@ -141,7 +141,7 @@ def test_unavailable_updates_are_refused_with_the_reason(daemon_http, monkeypatc
 
 def test_a_server_without_a_restart_hook_has_no_update(tmp_path):
     srv = server.serve(None, "127.0.0.1", 0, Roots(tmp_path / "cache", tmp_path / "state" / "roots.json"))
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         assert post(f"http://127.0.0.1:{srv.server_address[1]}/api/daemon/update")[0] == 404
     finally:

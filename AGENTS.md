@@ -15,7 +15,8 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/media.py` | PNG/MP4 encoding for logged arrays (numpy and ffmpeg imported lazily) |
 | `trex/index.py` | `Explorer`: crawl, per-run scans (inline or process pool), index cache, top tiles, on-demand finer tiles with a size-bounded cache, event hub |
 | `trex/server.py` | read-only HTTP + SSE for the UI: `/api/runs`, `/api/tiles`, `/api/rows`, `/api/stream`, media |
-| `trex/daemon.py` | `trex daemon`: `Roots` (directories by name in `roots.json`, remembered ones in `history.json`), the Unix control socket, its client |
+| `trex/daemon.py` | `trex daemon`: `Roots` (tracked directories by spec, `unique_names`, workspaces; `roots.json`, remembered ones in `history.json`), the Unix control socket, its client |
+| `trex/workspace.py` | workspaces: `Workspace` merges member directories (`Local`, `Far`) behind the Explorer interface, renaming run ids |
 | `trex/remote.py` | `host:path` directories: `parse`, the ssh + `uvx` command, `Remote` (one ssh session, reconnected with backoff) |
 | `trex/update.py` | the daemon's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd to restart it |
 | `trex/query.py` | read-side queries for the CLI: records, filters, sorting, statistics, series |
@@ -32,9 +33,9 @@ as video). The UI loads no external scripts, and the server is standard library.
 ## Commands
 
 ```bash
-uv sync && npm install                                    # dev deps: pytest, pytest-cov, pyright, radon, pdoc; eslint (UI tests only)
+uv sync && npm install                                    # dev deps: pytest, pytest-cov, pytest-xdist, pyright, radon, pdoc; eslint (UI tests only)
 uv run pyright                                            # types: strict for the logging API and formats, standard elsewhere
-uv run pytest                                             # writer, media, chunks/tiles, explorer, HTTP, daemon, CLI, complexity
+uv run pytest                                             # all suites, one worker per CPU (-n0: serially)
 uv run pytest --cov                                       # the same with branch coverage, subprocesses included; fails below 94%
 uv run python docs/build.py                               # pdoc pages into site/
 node --test tests/*.test.mjs                              # JS kernel and complexity (node >= 18)
@@ -73,8 +74,13 @@ them WebGL falls back to software and timings mean nothing.
   evicted). A cached tile stays valid while later rows
   lie beyond its step range. `/api/tiles/bundle` answers one kept tier of one metric for every run
   of a folder in one indexed read.
-- **Daemon**: one server, one `Explorer` per directory. A directory's URLs are its standalone URLs
-  under `/r/<name>/`, and the UI prefixes every request with that (`BASE` in `data.js`).
+- **Daemon**: one server, one `Explorer` (or `Remote`) per tracked directory. A directory's URLs are its
+  standalone URLs under `/r/<name>/`, a workspace's under `/w/<name>/`, and the UI prefixes every request
+  with that (`BASE` in `data.js`); `/` is the root page. Names follow Emacs's uniquify (`runs<chush>`)
+  and change when a collision appears or ends; specs (paths, `host:path`) are the stable keys.
+- **Workspace**: answers the Explorer interface by asking its members in parallel. A run id is the
+  member's path, or `path<member>` when an earlier member holds the same path; `resolve` maps it back.
+  Its stream merges the members' streams, renaming run ids in every event (`Workspace._rename_event`).
   `/api/daemon` lists the directories, the remembered ones and the running trex; directories are
   added over the control socket (mode 0600) or HTTP and removed over HTTP. An update installs
   `$TREX_SOURCE` and exits with `update.RESTART_STATUS`; the unit's `RestartForceExitStatus` restarts

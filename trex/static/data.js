@@ -6,8 +6,8 @@ import { Col, crc32 } from "./kernel.js";
 
 const num = (v) => (typeof v === "number" ? v : Number(v));
 
-/** URL prefix of the served directory: "/r/<name>" under the daemon, else "". */
-export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/r\/[^/]+(?=\/)/) || [""])[0];
+/** URL prefix of what the page shows: a daemon's tracked directory ("/r/<name>") or workspace ("/w/<name>"), else "". */
+export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/[rw]\/[^/]+(?=\/)/) || [""])[0];
 
 /** URL of a media record's file; content-addressed, so browsers cache it as immutable. */
 export const mediaURL = (rec) => `${BASE}/m/${encodeURIComponent(rec.run)}/${rec.file}`;

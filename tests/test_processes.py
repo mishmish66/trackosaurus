@@ -83,7 +83,7 @@ def test_daemon_takes_directories_from_serve_and_removes_its_socket_on_exit(tmp_
     finally:
         assert interrupt(p) == 0
     assert not (tmp_path / "state" / "daemon.sock").exists()
-    assert [e["root"] for e in json.loads((tmp_path / "state" / "roots.json").read_text())] == [str(a), str(b)]
+    assert json.loads((tmp_path / "state" / "roots.json").read_text())["tracked"] == [str(a), str(b)]
 
 
 def test_restarted_daemon_serves_the_directories_it_had(tmp_path, env):

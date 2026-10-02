@@ -40,6 +40,7 @@ dev = [
     "radon",
     "pytest-cov",
     "pdoc>=16.0.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [build-system]
@@ -55,6 +56,7 @@ exclude = ["docs/media"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-n auto"  # one worker per CPU; -n0 runs serially, e.g. to debug one test
 
 [tool.coverage.run]
 source = ["trex"]

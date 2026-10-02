@@ -804,6 +804,9 @@ class Explorer:
             "seq": st["seq"], "mseq": st["mseq"], "keys": st["keys"], "tiles_seq": st["tiles_seq"],
         }
 
+    def info(self) -> dict[str, object]:
+        return {"root": str(self.root), "name": self.root.name, "cache": self.cache_dir.name}
+
     def tree(self) -> list[tuple[str, RunState]]:
         with self.lock:
             return [(p, st["state"]) for p, st in sorted(self.state.items())]

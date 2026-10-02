@@ -34,7 +34,7 @@ const tailOf = (s, n) => (s.length > n ? `…${s.slice(1 - n)}` : s);
 const daemonInfo = async () => (await fetch("/api/daemon", { cache: "no-store" })).json();
 
 /** Group-by field id from a declared default: "subfolder", "parent", "config.<key>", or a bare config key. */
-const normalizeField = (f) => (f === "subfolder" || f === "parent" || f.startsWith("config.") ? f : `config.${f}`);
+const normalizeField = (f) => (["subfolder", "parent", "dir"].includes(f) || f.startsWith("config.") ? f : `config.${f}`);
 
 function fmtAny(v) {
   if (typeof v === "number") return fmt(v);
@@ -144,7 +144,7 @@ function grown(a, n) {
 /** What the run filter matches: name, path, tags and key=value config entries. */
 function searchText(m) {
   const cfg = Object.entries(m.config || {}).map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`);
-  return [m.name, m.id, ...(m.tags || []), ...cfg].join(" ");
+  return [m.name, m.id, ...(m.dir ? [`dir=${m.dir}`] : []), ...(m.tags || []), ...cfg].join(" ");
 }
 
 /** Page options from the URL hash. */
@@ -354,33 +354,83 @@ class App {
     setInterval(() => this.refreshTree().then(() => this.renderCrumbs()), 15000);
   }
 
-  /** Under the daemon, its directories (else null); false when this page serves none of them, after moving
-   * to one or, with none, showing the daemon panel. */
+  /** Under the daemon, its state (else null). False when the page is the daemon's root (/), after opening its only
+   * tracked directory, or else showing the root page. */
   async enterDaemon() {
     const d = await daemonInfo();
-    this.daemon = d.daemon ? d.roots : null;
-    if (!d.daemon || d.roots.some((r) => r.url === `${BASE}/`)) return true;
-    if (d.roots.length) location.replace(d.roots[0].url);
+    this.daemon = d.daemon ? d : null;
+    if (!d.daemon || BASE) return true;
+    if (d.roots.length === 1 && !d.workspaces.length) location.replace(d.roots[0].url);
     else this.daemonHome(d);
     return false;
   }
 
-  /** The page of a daemon serving no directories. */
+  /** The daemon's root page (/): its workspaces and tracked directories, to open or change. */
   daemonHome(d) {
-    $("#status").textContent = "the trex daemon serves no directories";
+    $("#status").textContent = "";
+    $("#crumbPath").replaceChildren(h("span", { className: "seg current rootseg" }, h("span", { className: "crumb", textContent: "/" })));
     $("#panels").replaceChildren(h("div", { className: "dhome" }, this.daemonPanel(d, async () => this.daemonHome(await daemonInfo()))));
   }
 
   async rootMenu(anchor) {
     const d = await daemonInfo();
-    this.daemon = d.roots;
+    this.daemon = d;
     menu.open(anchor, this.daemonPanel(d, () => this.rootMenu(anchor)));
   }
 
-  /** Daemon directories: open one, stop serving one (×), or add one by path or from the remembered ones.
-   * `refresh` redraws the panel. */
+  /** The daemon's workspaces and tracked directories: open, edit or remove one, add a directory (by path, as
+   * host:path, or from the remembered ones) or a workspace. `refresh` redraws the panel. */
   daemonPanel(d, refresh) {
-    const err = h("div", { className: "merr" }), note = h("div", { className: "mhint" });
+    const err = h("div", { className: "merr" });
+    const panel = h("div", { className: "dpanel" });
+    const show = (...kids) => panel.replaceChildren(...kids);
+    const home = () => show(h("div", { className: "mtitle", textContent: "workspaces" }), ...this.workspaceRows(d, refresh, edit),
+      h("button", { className: "mclear", textContent: "+ new workspace", onclick: () => edit(null) }),
+      h("div", { className: "mtitle msec", textContent: "tracked directories" }), ...this.trackedRows(d, refresh, err), err,
+      this.versionRow(d, err));
+    const edit = (ws) => show(this.workspaceEditor(d, ws, home));
+    home();
+    return panel;
+  }
+
+  workspaceRows(d, refresh, edit) {
+    return d.workspaces.map((w) => h("div", { className: "mrow" },
+      h("button", { className: "mitem" + (w.url === `${BASE}/` ? " active" : ""), onclick: () => (location.href = w.url) },
+        h("span", { className: "ml", textContent: w.name }), h("span", { className: "ms", textContent: w.members.join(" · ") || "empty" })),
+      h("button", { className: "chev", textContent: "✎", title: "edit this workspace", onclick: () => edit(w) }),
+      h("button", { className: "chev", textContent: "×", title: "delete this workspace (its directories stay tracked)",
+        onclick: () => this.deleteWorkspace(w, refresh) })));
+  }
+
+  /** Name and members of a new workspace, or of `ws`; `done` returns to the panel. */
+  workspaceEditor(d, ws, done) {
+    const err = h("div", { className: "merr" });
+    const name = h("input", { type: "text", placeholder: "workspace name", value: ws?.name || "", spellcheck: false });
+    const boxes = d.roots.map((r) => h("input", { type: "checkbox", checked: !!ws?.members.includes(r.name), value: r.name }));
+    const save = async () => {
+      const body = { name: name.value, members: boxes.filter((b) => b.checked).map((b) => b.value), old: ws?.name };
+      const r = await fetch("/api/daemon/workspace", { method: "POST", body: JSON.stringify(body) });
+      const j = await r.json();
+      if (r.ok) location.href = j.url;
+      else err.textContent = j.error;
+    };
+    return h("div", {}, h("div", { className: "mtitle", textContent: ws ? `edit ${ws.name}` : "new workspace" }),
+      h("div", { className: "madd" }, name),
+      ...d.roots.map((r, i) => h("label", { className: "mitem mcheck", title: r.root }, boxes[i],
+        h("span", { className: "ml", textContent: r.name }), h("span", { className: "ms", textContent: tailOf(r.root, 36) }))),
+      err, h("div", { className: "mfoot" }, h("button", { textContent: "cancel", onclick: done }), h("button", { textContent: "save", onclick: save })));
+  }
+
+  async deleteWorkspace(w, refresh) {
+    if (!confirm(`Delete workspace ${w.name}? Its directories stay tracked.`)) return;
+    await fetch("/api/daemon/workspace/delete", { method: "POST", body: JSON.stringify({ name: w.name }) });
+    if (w.url === `${BASE}/`) location.href = "/";
+    else refresh();
+  }
+
+  /** Rows of the tracked directories, the add box and the remembered directories. */
+  trackedRows(d, refresh, err) {
+    const note = h("div", { className: "mhint" });
     const add = async (path) => {
       const host = REMOTE.exec(path.trim())?.[1];
       [err.textContent, note.textContent] = ["", host ? `starting trex on ${host}…` : ""];
@@ -396,21 +446,18 @@ class App {
       h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || r.root, onclick: () => (location.href = r.url) },
         h("span", { className: "ml", textContent: r.name }),
         h("span", { className: "ms", textContent: tailOf(r.root, 36) + (r.state === "local" || r.state === "connected" ? "" : ` · ${r.state}`) })),
-      h("button", { className: "chev", textContent: "×", title: "stop serving this directory (its files are kept)",
+      h("button", { className: "chev", textContent: "×", title: "stop tracking this directory (its files are kept)",
         onclick: () => this.removeRoot(r, refresh) })));
-    const recent = d.history.map((path) => h("button", { className: "mitem", title: `serve ${path}`, onclick: () => add(path) },
+    const recent = d.history.map((path) => h("button", { className: "mitem", title: `track ${path}`, onclick: () => add(path) },
       h("span", { className: "micon", textContent: "+" }), h("span", { className: "ml", textContent: tailOf(path, 56) })));
     const clear = async () => {
       await fetch("/api/daemon/history/clear", { method: "POST", body: "{}" });
       refresh();
     };
-    return h("div", { className: "dpanel" },
-      h("div", { className: "mtitle", textContent: "trex daemon" }),
-      served.length ? h("div", { className: "mlist" }, ...served) : h("div", { className: "mhint", textContent: "no directories served" }),
-      h("div", { className: "madd" }, input, h("button", { textContent: "add", onclick: () => add(input.value) })), note, err,
+    return [served.length ? h("div", { className: "mlist" }, ...served) : h("div", { className: "mhint", textContent: "none tracked" }),
+      h("div", { className: "madd" }, input, h("button", { textContent: "add", onclick: () => add(input.value) })), note,
       recent.length ? h("div", { className: "mrecent" }, h("div", { className: "mtitle", textContent: "recent" }),
-        h("div", { className: "mlist" }, ...recent), h("button", { className: "mclear", textContent: "clear history", onclick: clear })) : null,
-      this.versionRow(d, err));
+        h("div", { className: "mlist" }, ...recent), h("button", { className: "mclear", textContent: "clear history", onclick: clear })) : null];
   }
 
   /** The daemon's trex version, with an update button when it can update itself. */
@@ -617,7 +664,8 @@ class App {
   }
 
   get rootName() {
-    return this.daemon?.find((r) => r.url === `${BASE}/`)?.name || this.data.info?.name || "runs";
+    const here = [...(this.daemon?.workspaces || []), ...(this.daemon?.roots || [])].find((r) => r.url === `${BASE}/`);
+    return here?.name || this.data.info?.name || "runs";
   }
 
   /** Path bar: clicking a segment opens that folder; ▾ switches to a sibling; › opens a child. */
@@ -640,7 +688,9 @@ class App {
     };
     const chart = o.chart && this.charts.has(o.chart);
     seg(this.rootName, "", { current: !parts.length && !o.fgroup && !chart, cls: "rootseg" });
-    if (this.daemon) path.push(h("button", { className: "chev", textContent: "▾", title: "switch directory",
+    if (this.daemon) path.unshift(h("span", { className: "seg" }, h("button", { className: "crumb", textContent: "/",
+      title: "the daemon's workspaces and tracked directories", onclick: () => (location.href = "/") })));
+    if (this.daemon) path.push(h("button", { className: "chev", textContent: "▾", title: "switch workspace or directory",
       onclick: (e) => this.rootMenu(e.currentTarget) }));
     parts.forEach((p, i) => seg(p, parts.slice(0, i + 1).join("/"),
       { current: i === parts.length - 1 && !o.fgroup && !chart, siblingsOf: parts.slice(0, i).join("/") }));
@@ -750,7 +800,8 @@ class App {
     const runs = this.runList.filter((r) => r.match);
     const distinct = (get) => new Set(runs.map((r) => JSON.stringify(get(r) ?? null))).size;
     const fields = [{ id: "subfolder", label: "subfolder", n: distinct((r) => this.subfolder(r)) },
-                    { id: "parent", label: "parent folder", n: distinct((r) => r.meta.parent) }];
+                    { id: "parent", label: "parent folder", n: distinct((r) => r.meta.parent) },
+                    ...(runs.some((r) => r.meta.dir) ? [{ id: "dir", label: "tracked dir", n: distinct((r) => r.meta.dir) }] : [])];
     const keys = new Set();
     for (const r of runs) for (const k of Object.keys(r.meta.config || {})) keys.add(k);
     for (const k of [...keys].sort()) {
@@ -761,7 +812,7 @@ class App {
   }
 
   fieldLabel(id) {
-    return id === "subfolder" ? "subfolder" : id === "parent" ? "parent folder" : id.slice(7);
+    return { subfolder: "subfolder", parent: "parent folder", dir: "tracked dir" }[id] ?? id.slice(7);
   }
 
   /** First path component of a run below the current folder (the run's own name if it sits directly in it). */
@@ -832,7 +883,7 @@ class App {
     if (!this.opts.group.length) return null;
     const m = r.meta;
     return this.opts.group.map((f) => {
-      const v = f === "subfolder" ? this.subfolder(r) : f === "parent" ? this.rel(m.parent) : m.config?.[f.slice(7)];
+      const v = f === "subfolder" ? this.subfolder(r) : f === "parent" ? this.rel(m.parent) : f === "dir" ? m.dir : m.config?.[f.slice(7)];
       return v == null ? "∅" : typeof v === "object" ? JSON.stringify(v) : String(v);
     }).join(" · ");
   }

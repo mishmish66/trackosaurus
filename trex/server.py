@@ -16,11 +16,12 @@ from collections.abc import Callable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import remote, update
-from .daemon import root_url
+from .daemon import root_url, workspace_url
 from .remote import Remote
+from .workspace import Far, Workspace
 from .index import Explorer, dumps, sse
 
 if TYPE_CHECKING:
@@ -34,7 +35,7 @@ DEFAULT_PORT: Final = 13898
 PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
 HOP_HEADERS: Final = frozenset({"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
                                 "proxy-authorization", "proxy-authenticate"})
-ROOT_PREFIX: Final = re.compile(r"/r/([^/]+)(/.*)?")  # a daemon directory's URLs
+ROOT_PREFIX: Final = re.compile(r"/([rw])/([^/]+)(/.*)?")  # a tracked directory's (r) or workspace's (w) URLs
 HB_INTERVAL: Final = 10.0  # seconds of stream silence after which a heartbeat is sent
 MAX_TILE_REQUESTS: Final = 4096
 RESTART_DELAY: Final = 0.5  # seconds between answering an update and restarting, so the answer is sent
@@ -69,7 +70,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "trex"
 
-    _ex: Explorer | None = None
+    _ex: "Explorer | Workspace | None" = None
     _body: bytes = b""
 
     @property
@@ -77,8 +78,9 @@ class Handler(BaseHTTPRequestHandler):
         return cast(Server, self.server)
 
     @property
-    def ex(self) -> Explorer:
-        """The directory this request is for: the served one, or the daemon's named in the /r/<name>/ prefix."""
+    def ex(self) -> "Explorer | Workspace":
+        """What this request is for: the served directory, or the daemon's tracked directory (/r/<name>/) or
+        workspace (/w/<name>/)."""
         if self._ex is None:
             raise KeyError("runs directory")
         return self._ex
@@ -136,18 +138,19 @@ class Handler(BaseHTTPRequestHandler):
         pm = ROOT_PREFIX.fullmatch(path) if self.srv.roots is not None else None
         if self.srv.roots is None or pm is None:
             return path
+        kind, name, rest = pm[1], unquote(pm[2]), pm[3]
         try:
-            entry = self.srv.roots.get(unquote(pm[1]))
+            entry = self.srv.roots.get(name) if kind == "r" else self.srv.roots.workspace(name)
         except KeyError:
-            if pm[2] in (None, "/"):
+            if rest in (None, "/"):
                 return self.redirect("/")
             raise
-        if pm[2] is None:
+        if rest is None:
             return self.redirect(path + "/" + (f"?{query}" if query else ""))
         if isinstance(entry, Remote):
-            return self._proxy(entry, pm[2] + (f"?{query}" if query else ""))
+            return self._proxy(entry, rest + (f"?{query}" if query else ""))
         self._ex = entry
-        return pm[2]
+        return rest
 
     def _proxy(self, remote: Remote, target: str) -> None:
         """Pass the request through to the remote directory's server, streaming its answer back."""
@@ -274,12 +277,17 @@ class Handler(BaseHTTPRequestHandler):
         """Media are content-addressed (media/<sha256>.<ext>), so they are cached as immutable."""
         html = file.endswith(".html")
         extra = {"Content-Security-Policy": "sandbox allow-scripts"} if html else None
-        self.send_file(self.ex.media_path(run, file), f'"{file}"', "public, max-age=31536000, immutable", extra,
-                       compress=html)
+        ex = self.ex
+        if isinstance(ex, Workspace):
+            m, path = ex.resolve(run)
+            if isinstance(m, Far):
+                return self._proxy(m.remote, f"/m/{quote(path, safe='')}/{file}")
+            ex, run = m.ex, path
+        self.send_file(ex.media_path(run, file), f'"{file}"', "public, max-age=31536000, immutable", extra, compress=html)
 
     @route("GET", r"/api/info")
     def info(self, q: Query) -> None:
-        self._json({"root": str(self.ex.root), "name": self.ex.root.name, "cache": self.ex.cache_dir.name})
+        self._json(self.ex.info())
 
     @route("GET", r"/api/daemon")
     def daemon(self, q: Query) -> None:
@@ -287,6 +295,7 @@ class Handler(BaseHTTPRequestHandler):
         its directories, the remembered ones it does not serve, the trex it runs, and whether it can update."""
         roots = self.srv.roots
         self._json({"daemon": roots is not None, "roots": roots.served() if roots else [],
+                    "workspaces": roots.workspace_list() if roots else [],
                     "history": roots.history() if roots else [], "install": update.RUNNING if roots else None,
                     "updates": update.updates() if roots else None})
 
@@ -352,6 +361,24 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.srv.updating.release()
 
+    @route("POST", r"/api/daemon/workspace")
+    def daemon_workspace(self, q: Query) -> None:
+        """Body: {name, members: [tracked directory names], old?: name being renamed}. Response {url}, or 400."""
+        req = json.loads(self.body())
+        if not isinstance(req, dict) or not isinstance(req.get("members"), list):
+            raise ValueError("expected {name, members, old?}")
+        try:
+            self.daemon_roots.set_workspace(str(req.get("name", "")), [str(m) for m in req["members"]],
+                                            str(req["old"]) if req.get("old") else None)
+        except (ValueError, KeyError) as e:
+            return self._json({"error": str(e)}, 400)
+        self._json({"url": workspace_url(str(req["name"]).strip())})
+
+    @route("POST", r"/api/daemon/workspace/delete")
+    def daemon_workspace_delete(self, q: Query) -> None:
+        self.daemon_roots.delete_workspace(self.body_field("name"))
+        self._json({"ok": True})
+
     @route("POST", r"/api/daemon/history/clear")
     def daemon_clear_history(self, q: Query) -> None:
         self.daemon_roots.clear_history()
@@ -415,7 +442,10 @@ class Handler(BaseHTTPRequestHandler):
     def stream(self, q: Query) -> None:
         """SSE for runs under `path`: rows not yet in top tiles, then live events and heartbeats."""
         prefix = q.get("path", "")
-        sub = self.ex.hub.subscribe(prefix)
+        if isinstance(self.ex, Workspace):
+            return self._workspace_stream(self.ex, prefix)
+        ex = self.ex
+        sub = ex.hub.subscribe(prefix)
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -424,7 +454,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
-            self.wfile.write(b"retry: 2000\n\n" + b"".join(self.ex.backfill(prefix)))
+            self.wfile.write(b"retry: 2000\n\n" + b"".join(ex.backfill(prefix)))
             while not sub.dead:
                 msgs = []
                 try:
@@ -433,12 +463,34 @@ class Handler(BaseHTTPRequestHandler):
                         msgs.append(sub.q.get_nowait())
                 except queue.Empty:
                     if not msgs:
-                        msgs.append(sse("hb", self.ex.live_seqs(prefix)))
+                        msgs.append(sse("hb", ex.live_seqs(prefix)))
                 self.wfile.write(b"".join(msgs))
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
-            self.ex.hub.unsubscribe(sub)
+            ex.hub.unsubscribe(sub)
+
+    def _event_stream_headers(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def _workspace_stream(self, ws: Workspace, prefix: str) -> None:
+        """The merged streams of a workspace's members, until the client goes away."""
+        stop = threading.Event()
+        try:
+            self._event_stream_headers()
+            self.wfile.write(b"retry: 2000\n\n")
+            for msg in ws.events(prefix, stop):
+                self.wfile.write(msg)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            stop.set()
 
 
 class Server(ThreadingHTTPServer):
