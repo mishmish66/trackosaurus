@@ -170,10 +170,11 @@ def group_levels_smoke(page, url):
 
 
 def interactions_smoke(page, url):
-    """Whether the chart controls do what they say: hover and Shift-pinned tooltips (whose rows reveal and open
-    runs), x and box zooms and their reset, the chart settings (smoothing, axes, outliers, density, reset), sidebar
-    sorting and hiding, group-by search, keyboard scrolling, the media slider, back/forward (back to the grouping
-    the folder had), and Canvas 2D drawing."""
+    """Whether charts carry no legend and the chart controls do what they say: hover and Shift-pinned tooltips
+    (which the wheel scrolls, and whose rows reveal and open runs), x and box zooms and their reset, the chart
+    settings (smoothing, axes, outliers, density, reset), the sort box (type, pick, Enter, Escape), sidebar hiding,
+    group-by search, keyboard scrolling, the media slider, back/forward (back to the grouping the folder had), and
+    Canvas 2D drawing."""
     key, checks = "train/loss", {}
     sel = f".panel:has(.pname:text-is('{key}'))"
     chart = f"app.charts.get({key!r})"
@@ -198,6 +199,7 @@ def interactions_smoke(page, url):
 
     page.goto(f"{url}/?ix#path=sweep&group=")
     page.wait_for_function(READY, timeout=30000)
+    checks["charts carry no legend (the hover and the sidebar name the lines)"] = page.locator(".panel .legend").count() == 0
     at = plot()
     page.mouse.move(*at(0.2, 0.5))
     page.mouse.down()
@@ -239,10 +241,26 @@ def interactions_smoke(page, url):
 
     order = lambda: page.evaluate("app.runList.map((r) => r.id).join()")
     before = order()
-    page.select_option("#sortBy", index=1)
+    page.click("#sortBy")
+    checks["the sort box lists every field when focused"] = page.locator("#menu .mitem").count() == page.evaluate("app.sortFields.length")
+    page.keyboard.type("los")
+    checks["typing narrows the sort fields to matches"] = soon(
+        "(() => { const b = [...document.querySelectorAll('#menu .mitem')]; return b.length > 0 && b.length < app.sortFields.length"
+        " && b.every((x) => x.textContent.includes('los')); })()")
+    page.click("#menu .mitem:has-text('train/loss')")
+    checks["a picked field sorts the runs"] = soon("app.opts.sort === 'metric:train/loss' && document.querySelector('#sortBy').value === 'train/loss'")
     page.click("#sortDir")
     checks["sorting reorders the runs"] = order() != before
-    page.select_option("#sortBy", "created")
+    page.click("#sortBy")
+    page.keyboard.type("zzz")
+    checks["a field that matches nothing says so"] = soon("!!document.querySelector('#menu .mhint')")
+    page.keyboard.press("Escape")
+    checks["escape keeps the current sort"] = soon("app.opts.sort === 'metric:train/loss' && document.querySelector('#sortBy').value === 'train/loss'")
+    page.click("#sortBy")
+    page.keyboard.type("creat")
+    page.keyboard.press("Enter")
+    checks["enter picks the first match"] = soon("app.opts.sort === 'created'")
+    page.click("#sortDir")
     page.click("#hideAll")
     checks["hide all hides every run"] = soon("app.runList.every((r) => !r.shown)")
     page.click("#hideAll")
@@ -265,6 +283,10 @@ def interactions_smoke(page, url):
     hover(plot())
     page.keyboard.down("Shift")
     checks["shift pins the tooltip"] = page.evaluate("document.querySelector('#tip').classList.contains('pinned')")
+    first = "document.querySelector('#tip .trow .tl')?.textContent"
+    top, down = page.evaluate(first), page.locator("#tip .tmore", has_text="below").count() > 0
+    page.mouse.wheel(0, 300 if down else -300)
+    checks["the wheel scrolls a pinned tooltip"] = soon(f"{first} !== {json.dumps(top)} && !!document.querySelector('#tip .tmore')")
     tip_row = page.locator("#tip .trow").first
     tip_row.hover()
     checks["a pinned row marks its run in the sidebar"] = page.evaluate("!!app.sideMark")
@@ -441,7 +463,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="trex-smoke-"))
     runs = tmp / "runs"
-    subprocess.run([sys.executable, str(REPO / "examples/demo.py"), str(runs / "sweep"), "--seeds", "2", "--steps", "1500"], check=True)
+    subprocess.run([sys.executable, str(REPO / "examples/demo.py"), str(runs / "sweep"), "--seeds", "3", "--steps", "1500"], check=True)
     subprocess.run([sys.executable, "-c", NESTED_WRITER, str(runs)], check=True)
     port = free_port()
     env = {**os.environ, "TREX_DAEMON_DIR": str(tmp / "daemon")}

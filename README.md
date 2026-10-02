@@ -29,7 +29,7 @@ run.finish()                                    # also at exit; an uncaught exce
 
 - `trex serve runs` opens the UI at http://127.0.0.1:13898; it stays fast with 10,000 runs.
 - Group by folder or config key: median or mean lines with 95% CI, IQR or min/max bands.
-- Drag to zoom, hover for values, Shift to pin them; ⚙ sets smoothing and axes per metric.
+- Drag to zoom, hover for values, Shift to pin them and scroll; ⚙ sets smoothing and axes per metric.
 - Filter by name or a SQL WHERE clause (`lr = 0.001 and seed in (0, 1)`), in the UI or `trex ls -w`; `trex --help` lists the rest.
 
 ## Daemon

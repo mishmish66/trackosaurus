@@ -55,7 +55,7 @@ button.danger { color:var(--danger); border-color:var(--danger); }
 .mtitle { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; padding:2px 4px 6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .mlist { max-height:60vh; overflow:auto; }
 .mitem { display:flex; width:100%; align-items:center; gap:6px; border:0; background:transparent; text-align:left; padding:4px 6px; border-radius:4px; }
-.mitem:hover { background:var(--panel); }
+.mitem:hover, .mitem.hl { background:var(--panel); }
 .mitem.active { background:var(--grid); font-weight:600; }
 .mitem .ml { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .mitem .ms { color:var(--muted); font-size:11px; white-space:nowrap; }
@@ -100,6 +100,7 @@ aside { overflow:auto; border-right:1px solid var(--line); }
 .sideBar { display:flex; gap:4px; align-items:center; padding:2px 0; }
 .sideBar label { display:flex; gap:4px; align-items:center; color:var(--muted); }
 .sideBar select { max-width:220px; }
+#sortBy { width:160px; }
 td.stc { width:10px; padding:0 2px !important; }
 .dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--line); vertical-align:middle; }
 .dot.running { background:#59a14f; } .dot.crashed, .dot.failed { background:var(--danger); } .dot.finished { background:var(--muted); opacity:.5; }
@@ -161,9 +162,6 @@ details.section { scroll-margin-top:calc(var(--depth) * 26px); }
 .focusview .pbody { flex:1; height:auto; min-height:0; }
 .focusview .ptitle { font-size:15px; }
 .panel:hover .gear, .gear.on { opacity:1; } .gear.on { color:var(--accent); }
-.legend { display:flex; flex-wrap:wrap; gap:2px 10px; font-size:11px; color:var(--muted); padding:2px 4px 0; }
-.legend span { white-space:nowrap; max-width:100%; overflow:hidden; text-overflow:ellipsis; }
-.legend i { display:inline-block; width:10px; height:3px; border-radius:1px; vertical-align:middle; margin-right:4px; }
 .grid { align-items:start; }
 .grid > .panel { content-visibility:auto; contain-intrinsic-size:auto 250px; }
 .pbody { position:relative; height:210px; }
@@ -220,7 +218,7 @@ table.kv td:first-child { color:var(--muted); white-space:nowrap; width:1%; }
     <div id="sideHead">
       <div class="sideBar"><span id="runCount"></span><span class="spacer"></span>
         <button id="collapseAll" hidden>collapse all</button><button id="hideAll">hide all</button></div>
-      <div class="sideBar"><label>sort <select id="sortBy"></select></label><button id="sortDir" title="descending">↓</button></div>
+      <div class="sideBar"><label>sort <input id="sortBy" type="text" autocomplete="off" spellcheck="false" title="type to find a field to sort by"></label><button id="sortDir" title="descending">↓</button></div>
     </div>
     <table id="runTable"><colgroup><col style="width:20px"><col style="width:22px"><col style="width:26px"><col><col style="width:14px"><col style="width:46px"><col style="width:64px"></colgroup><tbody></tbody></table>
   </aside>

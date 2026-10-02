@@ -291,6 +291,7 @@ document.addEventListener("keyup", (e) => {
   if (e.key === "Shift") window.app?.unpinTip();
 });
 window.addEventListener("blur", () => window.app?.unpinTip());
+document.addEventListener("wheel", (e) => window.app?.scrollTip(e), { passive: false });
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (menu.el && !menu.el.hidden) return menu.close();
@@ -681,10 +682,7 @@ class App {
     });
     $("#resetZoom").addEventListener("click", () => this.resetZoom());
     $("#groupAdd").addEventListener("click", (e) => this.groupByMenu(e.currentTarget));
-    $("#sortBy").addEventListener("change", (e) => {
-      this.setOpt("sort", e.target.value);
-      this.onRuns();
-    });
+    this.bindSortBox();
     $("#sortDir").addEventListener("click", () => {
       this.setOpt("dir", this.opts.dir === "asc" ? "desc" : "asc");
       this.onRuns();
@@ -1119,21 +1117,73 @@ class App {
     return vals[(vals.length - 1) >> 1];
   }
 
+  /** The sort fields (base ones, then each metric's last value) and the sort box showing the current one. */
   renderSortOptions() {
-    const sel = $("#sortBy");
     const base = [["created", "created"], ["name", "name"], ["state", "state"], ["step", "steps"], ["runtime", "runtime"],
                   ["size", this.opts.group.length ? "group size" : "folder size"]];
     const metrics = [...this.data.keys.keys()].sort(cmpNames);
-    const sig = base.map((x) => x.join("=")).join("|") + "#" + metrics.join("|");
-    if (sel._sig !== sig) {
-      sel._sig = sig;
-      sel.replaceChildren(...base.map(([v, t]) => opt(v, t)),
-        h("optgroup", { label: "metric (last value)" }, ...metrics.map((k) => opt(`metric:${k}`, k))));
-    }
-    if (![...sel.options].some((x) => x.value === this.opts.sort)) this.opts.sort = "created";
-    sel.value = this.opts.sort;
+    this.sortFields = [...base.map(([value, label]) => ({ value, label, metric: false })),
+                       ...metrics.map((k) => ({ value: `metric:${k}`, label: k, metric: true }))];
+    if (!this.sortFields.some((f) => f.value === this.opts.sort)) this.opts.sort = "created";
+    const box = $("#sortBy");
+    if (document.activeElement !== box) box.value = this.sortLabel();
     $("#sortDir").textContent = this.opts.dir === "asc" ? "↑" : "↓";
     $("#sortDir").title = this.opts.dir === "asc" ? "ascending" : "descending";
+  }
+
+  sortLabel() {
+    return this.sortFields?.find((f) => f.value === this.opts.sort)?.label ?? this.opts.sort;
+  }
+
+  /** The sort box: focusing it lists every sort field, typing narrows the list (matches anywhere in the name), and a
+   * click, or Enter on the highlighted match (↑/↓ move it), picks one; Escape or leaving the box keeps the current. */
+  bindSortBox() {
+    const box = $("#sortBy"), st = { hl: 0, typed: false, shown: [] };
+    const restore = () => {
+      if (menu.anchor === box) menu.close();
+      box.value = this.sortLabel();
+    };
+    const pick = (f) => {
+      restore();
+      box.blur();
+      if (f.value !== this.opts.sort) this.setOpt("sort", f.value), this.onRuns();
+      box.value = this.sortLabel();
+    };
+    box.addEventListener("focus", () => {
+      Object.assign(st, { typed: false, hl: Math.max(0, this.sortFields.findIndex((f) => f.value === this.opts.sort)) });
+      box.select();
+      this.sortList(box, st, pick);
+    });
+    box.addEventListener("input", () => {
+      Object.assign(st, { typed: true, hl: 0 });
+      this.sortList(box, st, pick);
+    });
+    box.addEventListener("keydown", (e) => {
+      const step = { ArrowDown: 1, ArrowUp: -1 }[e.key];
+      if (step) (st.hl += step), this.sortList(box, st, pick);
+      else if (e.key === "Enter" && st.shown[st.hl]) pick(st.shown[st.hl]);
+      else if (e.key === "Escape") restore(), box.blur();
+      else return;
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    box.addEventListener("blur", restore);
+  }
+
+  /** The sort box's suggestions: every field, or those matching what was typed, with metrics under a heading. */
+  sortList(box, st, pick) {
+    const q = st.typed ? box.value.trim().toLowerCase() : "";
+    st.shown = this.sortFields.filter((f) => !q || f.label.toLowerCase().includes(q));
+    st.hl = Math.max(0, Math.min(st.hl, st.shown.length - 1));
+    const items = [];
+    st.shown.forEach((f, i) => {
+      if (f.metric && !st.shown[i - 1]?.metric) items.push(h("div", { className: "mtitle", textContent: "metric (last value)" }));
+      items.push(h("button", { className: "mitem" + (f.value === this.opts.sort ? " active" : "") + (i === st.hl ? " hl" : ""),
+        onmousedown: (e) => e.preventDefault(), onclick: () => pick(f) }, h("span", { className: "ml", textContent: f.label })));
+    });
+    const list = h("div", { className: "mlist" }, ...(items.length ? items : [h("div", { className: "mhint", textContent: "no matching field" })]));
+    menu.open(box, list);
+    list.querySelector(".hl")?.scrollIntoView({ block: "nearest" });
   }
 
   /** Folder tree of `runs` relative to the scope: {name, path, dirs: Map, runs: [], all: []}. */
@@ -1564,12 +1614,18 @@ class App {
 
   /** Value tooltip: rows by value, the TIP_ROWS around `near` (the line nearest the pointer). */
   tip(e, chart, xs, rows, near = -1) {
-    const t = $("#tip"), key = chart?.key;
-    if (!e) return (t.hidden = true);
-    const a = near < 0 ? 0 : Math.max(0, Math.min(near - (TIP_ROWS >> 1), rows.length - TIP_ROWS)), b = Math.min(rows.length, a + TIP_ROWS);
+    if (!e) return ($("#tip").hidden = true);
+    this.tipView = { e, chart, xs, rows, near, start: near < 0 ? 0 : near - (TIP_ROWS >> 1) };
+    this.renderTip();
+  }
+
+  /** The tooltip's TIP_ROWS rows from `tipView.start`, beside the pointer. */
+  renderTip() {
+    const t = $("#tip"), v = this.tipView, { e, chart, xs, rows, near } = v;
+    const a = (v.start = Math.max(0, Math.min(v.start, rows.length - TIP_ROWS))), b = Math.min(rows.length, a + TIP_ROWS);
     const more = (n, where) => n > 0 && h("div", { className: "tmore", textContent: `${n} more ${where}` });
     t.replaceChildren(...[
-      h("div", { className: "th", textContent: `${key} · ${xs}` }),
+      h("div", { className: "th", textContent: `${chart?.key} · ${xs}` }),
       more(a, "above"),
       ...rows.slice(a, b).map(({ ln, val, extra }, i) =>
         h("div", { className: "trow" + (a + i === near ? " near" : ""), onmouseenter: () => this.tipRowEnter(chart, ln),
@@ -1589,9 +1645,20 @@ class App {
     t.style.transform = `translate(${x}px, ${y}px)`;
   }
 
+  /** While the tooltip is pinned, the wheel (vertical, or horizontal as Shift makes it) moves its rows. */
+  scrollTip(e) {
+    if (!this.tipPinned || !this.tipView || $("#tip").hidden) return;
+    e.preventDefault();
+    const d = e.deltaY || e.deltaX;
+    if (!d) return;
+    this.tipView.start += Math.sign(d) * 3;
+    this.renderTip();
+  }
+
   tipFooter() {
     const f = $("#tip .tf");
-    if (f) f.textContent = this.tipPinned ? "hover a row to find it in the list · click to open it"
+    const scroll = this.tipView?.rows.length > TIP_ROWS ? " · scroll for more" : "";
+    if (f) f.textContent = this.tipPinned ? `hover a row to find it in the list · click to open it${scroll}`
       : "hold shift to pin · drag: zoom x · drag a box: zoom x and y · click: reset";
   }
 

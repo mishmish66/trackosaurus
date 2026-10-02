@@ -13,7 +13,6 @@ const DENSITY_TIP = 8; // runs listed by the density tooltip
 
 const M = { l: 52, r: 10, t: 6, b: 20 };
 export const BAND_LABEL = { ci: "95% CI", iqr: "IQR", minmax: "min/max", std: "±std", stderr: "±stderr", none: "none" };
-const MAX_LEGEND = 12;
 const CLICK_MAX = 5; // px of movement below which a press is a click
 const BOX_MIN = 8; // px of vertical drag that turns an x zoom into a box zoom
 
@@ -421,7 +420,7 @@ export class Chart {
     this.el = document.createElement("div");
     this.el.className = "panel";
     this.el.innerHTML = `<div class="ptitle"><span class="pname"></span><button class="pin" title="pin to the top"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M10.2 1.3l4.5 4.5-1.3 1.3-.8-.4-2.7 2.7.4 3.2-1.3 1.3-2.9-2.9-3.6 3.6H1.8v-.7l3.6-3.6-2.9-2.9 1.3-1.3 3.2.4 2.7-2.7-.4-.8z"/></svg></button><button class="full" title="show this chart large (Esc to go back)">⛶</button><button class="gear" title="chart settings">⚙</button></div>
-      <div class="pbody"><canvas></canvas><canvas class="ov"></canvas></div><div class="legend"></div>`;
+      <div class="pbody"><canvas></canvas><canvas class="ov"></canvas></div>`;
     this.el.querySelector(".pname").textContent = key;
     this.gear = this.el.querySelector(".gear");
     this.gear.addEventListener("click", (e) => app.panelSettings(this, e.currentTarget));
@@ -429,7 +428,6 @@ export class Chart {
     this.pinBtn = this.el.querySelector(".pin");
     this.pinBtn.addEventListener("click", () => app.togglePin(this.key));
     this.body = this.el.querySelector(".pbody");
-    this.legendEl = this.el.querySelector(".legend");
     [this.cv, this.ov] = this.el.querySelectorAll("canvas");
     this.el._chart = this;
     this.drag = null;
@@ -707,7 +705,6 @@ export class Chart {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.w, this.h);
     const view = (this.view = this.compute());
-    this.renderLegend(view);
     const css = getComputedStyle(document.documentElement);
     ctx.font = "10px system-ui, sans-serif";
     ctx.fillStyle = css.getPropertyValue("--muted");
@@ -771,27 +768,6 @@ export class Chart {
       else ctx.moveTo(X, Y), (pen = true);
     }
     ctx.stroke();
-  }
-
-
-  renderLegend(view) {
-    const lines = view ? view.lines : [];
-    const density = !!view?.density;
-    const sig = density + "#" + lines.map((l) => l.color + l.label).join("|");
-    if (sig === this.legendSig) return;
-    this.legendSig = sig;
-    if (density || lines.length > (this.app.grouped ? 2 * MAX_LEGEND : MAX_LEGEND)) {
-      const text = density ? `${lines.length} lines · density (log scale) · hover for nearest runs` : `${lines.length} lines · hover for values`;
-      this.legendEl.replaceChildren(Object.assign(document.createElement("span"), { textContent: text }));
-      return;
-    }
-    const items = lines.map((l) => {
-      const s = document.createElement("span");
-      s.innerHTML = `<i style="background:${l.color}"></i>`;
-      s.append(l.label);
-      return s;
-    });
-    this.legendEl.replaceChildren(...items);
   }
 
   drawBand(ctx, ln) {
