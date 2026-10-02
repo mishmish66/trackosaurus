@@ -12,7 +12,8 @@ With `--source`, the UI's update button installs the newest trex and systemd res
 
 A directory added as `host:path` (in the UI or with `trex serve host:path`) is served from that machine
 over ssh: the daemon runs this trex there with uvx (`trex.remote`), so the machine needs only uv and an
-ssh key that works without a prompt.
+ssh key that works without a prompt. On a cluster, use a host that allows long-running processes, such
+as a data-transfer node; runs written by jobs on other nodes are followed through their journals.
 """
 
 import json

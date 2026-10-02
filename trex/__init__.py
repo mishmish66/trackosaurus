@@ -1,6 +1,6 @@
 """trex (trackosaurus exp): log runs to directories; explore them with `trex serve` or the trex CLI.
 
-![A sweep grouped by learning rate](media/screenshot.png)
+<video src="media/tour.mp4" poster="media/screenshot.png" controls width="100%"></video>
 
 Install the trex command, or the logging API (`trex.writer`) in a training project:
 

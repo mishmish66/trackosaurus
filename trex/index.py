@@ -27,6 +27,7 @@ from typing import Final, Literal, NamedTuple, Self, TypedDict
 import numpy as np
 
 from . import chunks, tiles
+from .journal import JOURNAL
 from .format import (DB, INFO_FILE, JSONValue, MediaKind, RunState, as_dict, as_float, as_run_state, as_str, as_str_list,
                      connect_ro)
 
@@ -279,10 +280,16 @@ class Hub:
 
 
 def _stat_sig(d: str | os.PathLike[str]) -> Sig:
+    """mtime and size of the database, its WAL and its journal; the journal's opened, which makes a network
+    filesystem report its current size."""
     sig: Sig = []
-    for name in (DB, DB + "-wal"):
+    for name in (DB, DB + "-wal", JOURNAL):
         try:
-            st = os.stat(Path(d) / name)
+            if name == JOURNAL:
+                with open(Path(d) / name, "rb") as f:
+                    st = os.fstat(f.fileno())
+            else:
+                st = os.stat(Path(d) / name)
             sig += [st.st_mtime_ns, st.st_size]
         except FileNotFoundError:
             sig += [0, 0]

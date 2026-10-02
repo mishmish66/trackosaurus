@@ -97,6 +97,11 @@ The daemon starts the same trex there over ssh with `uvx` and passes the directo
 so live runs stream as they do locally and nothing is copied. The other machine needs only
 [uv](https://docs.astral.sh/uv/) and an ssh key that works without a prompt.
 
+On a cluster, add the shared storage through a host that allows long-running processes, such as a
+data-transfer node (`xfer:/scratch/me/runs`); login nodes usually stop them. Runs on a network
+filesystem also keep a journal (`trex.journal`), which lets any host follow them while jobs on other
+nodes write them.
+
 ## CLI
 
 Every command reads run files directly (through the same `.trex_cache` index as the server) and

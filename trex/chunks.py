@@ -102,14 +102,27 @@ def decode(blob: bytes) -> Chunk:
     return Chunk(False, pos, mv[off:].cast("d"))
 
 
-def write(c: sqlite3.Connection, seq0: int, rows: Sequence[CommitRow], ids: dict[str, int]) -> int:
-    """Insert a commit inside the caller's transaction; returns its row count."""
+type Insert = tuple[str, tuple[int | float | str | bytes, ...]]
+"""(table, values) of one row a commit inserts."""
+
+
+def inserts(seq0: int, rows: Sequence[CommitRow], ids: dict[str, int]) -> list[Insert]:
+    """The keys, rowmeta and chunk rows of a commit; new names are added to `ids`."""
     known = len(ids)
     (n, lo, hi, meta), parts = encode(rows, ids)
-    c.executemany("INSERT INTO keys VALUES (?, ?)", [(kid, k) for k, kid in ids.items() if kid >= known])
-    c.execute("INSERT INTO rowmeta VALUES (?, ?, ?, ?, ?)", (seq0, n, lo, hi, meta))
-    c.executemany("INSERT INTO chunk(key_id, seq0, data) VALUES (?, ?, ?)", [(kid, seq0, b) for kid, b in parts])
-    return n
+    return [*(("keys", (kid, k)) for k, kid in ids.items() if kid >= known), ("rowmeta", (seq0, n, lo, hi, meta)),
+            *(("chunk", (kid, seq0, b)) for kid, b in parts)]
+
+
+def write(c: sqlite3.Connection, seq0: int, rows: Sequence[CommitRow], ids: dict[str, int]) -> int:
+    """Insert a commit inside the caller's transaction; returns its row count."""
+    for table, values in inserts(seq0, rows, ids):
+        c.execute(f"INSERT INTO {INSERT_INTO[table]} VALUES ({', '.join('?' * len(values))})", values)
+    return len(rows)
+
+
+INSERT_INTO: Final = {"keys": "keys(id, name)", "rowmeta": "rowmeta(seq0, n, step_lo, step_hi, data)",
+                      "chunk": "chunk(key_id, seq0, data)"}
 
 
 def key_names(c: sqlite3.Connection) -> dict[int, str]:

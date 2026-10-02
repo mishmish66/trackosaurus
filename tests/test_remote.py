@@ -161,6 +161,7 @@ def test_remote_directories_are_served_through_the_daemon(roots, runs, http, hom
     assert name == "my runs@box" and roots.served()[0]["state"] == "connected"
     base = f"{http}/r/{urllib.parse.quote(name)}"
     assert "--from" in (args := (home / "uvx.args").read_text().split("\n")) and args[args.index("--from") + 1].endswith("@abc123")
+    assert args[args.index("--no-build-package") + 1] == "numpy"
     status, _, body = get(f"{base}/")
     assert status == 200 and b"/static/app.js" in body
     assert wait_for(lambda: len(json.loads(get(f"{base}/api/runs")[2])["runs"]) == 2)

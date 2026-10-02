@@ -12,7 +12,7 @@ import sqlite3
 from pathlib import Path
 from typing import Final, Literal
 
-from . import chunks
+from . import chunks, journal
 from .chunks import key_names, row_count
 
 __all__ = ["DB", "FORMAT", "INFO_FILE", "SCHEMA", "JSONValue", "MediaKind", "RunState", "as_dict", "as_float",
@@ -45,10 +45,14 @@ def connect_rw(run_dir: str | os.PathLike[str]) -> sqlite3.Connection:
 
 
 def connect_ro(run_dir: str | os.PathLike[str]) -> sqlite3.Connection:
-    """Read-only connection that creates no files: through the WAL when a -wal file exists, else
+    """Read-only connection that creates no files in the run directory: to the local replica of its journal
+    while the run is live and journaled (`journal.sync`), through the WAL when a -wal file exists, else
     immutable (callers re-check the file signature after reading)."""
     db = Path(run_dir) / DB
-    mode = "mode=ro" if db.with_name(DB + "-wal").exists() else "mode=ro&immutable=1"
+    live = db.with_name(DB + "-wal").exists()
+    if live and (Path(run_dir) / journal.JOURNAL).exists():
+        db, live = journal.sync(Path(run_dir), SCHEMA), True
+    mode = "mode=ro" if live else "mode=ro&immutable=1"
     c = sqlite3.connect(f"file:{db}?{mode}", uri=True, isolation_level=None, timeout=30)
     c.execute("PRAGMA query_only=1")
     return c

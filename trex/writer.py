@@ -19,7 +19,7 @@ from typing import IO, Literal, NamedTuple, Protocol, Self, cast, runtime_checka
 
 from numpy.typing import ArrayLike
 
-from . import chunks
+from . import chunks, journal
 from .format import FORMAT, INFO_FILE, JSONValue, MediaKind, as_dict, as_float, as_str, connect_rw, key_names, row_count
 from .media import encode_mp4, encode_png, sniff_image
 
@@ -165,8 +165,16 @@ class Run:
         self._mseq: int = c.execute("SELECT coalesce(max(seq) + 1, 0) FROM media").fetchone()[0]
         self._ids = {key: kid for kid, key in key_names(c).items()}
         last: float | None = c.execute("SELECT max(step_hi) FROM rowmeta").fetchone()[0]
-        c.close()
         self.id, self.name, self.created = str(meta["id"]), str(meta["name"]), as_float(meta["created"]) or 0.0
+        self._journal: journal.Writer | None = None
+        self._journaled: dict[str, str] = {}
+        if journal.wanted(self.dir):
+            try:
+                self._journal = journal.Writer(self.dir, self.id, self._seq, self._mseq, lambda: _snapshot(c))
+                self._journal.append(self._meta_ops(meta), self._seq, self._mseq)
+            except OSError as e:
+                self._journal_failed(e)
+        c.close()
         self._next_step: float = int(last) + 1 if last is not None else 0
         self._summary = as_dict(meta.get("summary"))
         self._info = as_dict(meta["info"])
@@ -277,14 +285,34 @@ class Run:
             self._media.append(_Media(key, step, time.time(), kind, ext, data))
 
     def _write_media_file(self, ext: str, data: bytes) -> str:
-        """Write media content-addressed under media/ (temp name, then rename); returns its relative path."""
+        """Write media content-addressed under media/ (temp name, fsync'd when journaling, then rename);
+        returns its relative path."""
         name = f"media/{hashlib.sha256(data).hexdigest()}.{ext}"
         path = self.dir / name
         if not path.exists():
             tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            tmp.write_bytes(data)
+            with open(tmp, "wb") as f:
+                f.write(data)
+                if self._journal is not None:
+                    f.flush()
+                    os.fsync(f.fileno())
             os.replace(tmp, path)
         return name
+
+    def _meta_ops(self, meta: Mapping[str, JSONValue]) -> list[journal.Op]:
+        """Inserts of the meta values that changed since last journaled."""
+        ops: list[journal.Op] = []
+        for k, v in meta.items():
+            text = json.dumps(v)
+            if self._journaled.get(k) != text:
+                self._journaled[k] = text
+                ops.append(("meta", (k, text)))
+        return ops
+
+    def _journal_failed(self, e: OSError) -> None:
+        """Stop journaling; the run goes on in trex.sqlite, readable on this host."""
+        self._journal = None
+        print(f"[trex] journal of {self.dir} failed, so other hosts stop seeing this run's updates: {e!r}", file=sys.stderr)
 
     def _commit(self, c: sqlite3.Connection, final_state: FinalState | None = None) -> None:
         with self._lock:
@@ -293,19 +321,25 @@ class Run:
             summary = dict(self._summary)
             info = dict(self._info)
         files = [(m.key, m.step, m.time, m.kind, self._write_media_file(m.ext, m.data), len(m.data)) for m in media]
-        c.execute("BEGIN")
+        ops: list[journal.Op] = []
         for i in range(0, len(rows), chunks.MAX_ROWS):
             part = [(float(r.step), r.time - self.created, r.values) for r in rows[i: i + chunks.MAX_ROWS]]
-            chunks.write(c, self._seq + i, part, self._ids)
-        c.executemany("INSERT INTO media VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      [(self._mseq + i, float(s), t, k, kind, f, n) for i, (k, s, t, kind, f, n) in enumerate(files)])
+            ops += chunks.inserts(self._seq + i, part, self._ids)
+        ops += [("media", (self._mseq + i, float(s), t, k, kind, f, n)) for i, (k, s, t, kind, f, n) in enumerate(files)]
         meta: dict[str, JSONValue] = {"heartbeat": time.time(), "summary": summary, "info": info}
         if final_state:
             meta["state"] = final_state
+        c.execute("BEGIN")
+        journal.replay(c, ops)
         c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [(k, json.dumps(v)) for k, v in meta.items()])
         c.execute("COMMIT")
         self._seq += len(rows)
         self._mseq += len(files)
+        if self._journal is not None:
+            try:
+                self._journal.append(ops + self._meta_ops(meta), self._seq, self._mseq)
+            except OSError as e:
+                self._journal_failed(e)
 
     def _loop(self) -> None:
         c = connect_rw(self.dir)
@@ -322,6 +356,16 @@ class Run:
             print(f"[trex] writer for {self.dir} failed: {e!r}", file=sys.stderr)
         finally:
             c.close()
+            if self._journal is not None:
+                self._journal.close()
+
+
+def _snapshot(c: sqlite3.Connection) -> list[journal.Op]:
+    """Inserts that rebuild the run in `c`."""
+    ops: list[journal.Op] = []
+    for table, cols in journal.TABLES.items():
+        ops += [(table, tuple(row)) for row in c.execute(f"SELECT {cols[cols.index('(') + 1:-1]} FROM {table}")]
+    return ops
 
 
 def init(dir: str | os.PathLike[str], *, name: str | None = None, config: Mapping[str, object] | None = None,

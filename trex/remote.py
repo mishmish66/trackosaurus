@@ -49,11 +49,14 @@ def source() -> str:
 
 
 def remote_command(addr: Address, sock: str, src: str) -> str:
-    """The shell command that serves `addr.path` on the Unix socket `sock`, until its stdin closes."""
-    serve = shlex.join(["uvx", "--from", src, "trex", "serve", addr.path, "--standalone", "--unix", sock,
+    """The shell command that serves `addr.path` on the Unix socket `sock`, until its stdin closes, with numpy from a
+    wheel (the newest one for the host's glibc, as old cluster systems need), its index
+    on the host's local disk (never shared by two hosts, as a network home would be) and at most 4 index workers
+    unless $TREX_WORKERS says otherwise there (remote hosts are often shared)."""
+    serve = shlex.join(["uvx", "--no-build-package", "numpy", "--from", src, "trex", "serve", addr.path, "--standalone", "--unix", sock,
                         "--exit-on-eof"])
     script = (f'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"; command -v uvx >/dev/null || '
-              f'{{ echo "{NO_UV}" >&2; exit 127; }}; NO_COLOR=1 PYTHONUNBUFFERED=1 exec {serve} --cache "$HOME/.cache/trex"')
+              f'{{ echo "{NO_UV}" >&2; exit 127; }}; NO_COLOR=1 PYTHONUNBUFFERED=1 TREX_WORKERS="${{TREX_WORKERS:-4}}" exec {serve} --cache "${{TMPDIR:-/tmp}}/trex-cache-$(id -u)"')
     return shlex.join(["sh", "-c", script])
 
 

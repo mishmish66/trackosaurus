@@ -8,6 +8,7 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | path | what |
 |---|---|
 | `trex/format.py` | the run file: `trex.sqlite` schema (format 3), `connect_rw`, `connect_ro`. The contract between writer and readers. |
+| `trex/journal.py` | commit journal for runs on network filesystems: `Writer` (append + fsync), `records`, `sync` (replay into a local replica) |
 | `trex/chunks.py` | per-metric chunk codec: each commit is one `rowmeta` row (steps, times) plus one `chunk` per metric present |
 | `trex/tiles.py` | envelope pyramid tiles (min, max, mean, mean step, mean runtime and count per bucket), `top_tiles`, `build`, `coarsen`, `decode` |
 | `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread |
@@ -57,6 +58,10 @@ them WebGL falls back to software and timings mean nothing.
   `rowmeta(seq0, n, step_lo, step_hi, steps|times)` and `chunk(key_id, seq0, values)`. One commit
   of at most 65535 rows is one `rowmeta` row and one chunk per metric logged in it, so reading one
   metric is an index range scan.
+- **Journal** (`trex.journal`, runs on network filesystems, or `TREX_JOURNAL=1`): every commit's inserts,
+  appended and fsync'd, because SQLite's WAL is readable only on the writer's host. `connect_ro`
+  reads a live journaled run (one with a `-wal`) from a replica in `$TREX_REPLICAS` (default
+  `<tmp>/trex-<uid>/replicas`), brought up to date from the journal on each open.
 - **Index** (`<cache>/<hash of root>/index.sqlite`): per-run metadata, last values, metric names,
   media, and two kept tile tiers of every metric: the *top tiles* (the coarsest pyramid level
   covering the run in at most two tiles) and *overview tiles* (the top tiles merged `OVERVIEW_UP`
@@ -117,6 +122,9 @@ them WebGL falls back to software and timings mean nothing.
 - **Other sites cannot use the server.** `Handler._refusal` answers only requests whose Host is an
   IP address, `localhost`, this machine's name or an `--allow-host` name (DNS rebinding), and
   refuses a POST whose Origin is not its Host. The UI sends no cross-origin requests.
+- **A live run is read on its writer's host or through its journal.** Never open another host's WAL:
+  even read-only readers write SQLite's shared index, which a network filesystem does not keep
+  coherent. A journal replayed from its start rebuilds the run exactly (`tests/test_journal.py`).
 - **Writer never crashes training.** Errors in the commit thread are recorded and raised from
   `finish()`, not from `log()`. Media files are written (temp name, then rename) before the row
   that references them commits.
