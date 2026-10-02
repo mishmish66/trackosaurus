@@ -23,7 +23,7 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (tile store, scheduler, IndexedDB, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (columns, smoothing, decimation, group stats, CRC-32); `index.html` |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/`; the user guide is the `trex` and `trex.daemon` docstrings (Markdown) |
-| `docs/media/` | the README's and docs' screenshot and video tour (left out of the sdist) |
+| `docs/media/` | the docs' video tour and its poster image (left out of the sdist); the README embeds the same video, uploaded to GitHub |
 | `tests/` | pytest suites (`test_processes.py` runs real `trex` processes), the node kernel tests, and the browser smoke test |
 
 Runtime dependencies: Python ≥ 3.12, numpy, and Typer for the CLI (ffmpeg only to log frame arrays
