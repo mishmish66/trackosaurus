@@ -1,5 +1,5 @@
 import { BASE, Data, clearCache, mediaURL } from "./data.js";
-import { compileWhere, runField } from "./where.js";
+import { compileWhere, completionContext, literal, runField, textOf } from "./where.js";
 import { BAND_LABEL, Chart, DENSITY_AUTO, USE_GL, fmt, fmtDur, fmtSI } from "./plot.js";
 
 const PALETTE = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
@@ -700,6 +700,7 @@ class App {
       });
     };
     bind("#runFilter", "filter", "input", (e) => e.value, throttle(() => this.onRuns(), 150));
+    this.bindFilterBox();
     bind("#center", "center", "change", (e) => e.value, () => this.redrawAll());
     bind("#band", "band", "change", (e) => e.value, () => this.redrawAll());
     bind("#keyFilter", "keys", "input", (e) => e.value, throttle(() => this.renderPanels(), 150));
@@ -1195,6 +1196,92 @@ class App {
       e.stopPropagation();
     });
     box.addEventListener("blur", restore);
+  }
+
+  /** The filter box's completions: field names, operators, a field's values (with run counts) or and / or, as the
+   * text before the caret calls for; ↑/↓ choose, Tab or Enter take one, Escape closes them. */
+  bindFilterBox() {
+    const box = $("#runFilter"), st = { hl: 0, items: [], ctx: null };
+    const show = () => this.filterList(box, st);
+    box.addEventListener("focus", show);
+    box.addEventListener("click", show);
+    box.addEventListener("input", () => ((st.hl = 0), show()));
+    box.addEventListener("keydown", (e) => {
+      if (menu.anchor !== box || !st.items.length) return;
+      const step = { ArrowDown: 1, ArrowUp: -1 }[e.key];
+      if (step) (st.hl = (st.hl + step + st.items.length) % st.items.length), this.filterList(box, st, false);
+      else if (e.key === "Tab" || e.key === "Enter") this.takeCompletion(box, st, st.items[st.hl]);
+      else if (e.key === "Escape") menu.close();
+      else return;
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    box.addEventListener("blur", () => menu.anchor === box && menu.close());
+  }
+
+  /** Show the completions for the caret's word (recomputed unless `fresh` is false), or close them when there are none. */
+  filterList(box, st, fresh = true) {
+    if (fresh) {
+      st.ctx = completionContext(box.value, box.selectionStart ?? box.value.length);
+      const q = st.ctx.prefix.toLowerCase(), all = this.completions(st.ctx);
+      const rank = (it) => (it.label.toLowerCase().startsWith(q) ? 0 : 1); // matches from the start come first
+      st.items = all.filter((it) => !q || it.label.toLowerCase().includes(q)).sort((a, b) => rank(a) - rank(b)).slice(0, 200);
+      st.hl = Math.min(st.hl, Math.max(0, st.items.length - 1));
+    }
+    if (!st.items.length) return menu.anchor === box && menu.close();
+    const list = h("div", { className: "mlist" }, ...st.items.map((it, i) =>
+      h("button", { className: "mitem" + (i === st.hl ? " hl" : ""), onmousedown: (e) => e.preventDefault(), onclick: () => this.takeCompletion(box, st, it) },
+        h("span", { className: "ml", textContent: it.label }), it.sub ? h("span", { className: "ms", textContent: it.sub }) : null)));
+    menu.open(box, list);
+    list.querySelector(".hl")?.scrollIntoView({ block: "nearest" });
+  }
+
+  /** Replace the caret's word with completion `it` (and a space), and filter by the result. */
+  takeCompletion(box, st, it) {
+    const { from, to } = st.ctx, after = box.value.slice(to), text = it.insert + (it.insert.endsWith("(") || after.startsWith(" ") ? "" : " ");
+    box.value = box.value.slice(0, from) + text + after;
+    box.setSelectionRange(from + text.length, from + text.length);
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+    box.focus();
+  }
+
+  /** Candidates for a completion context: [{label, insert, sub}]. */
+  completions(ctx) {
+    if (ctx.kind === "field") return this.filterFields().map((f) => ({ label: f, insert: /^[A-Za-z_][\w./:-]*$/.test(f) ? f : `"${f.replaceAll('"', '""')}"` }));
+    if (ctx.kind === "joiner") return ["and", "or"].map((w) => ({ label: w, insert: w }));
+    if (ctx.kind === "operator") {
+      const ops = /\bnot\s*$/i.test($("#runFilter").value.slice(0, ctx.from)) ? ["in (", "like"]
+        : ["=", "!=", "<", "<=", ">", ">=", "in (", "not in (", "like", "~", "is null", "is not null"];
+      return ops.map((o) => ({ label: o, insert: o }));
+    }
+    if (ctx.kind === "value" && ctx.field) return this.fieldValues(ctx.field);
+    return [];
+  }
+
+  /** Fields the filter can name: the plain ones, then config keys, then each metric's last value as summary.KEY. */
+  filterFields() {
+    if (this.fieldsFor === this.data.runs.size + "#" + this.data.keys.size) return this.fieldList;
+    const cfg = new Set();
+    for (const r of this.data.runs.values()) for (const k of Object.keys(r.meta.config || {})) cfg.add(k);
+    this.fieldsFor = this.data.runs.size + "#" + this.data.keys.size;
+    this.fieldList = ["name", "path", "parent", "state", "tags", "dir", "step", "runtime", "created",
+                      ...[...cfg].sort(cmpNames), ...[...this.data.keys.keys()].sort(cmpNames).map((k) => `summary.${k}`)];
+    return this.fieldList;
+  }
+
+  /** The values `field` takes across the runs in scope, most common first, with their run counts. */
+  fieldValues(field) {
+    const seen = new Map();
+    for (const r of this.data.runs.values()) {
+      const v = runField(r, field);
+      for (const x of Array.isArray(v) ? v : [v]) {
+        if (x == null || (typeof x === "number" && !Number.isFinite(x))) continue;
+        const k = textOf(x), e = seen.get(k);
+        e ? e.n++ : seen.set(k, { v: x, n: 1 });
+      }
+    }
+    return [...seen.values()].sort((a, b) => b.n - a.n || cmpNames(textOf(a.v), textOf(b.v))).slice(0, 500)
+      .map(({ v, n }) => ({ label: textOf(v), insert: literal(v), sub: `${n} run${n === 1 ? "" : "s"}` }));
   }
 
   /** The sort box's suggestions: every field, or those matching what was typed, with metrics under a heading. */

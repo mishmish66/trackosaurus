@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { asNumber, compileWhere, runField, textOf } from "../trex/static/where.js";
+import { asNumber, compileWhere, completionContext, literal, runField, textOf } from "../trex/static/where.js";
 
 const CASES = JSON.parse(readFileSync(new URL("./where_cases.json", import.meta.url), "utf8"));
 
@@ -35,4 +35,31 @@ test("UI runs resolve fields as the CLI does: config first, then summary, with p
     "summary.acc": 0.5, "s.both": 2.0, "m.missing": null, "info.git.sha": "abc", "info.a.b": 1, "info.git.nope": null,
     state: "finished", path: "a/r", step: 9, rows: 7, media: 2, tags: ["x"], dir: null };
   for (const [f, v] of Object.entries(want)) assert.deepEqual(runField(r, f), v, f);
+});
+
+test("completion knows whether a field, operator, value or joiner comes next, and which field a value is for", () => {
+  const at = (text) => { const c = compileContext(text); return [c.kind, c.field ?? null, c.prefix]; };
+  const compileContext = (t) => completionContext(t, t.length);
+  assert.deepEqual(at(""), ["field", null, ""]);
+  assert.deepEqual(at("l"), ["field", null, "l"]);
+  assert.deepEqual(at("lr "), ["operator", null, ""]);
+  assert.deepEqual(at("lr = "), ["value", "lr", ""]);
+  assert.deepEqual(at("lr = 0.0"), ["value", "lr", "0.0"]);
+  assert.deepEqual(at("lr = 0.001 "), ["joiner", null, ""]);
+  assert.deepEqual(at("lr = 0.001 and se"), ["field", null, "se"]);
+  assert.deepEqual(at("seed not in (0, "), ["value", "seed", ""]);
+  assert.deepEqual(at("seed in (0"), ["value", "seed", "0"]);
+  assert.deepEqual(at("algo like "), ["value", "algo", ""]);
+  assert.deepEqual(at("not ("), ["field", null, ""]);
+  assert.deepEqual(at("seed not "), ["operator", null, ""]);
+  assert.deepEqual(at("lr = 1 and not "), ["field", null, ""]);
+  assert.deepEqual(at("\"opt/name\" = "), ["value", "opt/name", ""]);
+  assert.equal(completionContext("name = 'it", 10).kind, null);
+  const c = completionContext("lr = 0.0 and seed = 1", 8);
+  assert.deepEqual([c.kind, c.from, c.to], ["value", 5, 8]);
+});
+
+test("completion writes values as filter text", () => {
+  assert.deepEqual([0.001, "PPO", "push-t:v2", "two words", "and", "12", "it's", true].map(literal),
+                   ["0.001", "PPO", "push-t:v2", "'two words'", "'and'", "'12'", "'it''s'", "true"]);
 });

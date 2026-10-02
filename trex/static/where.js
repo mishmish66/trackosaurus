@@ -72,6 +72,76 @@ function tokens(text) {
 
 const isKw = (t, ...words) => !!t && t.kind === "word" && words.includes(t.text.toLowerCase());
 
+const VALUE_AFTER = new Set([...COMPARE, "("]);
+
+/** What the word at `caret` in a filter is, for completion: {kind: "field" | "operator" | "value" | "joiner" | null,
+ * field (for a value), from, to (the span the completion replaces), prefix (its text so far)}. */
+export function completionContext(text, caret) {
+  const toks = spans(text.slice(0, caret));
+  if (!toks) return { kind: null, from: caret, to: caret, prefix: "" };
+  const last = toks.at(-1), partial = last && last.end === caret && (last.kind === "word" || last.kind === "id") ? last : null;
+  const prev = partial ? toks.slice(0, -1) : toks;
+  const at = { from: partial ? partial.start : caret, to: caret, prefix: partial ? partial.text : "" };
+  if (fieldNext(prev)) return { kind: "field", ...at };
+  if (valueNext(prev.at(-1))) return { kind: "value", field: fieldBefore(prev), ...at };
+  if (termEnds(prev.at(-1))) return { kind: valueEnds(prev) ? "joiner" : "operator", ...at };
+  return { kind: null, ...at };
+}
+
+/** After nothing, `and`, `or`, `not` or an opening parenthesis (not an `in` list's), a field comes next. */
+function fieldNext(prev) {
+  const p = prev.at(-1);
+  if (!p || isKw(p, "and", "or")) return true;
+  if (isKw(p, "not")) return !isField(prev.slice(0, -1)); // `field not` takes in or like
+  return p.kind === "op" && p.text === "(" && !isKw(prev.at(-2), "in");
+}
+
+/** Whether `toks` ends with a field: a term that is neither a keyword nor a compared value. */
+function isField(toks) {
+  const q = toks.at(-1);
+  return !!q && termEnds(q) && !isKw(q, "and", "or", "not") && !valueEnds(toks);
+}
+
+const valueNext = (p) => (p.kind === "op" && (VALUE_AFTER.has(p.text) || p.text === ",")) || isKw(p, "like");
+
+const termEnds = (p) => p.kind === "word" || p.kind === "str" || p.kind === "id" || (p.kind === "op" && p.text === ")");
+
+/** Whether the term ending `prev` is a value (after an operator, `like`, `is` or a list comma), not a field. */
+function valueEnds(prev) {
+  const q = prev.at(-2);
+  return !!q && (COMPARE.has(q.text) || q.text === "," || isKw(q, "like", "is"));
+}
+
+/** The field a value at the end of `toks` compares: before its operator, `like`, or `in (` list. */
+function fieldBefore(toks) {
+  let i = toks.length - 1;
+  while (i >= 0 && !(COMPARE.has(toks[i].text) || isKw(toks[i], "like", "in"))) i--;
+  let j = i - 1;
+  if (isKw(toks[j], "not")) j--;
+  return toks[j] && (toks[j].kind === "word" || toks[j].kind === "id") ? toks[j].text : null;
+}
+
+/** Tokens of `text` with their spans; null where it does not tokenize (an open quote, a stray character). */
+function spans(text) {
+  const out = [];
+  TOKEN.lastIndex = 0;
+  while (TOKEN.lastIndex < text.length && text.slice(TOKEN.lastIndex).trim()) {
+    const m = TOKEN.exec(text);
+    if (!m || m[5] !== undefined) return null;
+    const lead = m[0].length - m[0].trimStart().length, start = m.index + lead, end = m.index + m[0].length;
+    const kind = m[1] !== undefined ? "str" : m[2] !== undefined ? "id" : m[3] !== undefined ? "op" : "word";
+    out.push({ kind, text: kind === "str" || kind === "id" ? text.slice(start + 1, end - 1) : text.slice(start, end), start, end });
+  }
+  return out;
+}
+
+/** A value as filter text: numbers and plain words bare, anything else in single quotes. */
+export function literal(v) {
+  const t = textOf(v);
+  if (typeof v === "number" || typeof v === "boolean") return t;
+  return /^[A-Za-z_][\w./:-]*$/.test(t) && !KEYWORDS.has(t.toLowerCase()) && !NUMBER.test(t) ? t : `'${t.replaceAll("'", "''")}'`;
+}
+
 /** A number, or the text of one (including the markers "NaN", "Infinity", "-Infinity"); else null. */
 export function asNumber(v) {
   if (typeof v === "number") return v;

@@ -426,8 +426,8 @@ r.finish()
 
 
 def filter_smoke(page, url):
-    """Whether the filter box keeps the runs a WHERE clause or a name search selects, and marks a clause that does
-    not parse while filtering nothing."""
+    """Whether the filter box keeps the runs a WHERE clause or a name search selects, marks a clause that does not
+    parse while filtering nothing, and completes fields, a field's values (with counts) and and / or from the keyboard."""
     page.goto(f"{url}/?filter#path=sweep")
     page.wait_for_function(READY, timeout=30000)
     shown = "app.runList.filter((r) => r.shown).map((r) => r.id).sort()"
@@ -439,8 +439,31 @@ def filter_smoke(page, url):
         page.wait_for_timeout(600)
         results[text] = [page.evaluate(shown), page.evaluate("document.querySelector('#runFilter').classList.contains('bad')")]
     page.fill("#runFilter", "")
-    print(f"filter: of {len(every)} runs, " + "; ".join(f"{t!r} keeps {len(v[0])}{' (marked bad)' if v[1] else ''}" for t, v in results.items()))
-    return (want and results["lr = 0.001 and seed = 1"] == [want, False] and results["lr = 0.00"] == [[], False]
+    items = lambda: page.evaluate("[...document.querySelectorAll('#menu .mitem .ml')].map((e) => e.textContent)")
+    page.click("#runFilter")
+    page.keyboard.type("l")
+    field_items = items()
+    page.keyboard.press("Tab")
+    after_field = page.input_value("#runFilter")
+    page.keyboard.type("= ")
+    value_items = page.evaluate("[...document.querySelectorAll('#menu .mitem')].map((e) => e.textContent)")
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")
+    picked = page.input_value("#runFilter")
+    page.wait_for_timeout(600)
+    kept = page.evaluate(shown)
+    page.keyboard.type("a")
+    joiners = items()
+    page.keyboard.press("Escape")
+    page.fill("#runFilter", "")
+    page.wait_for_timeout(400)
+    lrs = sorted({str(x) for x in page.evaluate("app.runList.map((r) => r.meta.config.lr)")})
+    complete = ("lr" in field_items and after_field == "lr " and len(value_items) == len(lrs)
+                and all("runs" in t for t in value_items) and picked.startswith("lr = ") and picked.endswith(" ")
+                and 0 < len(kept) < len(every) and joiners == ["and"])
+    print(f"filter completion: 'l' offers {field_items[:4]}…, Tab gives {after_field!r}; 'lr = ' offers {value_items}; "
+          f"↓ Enter gives {picked!r}, keeping {len(kept)}; then 'a' offers {joiners}")
+    return (complete and want and results["lr = 0.001 and seed = 1"] == [want, False] and results["lr = 0.00"] == [[], False]
             and results["seed1"][0] == [r for r in every if "seed1" in r] and results["lr ="] == [every, True])
 
 
