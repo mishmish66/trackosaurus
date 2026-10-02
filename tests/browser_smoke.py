@@ -207,7 +207,7 @@ def filter_smoke(page, url):
 def sections_smoke(page, url):
     """Whether chart sections nest by key path and fold one at a time, and a pinned chart shows in the pinned section
     while staying in its own."""
-    tree = """() => { const walk = (d) => [d.querySelector(':scope > summary').textContent, d.open,
+    tree = """() => { const walk = (d) => [d.querySelector(':scope > summary .stitle').textContent, d.open,
         [...d.querySelectorAll(':scope > .grid > .panel > .ptitle > span:first-child')].map((e) => e.textContent),
         [...d.querySelectorAll(':scope > details.section')].map(walk)];
         return [...document.querySelectorAll('#panels > details.section')].map(walk); }"""
@@ -215,22 +215,32 @@ def sections_smoke(page, url):
     page.wait_for_function(READY, timeout=30000)
     page.wait_for_selector("#panels details.section details.section")
     nested = page.evaluate(tree)
-    page.click("#panels details.section details.section > summary:text-is('return (2)')")
+    page.click("#panels details.section details.section > summary:has(.stitle:text-is('return (2)'))")
     folded = page.evaluate(tree)
-    page.click("#panels details.section details.section > summary:text-is('return (2)')")
+    page.click("#panels details.section details.section > summary:has(.stitle:text-is('return (2)'))")
+    head = "#panels details.section:has(> summary .stitle:text-is('eval (4)')) > summary"
+    links = page.locator(f"{head} .sublinks button").all_inner_texts()
+    sticky = page.locator(head).evaluate("(e) => getComputedStyle(e).position")
+    page.click(f"{head} .subfold")
+    inside = page.evaluate(tree)[1]
+    page.click(f"{head} .subfold")
+    reopened = page.evaluate(tree)[1]
     page.hover(".panel:has(.pname:text-is('eval/return/mean')) .ptitle")
     page.click(".panel:has(.pname:text-is('eval/return/mean')) .pin")
-    page.wait_for_function("document.querySelector('#panels > details.section > summary')?.textContent.startsWith('📌')")
+    page.wait_for_function("document.querySelector('#panels > details.section > summary')?.textContent.startsWith('pinned')")
     pinned = page.evaluate(tree)
     copies = page.evaluate("app.chartsOf('eval/return/mean').filter((c) => c.el.isConnected).length")
     page.click("#panels > details.section:first-of-type .pin")
-    page.wait_for_function("!document.querySelector('#panels > details.section > summary')?.textContent.startsWith('📌')")
+    page.wait_for_function("!document.querySelector('#panels > details.section > summary')?.textContent.startsWith('pinned')")
     unpinned = [page.evaluate(tree)[0][0], page.evaluate("app.chartsOf('eval/return/mean').length")]
-    print(f"sections: {nested}; return folded {folded[1][3][0][1]}, eval open {folded[1][1]}; pinned {pinned[0]}, copies {copies}; unpinned {unpinned}")
+    print(f"sections: {nested}; return folded {folded[1][3][0][1]}, eval open {folded[1][1]}; eval links {links}, header {sticky}, "
+          f"fold inside leaves {[inside[1]] + [c[1] for c in inside[3]]}; pinned {pinned[0]}, copies {copies}; unpinned {unpinned}")
     eval_sec = ["eval (4)", True, ["eval/len"], [["return (2)", True, ["eval/return/mean", "eval/return/std"], []],
                                                  ["video (1)", True, ["eval/video/frame"], []]]]
     return (nested == [["charts (1)", True, ["loss"], []], eval_sec] and folded[1][1] and not folded[1][3][0][1] and folded[1][3][1][1]
-            and pinned[0] == ["📌 pinned (1)", True, ["eval/return/mean"], []] and pinned[2] == eval_sec and copies == 2
+            and links == ["return (2)", "video (1)"] and sticky == "sticky" and [inside[1]] + [c[1] for c in inside[3]] == [True, False, False]
+            and reopened == eval_sec
+            and pinned[0] == ["pinned (1)", True, ["eval/return/mean"], []] and pinned[2] == eval_sec and copies == 2
             and unpinned == ["charts (1)", 1])
 
 

@@ -10,6 +10,7 @@ import math
 import multiprocessing
 import os
 import queue
+import signal
 import sqlite3
 import struct
 import sys
@@ -180,6 +181,7 @@ SKIP_DIRS: Final = frozenset({"node_modules", "__pycache__"})
 INLINE_BYTES = 5 << 20  # polls whose run files grew by at most this many bytes are read in the main process
 BATCH_RUNS: Final = 256  # scan results per index transaction
 BATCH_SECONDS: Final = 0.5  # longest wait before committing a partial batch
+CLOSE_WAIT: Final = 5.0  # longest `close` waits for a scan in progress
 TILE_CACHE_BYTES = int(os.environ.get("TREX_TILE_CACHE_MB", "4096")) << 20
 PAGE_SIZE: Final = 16384
 READ_ERRORS: Final = (sqlite3.Error, OSError, ValueError, KeyError, struct.error)
@@ -439,6 +441,11 @@ class _Batch:
         self.results, self.t0 = [], time.time()
 
 
+def _worker_init() -> None:
+    """Index workers leave Ctrl-C to the main process, which stops them."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def _mp_context() -> BaseContext:
     """Fresh worker interpreters that import only trex (the main process runs threads)."""
     if "forkserver" in multiprocessing.get_all_start_methods():
@@ -566,7 +573,7 @@ class Explorer:
         """Stop polling, end subscriptions, leave the tile budget and close the index's connections."""
         self.stop()
         if self._poller is not None and self._poller is not threading.current_thread():
-            self._poller.join()
+            self._poller.join(CLOSE_WAIT)
         self.hub.close()
         with self.budget.lock:
             if self in self.budget.members:
@@ -696,6 +703,8 @@ class Explorer:
     def _sync_inline(self, todo: Sequence[tuple[str, Path, Sig]]) -> None:
         batch = _Batch(self)
         for t in todo:
+            if self._stop.is_set():
+                break
             j = self._job(*t)
             try:
                 batch.add(scan(j))
@@ -708,35 +717,36 @@ class Explorer:
     def _sync_pool(self, todo: Sequence[tuple[str, Path, Sig]]) -> None:
         jobs = deque(self._job(*t) for t in todo)
         batch = _Batch(self)
-        with ProcessPoolExecutor(max_workers=min(self.workers, len(todo)), mp_context=_mp_context()) as pool:
-            pending: dict[Future[ScanResult | None], Job] = {}
-            try:
-                while jobs or pending:
-                    while jobs and len(pending) < 2 * self.workers:
-                        j = jobs.popleft()
-                        pending[pool.submit(scan, j)] = j
-                    done, _ = wait(pending, timeout=BATCH_SECONDS, return_when=FIRST_COMPLETED)
-                    for f in done:
-                        j = pending.pop(f)
-                        try:
-                            batch.add(f.result())
-                        except BrokenProcessPool:
-                            raise
-                        except Exception as e:
-                            print(f"[trex] {j['path']}: {e!r}", file=sys.stderr, flush=True)
-                    if batch.full() or not (jobs or pending) or time.time() - batch.t0 >= BATCH_SECONDS:
-                        batch.commit()
-            except BrokenProcessPool as e:
-                print(f"[trex] index worker died: {e!r}", file=sys.stderr, flush=True)
-            finally:
-                for f in pending:
-                    f.cancel()
+        pool = ProcessPoolExecutor(max_workers=min(self.workers, len(todo)), mp_context=_mp_context(), initializer=_worker_init)
+        pending: dict[Future[ScanResult | None], Job] = {}
+        try:
+            while (jobs or pending) and not self._stop.is_set():
+                while jobs and len(pending) < 2 * self.workers:
+                    j = jobs.popleft()
+                    pending[pool.submit(scan, j)] = j
+                done, _ = wait(pending, timeout=BATCH_SECONDS, return_when=FIRST_COMPLETED)
+                for f in done:
+                    j = pending.pop(f)
+                    try:
+                        batch.add(f.result())
+                    except BrokenProcessPool:
+                        raise
+                    except Exception as e:
+                        print(f"[trex] {j['path']}: {e!r}", file=sys.stderr, flush=True)
+                if batch.full() or not (jobs or pending) or time.time() - batch.t0 >= BATCH_SECONDS:
+                    batch.commit()
+        except BrokenProcessPool as e:
+            print(f"[trex] index worker died: {e!r}", file=sys.stderr, flush=True)
+        finally:
+            pool.shutdown(wait=not self._stop.is_set(), cancel_futures=True)
         batch.commit()
 
     def drop(self, path: str, publish: bool = False) -> None:
         with self.lock:
             self.state.pop(path, None)
         with self._tile_lock:
+            if self._closed:
+                return
             self.w.execute("BEGIN IMMEDIATE")
             for t in ("runs", "media", "tiles"):
                 self.w.execute(f"DELETE FROM {t} WHERE path=?", (path,))
@@ -745,11 +755,13 @@ class Explorer:
             self.hub.publish(path, "delete", {"run": path})
 
     def apply(self, results: Sequence[ScanResult]) -> None:
-        """Commit scan results in one transaction, then publish their events in order."""
+        """Commit scan results in one transaction, then publish their events in order; nothing once closed."""
         staged: dict[str, RunRecord] = {}
         events: list[tuple[str, list[Event]]] = []
         now = time.time()
         with self._tile_lock:
+            if self._closed:
+                return
             self.w.execute("BEGIN IMMEDIATE")
             try:
                 for r in results:

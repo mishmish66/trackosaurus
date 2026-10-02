@@ -136,15 +136,24 @@ tr.grp:hover .gfocus { opacity:1; }
 details { margin:4px 0; }
 summary { cursor:pointer; font-weight:600; padding:4px 0; color:var(--muted); }
 .section .section { margin-left:14px; }
+details.section > summary { position:sticky; top:calc(var(--depth) * 26px); z-index:3; background:var(--bg); display:flex; align-items:baseline; gap:10px; }
+details.section > summary::before { content:"▸"; width:10px; } details.section[open] > summary::before { content:"▾"; }
+details.section > summary::-webkit-details-marker { display:none; } details.section > summary { list-style:none; }
+details.section { scroll-margin-top:calc(var(--depth) * 26px); }
+.sublinks { display:flex; flex-wrap:wrap; gap:4px 10px; font-weight:400; }
+.sublinks button.linkish { font-size:12px; text-decoration:none; }
+.sublinks button.linkish:hover { text-decoration:underline; }
+.subfold { margin-left:auto; border:0; background:transparent; color:var(--muted); font-size:11px; padding:0 4px; }
+.subfold:hover { color:var(--accent); }
 .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(360px, 1fr)); gap:8px; }
 .panel { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:4px 6px; min-width:0; }
 .ptitle { font-weight:600; font-size:12px; padding:0 2px 2px; display:flex; gap:8px; align-items:center; overflow:hidden; white-space:nowrap; }
 .pname { flex:1; overflow:hidden; text-overflow:ellipsis; }
 .gear, .full { border:0; background:transparent; color:var(--muted); padding:0 4px; font-size:13px; opacity:.5; }
 .panel:hover .full { opacity:1; }
-.pin { border:0; background:transparent; padding:0 2px; font-size:11px; opacity:.5; filter:grayscale(1); margin-left:auto; }
+.pin { border:0; background:transparent; color:var(--muted); padding:0 4px; opacity:.5; margin-left:auto; display:inline-flex; }
 .panel:hover .pin { opacity:1; }
-.pin.on { opacity:1; filter:none; }
+.pin.on { opacity:1; color:var(--accent); }
 #panels.focus { display:flex; flex-direction:column; }
 #panels.focus > :not(.focusview) { display:none; }
 .focusview { flex:1; min-height:0; display:flex; padding-top:4px; }

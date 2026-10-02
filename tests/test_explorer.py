@@ -773,3 +773,46 @@ def test_a_shared_tile_budget_evicts_the_least_recently_used_tiles_of_any_explor
 
     (kept_a, bytes_a), (kept_b, bytes_b) = cached(a), cached(b)
     assert kept_a == [2] and kept_b == [0, 1, 2] and budget.used() == bytes_a + bytes_b <= 4.5 * size
+
+
+def slow_scans(monkeypatch, seconds):
+    """Make every inline scan take `seconds`; the paths scanned so far."""
+    real, scanned = trex_index.scan, []
+
+    def slow(job):
+        scanned.append(job["path"])
+        time.sleep(seconds)
+        return real(job)
+
+    monkeypatch.setattr(trex_index, "scan", slow)
+    return scanned
+
+
+def test_closing_in_the_middle_of_a_pass_stops_it_after_the_run_being_scanned(root, tmp_path, monkeypatch):
+    for i in range(30):
+        write_run(root / f"r{i}", 3)
+    scanned = slow_scans(monkeypatch, 0.1)
+    ex = Explorer(root, tmp_path / "cache", workers=1).start()
+    while len(scanned) < 3:
+        time.sleep(0.01)
+    t0 = time.time()
+    ex.close()
+    assert time.time() - t0 < 0.5 and len(scanned) < 6
+
+
+def test_close_returns_while_a_long_scan_finishes_and_the_scan_writes_nothing(root, tmp_path, monkeypatch, capfd):
+    write_run(root / "r0", 3)
+    scanned = slow_scans(monkeypatch, 1.5)
+    monkeypatch.setattr(trex_index, "CLOSE_WAIT", 0.2)
+    errors = []
+    monkeypatch.setattr(threading, "excepthook", lambda a: errors.append(a.exc_value))
+    ex = Explorer(root, tmp_path / "cache", workers=1).start()
+    while not scanned:
+        time.sleep(0.01)
+    t0 = time.time()
+    ex.close()
+    assert time.time() - t0 < 0.5
+    poller = ex._poller
+    assert poller is not None
+    poller.join(5)
+    assert not poller.is_alive() and not errors and "[trex]" not in capfd.readouterr().err

@@ -144,6 +144,25 @@ function grown(a, n) {
 
 /** What the run filter matches: name, path, tags and key=value config entries. */
 const FILTER_HINT = "name search, or a WHERE clause: lr = 0.001 and seed in (0, 1), algo like 'pp%', state = running";
+/** Header controls of a section with subsections: a link to each (opening and scrolling to it) and a button
+ * folding or unfolding everything inside the section. */
+function subsectionControls(sec, subs) {
+  const stop = (f) => (e) => (e.preventDefault(), e.stopPropagation(), f(e));
+  const open = (d) => {
+    d.parentElement.open = true;
+    d.open = true;
+    requestAnimationFrame(() => d.scrollIntoView({ block: "start" }));
+  };
+  const all = (e) => {
+    const inner = [...e.currentTarget.closest("details").querySelectorAll("details.section")];
+    const fold = inner.some((d) => d.open);
+    for (const d of inner) d.open = !fold;
+  };
+  return [h("span", { className: "sublinks" }, ...sec.children.map((x, i) => h("button", { className: "linkish", title: `open ${x.id}`,
+            textContent: `${x.title} (${x.n})`, onclick: stop(() => open(subs[i])) }))),
+          h("button", { className: "subfold", onclick: stop(all) })];
+}
+
 /** Sorted copy of a section and its subsections: panels by name, subsections by sectionCmp. */
 function orderSection(sec) {
   const byName = (a, b) => cmpNames(a[0], b[0]);
@@ -1341,15 +1360,19 @@ class App {
     this.renderMedia();
   }
 
-  /** A foldable section: its panels, then its subsections; whether it is folded is remembered by its path. */
-  sectionEl(sec, closed) {
+  /** A foldable section: its panels, then its subsections; whether it is folded is remembered by its path. Its
+   * header stays in view while scrolling, links to its subsections and folds or unfolds all of them. */
+  sectionEl(sec, closed, depth = 0) {
     const grid = sec.items.length ? h("div", { className: "grid" }, ...sec.items.map(([key, kind, pinned]) => this.panelEl(key, kind, pinned))) : null;
-    return h("details", { className: "section", open: !closed[sec.id], ontoggle: (e) => {
+    const subs = sec.children.map((x) => this.sectionEl(x, closed, depth + 1));
+    const el = h("details", { className: "section", style: `--depth:${depth}`, open: !closed[sec.id], ontoggle: (e) => {
       const c = store.get("closedSections", {});
       c[sec.id] = !e.target.open;
       store.set("closedSections", c);
       this.updateSectionsToggle();
-    } }, h("summary", { textContent: `${sec.title} (${sec.n})` }), ...[grid, ...sec.children.map((x) => this.sectionEl(x, closed))].filter(Boolean));
+    } }, h("summary", {}, h("span", { className: "stitle", textContent: `${sec.title} (${sec.n})` }),
+      ...(subs.length ? subsectionControls(sec, subs) : [])), ...[grid, ...subs].filter(Boolean));
+    return el;
   }
 
   /** Sections of the panels passing the chart filter, in display order: pinned charts (in pin order; each also
@@ -1377,7 +1400,7 @@ class App {
     const pinOrder = new Map(this.pins.map((k, i) => [k, i]));
     pins.sort((a, b) => pinOrder.get(a[0]) - pinOrder.get(b[0]));
     const sorted = [...top.values()].map(orderSection).sort((a, b) => (a.id !== "charts") - (b.id !== "charts") || sectionCmp(a, b));
-    return pins.length ? [{ id: PINNED, title: "📌 pinned", items: pins, children: [], n: pins.length }, ...sorted] : sorted;
+    return pins.length ? [{ id: PINNED, title: "pinned", items: pins, children: [], n: pins.length }, ...sorted] : sorted;
   }
 
   /** The chart or media panel of `key` (the pinned section's own copy when `pinned`), created on first use. */
@@ -1426,6 +1449,11 @@ class App {
     const secs = [...document.querySelectorAll("#panels details.section")];
     btn.textContent = secs.some((d) => d.open) ? "collapse all sections" : "expand all sections";
     btn.hidden = !secs.length;
+    for (const b of document.querySelectorAll("#panels .subfold")) {
+      const open = [...b.closest("details").querySelectorAll("details.section")].some((d) => d.open);
+      b.textContent = open ? "fold inside" : "unfold inside";
+      b.title = open ? "fold every subsection of this section" : "unfold every subsection of this section";
+    }
   }
 
   onData(keys, r) {

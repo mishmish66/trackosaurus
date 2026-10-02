@@ -420,7 +420,7 @@ export class Chart {
     this.visible = false;
     this.el = document.createElement("div");
     this.el.className = "panel";
-    this.el.innerHTML = `<div class="ptitle"><span class="pname"></span><button class="pin" title="pin to the top">📌</button><button class="full" title="show this chart large (Esc to go back)">⛶</button><button class="gear" title="chart settings">⚙</button></div>
+    this.el.innerHTML = `<div class="ptitle"><span class="pname"></span><button class="pin" title="pin to the top"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M10.2 1.3l4.5 4.5-1.3 1.3-.8-.4-2.7 2.7.4 3.2-1.3 1.3-2.9-2.9-3.6 3.6H1.8v-.7l3.6-3.6-2.9-2.9 1.3-1.3 3.2.4 2.7-2.7-.4-.8z"/></svg></button><button class="full" title="show this chart large (Esc to go back)">⛶</button><button class="gear" title="chart settings">⚙</button></div>
       <div class="pbody"><canvas></canvas><canvas class="ov"></canvas></div><div class="legend"></div>`;
     this.el.querySelector(".pname").textContent = key;
     this.gear = this.el.querySelector(".gear");
