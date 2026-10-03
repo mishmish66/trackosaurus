@@ -86,6 +86,89 @@ def test_killed_writer_leaves_a_readable_consistent_run(tmp_path):
     assert meta_of(tmp_path / "r")["state"] == "running"
 
 
+def test_merge_plan_merges_fan_in_commits_of_a_tier_newest_first():
+    F, ones = trex.writer.FAN_IN, [(i, 1) for i in range(trex.writer.FAN_IN)]
+    assert trex.writer.merge_plan(ones[:-1]) is None
+    assert trex.writer.merge_plan(ones) == 0
+    assert trex.writer.merge_plan([(0, 50), (50, F)] + [(50 + F + i, 1) for i in range(F)]) == 2
+    assert trex.writer.merge_plan([(0, F)] + [(F + i, 1) for i in range(F - 1)]) == 0
+    big = 30_000
+    assert trex.writer.merge_plan([(i * big, big) for i in range(F)]) is None
+    assert trex.writer.merge_plan([(0, trex.writer.SEALED)] + [(trex.writer.SEALED + i, 1) for i in range(F - 1)]) is None
+
+
+def log_one_row_per_commit(run, n, start=0):
+    for i in range(start, start + n):
+        run.log({"loss": i + 0.5, **({"eval": -float(i)} if i % 7 == 0 else {})}, step=i)
+        time.sleep(0.003)
+
+
+def expected_rows(n):
+    return [(i, float(i), {"loss": i + 0.5, **({"eval": -float(i)} if i % 7 == 0 else {})}) for i in range(n)]
+
+
+def test_small_commits_are_merged_as_the_run_goes(tmp_path, monkeypatch):
+    merges = []
+    merge = chunks.merge
+    monkeypatch.setattr(chunks, "merge", lambda c, seq0, stop: merges.append((seq0, stop)) or merge(c, seq0, stop))
+    run = trex.init(tmp_path / "r", commit_interval=0.001)
+    log_one_row_per_commit(run, 300)
+    run.finish()
+    assert rows_of(tmp_path / "r") == expected_rows(300)
+    c = connect_ro(tmp_path / "r")
+    commits = c.execute("SELECT count(*) FROM rowmeta").fetchone()[0]
+    c.close()
+    assert len(merges) >= 10 and commits < 3 * trex.writer.FAN_IN
+
+
+def test_a_failing_merge_stops_compaction_and_leaves_every_row(tmp_path, monkeypatch, capsys):
+    def broken(c, seq0, stop):
+        c.execute("DELETE FROM rowmeta WHERE seq0 >= ? AND seq0 < ?", (seq0, stop))
+        raise OSError("disk full")
+
+    monkeypatch.setattr(chunks, "merge", broken)
+    run = trex.init(tmp_path / "r", commit_interval=0.001)
+    log_one_row_per_commit(run, 40)
+    run.finish()
+    assert rows_of(tmp_path / "r") == expected_rows(40)
+    assert "compaction of" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("where", ["halfway through a merge", "before a merge commits"])
+@pytest.mark.parametrize("nth", [2, 9])
+def test_a_writer_killed_while_merging_keeps_every_committed_row(tmp_path, where, nth):
+    d = tmp_path / "r"
+    hook = "_merged" if where == "halfway through a merge" else "merge"
+    code = textwrap.dedent(f"""
+        import os, signal, time, trex
+        from trex import chunks
+        real, calls = chunks.{hook}, [0]
+        def explode(*args):
+            calls[0] += 1
+            out = real(*args)
+            if calls[0] == {nth * 3 if hook == "_merged" else nth}:
+                os.kill(os.getpid(), signal.SIGKILL)
+            return out
+        chunks.{hook} = explode
+        run = trex.init({str(d)!r}, commit_interval=0.001)
+        for i in range(2000):
+            run.log({{"loss": i + 0.5, **({{"eval": -float(i)}} if i % 7 == 0 else {{}})}}, step=i)
+            time.sleep(0.003)
+    """)
+    assert subprocess.run([sys.executable, "-c", code]).returncode == -9
+    c = connect_ro(d)
+    assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    n = row_count(c)
+    commits = c.execute("SELECT seq0, n FROM rowmeta ORDER BY seq0").fetchall()
+    c.close()
+    assert n > 0 and sum(k for _, k in commits) == n and [s for s, _ in commits] == [sum(k for _, k in commits[:i]) for i in range(len(commits))]
+    assert rows_of(d) == expected_rows(n)
+    run = trex.init(d, commit_interval=0.001)
+    log_one_row_per_commit(run, 20, start=n)
+    run.finish()
+    assert rows_of(d) == expected_rows(n + 20)
+
+
 def test_media_files_are_written_before_their_rows(tmp_path):
     run = trex.init(tmp_path / "r")
     png = b"\x89PNG\r\n\x1a\n" + bytes(100)

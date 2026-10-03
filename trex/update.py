@@ -1,4 +1,4 @@
-"""Updating the daemon's trex from $TREX_SOURCE: `uv tool install $TREX_SOURCE`, then systemd restarts it."""
+"""Updating the daemon's trex from $TREX_SOURCE: `uv tool install $TREX_SOURCE`, then systemd or launchd restarts it."""
 
 import functools
 import importlib.metadata
@@ -13,7 +13,7 @@ from typing import Final, TypedDict
 
 DEFAULT_SOURCE: Final = "git+https://github.com/mishmish66/trackosaurus"
 INSTALL_TIMEOUT: Final = 600.0  # seconds
-RESTART_STATUS: Final = 75  # exit status asking systemd to start the daemon again (the unit's RestartForceExitStatus)
+RESTART_STATUS: Final = 75  # exit status asking the service manager to start the daemon again (systemd's RestartForceExitStatus)
 
 
 class Install(TypedDict):
@@ -69,14 +69,19 @@ def tool_env() -> Path | None:
 
 
 def updates(env: Mapping[str, str] = os.environ, prefix: Path | None = None) -> Updates:
-    """Whether this process can update itself: it needs $TREX_SOURCE, systemd to restart it, and to run the trex
-    that `uv tool install` replaces."""
+    """Whether this process can update itself: it needs $TREX_SOURCE, systemd or launchd to restart it, and to run
+    the trex that `uv tool install` replaces."""
     source = env.get("TREX_SOURCE") or None
     prefix = (prefix or Path(sys.prefix)).resolve()
     reason = ("TREX_SOURCE is not set" if source is None else
-              "not running under systemd (see `trex systemd-unit`)" if "INVOCATION_ID" not in env else
+              "not running as a service (see `trex systemd-unit`, `trex launchd-plist`)" if not service(env) else
               f"this trex ({prefix}) is not the uv tool install ({tool_env()})" if tool_env() != prefix else "")
     return {"source": source, "available": not reason, "reason": reason}
+
+
+def service(env: Mapping[str, str]) -> bool:
+    """Whether systemd or launchd (`trex launchd-plist`) runs this process."""
+    return "INVOCATION_ID" in env or env.get("TREX_SERVICE") == "launchd"
 
 
 def install(source: str) -> str:

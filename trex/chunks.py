@@ -2,8 +2,10 @@
     rowmeta(seq0, n, step_lo, step_hi, data)   data: f64 step[n], f64 t[n] (seconds since creation)
     chunk(key_id, seq0, data)                  per metric in the commit: u32 dense, u32 m,
                                                u16 pos[m] padded to 8 (unless dense), f64 value[m]
+Readers find rows by the commits that overlap them, so a writer may merge adjacent commits (`merge`).
 """
 
+import hashlib
 import sqlite3
 import struct
 import sys
@@ -81,14 +83,15 @@ def encode(rows: Sequence[CommitRow], ids: dict[str, int]) -> tuple[tuple[int, f
                 e = per[kid] = (array("H"), array("d"))
             e[0].append(i)
             e[1].append(v)
-    out: list[tuple[int, bytes]] = []
-    for kid, (pos, vals) in per.items():
-        if len(pos) == n:
-            out.append((kid, struct.pack("<II", 1, n) + vals.tobytes()))
-        else:
-            p = pos.tobytes()
-            out.append((kid, struct.pack("<II", 0, len(pos)) + p + b"\0" * (-len(p) % 8) + vals.tobytes()))
+    out = [(kid, _blob(None if len(pos) == n else pos.tobytes(), len(pos), vals.tobytes())) for kid, (pos, vals) in per.items()]
     return (n, min(steps), max(steps), steps.tobytes() + times.tobytes()), out
+
+
+def _blob(positions: bytes | None, m: int, values: bytes) -> bytes:
+    """A chunk of `m` values: dense (one per row of its commit) when `positions` is None."""
+    if positions is None:
+        return struct.pack("<II", 1, m) + values
+    return struct.pack("<II", 0, m) + positions + b"\0" * (-len(positions) % 8) + values
 
 
 def decode(blob: bytes) -> Chunk:
@@ -203,3 +206,77 @@ def rows(c: sqlite3.Connection, start: int = 0, stop: int | None = None) -> list
         lo, hi = max(start - seq0, 0), (stop - seq0) if stop is not None else n
         out.extend(part[lo:hi])
     return out
+
+
+def merge(c: sqlite3.Connection, seq0: int, stop: int) -> int:
+    """Rewrite the commits holding exactly rows [seq0, stop) as one commit, inside the caller's transaction; returns
+    how many commits it replaced. Raises, leaving the caller to roll back, unless every metric and the rows' steps
+    and times read back byte for byte as before."""
+    n = stop - seq0
+    if not 0 < n <= MAX_ROWS:
+        raise ValueError(f"a commit holds 1..{MAX_ROWS} rows")
+    metas: list[tuple[int, int, float, float, bytes]] = c.execute(
+        "SELECT seq0, n, step_lo, step_hi, data FROM rowmeta WHERE seq0 >= ? AND seq0 < ? ORDER BY seq0", (seq0, stop)).fetchall()
+    at = seq0
+    for s, k, *_ in metas:
+        if s != at:
+            break
+        at += k
+    if at != stop or not metas:
+        raise ValueError(f"rows [{seq0}, {stop}) are not whole contiguous commits")
+    kids: list[int] = [kid for (kid,) in c.execute("SELECT id FROM keys")]
+    before = _digest(c, kids, seq0, stop)
+    steps = np.concatenate([np.frombuffer(d, dtype="<f8", count=k) for _, k, _, _, d in metas])
+    times = np.concatenate([np.frombuffer(d, dtype="<f8", count=k, offset=8 * k) for _, k, _, _, d in metas])
+    c.execute("DELETE FROM rowmeta WHERE seq0 >= ? AND seq0 < ?", (seq0, stop))
+    c.execute("INSERT INTO rowmeta(seq0, n, step_lo, step_hi, data) VALUES (?, ?, ?, ?, ?)",
+              (seq0, n, min(m[2] for m in metas), max(m[3] for m in metas), steps.tobytes() + times.tobytes()))
+    for kid in kids:
+        parts: list[tuple[int, bytes]] = c.execute(
+            "SELECT seq0, data FROM chunk WHERE key_id = ? AND seq0 >= ? AND seq0 < ? ORDER BY seq0", (kid, seq0, stop)).fetchall()
+        if not parts:
+            continue
+        c.execute("DELETE FROM chunk WHERE key_id = ? AND seq0 >= ? AND seq0 < ?", (kid, seq0, stop))
+        c.execute("INSERT INTO chunk(key_id, seq0, data) VALUES (?, ?, ?)", (kid, seq0, _merged(parts, seq0, n)))
+    if _digest(c, kids, seq0, stop) != before:
+        raise RuntimeError(f"merging rows [{seq0}, {stop}) would change them")
+    return len(metas)
+
+
+def _merged(parts: Sequence[tuple[int, bytes]], seq0: int, n: int) -> bytes:
+    """One chunk of the `n` rows from `seq0` holding the values of `parts` (commit seq0, chunk), in row order."""
+    pos: list[npt.NDArray[np.int64]] = []
+    vals: list[Floats] = []
+    for s, blob in parts:
+        dense, m = struct.unpack_from("<II", blob, 0)
+        if dense:
+            pos.append(np.arange(m, dtype=np.int64) + (s - seq0))
+            vals.append(np.frombuffer(blob, dtype="<f8", offset=8))
+        else:
+            pos.append(np.frombuffer(blob, dtype="<u2", count=m, offset=8).astype(np.int64) + (s - seq0))
+            vals.append(np.frombuffer(blob, dtype="<f8", offset=8 + -(-2 * m // 8) * 8))
+    p, v = np.concatenate(pos), np.concatenate(vals)
+    return _blob(None if len(p) == n else p.astype("<u2").tobytes(), len(p), v.tobytes())
+
+
+def _digest(c: sqlite3.Connection, kids: Sequence[int], seq0: int, stop: int) -> bytes:
+    """Hash of rows [seq0, stop) as readers see them: their steps and times, and every metric's points."""
+    h = hashlib.sha256()
+    for r in _row_steps(c, seq0, stop):
+        h.update(r)
+    for kid in kids:
+        s, v, t = metric(c, kid, seq0, stop)
+        h.update(struct.pack("<q", kid) + s.tobytes() + v.tobytes() + t.tobytes())
+    return h.digest()
+
+
+def _row_steps(c: sqlite3.Connection, start: int, stop: int) -> list[bytes]:
+    """Steps then times of rows [start, stop), as f64 bytes."""
+    steps: list[Floats] = []
+    times: list[Floats] = []
+    for seq0, n, data in c.execute("SELECT seq0, n, data FROM rowmeta WHERE seq0 + n > ? AND seq0 < ? ORDER BY seq0", (start, stop)):
+        rm = np.frombuffer(data, dtype="<f8")
+        lo, hi = max(start - seq0, 0), min(stop - seq0, n)
+        steps.append(rm[lo:hi])
+        times.append(rm[n + lo: n + hi])
+    return [np.concatenate(steps).tobytes() if steps else b"", np.concatenate(times).tobytes() if times else b""]

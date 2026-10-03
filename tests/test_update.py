@@ -27,7 +27,7 @@ def test_installed_version_and_commit_come_from_the_environment(tmp_path):
     assert update.installed(tmp_path / "empty") == {"version": "unknown", "commit": None}
 
 
-def test_updates_need_a_source_systemd_and_the_uv_tool_install(tmp_path, monkeypatch):
+def test_updates_need_a_source_a_service_manager_and_the_uv_tool_install(tmp_path, monkeypatch):
     tool = tmp_path / "tools" / "trex"
     tool.mkdir(parents=True)
     monkeypatch.setattr(update, "tool_env", lambda: tool.resolve())
@@ -36,6 +36,8 @@ def test_updates_need_a_source_systemd_and_the_uv_tool_install(tmp_path, monkeyp
     assert "TREX_SOURCE" in update.updates({"INVOCATION_ID": "1"}, tool)["reason"]
     assert "systemd" in update.updates({"TREX_SOURCE": "git+https://x"}, tool)["reason"]
     assert "not the uv tool install" in update.updates(systemd, tmp_path)["reason"]
+    launchd = {"TREX_SOURCE": "git+https://x", "TREX_SERVICE": "launchd"}
+    assert update.updates(launchd, tool) == {"source": "git+https://x", "available": True, "reason": ""}
 
 
 def test_install_failure_carries_uvs_output(monkeypatch, tmp_path):

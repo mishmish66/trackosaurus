@@ -9,19 +9,19 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 |---|---|
 | `trex/format.py` | the run file: `trex.sqlite` schema (format 3), `connect_rw`, `connect_ro`. The contract between writer and readers. |
 | `trex/journal.py` | commit journal for runs on network filesystems: `Writer` (append + fsync), `records`, `sync` (replay into a local replica) |
-| `trex/chunks.py` | per-metric chunk codec: each commit is one `rowmeta` row (steps, times) plus one `chunk` per metric present |
+| `trex/chunks.py` | per-metric chunk codec: each commit is one `rowmeta` row (steps, times) plus one `chunk` per metric present; `merge` rewrites adjacent commits as one |
 | `trex/tiles.py` | envelope pyramid tiles (min, max, mean, mean step, mean runtime and count per bucket), `top_tiles`, `build`, `coarsen`, `decode` |
-| `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread |
+| `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread, which also merges small commits |
 | `trex/media.py` | PNG/MP4 encoding for logged arrays (numpy and ffmpeg imported lazily) |
 | `trex/index.py` | `Explorer`: crawl, per-run scans (inline or process pool), index cache, top tiles, on-demand finer tiles with a size-bounded cache, event hub |
 | `trex/server.py` | read-only HTTP + SSE for the UI: `/api/runs`, `/api/tiles`, `/api/rows`, `/api/stream`, media |
 | `trex/daemon.py` | `trex daemon`: `Roots` (tracked directories by spec, `unique_names`, workspaces; `roots.json`, remembered ones in `history.json`), the Unix control socket, its client |
 | `trex/workspace.py` | workspaces: `Workspace` merges member directories (`Local`, `Far`) behind the Explorer interface, renaming run ids |
 | `trex/remote.py` | `host:path` directories: `parse`, the ssh + `uvx` command, `Remote` (one ssh session, reconnected with backoff) |
-| `trex/update.py` | the daemon's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd to restart it |
+| `trex/update.py` | the daemon's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd or launchd to restart it |
 | `trex/query.py` | read-side queries for the CLI: records, field access, sorting, statistics, series |
 | `trex/where.py` | run filters: a SQL WHERE clause (or a name search) compiled to a test over a field getter |
-| `trex/cli.py` | `trex` command (Typer): `serve daemon systemd-unit ls groups keys tree show series tail media diff index` |
+| `trex/cli.py` | `trex` command (Typer): `serve daemon systemd-unit launchd-plist ls groups keys tree show series tail media diff index` |
 | `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (tile store, scheduler, IndexedDB, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (columns, smoothing, decimation, group stats, CRC-32), `where.js` (run filters, run fields, filter completion); `index.html` |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/`; the user guide is the `trex` and `trex.daemon` docstrings (Markdown) |
@@ -60,7 +60,10 @@ them WebGL falls back to software and timings mean nothing.
 - **Run file** (`trex.sqlite`, SQLite in WAL mode, plus `media/`): `meta`, `media`, `keys`,
   `rowmeta(seq0, n, step_lo, step_hi, steps|times)` and `chunk(key_id, seq0, values)`. One commit
   of at most 65535 rows is one `rowmeta` row and one chunk per metric logged in it, so reading one
-  metric is an index range scan.
+  metric is an index range scan. After each commit the writer's thread merges its newest small commits
+  (`writer.merge_plan`: `FAN_IN` of a size tier at a time, up to `SEALED` rows), so a run logging a row
+  per commit stays near 8 bytes per value. Readers find rows by the commits that overlap them and never
+  depend on where commits begin or end.
 - **Journal** (`trex.journal`, runs on network filesystems, or `TREX_JOURNAL=1`): every commit's inserts,
   appended and fsync'd, because SQLite's WAL is readable only on the writer's host. `connect_ro`
   reads a live journaled run (one with a `-wal`) from a replica in `$TREX_REPLICAS` (default
@@ -86,8 +89,8 @@ them WebGL falls back to software and timings mean nothing.
   Its stream merges the members' streams, renaming run ids in every event (`Workspace._rename_event`).
   `/api/daemon` lists the directories, the remembered ones and the running trex; directories are
   added over the control socket (mode 0600) or HTTP and removed over HTTP. An update installs
-  `$TREX_SOURCE` and exits with `update.RESTART_STATUS`; the unit's `RestartForceExitStatus` restarts
-  it, and the UI reloads once `/api/daemon` reports the new install (`update.RUNNING`, read at start).
+  `$TREX_SOURCE` and exits with `update.RESTART_STATUS`; the systemd unit's `RestartForceExitStatus`
+  or the launchd agent's `KeepAlive` restarts it, and the UI reloads once `/api/daemon` reports the new install (`update.RUNNING`, read at start).
   A removed directory's `Explorer` is closed (`Explorer.close`). A `host:path` directory is a `Remote`:
   one `ssh -L <local socket>:<remote socket> host uvx --from <source>@<this commit> trex serve PATH --unix
   <remote socket> --exit-on-eof`, and `Handler._proxy` passes its `/r/<name>/` requests (the stream too)
@@ -142,10 +145,14 @@ them WebGL falls back to software and timings mean nothing.
   refuses a POST whose Origin is not its Host. The UI sends no cross-origin requests.
 - **A live run is read on its writer's host or through its journal.** Never open another host's WAL:
   even read-only readers write SQLite's shared index, which a network filesystem does not keep
-  coherent. A journal replayed from its start rebuilds the run exactly (`tests/test_journal.py`).
+  coherent. A journal replayed from its start rebuilds the run's rows, meta and media exactly
+  (`tests/test_journal.py`); its commits stay as written, since merges are not journaled.
 - **Writer never crashes training.** Errors in the commit thread are recorded and raised from
   `finish()`, not from `log()`. Media files are written (temp name, then rename) before the row
   that references them commits.
+- **A killed writer loses no committed row.** Every commit and every merge is one SQLite transaction,
+  and a merge commits only if every metric and the rows' steps and times read back byte for byte as
+  before (`chunks.merge`). A failed merge stops merging for that run and changes nothing.
 - **Run identity is its path** (relative to the served root). A changed `meta.id` or a shrunken
   row count makes the explorer drop and re-index the run.
 

@@ -17,16 +17,17 @@ def journaled(tmp_path, monkeypatch):
     monkeypatch.setenv("TREX_REPLICAS", str(tmp_path / "replicas"))
 
 
-def tables(c):
-    """Every table's rows, as stored."""
-    return {t: sorted(c.execute(f"SELECT {cols[cols.index('(') + 1:-1]} FROM {t}").fetchall())
-            for t, cols in journal.TABLES.items()}
+def content(c):
+    """What readers see of a run: meta, metric names, media and every row (NaN-safe); not how commits are laid out."""
+    tables = {t: sorted(c.execute(f"SELECT * FROM {t}").fetchall()) for t in ("meta", "keys", "media")}
+    rows = [(r.seq, r.step, r.t, sorted((k, repr(v)) for k, v in r.values.items())) for r in chunks.rows(c)]
+    return {**tables, "rows": rows}
 
 
 def replica_of(d):
     c = sqlite3.connect(journal.sync(d, SCHEMA))
     try:
-        return tables(c)
+        return content(c)
     finally:
         c.close()
 
@@ -34,7 +35,7 @@ def replica_of(d):
 def stored(d):
     c = sqlite3.connect(d / DB)
     try:
-        return tables(c)
+        return content(c)
     finally:
         c.close()
 
@@ -44,7 +45,7 @@ def log_some(run, n, start=0):
         run.log({"loss": 1.0 / (i + 1), "odd": float("nan")} if i % 2 else {"loss": 1.0 / (i + 1)}, step=i)
 
 
-def test_replaying_the_journal_rebuilds_the_run_exactly(tmp_path):
+def test_replaying_the_journal_rebuilds_the_runs_rows_meta_and_media(tmp_path):
     d = tmp_path / "r"
     run = trex.init(d, config={"lr": 0.1}, commit_interval=0.02)
     log_some(run, 70_000)
@@ -52,6 +53,19 @@ def test_replaying_the_journal_rebuilds_the_run_exactly(tmp_path):
     run.summary(best=0.5)
     run.finish()
     assert (d / journal.JOURNAL).exists() and replica_of(d) == stored(d)
+
+
+def test_a_compacted_run_and_its_replica_hold_the_same_rows(tmp_path):
+    d = tmp_path / "r"
+    run = trex.init(d, commit_interval=0.001)
+    for i in range(120):
+        log_some(run, 1, start=i)
+        time.sleep(0.003)
+    run.finish()
+    c = sqlite3.connect(d / DB)
+    commits = c.execute("SELECT count(*) FROM rowmeta").fetchone()[0]
+    c.close()
+    assert commits < 20 and replica_of(d) == stored(d) and len(stored(d)["rows"]) == 120
 
 
 def test_a_live_journaled_run_is_read_from_its_replica(tmp_path):
@@ -109,7 +123,7 @@ def test_a_run_reopened_without_its_journal_is_journaled_from_a_snapshot(tmp_pat
     run = trex.init(d)
     log_some(run, 3, start=4)
     run.finish()
-    assert replica_of(d) == stored(d) and stored(d)["rowmeta"][-1][0] == 4
+    assert replica_of(d) == stored(d) and [r[0] for r in stored(d)["rows"]] == list(range(7))
 
 
 def test_a_rewritten_journal_rebuilds_the_replica(tmp_path):
@@ -122,7 +136,7 @@ def test_a_rewritten_journal_rebuilds_the_replica(tmp_path):
     run = trex.init(d)
     log_some(run, 2)
     run.finish()
-    assert replica_of(d) == stored(d) and len(stored(d)["rowmeta"]) == 1
+    assert replica_of(d) == stored(d) and [r[0] for r in stored(d)["rows"]] == [0, 1]
 
 
 def test_a_failing_journal_stops_journaling_but_not_the_run(tmp_path, monkeypatch, capsys):

@@ -1,6 +1,7 @@
 import io
 import json
 import math
+import plistlib
 import re
 import shlex
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -382,6 +384,34 @@ def test_systemd_unit_with_an_empty_source_has_no_update_source(capsys, monkeypa
     monkeypatch.setenv("TREX_SOURCE", "git+https://example.org/trex")
     main(["systemd-unit", "--source", ""])
     assert "TREX_SOURCE" not in capsys.readouterr().out.split("[Unit]")[1]
+
+
+def test_launchd_plist_runs_this_trex_and_restarts_it_after_an_update(capsys, tmp_path):
+    main(["launchd-plist", "--host", "127.0.0.1", "--port", "9000", "--allow-host", "box.tailnet.ts.net",
+          "--cache", str(tmp_path / "cache"), "--source", "git+https://example.org/trex"])
+    agent = plistlib.loads(capsys.readouterr().out.encode())
+    assert agent["ProgramArguments"] == [sys.executable, "-m", "trex", "daemon", "--host", "127.0.0.1",
+                                         "--allow-host", "box.tailnet.ts.net", "--port", "9000"]
+    env = agent["EnvironmentVariables"]
+    assert {"TREX_SOURCE": "git+https://example.org/trex", "TREX_CACHE": str((tmp_path / "cache").resolve())}.items() <= env.items()
+    assert update.service(env) and str(Path(sys.executable).parent) in env["PATH"].split(":")
+    assert agent["RunAtLoad"] and agent["KeepAlive"] == {"SuccessfulExit": False}
+    assert Path(agent["StandardOutPath"]).is_absolute() and agent["StandardErrorPath"] == agent["StandardOutPath"]
+    if shutil.which("plutil"):
+        (tmp_path / "trex.plist").write_bytes(plistlib.dumps(agent))
+        assert subprocess.run(["plutil", "-lint", str(tmp_path / "trex.plist")], capture_output=True).returncode == 0
+
+
+def test_launchd_plist_updates_from_the_trex_repository_by_default(capsys, monkeypatch):
+    monkeypatch.delenv("TREX_SOURCE", raising=False)
+    main(["launchd-plist"])
+    assert plistlib.loads(capsys.readouterr().out.encode())["EnvironmentVariables"]["TREX_SOURCE"] == update.DEFAULT_SOURCE
+
+
+def test_launchd_plist_with_an_empty_source_has_no_update_source(capsys, monkeypatch):
+    monkeypatch.setenv("TREX_SOURCE", "git+https://example.org/trex")
+    main(["launchd-plist", "--source", ""])
+    assert "TREX_SOURCE" not in plistlib.loads(capsys.readouterr().out.encode())["EnvironmentVariables"]
 
 
 def test_version_names_the_installed_trex(capsys):

@@ -1,5 +1,5 @@
-"""Logging API. A background thread commits logged rows every `commit_interval` seconds; writer
-errors surface from `Run.finish`, never from logging."""
+"""Logging API. A background thread commits logged rows every `commit_interval` seconds and merges small
+commits as it goes; writer errors surface from `Run.finish`, never from logging."""
 
 import atexit
 import hashlib
@@ -15,7 +15,7 @@ import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
-from typing import IO, Literal, NamedTuple, Protocol, Self, cast, runtime_checkable
+from typing import IO, Final, Literal, NamedTuple, Protocol, Self, cast, runtime_checkable
 
 from numpy.typing import ArrayLike
 
@@ -52,6 +52,25 @@ type VideoInput = str | os.PathLike[str] | bytes | bytearray | ArrayLike
 """Path, mp4 bytes, or THW/THWC frames (needs ffmpeg)."""
 
 type FinalState = Literal["finished", "failed"]
+
+FAN_IN: Final = 8  # commits merged into one at a time
+SEALED: Final = FAN_IN ** 5  # rows of a commit that compaction leaves as it is
+
+
+def merge_plan(tail: Sequence[tuple[int, int]]) -> int | None:
+    """Where a merge through the newest commit starts in `tail` (a writer's newest commits as (seq0, rows), oldest
+    first), or None: the newest commits each under FAN_IN**t rows, for the smallest t with FAN_IN of them that fit
+    one commit together. Each row is rewritten about log_FAN_IN(SEALED) times."""
+    t = FAN_IN
+    while t <= SEALED:
+        k = rows = 0
+        while k < len(tail) and tail[-1 - k][1] < t and rows + tail[-1 - k][1] <= chunks.MAX_ROWS:
+            rows += tail[-1 - k][1]
+            k += 1
+        if k >= FAN_IN:
+            return len(tail) - k
+        t *= FAN_IN
+    return None
 
 
 class _Row(NamedTuple):
@@ -180,6 +199,8 @@ class Run:
         self._info = as_dict(meta["info"])
         self._rows: list[_Row] = []
         self._media: list[_Media] = []
+        self._tail: list[tuple[int, int]] = []  # this session's commits that compaction may merge, as (seq0, rows)
+        self._compacting = True
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = False
@@ -333,6 +354,7 @@ class Run:
         journal.replay(c, ops)
         c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [(k, json.dumps(v)) for k, v in meta.items()])
         c.execute("COMMIT")
+        self._tail += [(self._seq + i, min(chunks.MAX_ROWS, len(rows) - i)) for i in range(0, len(rows), chunks.MAX_ROWS)]
         self._seq += len(rows)
         self._mseq += len(files)
         if self._journal is not None:
@@ -340,6 +362,22 @@ class Run:
                 self._journal.append(ops + self._meta_ops(meta), self._seq, self._mseq)
             except OSError as e:
                 self._journal_failed(e)
+
+    def _compact(self, c: sqlite3.Connection) -> None:
+        """Merge this session's newest commits as `merge_plan` says, one transaction each. The run file holds the
+        same rows whatever happens; a failed merge stops compaction for the run. The journal keeps the commits as
+        written."""
+        while self._compacting and (i := merge_plan(self._tail)) is not None:
+            seq0, stop = self._tail[i][0], self._tail[-1][0] + self._tail[-1][1]
+            try:
+                _merge(c, seq0, stop)
+            except Exception as e:
+                self._compacting = False
+                print(f"[trex] compaction of {self.dir} stopped; its rows are unchanged: {e!r}", file=sys.stderr)
+                return
+            self._tail[i:] = [(seq0, stop - seq0)]
+            if stop - seq0 >= SEALED:
+                self._tail = []
 
     def _loop(self) -> None:
         c = connect_rw(self.dir)
@@ -349,6 +387,7 @@ class Run:
                 self._wake.clear()
                 stop = self._stop
                 self._commit(c, self._state if stop else None)
+                self._compact(c)
                 if stop:
                     return
         except Exception as e:  # surfaced by finish(); logging must never crash training
@@ -358,6 +397,18 @@ class Run:
             c.close()
             if self._journal is not None:
                 self._journal.close()
+
+
+def _merge(c: sqlite3.Connection, seq0: int, stop: int) -> None:
+    """Merge the commits of rows [seq0, stop) in one transaction: all of it lands, or none of it."""
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        chunks.merge(c, seq0, stop)
+        c.execute("COMMIT")
+    except BaseException:
+        if c.in_transaction:
+            c.execute("ROLLBACK")
+        raise
 
 
 def _snapshot(c: sqlite3.Connection) -> list[journal.Op]:

@@ -435,7 +435,7 @@ def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]..
         control.server_close()
         roots.close()
     if restarting.is_set():
-        typer.echo(f"trex daemon: updated; exiting with status {update.RESTART_STATUS} for systemd to restart it")
+        typer.echo(f"trex daemon: updated; exiting with status {update.RESTART_STATUS} for its service manager to restart it")
         sys.exit(update.RESTART_STATUS)
 
 
@@ -468,13 +468,18 @@ WantedBy=default.target
 """
 
 
+def daemon_args(hosts: list[str], allow: list[str]) -> list[str]:
+    """The `trex daemon` options a service passes for `hosts` and allowed host names."""
+    return [*(a for h in hosts for a in ("--host", h)), *(a for n in allow for a in ("--allow-host", n))]
+
+
 def systemd_unit(hosts: list[str], port: int, allow: list[str], cache: str | None, source: str | None) -> str:
     """The unit for `trex systemd-unit`."""
     import shlex
 
     from . import update
 
-    host_args = [*(a for h in hosts for a in ("--host", h)), *(a for n in allow for a in ("--allow-host", n))]
+    host_args = daemon_args(hosts, allow)
     options = [*(["--port", str(port)] if port != DEFAULT_PORT else []), *(["--cache", cache] if cache else []),
                *(["--source", source] if source else [])]
     env = {"TREX_CACHE": str(Path(cache).expanduser().resolve()) if cache else None, "TREX_SOURCE": source}
@@ -495,9 +500,62 @@ def systemd_unit_cmd(host: Hosts = None, port: Annotated[int, typer.Option(help=
 
     source = update.DEFAULT_SOURCE if source is None else source or None
     typer.echo(systemd_unit(host or [], port, allow_host or [], cache, source), nl=False)
+    warn_not_tool_install("systemd-unit", source)
+
+
+def warn_not_tool_install(command: str, source: str | None) -> None:
+    """Say on stderr that the update button will not show when this trex is not the uv tool install."""
+    from . import update
+
     if source and update.tool_env() != Path(sys.prefix).resolve():
-        typer.echo(f"trex systemd-unit: this trex ({sys.prefix}) is not the uv tool install, so the update button will "
-                   f"not show; run the unit from `uv tool install {source}`", err=True)
+        typer.echo(f"trex {command}: this trex ({sys.prefix}) is not the uv tool install, so the update button will "
+                   f"not show; run the service from `uv tool install {source}`", err=True)
+
+
+LAUNCHD_LABEL: Final = "trex"
+PLIST_HEAD: Final = """\
+<!-- trex daemon as a launchd agent, running while you are logged in:
+       trex launchd-plist > ~/Library/LaunchAgents/trex.plist
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/trex.plist
+       launchctl kickstart -k gui/$(id -u)/trex    restart it
+       launchctl bootout gui/$(id -u)/trex         stop and unload it
+       tail -f ~/Library/Logs/trex.log             its log
+     A failed start (an address that is not up yet) is retried; after an update the daemon exits with
+     {status} to be started again on the new trex. -->
+"""
+
+
+def launchd_plist(hosts: list[str], port: int, allow: list[str], cache: str | None, source: str | None) -> str:
+    """The agent for `trex launchd-plist`."""
+    import plistlib
+
+    from . import update
+
+    path = [str(Path(update.uv()).parent), str(Path(sys.executable).parent), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    env = {"PATH": ":".join(dict.fromkeys(path)), "PYTHONUNBUFFERED": "1", "NO_COLOR": "1", "TREX_SERVICE": "launchd",
+           "TREX_CACHE": str(Path(cache).expanduser().resolve()) if cache else None, "TREX_SOURCE": source}
+    log = str(Path.home() / "Library" / "Logs" / "trex.log")
+    agent = {"Label": LAUNCHD_LABEL,
+             "ProgramArguments": [sys.executable, "-m", "trex", "daemon", *daemon_args(hosts, allow), "--port", str(port)],
+             "EnvironmentVariables": {k: v for k, v in env.items() if v}, "RunAtLoad": True,
+             "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 2, "ExitTimeOut": 30,
+             "StandardOutPath": log, "StandardErrorPath": log}
+    head, plist, body = plistlib.dumps(agent, sort_keys=False).decode().partition("<plist")
+    return head + PLIST_HEAD.format(status=update.RESTART_STATUS) + plist + body
+
+
+@command("launchd-plist")
+def launchd_plist_cmd(host: Hosts = None, port: Annotated[int, typer.Option(help="Port.")] = DEFAULT_PORT, allow_host: AllowHosts = None,
+                      cache: Annotated[str | None, typer.Option(help="Cache directory (default ~/.cache/trex).")] = None,
+                      source: Annotated[str | None, typer.Option(envvar="TREX_SOURCE", show_envvar=False,
+                                        help="What the UI's update button installs (default $TREX_SOURCE, else "
+                                             "git+https://github.com/mishmish66/trackosaurus; '' for no update button).")] = None) -> None:
+    """Print a launchd agent (macOS) that runs `trex daemon` on this trex; its header says how to install it."""
+    from . import update
+
+    source = update.DEFAULT_SOURCE if source is None else source or None
+    typer.echo(launchd_plist(host or [], port, allow_host or [], cache, source), nl=False)
+    warn_not_tool_install("launchd-plist", source)
 
 
 @command("ls", "find")

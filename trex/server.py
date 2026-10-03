@@ -505,7 +505,7 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 128
     explorer: Explorer | None = None
     roots: "Roots | None" = None
-    restart: Callable[[], None] | None = None  # ends the daemon so that systemd starts the updated one
+    restart: Callable[[], None] | None = None  # ends the daemon so that its service manager starts the updated one
     updating: threading.Lock  # held during an update, and from a successful one until the restart
     names: frozenset[str] = frozenset()  # host names besides IP addresses that requests may address it by
 

@@ -8,8 +8,14 @@ As a systemd user service:
     systemctl --user daemon-reload && systemctl --user enable --now trex
     loginctl enable-linger "$USER"
 
+As a launchd agent on macOS (running while you are logged in; log in ~/Library/Logs/trex.log):
+
+    uv tool install git+https://github.com/mishmish66/trackosaurus
+    trex launchd-plist > ~/Library/LaunchAgents/trex.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/trex.plist
+
 The update button in the trex panel installs the newest trex from `--source` (default this repository), and
-systemd restarts the daemon on it.
+systemd or launchd restarts the daemon on it.
 
 / shows every tracked directory, each as a top-level folder; clicking trex (top left) opens the panel that
 switches and manages them, and workspaces: named sets of directories whose folder trees are merged, so runs
