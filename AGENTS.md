@@ -105,7 +105,10 @@ them WebGL falls back to software and timings mean nothing.
   its kept tiles were built. Top tiles of finished runs are cached in IndexedDB, keyed by metric so
   one range read serves a whole chart.
 - **Rendering**: WebGL2 by default (`?gl=0` selects Canvas 2D). Above 300 lines a chart draws a
-  density heatmap.
+  density heatmap. No upload overwrites GPU data a queued draw may read: each draw's line table
+  takes fresh rows of the table texture (`Renderer.bind`), and a changed column moves to a new slot
+  (`LineSet.update`); only appends past a column's drawn points are written in place. Charts then
+  never depend on how a driver orders uploads against earlier draws.
 
 ## Invariants (things that break silently if ignored)
 

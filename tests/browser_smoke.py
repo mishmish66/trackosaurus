@@ -1,8 +1,8 @@
 """Headless-browser smoke test against a throwaway trex server on a temporary runs directory.
 
-Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, the filter box, console errors,
-UI line coverage (at least UI_COVERAGE of the modules' code lines run), and that a client dropping every 5th
-stream event still converges to the run files: every row and media item, and top tiles whose
+Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, panels of
+hidden runs, the filter box, console errors, UI line coverage (at least UI_COVERAGE of the modules' code lines run),
+and that a client dropping every 5th stream event still converges to the run files: every row and media item, and top tiles whose
 bucket counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
 a directory with `trex serve -y`, the root view of both, making a workspace of them in the panel the trex
 brand opens, and from that panel removing a directory and re-adding it from the remembered ones.
@@ -277,6 +277,7 @@ def interactions_smoke(page, url):
         page.keyboard.press(k)
     slider = page.locator(".panel.media input[type=range]").first
     slider.scroll_into_view_if_needed()
+    soon("+document.querySelector('.panel.media input[type=range]').max > 0")
     slider.fill("0")
     checks["the media slider steps back"] = page.evaluate("[...app.mediaPanels.values()].some((m) => !m.follow)")
 
@@ -507,6 +508,40 @@ def sections_smoke(page, url):
             and unpinned == ["charts (1)", 1])
 
 
+def hidden_runs_smoke(page, url):
+    """Whether panels follow the shown runs: hiding the only run that logs some keys removes their panels, showing it
+    brings them back, and hiding every run leaves no panels, as in a folder without runs."""
+    panels = "[...document.querySelectorAll('#panels .panel > .ptitle > span:first-child')].map((e) => e.textContent).sort()"
+    only = ["eval/len", "eval/return/mean", "eval/return/std", "eval/video/frame", "loss"]
+    box = "#runTable tr:has(td.name[title='nested/r0']) input[type=checkbox]"
+
+    def settle(want):
+        try:
+            page.wait_for_function(f"JSON.stringify({panels}) === {json.dumps(json.dumps(want))}", timeout=5000)
+        except Exception:
+            pass
+        return page.evaluate(panels)
+
+    page.goto(f"{url}/?hidden#path=&group=")
+    page.wait_for_function(READY, timeout=30000)
+    page.wait_for_function(f"{panels}.includes('eval/video/frame')", timeout=10000)
+    before = page.evaluate(panels)
+    rest = [k for k in before if k not in only]
+    page.locator(box).uncheck()
+    hidden = settle(rest)
+    page.locator(box).check()
+    shown = settle(before)
+    page.click("#hideAll")
+    none = settle([])
+    count = page.inner_text("#panels .panelbar .muted")
+    page.click("#hideAll")
+    back = settle(before)
+    print(f"hidden runs: {len(before)} panels; nested/r0 hidden leaves {len(hidden)}, shown again {len(shown)}; "
+          f"all hidden {len(none)} ({count!r}); all shown {len(back)}")
+    return (set(only) <= set(before) and bool(rest) and hidden == rest and shown == before and none == []
+            and count == "0 sections · 0 panels" and back == before)
+
+
 def main():
     out = Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="trex-shots-"))
     out.mkdir(parents=True, exist_ok=True)
@@ -541,6 +576,7 @@ def main():
 
             ok &= group_levels_smoke(page, url)
             ok &= sections_smoke(page, url)
+            ok &= hidden_runs_smoke(page, url)
             ok &= filter_smoke(page, url)
             ok &= interactions_smoke(page, url)
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])

@@ -292,7 +292,7 @@ class LineSet {
     return p.vx0 >= w0 && p.vx1 <= w1 && (this.R * (p.vx1 - p.vx0)) / (w1 - w0) >= p.pw;
   }
 
-  /** Rewrite the columns that changed in place; false if a rebuild is needed instead. */
+  /** Bring the columns that changed up to date; false if a rebuild is needed instead. */
   updateStale(cols, p, alpha) {
     const stale = cols.filter((c) => this.slots.get(c)?.ver !== c.n);
     return stale.length <= 256 && stale.every((c) => this.update(c, p, alpha));
@@ -360,7 +360,8 @@ class LineSet {
     return r.n;
   }
 
-  /** Rewrite one column in place (or in a new slot at the end); false if a rebuild is needed. */
+  /** Append to one column, or rewrite it in a new slot at the end: points a draw may have read are never
+   * overwritten. False if a rebuild is needed. */
   update(c, p, alpha) {
     const s = this.slots.get(c);
     if (!this.win && s && c.n > s.ver && c.n <= s.cap) {
@@ -373,12 +374,6 @@ class LineSet {
     }
     scratchPts = pointBuffer(scratchPts, this.bound(c));
     const n = this.convert(c, p, alpha, scratchPts, 0);
-    if (s && n <= s.cap) {
-      this.pts.write(s.off, scratchPts, n);
-      s.n = n;
-      s.ver = c.n;
-      return true;
-    }
     const cap = n + this.slack(n);
     if (this.next + cap > this.pts.cap) return false;
     if (s) this.garbage += s.cap;

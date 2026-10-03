@@ -5,6 +5,7 @@
 
 const TW = 2048; // points per row of a point texture
 const MW = 1024; // lines per row of a line table
+const META_ROWS = 64; // rows of a line-table texture
 const BREAK = 1e38; // coordinate marking a line break
 const MAX_BINS = 16; // texels of the density maximum
 
@@ -35,10 +36,10 @@ precision highp float;
 precision highp int;
 uniform highp sampler2D u_pos;
 uniform highp isampler2D u_meta;
-uniform int u_base;
+uniform int u_base, u_row0;
 uniform vec2 u_off, u_scale, u_org, u_size;
 vec2 fetch(int i) { return texelFetch(u_pos, ivec2(i % ${TW}, i / ${TW}), 0).xy; }
-ivec4 meta(int line) { return texelFetch(u_meta, ivec2(line % ${MW}, line / ${MW}), 0); }
+ivec4 meta(int line) { return texelFetch(u_meta, ivec2(line % ${MW}, u_row0 + line / ${MW}), 0); }
 bool broken(vec2 p) { return abs(p.y) > 1.0e37 || abs(p.x) > 1.0e37; }
 vec2 toPx(vec2 p) { return vec2(u_org.x + (p.x - u_off.x) * u_scale.x, u_org.y - (p.y - u_off.y) * u_scale.y); }
 vec4 toClip(vec2 P) { return vec4(P.x / u_size.x * 2.0 - 1.0, 1.0 - P.y / u_size.y * 2.0, 0.0, 1.0); }
@@ -328,8 +329,8 @@ class Renderer {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     }
     this.dens = null;
-    this.metaTex = gl.createTexture();
-    this.metaRows = 0;
+    this.metaTex = null;
+    this.metaRows = this.metaAt = 0;
     this.vao = gl.createVertexArray();
     this.firsts = this.counts = this.inst = null;
   }
@@ -405,7 +406,9 @@ class Renderer {
     this.gl.scissor(x, shift + this.H - y - h, w, h);
   }
 
-  /** Bind `pts`, a line table and `view` {off: data at the plot origin, scale: px per unit, org: device px}. */
+  /** Bind `pts`, a line table and `view` {off: data at the plot origin, scale: px per unit, org: device px}.
+   * Each table goes to rows of the table texture no earlier draw reads, so no upload changes what a queued
+   * draw sees. */
   bind(prog, pts, table, view) {
     const gl = this.gl, u = prog.u;
     gl.useProgram(prog.p);
@@ -413,20 +416,22 @@ class Renderer {
     gl.bindTexture(gl.TEXTURE_2D, pts.tex);
     gl.uniform1i(u.u_pos, 0);
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.metaTex);
     const rows = Math.max(1, Math.ceil(table.n / MW)), need = 4 * MW * rows;
     if (table.a.length < need) {
       const b = new Int32Array(need);
       b.set(table.a);
       table.a = b;
     }
-    if (rows > this.metaRows) {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32I, MW, rows, 0, gl.RGBA_INTEGER, gl.INT, null);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      this.metaRows = rows;
+    if (this.metaAt + rows > this.metaRows) {
+      if (this.metaTex) gl.deleteTexture(this.metaTex);
+      this.metaRows = Math.max(META_ROWS, rows);
+      this.metaTex = this.texture(gl.RGBA32I, MW, this.metaRows, gl.RGBA_INTEGER, gl.INT, null);
+      this.metaAt = 0;
     }
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MW, rows, gl.RGBA_INTEGER, gl.INT, table.a, 0);
+    gl.bindTexture(gl.TEXTURE_2D, this.metaTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, this.metaAt, MW, rows, gl.RGBA_INTEGER, gl.INT, table.a, 0);
+    gl.uniform1i(u.u_row0, this.metaAt);
+    this.metaAt += rows;
     gl.uniform1i(u.u_meta, 1);
     gl.uniform2f(u.u_off, view.off[0], view.off[1]);
     gl.uniform2f(u.u_scale, view.scale[0], view.scale[1]);

@@ -1021,9 +1021,10 @@ class App {
       r.focused = o.focus.every(([fields, value]) => this.groupValue(r, fields) === value);
     }
     if (o.focus.length && runs.length && !runs.some((r) => r.focused)) o.focus = [];
+    const isRun = this.scopeIsRun;
     for (const r of runs) {
       r.inFocus = r.match && r.focused;
-      r.shown = r.inFocus && (!this.hidden.has(r.id) || this.scopeIsRun);
+      r.shown = r.inFocus && (!this.hidden.has(r.id) || isRun);
     }
     runs.sort((a, b) => this.compare(this.sortValue(a), this.sortValue(b)) || (b.meta.created || 0) - (a.meta.created || 0));
     this.groups = o.group.length ? this.buildGroups(runs) : new Map();
@@ -1052,14 +1053,15 @@ class App {
   }
 
 
-  /** Metrics logged by a run that passes the filter and group focus (null: every metric, when all
-   * runs pass); true when that set changed. */
+  /** Metric and media keys of the shown runs (null: every key, when all runs are shown); true when that set
+   * changed. */
   updateScopeKeys() {
-    const runs = this.runList.filter((r) => r.inFocus);
+    const runs = this.runList.filter((r) => r.shown);
     let keys = null;
     if (runs.length < this.runList.length) {
       keys = new Set();
       for (const r of runs) for (const k of r.meta.keys || []) keys.add(k);
+      for (const [k, m] of this.data.media) if (runs.some((r) => m.has(r.id))) keys.add(k);
     }
     const sig = keys ? [...keys].sort().join("\0") : null;
     if (sig === this.scopeKeySig) return false;
@@ -1544,7 +1546,7 @@ class App {
     return el;
   }
 
-  /** Sections of the panels passing the chart filter, in display order: pinned charts (in pin order; each also
+  /** Sections of the shown runs' panels passing the chart filter, in display order: pinned charts (in pin order; each also
    * stays in its own section), "charts" (keys without a slash), then a section per key prefix, nested by path,
    * media-only sections last at each level. A section is {id (its path), title, items: [[key, kind, pinned]],
    * children, n (panels in it and below)}. */
@@ -1565,7 +1567,7 @@ class App {
       n.items.push([key, kind, false]);
     };
     for (const k of this.data.keys.keys()) if (!this.scopeKeys || this.scopeKeys.has(k)) add(k, "metric");
-    for (const k of this.data.media.keys()) add(k, "media");
+    for (const k of this.data.media.keys()) if (!this.scopeKeys || this.scopeKeys.has(k)) add(k, "media");
     const pinOrder = new Map(this.pins.map((k, i) => [k, i]));
     pins.sort((a, b) => pinOrder.get(a[0]) - pinOrder.get(b[0]));
     const sorted = [...top.values()].map(orderSection).sort((a, b) => (a.id !== "charts") - (b.id !== "charts") || sectionCmp(a, b));
