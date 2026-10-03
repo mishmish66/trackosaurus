@@ -946,6 +946,49 @@ def run_labels(dirs: Sequence[Path], metas: Sequence[Mapping[str, JSONValue]]) -
     return [d.resolve().relative_to(common).as_posix() or d.name for d in dirs]
 
 
+@command("compact")
+def compact_cmd(paths: Annotated[list[str], typer.Argument(metavar="PATH...", help="Runs, or directories searched for runs.",
+                                                           show_default=False)]) -> None:
+    """Rewrite runs with their commits merged, which shrinks runs logged a few rows per commit; the one command that
+    writes run files. A run another process has open, such as one still being written, is skipped."""
+    import sqlite3
+
+    from .compact import InUse, compact
+    from .format import DB
+
+    found: list[Path] = []
+    for a in paths:
+        p = Path(a).expanduser()
+        if Q.is_run(p):
+            found.append(p)
+        elif p.is_dir():
+            found += sorted(d.parent for d in p.rglob(DB))
+        else:
+            sys.exit(f"trex compact: {a} is not a run or a directory")
+    before = after = done = skipped = failed = 0
+
+    def mb(b: int) -> str:
+        return f"{b / 1e6:,.1f} MB"
+
+    for i, run in enumerate(found, 1):
+        try:
+            r = compact(run)
+        except InUse:
+            skipped += 1
+            typer.echo(f"[{i}/{len(found)}] {run}: skipped, open in another process")
+            continue
+        except (ValueError, RuntimeError, sqlite3.Error, OSError) as e:
+            failed += 1
+            typer.echo(f"[{i}/{len(found)}] {run}: failed, left as it was: {e}", err=True)
+            continue
+        done, before, after = done + 1, before + r.bytes_before, after + r.bytes_after
+        typer.echo(f"[{i}/{len(found)}] {run}: {r.commits_before:,} -> {r.commits_after:,} commits, "
+                   f"{mb(r.bytes_before)} -> {mb(r.bytes_after)}")
+    typer.echo(f"compacted {done} runs, {mb(before)} -> {mb(after)}; {skipped} skipped, {failed} failed")
+    if failed:
+        raise SystemExit(1)
+
+
 @command("diff")
 def diff_cmd(runs: RunsArg, all_keys: Annotated[bool, typer.Option("--all", help="Include keys that are equal.")] = False,
              info: Annotated[bool, typer.Option("--info", help="Compare info instead of config.")] = False,

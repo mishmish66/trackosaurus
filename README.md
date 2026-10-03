@@ -40,6 +40,7 @@ run.finish()                                    # also at exit; an uncaught exce
 - Add `host:path` for another machine: trex runs there over ssh with `uvx`, so it needs only uv.
 - On a cluster, use a data-transfer node (`xfer:/scratch/me/runs`); jobs on any node stream live.
 - `trex systemd-unit` or `trex launchd-plist` (macOS) gives a service with an update button in the `trex` panel.
+- `trex compact DIR` shrinks runs written before compaction: their commits merged, the rows unchanged.
 
 ## Limits
 

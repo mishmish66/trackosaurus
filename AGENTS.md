@@ -18,10 +18,11 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/daemon.py` | `trex daemon`: `Roots` (tracked directories by spec, `unique_names`, workspaces; `roots.json`, remembered ones in `history.json`), the Unix control socket, its client |
 | `trex/workspace.py` | workspaces: `Workspace` merges member directories (`Local`, `Far`) behind the Explorer interface, renaming run ids |
 | `trex/remote.py` | `host:path` directories: `parse`, the ssh + `uvx` command, `Remote` (one ssh session, reconnected with backoff) |
+| `trex/compact.py` | `trex compact`: rewrites a run no process has open with its commits merged (exclusive lock, new file, verify, rename) |
 | `trex/update.py` | the daemon's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd or launchd to restart it |
 | `trex/query.py` | read-side queries for the CLI: records, field access, sorting, statistics, series |
 | `trex/where.py` | run filters: a SQL WHERE clause (or a name search) compiled to a test over a field getter |
-| `trex/cli.py` | `trex` command (Typer): `serve daemon systemd-unit launchd-plist ls groups keys tree show series tail media diff index` |
+| `trex/cli.py` | `trex` command (Typer): `serve daemon systemd-unit launchd-plist ls groups keys tree show series tail media diff index compact` |
 | `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (tile store, scheduler, IndexedDB, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (columns, smoothing, decimation, group stats, CRC-32), `where.js` (run filters, run fields, filter completion); `index.html` |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/`; the user guide is the `trex` and `trex.daemon` docstrings (Markdown) |
@@ -118,7 +119,8 @@ them WebGL falls back to software and timings mean nothing.
 ## Invariants (things that break silently if ignored)
 
 - **Explorer is read-only.** Nothing under a runs directory is ever created or modified by
-  `index.py`, `server.py`, `query.py` or the CLI. `connect_ro` opens runs without a `-wal` file as
+  `index.py`, `server.py`, `query.py` or the CLI, except `trex compact` (`compact.py`), which rewrites runs
+  no other process has open: a new file, verified, then atomically renamed over `trex.sqlite`. `connect_ro` opens runs without a `-wal` file as
   `immutable` so SQLite does not create `-wal`/`-shm`; a test asserts directory contents are
   unchanged. Callers re-check the file signature after reading.
 - **Sequence numbers are contiguous.** Rows and media are numbered 0, 1, 2, … per run; readers stop

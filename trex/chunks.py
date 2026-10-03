@@ -247,10 +247,7 @@ def prepare_merge(c: sqlite3.Connection, seq0: int, stop: int, first_id: int = 0
     merged: list[tuple[int, bytes]] = []
     values = 0
     for kid, group in _by_key(parts):
-        blob = _dense(group, sizes, n)
-        if blob is None:
-            blob, pos, vals = _merged(group, seq0, n)
-            _check(blob, pos, vals, n)
+        blob = merge_chunks(group, sizes, seq0, n)
         merged.append((kid, blob))
         values += struct.unpack_from("<II", blob)[1]
     return Merge(seq0, stop, [(s, k) for s, k, *_ in metas], first_id, len(parts), rowmeta, merged, values)
@@ -279,6 +276,17 @@ def merge(c: sqlite3.Connection, seq0: int, stop: int) -> int:
     return len(m.commits)
 
 
+def merge_chunks(parts: Sequence[tuple[int, bytes]], sizes: Mapping[int, int], seq0: int, n: int) -> bytes:
+    """One metric's chunk for the `n` rows from `seq0`, holding `parts` ((commit seq0, chunk), in row order) of
+    commits with `sizes` rows: their value bytes as they are when every part is dense and together they fill the
+    rows, else rebuilt, raising unless it decodes as readers decode it to the same values in the same rows."""
+    blob = _dense(parts, sizes, n)
+    if blob is None:
+        blob, pos, vals = _merged(parts, seq0, n)
+        _check(blob, pos, vals, n)
+    return blob
+
+
 def _by_key(parts: Sequence[tuple[int, int, bytes]]) -> list[tuple[int, list[tuple[int, bytes]]]]:
     out: list[tuple[int, list[tuple[int, bytes]]]] = []
     for kid, s, blob in parts:
@@ -304,14 +312,24 @@ def _dense(parts: Sequence[tuple[int, bytes]], sizes: Mapping[int, int], n: int)
 def _merged(parts: Sequence[tuple[int, bytes]], seq0: int, n: int) -> tuple[bytes, npt.NDArray[np.int64], Floats]:
     """One chunk of the `n` rows from `seq0` holding the values of `parts` (commit seq0, chunk), in row order, with
     the rows and values it should decode to."""
-    pos: list[npt.NDArray[np.int64]] = []
-    vals: list[Floats] = []
-    for s, blob in parts:
-        ch = decode(blob)
-        at = np.arange(len(ch.values), dtype=np.int64) if ch.positions is None else np.frombuffer(ch.positions, dtype="<u2").astype(np.int64)
-        pos.append(at + (s - seq0))
-        vals.append(np.frombuffer(ch.values, dtype="<f8"))
-    p, v = np.concatenate(pos), np.concatenate(vals)
+    counts: list[int] = []
+    sparse: list[bool] = []
+    pos_bytes: list[bytes] = []
+    val_bytes: list[bytes] = []
+    for _, blob in parts:
+        dense, m = struct.unpack_from("<II", blob)
+        off = 8 if dense else 8 + -(-2 * m // 8) * 8
+        counts.append(m)
+        sparse.append(not dense)
+        if not dense:
+            pos_bytes.append(blob[8: 8 + 2 * m])
+        val_bytes.append(blob[off: off + 8 * m])
+    k = np.array(counts, dtype=np.int64)
+    starts = np.cumsum(k) - k
+    p = np.arange(int(k.sum()), dtype=np.int64) - np.repeat(starts, k)  # each part's rows 0..m-1, as if dense
+    p[np.repeat(np.array(sparse), k)] = np.frombuffer(b"".join(pos_bytes), dtype="<u2")
+    p += np.repeat(np.array([s - seq0 for s, _ in parts], dtype=np.int64), k)
+    v = np.frombuffer(b"".join(val_bytes), dtype="<f8")
     return _blob(None if len(p) == n else p.astype("<u2").tobytes(), len(p), v.tobytes()), p, v
 
 

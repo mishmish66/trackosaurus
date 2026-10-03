@@ -20,6 +20,7 @@ SPEC: Final = re.compile(r"(?P<host>(?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s\[\]]+
 ADD_TIMEOUT: Final = 120.0  # seconds an add waits for the first start (uvx may install trex first)
 BACKOFF_MAX: Final = 60.0  # seconds between reconnection attempts, at most
 CLOSE_TIMEOUT: Final = 15.0  # seconds `close` waits for the session to end
+REMOTE_PYTHON: Final = "3.12"  # the oldest Python trex supports, whose numpy wheels reach the oldest glibc
 PROXY_TIMEOUT: Final = 120.0  # seconds a passed-through request may wait for the remote server
 SSH_OPTIONS: Final = ["-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
                       "-o", "StreamLocalBindMask=0177", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
@@ -50,11 +51,11 @@ def source() -> str:
 
 
 def remote_command(addr: Address, sock: str, src: str) -> str:
-    """The shell command that serves `addr.path` on the Unix socket `sock`, until its stdin closes, with numpy from a
-    wheel (the newest one for the host's glibc, as old cluster systems need), its index
+    """The shell command that serves `addr.path` on the Unix socket `sock`, until its stdin closes, on Python
+    REMOTE_PYTHON with numpy from a wheel (the newest one for the host's glibc, as old cluster systems need), its index
     on the host's local disk (never shared by two hosts, as a network home would be) and at most 4 index workers
     unless $TREX_WORKERS says otherwise there (remote hosts are often shared)."""
-    serve = shlex.join(["uvx", "--no-build-package", "numpy", "--from", src, "trex", "serve", addr.path, "--standalone", "--unix", sock,
+    serve = shlex.join(["uvx", "--python", REMOTE_PYTHON, "--no-build-package", "numpy", "--from", src, "trex", "serve", addr.path, "--standalone", "--unix", sock,
                         "--exit-on-eof"])
     script = (f'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"; command -v uvx >/dev/null || '
               f'{{ echo "{NO_UV}" >&2; exit 127; }}; NO_COLOR=1 PYTHONUNBUFFERED=1 TREX_WORKERS="${{TREX_WORKERS:-4}}" exec {serve} --cache "${{TMPDIR:-/tmp}}/trex-cache-$(id -u)"')
