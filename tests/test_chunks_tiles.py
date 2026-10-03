@@ -108,14 +108,29 @@ def test_a_merge_that_would_change_any_value_is_refused(db, monkeypatch):
     good = chunks._merged
 
     def flip_last_value(parts, seq0, n):
-        blob = bytearray(good(parts, seq0, n))
-        blob[-1] ^= 1
-        return bytes(blob)
+        blob, pos, vals = good(parts, seq0, n)
+        return bytes(blob[:-1]) + bytes([blob[-1] ^ 1]), pos, vals
 
     monkeypatch.setattr(chunks, "_merged", flip_last_value)
     db.execute("BEGIN")
-    with pytest.raises(RuntimeError, match="would change"):
+    with pytest.raises(RuntimeError, match="read back"):
         chunks.merge(db, 0, 24)
+    db.execute("ROLLBACK")
+    assert readback(db) == before and commits_of(db) == layout
+
+
+def test_a_merge_is_refused_once_its_commits_changed(db):
+    write_commits(db, SPARSE)
+    db.execute("BEGIN")
+    m = chunks.prepare_merge(db, 5, 24)
+    db.execute("COMMIT")
+    db.execute("BEGIN")
+    chunks.merge(db, 5, 14)
+    db.execute("COMMIT")
+    before, layout = readback(db), commits_of(db)
+    db.execute("BEGIN")
+    with pytest.raises(RuntimeError, match="changed"):
+        chunks.apply_merge(db, m)
     db.execute("ROLLBACK")
     assert readback(db) == before and commits_of(db) == layout
 

@@ -1,4 +1,4 @@
-"""Logging API. A background thread commits logged rows every `commit_interval` seconds and merges small
+"""Logging API. A background thread commits logged rows every `commit_interval` seconds, and another merges small
 commits as it goes; writer errors surface from `Run.finish`, never from logging."""
 
 import atexit
@@ -54,23 +54,40 @@ type VideoInput = str | os.PathLike[str] | bytes | bytearray | ArrayLike
 type FinalState = Literal["finished", "failed"]
 
 FAN_IN: Final = 8  # commits merged into one at a time
-SEALED: Final = FAN_IN ** 5  # rows of a commit that compaction leaves as it is
+SEALED: Final = FAN_IN ** 6  # values of a commit that compaction leaves as it is
+MERGE_VALUES: Final = 1 << 20  # values one merge may write
 
 
 def merge_plan(tail: Sequence[tuple[int, int]]) -> int | None:
-    """Where a merge through the newest commit starts in `tail` (a writer's newest commits as (seq0, rows), oldest
-    first), or None: the newest commits each under FAN_IN**t rows, for the smallest t with FAN_IN of them that fit
-    one commit together. Each row is rewritten about log_FAN_IN(SEALED) times."""
-    t = FAN_IN
-    while t <= SEALED:
-        k = rows = 0
-        while k < len(tail) and tail[-1 - k][1] < t and rows + tail[-1 - k][1] <= chunks.MAX_ROWS:
-            rows += tail[-1 - k][1]
-            k += 1
+    """Where a merge through the newest commit starts in `tail` (a writer's newest commits as (rows, values), oldest
+    first), or None: the newest commits each under FAN_IN**t values, for the smallest t with FAN_IN of them that fit
+    one merge together. Each value is rewritten about log_FAN_IN(SEALED) times."""
+    bound = FAN_IN
+    while bound <= SEALED:
+        k = rows = values = 0
+        while k < len(tail):
+            n, m = tail[-1 - k]
+            if m >= bound or rows + n > chunks.MAX_ROWS or values + m > MERGE_VALUES:
+                break
+            rows, values, k = rows + n, values + m, k + 1
         if k >= FAN_IN:
             return len(tail) - k
-        t *= FAN_IN
+        bound *= FAN_IN
     return None
+
+
+def sealed(rows: int, values: int) -> bool:
+    """Whether compaction leaves a commit as it is."""
+    return values >= SEALED or 2 * rows > chunks.MAX_ROWS
+
+
+class _Tail(NamedTuple):
+    """A commit compaction may merge."""
+
+    seq0: int
+    rows: int
+    values: int
+    first_id: int  # its chunks have rowids from here on
 
 
 class _Row(NamedTuple):
@@ -199,8 +216,12 @@ class Run:
         self._info = as_dict(meta["info"])
         self._rows: list[_Row] = []
         self._media: list[_Media] = []
-        self._tail: list[tuple[int, int]] = []  # this session's commits that compaction may merge, as (seq0, rows)
+        self._tail: list[_Tail] = []  # this session's commits that compaction may merge, oldest first
+        self._tail_lock = threading.Lock()
+        self._compact_wake = threading.Event()
         self._compacting = True
+        self._compactor = threading.Thread(target=self._compact_loop, name=f"trex-compact-{self.name}", daemon=True)
+        self._compactor.start()
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = False
@@ -290,7 +311,9 @@ class Run:
         self._finished = True
         self._state = state or ("failed" if self._failed else "finished")
         self._stop = True
+        self._compact_wake.set()
         self._wake.set()
+        self._compactor.join(timeout)
         self._thread.join(timeout)
         if sys.excepthook == self._excepthook:
             sys.excepthook = self._prev_hook
@@ -350,11 +373,17 @@ class Run:
         meta: dict[str, JSONValue] = {"heartbeat": time.time(), "summary": summary, "info": info}
         if final_state:
             meta["state"] = final_state
-        c.execute("BEGIN")
+        c.execute("BEGIN IMMEDIATE")
+        first_id: int = c.execute("SELECT coalesce(max(id), 0) + 1 FROM chunk").fetchone()[0]
         journal.replay(c, ops)
         c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [(k, json.dumps(v)) for k, v in meta.items()])
         c.execute("COMMIT")
-        self._tail += [(self._seq + i, min(chunks.MAX_ROWS, len(rows) - i)) for i in range(0, len(rows), chunks.MAX_ROWS)]
+        with self._tail_lock:
+            for i in range(0, len(rows), chunks.MAX_ROWS):
+                part = rows[i: i + chunks.MAX_ROWS]
+                self._tail.append(_Tail(self._seq + i, len(part), sum(len(r.values) for r in part), first_id))
+        if rows:
+            self._compact_wake.set()
         self._seq += len(rows)
         self._mseq += len(files)
         if self._journal is not None:
@@ -363,21 +392,57 @@ class Run:
             except OSError as e:
                 self._journal_failed(e)
 
-    def _compact(self, c: sqlite3.Connection) -> None:
-        """Merge this session's newest commits as `merge_plan` says, one transaction each. The run file holds the
-        same rows whatever happens; a failed merge stops compaction for the run. The journal keeps the commits as
-        written."""
-        while self._compacting and (i := merge_plan(self._tail)) is not None:
-            seq0, stop = self._tail[i][0], self._tail[-1][0] + self._tail[-1][1]
-            try:
-                _merge(c, seq0, stop)
-            except Exception as e:
-                self._compacting = False
-                print(f"[trex] compaction of {self.dir} stopped; its rows are unchanged: {e!r}", file=sys.stderr)
-                return
-            self._tail[i:] = [(seq0, stop - seq0)]
-            if stop - seq0 >= SEALED:
-                self._tail = []
+    def _compact_loop(self) -> None:
+        """Merge this session's newest commits as `merge_plan` says, apart from the commit thread: each merge is read
+        and checked outside any write lock, then swapped in by one short transaction, so commits wait only for the
+        swap. The run file holds the same rows whatever happens; a failed merge stops compaction for the run, and
+        stopping the run abandons a merge not yet swapped in. The journal keeps the commits as written."""
+        c: sqlite3.Connection | None = None
+        try:
+            while self._compacting:
+                self._compact_wake.wait()
+                self._compact_wake.clear()
+                if self._stop:
+                    return
+                c = c or connect_rw(self.dir)
+                while self._compacting and not self._stop and self._merge_next(c):
+                    pass
+        except Exception as e:
+            self._compacting = False
+            print(f"[trex] compaction of {self.dir} stopped; its rows are unchanged: {e!r}", file=sys.stderr)
+        finally:
+            if c is not None:
+                c.close()
+
+    def _merge_next(self, c: sqlite3.Connection) -> bool:
+        """Do the merge `merge_plan` asks for, if any; whether there was one."""
+        with self._tail_lock:
+            tail = list(self._tail)
+        i = merge_plan([(e.rows, e.values) for e in tail])
+        if i is None:
+            return False
+        j, last = len(tail), tail[-1]
+        c.execute("BEGIN")
+        try:
+            m = chunks.prepare_merge(c, tail[i].seq0, last.seq0 + last.rows, min(e.first_id for e in tail[i:]))
+        finally:
+            c.execute("COMMIT")
+        if self._stop:
+            return False
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            first = chunks.apply_merge(c, m)
+            c.execute("COMMIT")
+        except BaseException:
+            if c.in_transaction:
+                c.execute("ROLLBACK")
+            raise
+        rows = m.stop - m.seq0
+        with self._tail_lock:
+            self._tail[i:j] = [_Tail(m.seq0, rows, m.values, first)]
+            if sealed(rows, m.values):
+                del self._tail[: i + 1]
+        return True
 
     def _loop(self) -> None:
         c = connect_rw(self.dir)
@@ -387,7 +452,6 @@ class Run:
                 self._wake.clear()
                 stop = self._stop
                 self._commit(c, self._state if stop else None)
-                self._compact(c)
                 if stop:
                     return
         except Exception as e:  # surfaced by finish(); logging must never crash training
@@ -397,18 +461,6 @@ class Run:
             c.close()
             if self._journal is not None:
                 self._journal.close()
-
-
-def _merge(c: sqlite3.Connection, seq0: int, stop: int) -> None:
-    """Merge the commits of rows [seq0, stop) in one transaction: all of it lands, or none of it."""
-    c.execute("BEGIN IMMEDIATE")
-    try:
-        chunks.merge(c, seq0, stop)
-        c.execute("COMMIT")
-    except BaseException:
-        if c.in_transaction:
-            c.execute("ROLLBACK")
-        raise
 
 
 def _snapshot(c: sqlite3.Connection) -> list[journal.Op]:

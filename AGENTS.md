@@ -9,9 +9,9 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 |---|---|
 | `trex/format.py` | the run file: `trex.sqlite` schema (format 3), `connect_rw`, `connect_ro`. The contract between writer and readers. |
 | `trex/journal.py` | commit journal for runs on network filesystems: `Writer` (append + fsync), `records`, `sync` (replay into a local replica) |
-| `trex/chunks.py` | per-metric chunk codec: each commit is one `rowmeta` row (steps, times) plus one `chunk` per metric present; `merge` rewrites adjacent commits as one |
+| `trex/chunks.py` | per-metric chunk codec: each commit is one `rowmeta` row (steps, times) plus one `chunk` per metric present; `prepare_merge` / `apply_merge` rewrite adjacent commits as one |
 | `trex/tiles.py` | envelope pyramid tiles (min, max, mean, mean step, mean runtime and count per bucket), `top_tiles`, `build`, `coarsen`, `decode` |
-| `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread, which also merges small commits |
+| `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread, and a compactor thread that merges small commits |
 | `trex/media.py` | PNG/MP4 encoding for logged arrays (numpy and ffmpeg imported lazily) |
 | `trex/index.py` | `Explorer`: crawl, per-run scans (inline or process pool), index cache, top tiles, on-demand finer tiles with a size-bounded cache, event hub |
 | `trex/server.py` | read-only HTTP + SSE for the UI: `/api/runs`, `/api/tiles`, `/api/rows`, `/api/stream`, media |
@@ -60,10 +60,12 @@ them WebGL falls back to software and timings mean nothing.
 - **Run file** (`trex.sqlite`, SQLite in WAL mode, plus `media/`): `meta`, `media`, `keys`,
   `rowmeta(seq0, n, step_lo, step_hi, steps|times)` and `chunk(key_id, seq0, values)`. One commit
   of at most 65535 rows is one `rowmeta` row and one chunk per metric logged in it, so reading one
-  metric is an index range scan. After each commit the writer's thread merges its newest small commits
-  (`writer.merge_plan`: `FAN_IN` of a size tier at a time, up to `SEALED` rows), so a run logging a row
-  per commit stays near 8 bytes per value. Readers find rows by the commits that overlap them and never
-  depend on where commits begin or end.
+  metric is an index range scan. A second writer thread merges the session's newest small commits
+  (`writer.merge_plan`: `FAN_IN` commits of a value tier at a time, at most `MERGE_VALUES` values, and
+  never a `sealed` commit), so a run logging a row per commit stays near 8 bytes per value. It reads and
+  builds each merge outside any write lock and swaps it in with one short transaction, so commits wait
+  only for the swap. Readers find rows by the commits that overlap them and never depend on where
+  commits begin or end.
 - **Journal** (`trex.journal`, runs on network filesystems, or `TREX_JOURNAL=1`): every commit's inserts,
   appended and fsync'd, because SQLite's WAL is readable only on the writer's host. `connect_ro`
   reads a live journaled run (one with a `-wal`) from a replica in `$TREX_REPLICAS` (default
@@ -150,9 +152,11 @@ them WebGL falls back to software and timings mean nothing.
 - **Writer never crashes training.** Errors in the commit thread are recorded and raised from
   `finish()`, not from `log()`. Media files are written (temp name, then rename) before the row
   that references them commits.
-- **A killed writer loses no committed row.** Every commit and every merge is one SQLite transaction,
-  and a merge commits only if every metric and the rows' steps and times read back byte for byte as
-  before (`chunks.merge`). A failed merge stops merging for that run and changes nothing.
+- **A killed writer loses no committed row.** Every commit and every merge's swap is one SQLite
+  transaction. A swap applies only if its commits are still exactly the ones it read, and a merged
+  chunk either keeps its value bytes verbatim (dense) or must decode as readers decode it to the same
+  values in the same rows (`chunks.prepare_merge`). A failed merge stops merging for that run and
+  changes nothing; `finish()` abandons a merge not yet swapped in.
 - **Run identity is its path** (relative to the served root). A changed `meta.id` or a shrunken
   row count makes the explorer drop and re-index the run.
 
