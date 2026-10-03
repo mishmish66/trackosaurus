@@ -30,7 +30,7 @@ import numpy as np
 from . import chunks, tiles
 from .journal import JOURNAL
 from .format import (DB, INFO_FILE, JSONValue, MediaKind, RunState, as_dict, as_float, as_run_state, as_str, as_str_list,
-                     connect_ro)
+                     snapshot)
 
 type Sig = list[int]
 """[db mtime_ns, db size, wal mtime_ns, wal size]; 0s for a missing file."""
@@ -44,6 +44,7 @@ type Event = tuple[str, object]
 
 
 class MediaRecord(NamedTuple):
+    """A media item of a run."""
 
     run: str
     seq: int
@@ -56,6 +57,7 @@ class MediaRecord(NamedTuple):
 
 
 class TileRecord(NamedTuple):
+    """A tile of a metric of a run, as the index stores it."""
 
     key: str
     level: int
@@ -88,6 +90,8 @@ class Prev(TypedDict):
 
 
 class Job(TypedDict):
+    """A run to scan and how: `want_rows` when a browser watches it, `top_refresh` seconds between kept-tile rebuilds of
+    a growing run."""
 
     path: str
     dir: str
@@ -96,7 +100,6 @@ class Job(TypedDict):
     crash_after: float
     top_refresh: float
     want_rows: bool
-    quiet: bool
 
 
 class ScanResult(TypedDict):
@@ -115,9 +118,8 @@ class ScanResult(TypedDict):
     public: Public
     keys: list[str]
     summary: Summary | None
-    top: list[TileRecord] | None
+    kept: list[TileRecord] | None
     rows: str | None
-    quiet: bool
 
 
 class RunRecord(TypedDict):
@@ -169,11 +171,11 @@ class RunView(TypedDict):
     run: RunMeta
     media: list[MediaRecord]
 
-CACHE_VERSION: Final = 8  # bump whenever what the index stores changes; older caches are rebuilt
+CACHE_VERSION: Final = 10  # bump whenever what the index stores changes; older caches are rebuilt
 CRASH_AFTER = 300.0  # seconds without a heartbeat after which a running run shows as crashed
 POLL: Final = 1.0  # seconds between polls of known runs
 REWALK: Final = 3.0  # seconds between walks of the root for new and removed runs
-CACHED, TOP, OVERVIEW = 0, 1, 2  # tiles.top: what a stored tile is
+CACHED, TOP, OVERVIEW = 0, 1, 2  # values of tiles.kind
 KINDS: Final[dict[str, int]] = {"top": TOP, "overview": OVERVIEW}  # request names of the kept tile kinds
 OVERVIEW_UP: Final = 2  # overview tiles are top tiles merged this many levels coarser
 TOP_REFRESH = 10.0  # seconds between top-tile rebuilds of a growing run
@@ -189,16 +191,16 @@ ROWS_EVENT_MAX: Final = 20_000  # larger catch-ups reach browsers as refreshed t
 
 TABLES: Final = {
     "cache": "CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, value TEXT)",
-    "runs": "CREATE TABLE IF NOT EXISTS runs(path TEXT PRIMARY KEY, state TEXT NOT NULL)",
+    "runs": "CREATE TABLE IF NOT EXISTS runs(path TEXT PRIMARY KEY, record TEXT NOT NULL)",
     "media": "CREATE TABLE IF NOT EXISTS media(path TEXT, seq INTEGER, step REAL, key TEXT, kind TEXT, file TEXT, "
              "crc INTEGER, size INTEGER, PRIMARY KEY(path, seq)) WITHOUT ROWID",
-    # top: TOP for the coarsest tiles of a metric and OVERVIEW for those merged OVERVIEW_UP levels up
+    # kind: TOP for the coarsest tiles of a metric and OVERVIEW for those merged OVERVIEW_UP levels up
     # (both kept); CACHED for a finer tile built on request (evicted by `used`).
     # seq: run rows when built; a tile stays valid while later rows lie beyond its step range.
-    "tiles": "CREATE TABLE IF NOT EXISTS tiles(path TEXT, key TEXT, level INTEGER, idx INTEGER, top INTEGER, "
+    "tiles": "CREATE TABLE IF NOT EXISTS tiles(path TEXT, key TEXT, level INTEGER, idx INTEGER, kind INTEGER, "
              "seq INTEGER, used REAL, data BLOB, PRIMARY KEY(path, key, level, idx))",
-    "tiles_kind": "CREATE INDEX IF NOT EXISTS tiles_kind ON tiles(key, top)",
-    "tiles_used": "CREATE INDEX IF NOT EXISTS tiles_used ON tiles(top, used)",
+    "tiles_kind": "CREATE INDEX IF NOT EXISTS tiles_kind ON tiles(key, kind)",
+    "tiles_used": "CREATE INDEX IF NOT EXISTS tiles_used ON tiles(kind, used)",
 }
 
 
@@ -208,11 +210,8 @@ def dumps(obj: object) -> str:
 
 
 def wire(d: Mapping[str, float]) -> dict[str, float | str]:
-    """Metrics for JSON: non-finite values as "NaN", "Infinity", "-Infinity"."""
-    out: dict[str, float | str] = {}
-    for k, v in d.items():
-        out[k] = v if math.isfinite(v) else "NaN" if v != v else "Infinity" if v > 0 else "-Infinity"
-    return out
+    """Metrics for JSON: non-finite values as "nan", "inf", "-inf"."""
+    return {k: v if math.isfinite(v) else str(v) for k, v in d.items()}
 
 
 def sse(event: str, data: object) -> bytes:
@@ -331,32 +330,29 @@ def _top_tiles(c: sqlite3.Connection, names: Mapping[int, str], stop: int) -> li
 def scan(job: Job) -> ScanResult | None:
     """What changed in a run, or None to retry later (no id yet, or changed while read without a WAL)."""
     path, d, sig, prev = job["path"], Path(job["dir"]), job["sig"], job["prev"]
-    c = connect_ro(d)
-    try:
-        c.execute("BEGIN")
+    with snapshot(d) as c:
         meta: dict[str, JSONValue] = {k: json.loads(v) for k, v in c.execute("SELECT key, value FROM meta")}
         if "id" not in meta:
             return None
         state, heartbeat = _state(meta, job["crash_after"])
         seq = chunks.row_count(c)
-        m_file: int = c.execute("SELECT coalesce(max(seq) + 1, 0) FROM media").fetchone()[0]
-        reset = prev is not None and _rewritten(prev, meta["id"], seq, m_file)
+        media_count: int = c.execute("SELECT coalesce(max(seq) + 1, 0) FROM media").fetchone()[0]
+        reset = prev is not None and _rewritten(prev, meta["id"], seq, media_count)
         prev = None if reset else prev
         names = chunks.key_names(c)
         summary = _summary(c, names, seq) if prev is None or seq != prev["seq"] else None
-        top = _top_tiles(c, names, seq) if _top_due(prev, seq, state, job["top_refresh"]) else None
-        text = _rows_text(c, path, prev["seq"], seq) if prev and _rows_wanted(job, prev, seq) else None
+        kept = _top_tiles(c, names, seq) if _top_due(prev, seq, state, job["top_refresh"]) else None
+        text = (_rows_event(path, prev["seq"], chunks.rows(c, prev["seq"], seq))
+                if prev and _rows_wanted(job, prev, seq) else None)
         mseq = prev["mseq"] if prev else 0
         media = _new_media(c, d, path, mseq)
-    finally:
-        c.close()
     after = _stat_sig(d)
     if after != sig and not (sig[2] and after[2]):
         return None
     return {"path": path, "sig": sig, "uid": str(meta["id"]), "reset": reset, "fresh": prev is None,
             "seq": seq, "mseq": mseq + len(media), "media": media,
             "state": state, "heartbeat": heartbeat, "public": _public(meta, state), "keys": sorted(names.values()),
-            "summary": summary, "top": top, "rows": text, "quiet": job["quiet"]}
+            "summary": summary, "kept": kept, "rows": text}
 
 
 def _state(meta: Mapping[str, JSONValue], crash_after: float) -> tuple[RunState, float | None]:
@@ -369,10 +365,8 @@ def _state(meta: Mapping[str, JSONValue], crash_after: float) -> tuple[RunState,
 
 def _summary(c: sqlite3.Connection, names: Mapping[int, str], seq: int) -> Summary:
     out = wire(_last_values(c, names))
-    if seq:
-        n, data = c.execute("SELECT n, data FROM rowmeta WHERE seq0 + n = ?", (seq,)).fetchone()
-        mv = memoryview(data).cast("d")
-        out["_step"], out["_runtime"] = mv[n - 1], mv[2 * n - 1]
+    if (last := chunks.last_step_and_time(c, seq)) is not None:
+        out["_step"], out["_runtime"] = last
     return out
 
 
@@ -391,12 +385,13 @@ def _rewritten(prev: Prev, uid: JSONValue, rows: int, media: int) -> bool:
 
 def _rows_wanted(job: Job, prev: Prev, seq: int) -> bool:
     """A rows event goes to watching browsers, unless the catch-up is large (tiles serve it)."""
-    return job["want_rows"] and not job["quiet"] and 0 < seq - prev["seq"] <= ROWS_EVENT_MAX
+    return job["want_rows"] and 0 < seq - prev["seq"] <= ROWS_EVENT_MAX
 
 
-def _rows_text(c: sqlite3.Connection, path: str, start: int, stop: int) -> str:
-    rows = ",".join(dumps([r.step, r.t, wire(r.values)]) for r in chunks.rows(c, start, stop))
-    return f'{{"run":{dumps(path)},"seq0":{start},"rows":[{rows}]}}'
+def _rows_event(path: str, start: int, rows: Sequence[chunks.Row]) -> str:
+    """JSON of the `rows` event for `rows` of run `path`, the first of them row `start`; `run` comes first."""
+    text = ",".join(dumps([r.step, r.t, wire(r.values)]) for r in rows)
+    return f'{{"run":{dumps(path)},"seq0":{start},"rows":[{text}]}}'
 
 
 def _new_media(c: sqlite3.Connection, d: Path, path: str, mseq: int) -> list[MediaRecord]:
@@ -467,7 +462,7 @@ def _events(r: ScanResult, cur: RunRecord | None, st: RunRecord) -> list[Event]:
     media: list[Event] = [("media", m) for m in r["media"]]
     if cur is None:
         return [("run", None), *rows, *media]
-    changed = r["fresh"] or r["quiet"] or r["top"] is not None or r["public"] != cur["public"] or st["keys"] != cur["keys"]
+    changed = r["fresh"] or r["kept"] is not None or r["public"] != cur["public"] or st["keys"] != cur["keys"]
     return [*rows, *media, *([("run", None)] if changed else [])]
 
 
@@ -500,8 +495,17 @@ class TileBudget:
         self.members: "list[Explorer]" = []
         self.lock = threading.Lock()
 
+    def join(self, ex: "Explorer") -> None:
+        with self.lock:
+            self.members.append(ex)
+
+    def leave(self, ex: "Explorer") -> None:
+        with self.lock:
+            if ex in self.members:
+                self.members.remove(ex)
+
     def used(self) -> int:
-        return sum(m._tile_bytes for m in list(self.members))
+        return sum(m.cached_bytes for m in list(self.members))
 
     def enforce(self) -> None:
         limit = self.limit if self.limit is not None else TILE_CACHE_BYTES
@@ -510,9 +514,9 @@ class TileBudget:
         with self.lock:
             while (excess := self.used() - int(0.9 * limit)) > 0:
                 members = list(self.members)
-                oldest = sorted((t, i) for i, m in enumerate(members) if (t := m._oldest_cached()) is not None)
+                oldest = sorted((t, i) for i, m in enumerate(members) if (t := m.oldest_cached()) is not None)
                 bound = oldest[1][0] if len(oldest) > 1 else math.inf
-                if not oldest or not members[oldest[0][1]]._evict(bound, excess):
+                if not oldest or not members[oldest[0][1]].evict(bound, excess):
                     return
 
 
@@ -527,35 +531,34 @@ class Explorer:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "root.txt").write_text(str(self.root) + "\n")
         self.db_path = self.cache_dir / "index.sqlite"
-        self.w = self._connect()
+        self._writer = self._connect()
         for sql in TABLES.values():
-            self.w.execute(sql)
-        v = self.w.execute("SELECT value FROM cache WHERE key='version'").fetchone()
+            self._writer.execute(sql)
+        v = self._writer.execute("SELECT value FROM cache WHERE key='version'").fetchone()
         if v is None or int(v[0]) != CACHE_VERSION:
-            self.w.execute("BEGIN IMMEDIATE")
-            for t in [r[0] for r in self.w.execute("SELECT name FROM sqlite_master WHERE type='table' AND name != 'cache'")]:
-                self.w.execute(f"DROP TABLE {t}")
+            self._writer.execute("BEGIN IMMEDIATE")
+            for t in [r[0] for r in self._writer.execute("SELECT name FROM sqlite_master WHERE type='table' AND name != 'cache'")]:
+                self._writer.execute(f"DROP TABLE {t}")
             for name, sql in TABLES.items():
                 if name != "cache":
-                    self.w.execute(sql)
-            self.w.execute("INSERT OR REPLACE INTO cache VALUES ('version', ?)", (str(CACHE_VERSION),))
-            self.w.execute("COMMIT")
+                    self._writer.execute(sql)
+            self._writer.execute("INSERT OR REPLACE INTO cache VALUES ('version', ?)", (str(CACHE_VERSION),))
+            self._writer.execute("COMMIT")
+        self._write_lock = threading.Lock()  # serializes every use of `_writer`
         self.lock = threading.Lock()
         self.hub = Hub()
-        self.state: dict[str, RunRecord] = {path: json.loads(s) for path, s in self.w.execute("SELECT path, state FROM runs")}
+        self.records: dict[str, RunRecord] = {path: json.loads(s) for path, s in self._writer.execute("SELECT path, record FROM runs")}
         self.dirs: dict[str, Path] = {}
         self.folders: dict[str, tuple[int, dict[str, JSONValue]]] = {}  # folder path -> (mtime_ns, notes) of trex_info.json files
         self._readers: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue()
-        self._tile_lock = threading.Lock()
-        self._tile_w = self._connect()
-        self._tile_bytes: int = self._tile_w.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE top = ?",
-                                                     (CACHED,)).fetchone()[0]
+        self.cached_bytes: int = self._writer.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE kind = ?",
+                                                      (CACHED,)).fetchone()[0]
         self._stop = threading.Event()
         self._poller: threading.Thread | None = None
         self._closed = False
         self.ready = threading.Event()
         self.budget = budget or TileBudget()
-        self.budget.members.append(self)
+        self.budget.join(self)
 
     def __enter__(self) -> Self:
         return self
@@ -575,13 +578,10 @@ class Explorer:
         if self._poller is not None and self._poller is not threading.current_thread():
             self._poller.join(CLOSE_WAIT)
         self.hub.close()
-        with self.budget.lock:
-            if self in self.budget.members:
-                self.budget.members.remove(self)
-        with self.lock, self._tile_lock:
+        self.budget.leave(self)
+        with self.lock, self._write_lock:
             self._closed = True
-            self.w.close()
-            self._tile_w.close()
+            self._writer.close()
         while not self._readers.empty():
             self._readers.get_nowait().close()
 
@@ -618,13 +618,12 @@ class Explorer:
                 entries = list(os.scandir(d))
             except OSError:
                 continue
+            rel = Path(d).relative_to(self.root).as_posix()
             if any(e.name == DB and e.is_file() for e in entries):
-                rel = Path(d).relative_to(self.root).as_posix()
-                found["." if rel == "." else rel] = Path(d)
+                found[rel] = Path(d)
                 continue
             for e in entries:
                 if e.name == INFO_FILE and e.is_file():
-                    rel = Path(d).relative_to(self.root).as_posix()
                     infos["" if rel == "." else rel] = Path(e.path)
                 if e.is_dir(follow_symlinks=False) and not e.name.startswith(".") and e.name not in SKIP_DIRS:
                     stack.append(Path(e.path))
@@ -637,14 +636,17 @@ class Explorer:
         return d
 
     def poll_forever(self) -> None:
-        """Until `stop`; sets `ready` after the first pass."""
+        """Until `stop`; sets `ready` after the first pass. A failed pass is logged and the next one runs."""
         last_walk = 0.0
         while not self._stop.is_set():
             t0 = time.time()
-            if t0 - last_walk >= REWALK:
-                self.rewalk()
-                last_walk = t0
-            self.poll()
+            try:
+                if t0 - last_walk >= REWALK:
+                    self.rewalk()
+                    last_walk = t0
+                self.poll()
+            except Exception as e:
+                print(f"[trex] {self.root}: index pass failed: {e!r}", file=sys.stderr, flush=True)
             self.ready.set()
             self._stop.wait(max(0.0, POLL - (time.time() - t0)))
 
@@ -654,7 +656,7 @@ class Explorer:
     def rewalk(self) -> None:
         found, infos = self.walk()
         with self.lock:
-            gone = [p for p in self.state if p not in found]
+            gone = [p for p in self.records if p not in found]
             self.dirs = found
         for p in gone:
             self.drop(p, publish=True)
@@ -679,7 +681,7 @@ class Explorer:
         todo: list[tuple[str, Path, Sig]] = []
         growth = 0
         for path, d in list(self.dirs.items()):
-            st, sig = self.state.get(path), _stat_sig(d)
+            st, sig = self.records.get(path), _stat_sig(d)
             if st is None or _needs_scan(st, sig, now):
                 todo.append((path, d, sig))
                 growth += _bytes_of(sig) - (_bytes_of(st["sig"]) if st else 0)
@@ -692,13 +694,13 @@ class Explorer:
     # ---- per-run sync ----
 
     def _job(self, path: str, d: Path, sig: Sig) -> Job:
-        st = self.state.get(path)
+        st = self.records.get(path)
         prev: Prev | None = None
         if st:
             prev = {"uid": st["uid"], "seq": st["seq"], "mseq": st["mseq"], "tiles_seq": st["tiles_seq"],
                     "tiles_t": st["tiles_t"], "tiles_state": st["tiles_state"]}
         return {"path": path, "dir": str(d), "sig": sig, "prev": prev, "crash_after": CRASH_AFTER,
-                "top_refresh": TOP_REFRESH, "want_rows": self.hub.watched(path), "quiet": False}
+                "top_refresh": TOP_REFRESH, "want_rows": self.hub.watched(path)}
 
     def _sync_inline(self, todo: Sequence[tuple[str, Path, Sig]]) -> None:
         batch = _Batch(self)
@@ -708,7 +710,7 @@ class Explorer:
             j = self._job(*t)
             try:
                 batch.add(scan(j))
-            except READ_ERRORS as e:
+            except Exception as e:
                 print(f"[trex] {j['path']}: {e!r}", file=sys.stderr, flush=True)
             if batch.full():
                 batch.commit()
@@ -743,14 +745,17 @@ class Explorer:
 
     def drop(self, path: str, publish: bool = False) -> None:
         with self.lock:
-            self.state.pop(path, None)
-        with self._tile_lock:
+            self.records.pop(path, None)
+        with self._write_lock:
             if self._closed:
                 return
-            self.w.execute("BEGIN IMMEDIATE")
-            for t in ("runs", "media", "tiles"):
-                self.w.execute(f"DELETE FROM {t} WHERE path=?", (path,))
-            self.w.execute("COMMIT")
+            self._writer.execute("BEGIN IMMEDIATE")
+            try:
+                self._forget(path)
+            except BaseException:
+                self._writer.execute("ROLLBACK")
+                raise
+            self._writer.execute("COMMIT")
         if publish:
             self.hub.publish(path, "delete", {"run": path})
 
@@ -759,21 +764,21 @@ class Explorer:
         staged: dict[str, RunRecord] = {}
         events: list[tuple[str, list[Event]]] = []
         now = time.time()
-        with self._tile_lock:
+        with self._write_lock:
             if self._closed:
                 return
-            self.w.execute("BEGIN IMMEDIATE")
+            self._writer.execute("BEGIN IMMEDIATE")
             try:
                 for r in results:
-                    st, ev = self._stage(r, staged.get(r["path"]) or self.state.get(r["path"]), now)
+                    st, ev = self._stage(r, staged.get(r["path"]) or self.records.get(r["path"]), now)
                     staged[r["path"]] = st
                     events.append((r["path"], ev))
             except BaseException:
-                self.w.execute("ROLLBACK")
+                self._writer.execute("ROLLBACK")
                 raise
-            self.w.execute("COMMIT")
+            self._writer.execute("COMMIT")
         with self.lock:
-            self.state.update(staged)
+            self.records.update(staged)
         for path, ev in events:
             for kind, data in ev:
                 if kind == "run":
@@ -787,31 +792,35 @@ class Explorer:
         """Write one scan result inside `apply`'s transaction; its record and events."""
         path, ev = r["path"], list[Event]()
         if r["reset"] and cur is not None:
-            for t in ("runs", "media", "tiles"):
-                self.w.execute(f"DELETE FROM {t} WHERE path=?", (path,))
+            self._forget(path)
             ev.append(("delete", {"run": path}))
             cur = None
         if r["media"]:
-            self.w.executemany("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?,?,?)", r["media"])
+            self._writer.executemany("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?,?,?)", r["media"])
         st = _record(r, cur)
-        if r["top"] is not None:
-            self.w.execute("DELETE FROM tiles WHERE path=? AND top != ?", (path, CACHED))
-            self.w.executemany("INSERT OR REPLACE INTO tiles VALUES (?,?,?,?,?,?,?,?)",
-                               [(path, t.key, t.level, t.idx, t.kind, r["seq"], now, t.data) for t in r["top"]])
+        if r["kept"] is not None:
+            self._writer.execute("DELETE FROM tiles WHERE path=? AND kind != ?", (path, CACHED))
+            self._writer.executemany("INSERT OR REPLACE INTO tiles VALUES (?,?,?,?,?,?,?,?)",
+                                     [(path, t.key, t.level, t.idx, t.kind, r["seq"], now, t.data) for t in r["kept"]])
             st.update(tiles_seq=r["seq"], tiles_t=now, tiles_state=r["state"])
-        self.w.execute("INSERT OR REPLACE INTO runs VALUES (?, ?)", (path, dumps(st)))
+        self._writer.execute("INSERT OR REPLACE INTO runs VALUES (?, ?)", (path, dumps(st)))
         return st, ev + _events(r, cur, st)
+
+    def _forget(self, path: str) -> None:
+        """Delete a run's index rows inside the caller's write transaction."""
+        for t in ("runs", "media", "tiles"):
+            self._writer.execute(f"DELETE FROM {t} WHERE path=?", (path,))
 
     # ---- queries ----
 
     def run_meta(self, path: str) -> RunMeta:
-        st = self.state[path]
+        st = self.records[path]
         p = st["public"]
         parent = path.rsplit("/", 1)[0] if "/" in path else ""
         return {
             "id": path, "uid": st["uid"], "name": p.get("name") or path.rsplit("/", 1)[-1], "parent": parent,
-            "tags": p.get("tags") or [], "config": p.get("config") or {}, "info": p.get("info") or {},
-            "summary": {**p["user_summary"], **(st["summary"] or {})},
+            "tags": p["tags"], "config": p["config"], "info": p["info"],
+            "summary": {**p["user_summary"], **st["summary"]},
             "state": st["state"], "created": p.get("created"), "updated": st["heartbeat"],
             "seq": st["seq"], "mseq": st["mseq"], "keys": st["keys"], "tiles_seq": st["tiles_seq"],
         }
@@ -821,11 +830,11 @@ class Explorer:
 
     def tree(self) -> list[tuple[str, RunState]]:
         with self.lock:
-            return [(p, st["state"]) for p, st in sorted(self.state.items())]
+            return [(p, st["state"]) for p, st in sorted(self.records.items())]
 
     def runs(self, prefix: str) -> RunsView:
         with self.lock:
-            paths = [p for p in self.state if in_scope(p, prefix)]
+            paths = [p for p in self.records if in_scope(p, prefix)]
             metas = [self.run_meta(p) for p in sorted(paths)]
         c = self.reader()
         try:
@@ -846,39 +855,37 @@ class Explorer:
         out["media"] = [m for m in out["media"] if m[0] == path]
         return {"run": out["runs"][0], "media": out["media"]}
 
-    def rows_json(self, path: str, frm: int, stop: int | None = None) -> tuple[str, int]:
-        """(`rows` event JSON, row count) for rows [frm, stop) of the run file."""
+    def _read_rows(self, path: str, start: int, stop: int | None = None) -> list[chunks.Row]:
+        """Rows [start, stop) of the run file (to its last row when `stop` is None); KeyError for an unknown run."""
         with self.lock:
-            if path not in self.state:
+            if path not in self.records:
                 raise KeyError(path)
-        c = connect_ro(self.run_dir(path))
-        try:
-            c.execute("BEGIN")
-            rows = chunks.rows(c, frm, stop if stop is not None else chunks.row_count(c))
-        finally:
-            c.close()
-        parts = [dumps([r.step, r.t, wire(r.values)]) for r in rows]
-        return f'{{"run":{dumps(path)},"seq0":{frm},"rows":[{",".join(parts)}]}}', len(parts)
+        with snapshot(self.run_dir(path)) as c:
+            return chunks.rows(c, start, stop if stop is not None else chunks.row_count(c))
+
+    def rows_json(self, path: str, start: int, stop: int | None = None) -> str:
+        """The `rows` event JSON of rows [start, stop) of the run file."""
+        return _rows_event(path, start, self._read_rows(path, start, stop))
 
     def backfill(self, prefix: str) -> list[bytes]:
         """`rows` events for running runs' rows beyond their kept tiles."""
         with self.lock:
-            tails = [(p, st["tiles_seq"], st["seq"]) for p, st in self.state.items()
+            tails = [(p, st["tiles_seq"], st["seq"]) for p, st in self.records.items()
                      if in_scope(p, prefix) and st["state"] == "running" and 0 < st["seq"] - st["tiles_seq"] <= ROWS_EVENT_MAX]
         out: list[bytes] = []
-        for p, frm, stop in tails:
+        for p, start, stop in tails:
             try:
-                text, n = self.rows_json(p, frm, stop)
+                rows = self._read_rows(p, start, stop)
             except READ_ERRORS:
                 continue
-            if n:
-                out.append(sse_text("rows", text))
+            if rows:
+                out.append(sse_text("rows", _rows_event(p, start, rows)))
         return out
 
     def live_seqs(self, prefix: str) -> dict[str, tuple[int, int]]:
         """{path: (rows, media)} of running runs."""
         with self.lock:
-            return {p: (st["seq"], st["mseq"]) for p, st in self.state.items()
+            return {p: (st["seq"], st["mseq"]) for p, st in self.records.items()
                     if in_scope(p, prefix) and st["state"] == "running"}
 
     # ---- tiles ----
@@ -893,13 +900,13 @@ class Explorer:
             for req in requests:
                 path, key = str(req[0]), str(req[1])
                 with self.lock:
-                    st = self.state.get(path)
+                    st = self.records.get(path)
                 if st is None or key not in st["keys"]:
                     out.append([])
                     continue
                 if isinstance(req[2], str) and req[2] in KINDS:
                     out.append([r[0] for r in c.execute(
-                        "SELECT data FROM tiles WHERE path=? AND key=? AND top=? ORDER BY idx", (path, key, KINDS[req[2]]))])
+                        "SELECT data FROM tiles WHERE path=? AND key=? AND kind=? ORDER BY idx", (path, key, KINDS[req[2]]))])
                     continue
                 level, idx = _int(req[2]), _int(req[3])
                 if not tiles.MIN_LEVEL <= level <= tiles.MAX_LEVEL:
@@ -916,8 +923,8 @@ class Explorer:
         finally:
             self.release(c)
         if hits:
-            with self._tile_lock:
-                self._tile_w.executemany("UPDATE tiles SET used=? WHERE path=? AND key=? AND level=? AND idx=?",
+            with self._write_lock:
+                self._writer.executemany("UPDATE tiles SET used=? WHERE path=? AND key=? AND level=? AND idx=?",
                                          [(time.time(), *h) for h in hits])
         return out
 
@@ -925,7 +932,7 @@ class Explorer:
         """[(path, tiles)] of one kept kind of one metric for every run under `scope`."""
         c = self.reader()
         try:
-            rows = c.execute("SELECT path, data FROM tiles WHERE key=? AND top=? ORDER BY path, idx", (key, KINDS[kind])).fetchall()
+            rows = c.execute("SELECT path, data FROM tiles WHERE key=? AND kind=? ORDER BY path, idx", (key, KINDS[kind])).fetchall()
         finally:
             self.release(c)
         out: list[tuple[str, list[bytes]]] = []
@@ -940,58 +947,51 @@ class Explorer:
 
     def _still_valid(self, path: str, level: int, idx: int, seq: int) -> bool:
         """Whether every row after `seq` lies beyond the tile."""
-        lo, hi = tiles.tile_range(level, idx)
-        c = connect_ro(self.run_dir(path))
-        try:
+        _, hi = tiles.tile_range(level, idx)
+        with snapshot(self.run_dir(path)) as c:
             first = c.execute("SELECT min(step_lo) FROM rowmeta WHERE seq0 + n > ?", (seq,)).fetchone()[0]
-        finally:
-            c.close()
         return first is None or first >= hi
 
     def _build(self, path: str, key: str, level: int, idx: int) -> tuple[bytes, int]:
         """(tile, run rows read) from the run file."""
         lo, hi = tiles.tile_range(level, idx)
-        c = connect_ro(self.run_dir(path))
-        try:
-            c.execute("BEGIN")
+        with snapshot(self.run_dir(path)) as c:
             kid = c.execute("SELECT id FROM keys WHERE name=?", (key,)).fetchone()
             stop = chunks.row_count(c)
             if kid is None:
                 e = np.empty(0)
                 return tiles.build(e, e, e, level, idx), stop
             s, v, t = chunks.metric(c, kid[0], stop=stop, step_lo=lo, step_hi=hi)
-        finally:
-            c.close()
         return tiles.build(s, v, t, level, idx), stop
 
     def _store(self, path: str, key: str, level: int, idx: int, seq: int, blob: bytes) -> None:
         """Cache a built tile within the tile budget."""
-        with self._tile_lock:
-            old = self._tile_w.execute("SELECT length(data), top FROM tiles WHERE path=? AND key=? AND level=? AND idx=?",
+        with self._write_lock:
+            old = self._writer.execute("SELECT length(data), kind FROM tiles WHERE path=? AND key=? AND level=? AND idx=?",
                                        (path, key, level, idx)).fetchone()
-            if old and old[1]:
+            if old and old[1] != CACHED:
                 return
-            self._tile_w.execute("INSERT OR REPLACE INTO tiles VALUES (?,?,?,?,?,?,?,?)",
+            self._writer.execute("INSERT OR REPLACE INTO tiles VALUES (?,?,?,?,?,?,?,?)",
                                  (path, key, level, idx, CACHED, seq, time.time(), blob))
-            self._tile_bytes += len(blob) - (old[0] if old else 0)
+            self.cached_bytes += len(blob) - (old[0] if old else 0)
         self.budget.enforce()
 
-    def _oldest_cached(self) -> float | None:
+    def oldest_cached(self) -> float | None:
         """When the least recently used cached tile was last used."""
-        with self._tile_lock:
-            return None if self._closed else self._tile_w.execute("SELECT min(used) FROM tiles WHERE top=?", (CACHED,)).fetchone()[0]
+        with self._write_lock:
+            return None if self._closed else self._writer.execute("SELECT min(used) FROM tiles WHERE kind=?", (CACHED,)).fetchone()[0]
 
-    def _evict(self, before: float, nbytes: int) -> int:
+    def evict(self, before: float, nbytes: int) -> int:
         """Evict cached tiles last used at or before `before`, oldest first, until `nbytes` are freed; how many."""
-        with self._tile_lock:
-            rows = self._tile_w.execute("SELECT path, key, level, idx, length(data) FROM tiles WHERE top=? AND used<=? "
+        with self._write_lock:
+            rows = self._writer.execute("SELECT path, key, level, idx, length(data) FROM tiles WHERE kind=? AND used<=? "
                                         "ORDER BY used LIMIT 512", (CACHED, before)).fetchall()
             n = 0
             for p, k, lv, i, size in rows:
                 if nbytes <= 0:
                     break
-                self._tile_w.execute("DELETE FROM tiles WHERE path=? AND key=? AND level=? AND idx=?", (p, k, lv, i))
-                self._tile_bytes -= size
+                self._writer.execute("DELETE FROM tiles WHERE path=? AND key=? AND level=? AND idx=?", (p, k, lv, i))
+                self.cached_bytes -= size
                 nbytes -= size
                 n += 1
             return n

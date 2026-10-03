@@ -214,8 +214,8 @@ export class Points {
     return true;
   }
 
-  /** Overwrite points [off, off + n) with `data` from point `from`. */
-  write(off, data, n, from = 0) {
+  /** Overwrite points [off, off + n) with the first `n` points of `data`. */
+  write(off, data, n) {
     const gl = this.r.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     let i = 0;
@@ -224,16 +224,12 @@ export class Points {
       let w, h;
       if (col !== 0 || n - i < TW) (w = Math.min(TW - col, n - i)), (h = 1);
       else (w = TW), (h = Math.floor((n - i) / TW));
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, col, row, w, h, gl.RG, gl.FLOAT, data, 2 * (from + i));
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, col, row, w, h, gl.RG, gl.FLOAT, data, 2 * i);
       i += w * h;
     }
   }
 
   /** Free the texture; `live` turns false so the owner rebuilds. */
-  evict() {
-    this.release();
-  }
-
   release() {
     if (this.tex && this.gen === this.r.gen) this.r.gl.deleteTexture(this.tex);
     this.tex = null;
@@ -257,7 +253,7 @@ export class Table {
   clear() {
     this.n = 0;
   }
-  push(off, count, color, alpha = 1) {
+  push(off, count, color) {
     if (4 * (this.n + 1) > this.a.length) {
       const b = new Int32Array(this.a.length * 2);
       b.set(this.a);
@@ -267,7 +263,7 @@ export class Table {
     this.a[k] = off;
     this.a[k + 1] = count;
     this.a[k + 2] = (c[0] << 16) | (c[1] << 8) | c[2];
-    this.a[k + 3] = Math.round(c[3] * alpha);
+    this.a[k + 3] = c[3];
   }
 }
 
@@ -312,7 +308,7 @@ class Renderer {
     });
     try {
       this.progs = make(!!this.multi);
-    } catch (e) {
+    } catch {
       this.multi = null;
       this.progs = make(false);
     }
@@ -363,13 +359,13 @@ class Renderer {
     this.lru.set(owner, ++this.clock);
   }
 
-  /** Release least recently used owners (with `evict()`) until under budget, keeping `keep`. */
+  /** Release least recently used Points until under budget, keeping `keep`. */
   trim(keep) {
     if (this.bytes <= this.budget) return;
     const order = [...this.lru].sort((a, b) => a[1] - b[1]);
     for (const [o] of order) {
       if (this.bytes <= this.budget) break;
-      if (!keep.has(o) && o.evict) o.evict();
+      if (!keep.has(o)) o.release();
     }
   }
 
@@ -547,11 +543,6 @@ class Renderer {
     ctx.drawImage(this.canvas, 0, 0, this.W, this.H, 0, 0, this.W, this.H);
     ctx.restore();
   }
-
-  /** Block until the GPU has finished queued work. */
-  sync() {
-    this.gl.readPixels(0, 0, 1, 1, this.gl.RGBA, this.gl.UNSIGNED_BYTE, new Uint8Array(4));
-  }
 }
 
 let shared;
@@ -568,4 +559,4 @@ export function renderer() {
   return shared && !shared.lost ? shared : null;
 }
 
-export { BREAK, TW };
+export { BREAK };

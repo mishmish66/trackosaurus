@@ -1,4 +1,4 @@
-"""Read-side queries for the CLI: run records, filters, sorting, group statistics, and series."""
+"""Read-side queries for the CLI: run records, field access, sorting, group statistics, and series."""
 
 import json
 import math
@@ -6,14 +6,13 @@ import os
 import re
 import sqlite3
 from array import array
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Final, Literal, NotRequired, TypedDict, cast
 
 from . import chunks
 from .format import (DB, INFO_FILE, JSONValue, MediaKind, RunState, as_dict, as_float, as_run_state, as_str, as_str_list,
-                     connect_ro, key_names)
+                     key_names, snapshot)
 from .index import Explorer
 
 type PathLike = str | os.PathLike[str]
@@ -35,6 +34,7 @@ class Record(TypedDict):
     updated: float | None
     tags: list[str]
     dir: str
+    visible: bool  # whether the UI's sidebar shows the run; nothing hides one outside the UI
     config: dict[str, JSONValue]
     info: dict[str, JSONValue]
     summary: dict[str, JSONValue]
@@ -90,7 +90,10 @@ class RunSummary(TypedDict):
     media: list[MediaItem]
 
 
-PLAIN_FIELDS: Final = ("path", "name", "parent", "state", "step", "runtime", "rows", "media", "created", "updated", "tags", "dir")
+PLAIN_FIELDS: Final = ("path", "name", "parent", "state", "step", "runtime", "rows", "media", "created", "updated", "tags", "dir",
+                       "visible")
+SUMMARY_PREFIXES: Final = ("summary", "s", "metric", "m")
+# Two-sided 95% Student t critical values for df = 1..30; normal beyond.
 T95: Final = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.16, 2.145, 2.131,
        2.12, 2.11, 2.101, 2.093, 2.086, 2.08, 2.074, 2.069, 2.064, 2.06, 2.056, 2.052, 2.048, 2.045, 2.042]
 
@@ -100,9 +103,7 @@ def is_run(path: PathLike) -> bool:
 
 
 def num(v: object) -> float | None:
-    """Metric value as float; the wire markers "NaN"/"Infinity"/"-Infinity" become floats."""
-    if isinstance(v, bool):
-        return float(v)
+    """Metric value as float; the wire markers "nan"/"inf"/"-inf" become floats."""
     if isinstance(v, (int, float)):
         return float(v)
     if isinstance(v, str):
@@ -135,7 +136,7 @@ def records(ex: Explorer, prefix: str = "") -> list[Record]:
         out.append({
             "path": m["id"], "name": m["name"], "parent": m["parent"], "state": m["state"],
             "step": s.get("_step"), "runtime": s.get("_runtime"), "rows": m["seq"], "media": media.get(m["id"], 0),
-            "created": m["created"], "updated": m["updated"], "tags": m["tags"], "dir": str(ex.dirs[m["id"]]),
+            "created": m["created"], "updated": m["updated"], "tags": m["tags"], "dir": str(ex.dirs[m["id"]]), "visible": True,
             "config": m["config"], "info": m["info"],
             "summary": {k: v for k, v in s.items() if not k.startswith("_")},
         })
@@ -150,7 +151,7 @@ def get(rec: Record, field: str) -> object:
     head, _, rest = field.partition(".")
     if head in ("config", "c") and rest:
         return rec["config"].get(rest)
-    if head in ("summary", "s", "metric", "m") and rest:
+    if head in SUMMARY_PREFIXES and rest:
         v = rec["summary"].get(rest)
         return num(v) if v is not None else None
     if head == "info" and rest:
@@ -232,12 +233,16 @@ def stats(values: Iterable[float | None], center: Center = "median") -> Stats:
     if n > 1:
         if center in ("mean", "iqm"):
             m, se, df = (mean, std / math.sqrt(n), n - 1) if center == "mean" else (iqm, iqm_se, kept - 1)
-            t = (T95[df - 1] if df >= 1 else 0.0) if df <= 30 else 1.96
+            t = _t95(df)
             out.update(ci_lo=m - t * se, ci_hi=m + t * se, ci_coverage=0.95)
         else:
             k = median_ci_rank(n)
             out.update(ci_lo=xs[k - 1], ci_hi=xs[n - k], ci_coverage=median_ci_coverage(n))
     return out
+
+
+def _t95(df: int) -> float:
+    return T95[df - 1] if df <= 30 else 1.96
 
 
 def _iqm(xs: Sequence[float]) -> tuple[float, float, int]:
@@ -254,17 +259,6 @@ def _iqm(xs: Sequence[float]) -> tuple[float, float, int]:
 
 
 # ---- single runs (read straight from the run file) ----
-
-@contextmanager
-def snapshot(run_dir: PathLike) -> Iterator[sqlite3.Connection]:
-    """A connection in one read transaction."""
-    c = connect_ro(run_dir)
-    try:
-        c.execute("BEGIN")
-        yield c
-    finally:
-        c.close()
-
 
 def _meta(c: sqlite3.Connection) -> dict[str, JSONValue]:
     return {k: json.loads(v) for k, v in c.execute("SELECT key, value FROM meta")}
@@ -316,13 +310,9 @@ def run_summary(run_dir: PathLike) -> RunSummary:
             if steps.size:
                 keys[name] = {"points": int(steps.size), "first_step": float(steps[0]), "last_step": float(steps[-1]),
                               "last": float(values[-1])}
-        last = c.execute("SELECT n, data FROM rowmeta WHERE seq0 + n = ?", (rows,)).fetchone()
+        last = chunks.last_step_and_time(c, rows)
         media = _media(c, run_dir)
-    step = runtime = None
-    if last:
-        n, data = last
-        mv = memoryview(data).cast("d")
-        step, runtime = mv[n - 1], mv[2 * n - 1]
+    step, runtime = last or (None, None)
     return {
         "dir": str(Path(run_dir).resolve()), "id": as_str(meta.get("id")), "name": as_str(meta.get("name")),
         "state": as_run_state(meta.get("state")), "created": as_float(meta.get("created")),

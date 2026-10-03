@@ -508,6 +508,92 @@ def sections_smoke(page, url):
             and unpinned == ["charts (1)", 1])
 
 
+def hidden_panels_smoke(page, url):
+    """Whether a hidden panel leaves its section for a link in the section's header that shows it again, the section
+    menu checks shown panels and open subsections and toggles them, and hidden panels stay hidden on reload."""
+    head = "#panels details.section:has(> summary .stitle:text-is('{}')) > summary"
+    shown = "[...document.querySelectorAll('#panels .panel .ptitle > span:first-child')].map((e) => e.textContent).sort()"
+
+    def links(title):
+        return page.locator(f"{head.format(title)} .sublinks .hiddenlink").all_inner_texts()
+
+    def menu_items():
+        return page.evaluate("[...document.querySelectorAll('#menu .mitem')].map((b) => [b.querySelector('.micon').textContent, "
+                             "b.querySelector('.ml').textContent])")
+
+    page.goto(f"{url}/?hiddenpanels#path=nested")
+    page.wait_for_function(READY, timeout=30000)
+    page.hover(".panel:has(.pname:text-is('eval/return/mean')) .ptitle")
+    page.click(".panel:has(.pname:text-is('eval/return/mean')) .hide")
+    page.wait_for_function(f"!{shown}.includes('eval/return/mean')")
+    after_hide = [page.evaluate(shown), links("return (2)")]
+    page.click(f"{head.format('eval (4)')} .secmenu")
+    page.wait_for_selector("#menu .mitem")
+    menu_before = menu_items()
+    page.click("#menu .mitem:has(.ml:text-is('len'))")
+    page.wait_for_function("!document.querySelector('#panels .pname') || ![...document.querySelectorAll('#panels .panel .ptitle > span:first-child')].some((e) => e.textContent === 'eval/len')")
+    page.click("#menu .mitem:has(.ml:text-is('return/'))")
+    folded = page.locator(head.format("return (2)")).evaluate("(s) => !s.parentElement.open")
+    menu_after = menu_items()
+    page.keyboard.press("Escape")
+    eval_links = links("eval (4)")
+    page.click(f"{head.format('return (2)')} .hiddenlink:text-is('mean')")
+    page.wait_for_function(f"{shown}.includes('eval/return/mean')")
+    page.reload()
+    page.wait_for_function(READY, timeout=30000)
+    persisted = [page.evaluate(shown), links("eval (4)")]
+    page.click(f"{head.format('eval (4)')} .hiddenlink:text-is('len')")
+    page.wait_for_function(f"{shown}.includes('eval/len')")
+    page.locator(head.format("return (2)")).evaluate("(s) => { s.parentElement.open = true; }")
+    print(f"hidden panels: hiding mean leaves {after_hide[0]}, return links {after_hide[1]}; eval menu {menu_before} then "
+          f"{menu_after}, return folded {folded}, eval links {eval_links}; after reload {persisted}")
+    return (after_hide == [["eval/len", "eval/return/std", "eval/video/frame", "loss"], ["mean"]]
+            and menu_before == [["✓", "len"], ["✓", "return/"], ["✓", "video/"]]
+            and menu_after == [[" ", "len"], [" ", "return/"], ["✓", "video/"]] and folded and eval_links == ["len"]
+            and persisted == [["eval/return/mean", "eval/return/std", "eval/video/frame", "loss"], ["len"]])
+
+
+def grouping_modes_smoke(page, url):
+    """Whether the sidebar lists runs flat with nothing to group by, nests them by folder under "path" with a state dot
+    per folder, a field picked after "path" groups by that field alone, and `visible = true` leaves out unchecked
+    runs."""
+    heads = "[...document.querySelectorAll('#runTable tr.grp .gname')].map((e) => e.firstChild.textContent)"
+    runs = "document.querySelectorAll('#runTable tr:has(td.name a)').length"
+
+    def pick(label):
+        page.click(f"#menu .mitem:has(.ml:text-is('{label}'))")
+
+    page.goto(f"{url}/?modes#path=&group=")
+    page.wait_for_function(READY, timeout=30000)
+    flat = [page.evaluate(heads), page.evaluate(runs), page.evaluate("app.grouped")]
+    page.click("#groupAdd")
+    pick("path")
+    page.wait_for_function("app.byPath && document.querySelectorAll('#runTable tr.grp').length > 0")
+    nested = [page.evaluate(heads), page.evaluate("app.grouped"), page.evaluate("location.hash.includes('group=path')")]
+    dots = page.evaluate("[...document.querySelectorAll('#runTable tr.grp td.stc .dot')].map((d) => [d.className, d.title])")
+    pick("lr")
+    page.wait_for_function("app.grouped && [...document.querySelectorAll('#runTable tr.grp .gname')].some((e) => /^0\\./.test(e.firstChild.textContent))")
+    by_lr = [page.evaluate("app.opts.group"), [h for h in page.evaluate(heads) if h.startswith("lr")]]
+    page.keyboard.press("Escape")
+    page.evaluate("app.setGroup([])")
+    page.wait_for_function(f"{runs} > 10")
+    first = page.locator("#runTable tr:has(td.name a)").first
+    name = first.locator("td.name").get_attribute("title")
+    first.locator("input[type=checkbox]").uncheck()
+    page.fill("#runFilter", "visible = true")
+    page.wait_for_function(f"![...document.querySelectorAll('#runTable td.name')].some((t) => t.title === {name!r})")
+    filtered = [page.evaluate(runs), page.evaluate("app.runList.filter((r) => r.match).length")]
+    page.fill("#runFilter", "")
+    page.keyboard.press("Escape")
+    page.wait_for_function(f"[...document.querySelectorAll('#runTable td.name')].some((t) => t.title === {name!r})")
+    page.locator(f"#runTable tr:has(td.name[title='{name}']) input[type=checkbox]").check()
+    print(f"grouping modes: flat {flat}; path {nested}, dots {dots[:3]}; then lr {by_lr}; visible = true leaves {filtered} of {flat[1]}")
+    return (flat[0] == [] and flat[1] > 10 and flat[2] is False and "sweep" in nested[0] and nested[1] is False and nested[2]
+            and by_lr[0] == ["config.lr"] and by_lr[1] == [] and len(dots) == len(nested[0])
+            and all(c.split()[1] in ("running", "finished", "crashed", "failed") and t for c, t in dots)
+            and filtered == [flat[1] - 1, flat[1] - 1])
+
+
 def hidden_runs_smoke(page, url):
     """Whether panels follow the shown runs: hiding the only run that logs some keys removes their panels, showing it
     brings them back, and hiding every run leaves no panels, as in a folder without runs."""
@@ -577,6 +663,8 @@ def main():
             ok &= group_levels_smoke(page, url)
             ok &= sections_smoke(page, url)
             ok &= hidden_runs_smoke(page, url)
+            ok &= grouping_modes_smoke(page, url)
+            ok &= hidden_panels_smoke(page, url)
             ok &= filter_smoke(page, url)
             ok &= interactions_smoke(page, url)
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])

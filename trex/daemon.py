@@ -14,8 +14,8 @@ As a launchd agent on macOS (running while you are logged in; log in ~/Library/L
     trex launchd-plist > ~/Library/LaunchAgents/trex.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/trex.plist
 
-The update button in the trex panel installs the newest trex from `--source` (default this repository), and
-systemd or launchd restarts the daemon on it.
+The update button in the trex panel installs the newest trex from the `--source` given to `trex systemd-unit`
+or `trex launchd-plist` (default this repository), and systemd or launchd restarts the daemon on it.
 
 / shows every tracked directory, each as a top-level folder; clicking trex (top left) opens the panel that
 switches and manages them, and workspaces: named sets of directories whose folder trees are merged, so runs
@@ -66,6 +66,17 @@ def socket_path() -> Path:
 
 def default_cache() -> Path:
     return Path(os.environ.get("TREX_CACHE") or Path.home() / ".cache/trex")
+
+
+def resolve_root(root: str | os.PathLike[str], force: bool) -> Path:
+    """`root` resolved; ValueError for a non-directory, or for / and $HOME (whose crawl would sweep a whole
+    machine or home directory) unless `force`."""
+    r = Path(root).expanduser().resolve()
+    if not r.is_dir():
+        raise ValueError(f"{root} is not a directory")
+    if not force and r in (Path("/"), Path.home().resolve()):
+        raise ValueError(f"refusing to crawl {r}; point trex at a runs directory (or pass --force)")
+    return r
 
 
 def root_url(name: str) -> str:
@@ -135,16 +146,21 @@ class Roots:
             return
         tracked = saved.get("tracked", []) if isinstance(saved, dict) else [e.get("root", "") for e in saved]
         for spec in map(str, tracked):
-            if remote.parse(spec):
-                self.add_remote(spec, wait=False)
-            elif Path(spec).is_dir():
-                self.add(Path(spec))
-            else:
-                print(f"[trex] skipping saved directory {spec}: not a directory", file=sys.stderr, flush=True)
+            try:
+                self.track(spec, force=True, wait=False)
+            except ValueError as e:
+                print(f"[trex] skipping saved directory {spec}: {e}", file=sys.stderr, flush=True)
         for w in saved.get("workspaces", []) if isinstance(saved, dict) else []:
             members = [m for m in map(str, w.get("members", [])) if m in self.entries]
             with self.lock:
                 self.workspaces[str(w.get("name"))] = members
+
+    def track(self, spec: str, force: bool = False, wait: bool = True) -> str:
+        """Name of the tracked directory `spec` (a path or host:path), starting to serve it if new; ValueError if it
+        cannot be served."""
+        if remote.parse(spec):
+            return self.add_remote(spec, wait)
+        return self.add(resolve_root(spec, force))
 
     def add(self, root: Path) -> str:
         """Name of the tracked directory `root`, starting to serve it if new."""
@@ -329,14 +345,10 @@ class ControlServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.path = path
 
     def answer(self, req: dict[str, object]) -> dict[str, object]:
-        from .server import resolve_root
-
         if req.get("op") == "status":
             return {"urls": self.urls, "roots": self.roots.served()}
         if req.get("op") == "add":
-            path = str(req.get("path"))
-            name = (self.roots.add_remote(path) if remote.parse(path) else
-                    self.roots.add(resolve_root(path, bool(req.get("force")))))
+            name = self.roots.track(str(req.get("path")), bool(req.get("force")))
             return {"name": name, "url": self.urls[0].rstrip("/") + root_url(name)}
         return {"error": f"unknown request {req.get('op')!r}"}
 

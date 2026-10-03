@@ -41,9 +41,9 @@ STATE_COLORS: Final = {"running": "green", "failed": "red", "crashed": "red", "f
 # ---- output ----
 
 def jsonable(v: object) -> object:
-    """JSON-safe copy: non-finite floats as strings."""
+    """JSON-safe copy: non-finite floats as the strings "nan", "inf", "-inf"."""
     if isinstance(v, float) and not math.isfinite(v):
-        return "NaN" if v != v else ("Infinity" if v > 0 else "-Infinity")
+        return str(v)
     if isinstance(v, dict):
         return {str(k): jsonable(x) for k, x in v.items()}
     if isinstance(v, (list, tuple)):
@@ -233,11 +233,13 @@ def width(full: bool) -> int | None:
 
 EPILOG = """
 A run is any directory holding trex.sqlite. Query commands take `--json` (or `--format jsonl|csv|tsv`);
-non-finite numbers appear as the strings "NaN", "Infinity" and "-Infinity".
+non-finite numbers appear as the strings "nan", "inf" and "-inf".
 
 **Fields** (for `--where`, `--sort`, `--columns`, `--group-by`)
 
-    path name parent state step runtime rows media created updated tags dir
+    path name parent state step runtime rows media created updated tags dir visible
+    state         running, finished, failed or crashed
+    visible       whether the UI's sidebar shows the run (always true here)
     config.KEY    config value, e.g. config.lr, config.model/width
     summary.KEY   last logged value of a metric, or a run.summary value
     info.A.B      nested info value
@@ -309,6 +311,11 @@ Hosts = Annotated[list[str] | None, typer.Option("--host", help="Bind address; r
 AllowHosts = Annotated[list[str] | None, typer.Option("--allow-host", metavar="NAME",
                        help="Host name the UI may be opened by besides addresses, localhost and this machine's names (repeatable).")]
 Port = Annotated[int | None, typer.Option(help=f"Port (default the first free one from {DEFAULT_PORT}).", show_default=False)]
+ServicePort = Annotated[int, typer.Option(help="Port.")]
+ServiceCache = Annotated[str | None, typer.Option(help="Cache directory (default ~/.cache/trex).")]
+ServiceSource = Annotated[str | None, typer.Option(envvar="TREX_SOURCE", show_envvar=False,
+                          help="What the UI's update button installs (default $TREX_SOURCE, else "
+                               "git+https://github.com/mishmish66/trackosaurus; '' for no update button).")]
 
 
 def listen(explorer: "Explorer | None", hosts: list[str] | None, port: int | None, allow: list[str] | None,
@@ -401,8 +408,8 @@ def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]..
                cache: Annotated[str | None, typer.Option(help="Cache directory (default $TREX_CACHE or ~/.cache/trex).")] = None,
                force: Force = False) -> None:
     """Serve several runs directories from one server; `trex serve DIR` offers to add to it."""
-    from . import daemon, remote, update
-    from .server import check_root, urls
+    from . import daemon, update
+    from .server import urls
 
     roots = daemon.Roots(Path(cache).expanduser() if cache else daemon.default_cache(), daemon.state_dir() / "roots.json")
     servers = listen(None, host, port, allow_host, roots)
@@ -422,10 +429,10 @@ def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]..
     threading.Thread(target=control.serve_forever, name="trex-control", daemon=True).start()
     roots.load()
     for d in dirs or []:
-        if remote.parse(d):
-            roots.add_remote(d, wait=False)
-        else:
-            roots.add(check_root(d, force))
+        try:
+            roots.track(d, force, wait=False)
+        except ValueError as e:
+            sys.exit(f"trex: {e}")
     banner = [f"trex daemon on {'  '.join(urls(servers))}  socket={control.path}  cache={roots.cache}",
               *(f"  {r['name']}  {r['root']}" for r in roots.served())]
     try:
@@ -473,6 +480,27 @@ def daemon_args(hosts: list[str], allow: list[str]) -> list[str]:
     return [*(a for h in hosts for a in ("--host", h)), *(a for n in allow for a in ("--allow-host", n))]
 
 
+def service_source(source: str | None) -> str | None:
+    """The default repository when not given; None for ''."""
+    from . import update
+
+    return update.DEFAULT_SOURCE if source is None else source or None
+
+
+def service_env(cache: str | None, source: str | None) -> dict[str, str]:
+    """TREX_CACHE (resolved) and TREX_SOURCE of a service; empty values left out."""
+    env = {"TREX_CACHE": str(Path(cache).expanduser().resolve()) if cache else None, "TREX_SOURCE": source}
+    return {k: v for k, v in env.items() if v}
+
+
+def service_path(*extra: str) -> str:
+    """A service's PATH: uv's directory, this Python's, `extra`, then the system's."""
+    from . import update
+
+    path = [str(Path(update.uv()).parent), str(Path(sys.executable).parent), *extra, "/usr/local/bin", "/usr/bin", "/bin"]
+    return ":".join(dict.fromkeys(path))
+
+
 def systemd_unit(hosts: list[str], port: int, allow: list[str], cache: str | None, source: str | None) -> str:
     """The unit for `trex systemd-unit`."""
     import shlex
@@ -482,23 +510,16 @@ def systemd_unit(hosts: list[str], port: int, allow: list[str], cache: str | Non
     host_args = daemon_args(hosts, allow)
     options = [*(["--port", str(port)] if port != DEFAULT_PORT else []), *(["--cache", cache] if cache else []),
                *(["--source", source] if source else [])]
-    env = {"TREX_CACHE": str(Path(cache).expanduser().resolve()) if cache else None, "TREX_SOURCE": source}
-    path = [str(Path(update.uv()).parent), str(Path(sys.executable).parent), "/usr/local/bin", "/usr/bin", "/bin"]
     return UNIT.format(args="".join(f" {shlex.quote(a)}" for a in host_args + options), status=update.RESTART_STATUS,
-                       env="".join(f"Environment={k}={v}\n" for k, v in env.items() if v), path=":".join(dict.fromkeys(path)),
+                       env="".join(f"Environment={k}={v}\n" for k, v in service_env(cache, source).items()), path=service_path(),
                        exec_start=shlex.join([sys.executable, "-m", "trex", "daemon", *host_args, "--port", str(port)]))
 
 
 @command("systemd-unit")
-def systemd_unit_cmd(host: Hosts = None, port: Annotated[int, typer.Option(help="Port.")] = DEFAULT_PORT, allow_host: AllowHosts = None,
-                     cache: Annotated[str | None, typer.Option(help="Cache directory (default ~/.cache/trex).")] = None,
-                     source: Annotated[str | None, typer.Option(envvar="TREX_SOURCE", show_envvar=False,
-                                       help="What the UI's update button installs (default $TREX_SOURCE, else "
-                                            "git+https://github.com/mishmish66/trackosaurus; '' for no update button).")] = None) -> None:
+def systemd_unit_cmd(host: Hosts = None, port: ServicePort = DEFAULT_PORT, allow_host: AllowHosts = None,
+                     cache: ServiceCache = None, source: ServiceSource = None) -> None:
     """Print a systemd user unit that runs `trex daemon` on this trex; its header says how to install it."""
-    from . import update
-
-    source = update.DEFAULT_SOURCE if source is None else source or None
+    source = service_source(source)
     typer.echo(systemd_unit(host or [], port, allow_host or [], cache, source), nl=False)
     warn_not_tool_install("systemd-unit", source)
 
@@ -531,13 +552,12 @@ def launchd_plist(hosts: list[str], port: int, allow: list[str], cache: str | No
 
     from . import update
 
-    path = [str(Path(update.uv()).parent), str(Path(sys.executable).parent), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
-    env = {"PATH": ":".join(dict.fromkeys(path)), "PYTHONUNBUFFERED": "1", "NO_COLOR": "1", "TREX_SERVICE": "launchd",
-           "TREX_CACHE": str(Path(cache).expanduser().resolve()) if cache else None, "TREX_SOURCE": source}
+    env = {"PATH": service_path("/opt/homebrew/bin"), "PYTHONUNBUFFERED": "1", "NO_COLOR": "1", "TREX_SERVICE": "launchd",
+           **service_env(cache, source)}
     log = str(Path.home() / "Library" / "Logs" / "trex.log")
     agent = {"Label": LAUNCHD_LABEL,
              "ProgramArguments": [sys.executable, "-m", "trex", "daemon", *daemon_args(hosts, allow), "--port", str(port)],
-             "EnvironmentVariables": {k: v for k, v in env.items() if v}, "RunAtLoad": True,
+             "EnvironmentVariables": env, "RunAtLoad": True,
              "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 2, "ExitTimeOut": 30,
              "StandardOutPath": log, "StandardErrorPath": log}
     head, plist, body = plistlib.dumps(agent, sort_keys=False).decode().partition("<plist")
@@ -545,15 +565,10 @@ def launchd_plist(hosts: list[str], port: int, allow: list[str], cache: str | No
 
 
 @command("launchd-plist")
-def launchd_plist_cmd(host: Hosts = None, port: Annotated[int, typer.Option(help="Port.")] = DEFAULT_PORT, allow_host: AllowHosts = None,
-                      cache: Annotated[str | None, typer.Option(help="Cache directory (default ~/.cache/trex).")] = None,
-                      source: Annotated[str | None, typer.Option(envvar="TREX_SOURCE", show_envvar=False,
-                                        help="What the UI's update button installs (default $TREX_SOURCE, else "
-                                             "git+https://github.com/mishmish66/trackosaurus; '' for no update button).")] = None) -> None:
+def launchd_plist_cmd(host: Hosts = None, port: ServicePort = DEFAULT_PORT, allow_host: AllowHosts = None,
+                      cache: ServiceCache = None, source: ServiceSource = None) -> None:
     """Print a launchd agent (macOS) that runs `trex daemon` on this trex; its header says how to install it."""
-    from . import update
-
-    source = update.DEFAULT_SOURCE if source is None else source or None
+    source = service_source(source)
     typer.echo(launchd_plist(host or [], port, allow_host or [], cache, source), nl=False)
     warn_not_tool_install("launchd-plist", source)
 
@@ -636,7 +651,7 @@ class GroupSpec:
 
 
 def metric_key(metric: str) -> str:
-    return metric.partition(".")[2] if metric.split(".")[0] in ("summary", "s", "metric", "m") else metric
+    return metric.partition(".")[2] if metric.split(".")[0] in Q.SUMMARY_PREFIXES else metric
 
 
 def group_key(rec: Q.Record, field: str, prefix: str) -> object:
@@ -749,16 +764,16 @@ def tree_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
     notes = {p: v[1] for p, v in ex.folders.items()}
     fmt = out_format(fmt, as_json)
 
-    def as_json_(node: Folder, level: int) -> dict[str, object]:
+    def folder_json(node: Folder, level: int) -> dict[str, object]:
         out: dict[str, object] = {"path": node.path, "runs": sum(node.states.values()), "states": node.states, "info": notes.get(node.path)}
         if level < depth:
-            out["dirs"] = [as_json_(d, level + 1) for _, d in sorted(node.dirs.items())]
+            out["dirs"] = [folder_json(d, level + 1) for _, d in sorted(node.dirs.items())]
             if runs:
                 out["run_list"] = [{"path": r["path"], "state": r["state"], "step": r["step"]} for r in node.runs]
         return out
 
     if fmt in ("json", "jsonl"):
-        return typer.echo(json.dumps(jsonable(as_json_(tree, 0)), indent=1 if fmt == "json" else None))
+        return typer.echo(json.dumps(jsonable(folder_json(tree, 0)), indent=1 if fmt == "json" else None))
     print_tree(tree, 0, depth, runs, notes)
 
 

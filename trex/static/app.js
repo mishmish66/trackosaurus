@@ -1,6 +1,8 @@
 import { BASE, Data, clearCache, mediaURL } from "./data.js";
-import { compileWhere, completionContext, literal, runField, textOf } from "./where.js";
+import { asNumber, compileWhere, completionContext, fieldText, literal, runField, textOf } from "./where.js";
 import { BAND_LABEL, Chart, DENSITY_AUTO, USE_GL, fmt, fmtDur, fmtSI } from "./plot.js";
+import { X_RUNTIME, X_STEP } from "./kernel.js";
+import { renderer } from "./gl.js";
 
 const PALETTE = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
                  "#9c755f", "#bab0ac", "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#17becf", "#bcbd22"];
@@ -8,6 +10,8 @@ const SIDE_ROW = 24; // px height of a sidebar row
 const TIP_ROWS = 14; // value rows in view in the tooltip
 const TIP_ROW_PX = 18; // height of one (#tip .trow in index.html)
 const PINNED = "\0pinned"; // section of pinned charts
+const HIDE_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M2.1 1.1 1 2.2l2.3 2.3C2.1 5.4 1.1 6.6.5 8c1.2 2.9 4 5 7.5 5 1.3 0 2.5-.3 3.6-.9l2.3 2.3 1.1-1.1L2.1 1.1zM8 11.5A3.5 3.5 0 0 1 4.5 8c0-.6.2-1.2.4-1.7l1.2 1.2V8a1.9 1.9 0 0 0 2.4 1.8l1.2 1.2c-.5.3-1.1.5-1.7.5zm7.5-3.5C14.3 5.1 11.5 3 8 3c-.9 0-1.8.2-2.6.5l1.3 1.3c.4-.2.9-.3 1.3-.3A3.5 3.5 0 0 1 11.5 8c0 .5-.1.9-.3 1.3l1.9 1.9c1-.8 1.9-1.9 2.4-3.2z"/></svg>';
+const MENU_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="3" cy="8" r="1.5" fill="currentColor"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/><circle cx="13" cy="8" r="1.5" fill="currentColor"/></svg>';
 const SPREAD_SHOWN = 8; // values listed per config key that varies
 const FRAME_BUDGET_MS = 12; // chart drawing per frame
 const PLAN_IDLE_MS = 250; // tile planning interval while the view is unchanged
@@ -23,7 +27,6 @@ const h = (tag, attrs = {}, ...kids) => {
   e.append(...kids.filter((k) => k != null));
   return e;
 };
-const esc = (s) => String(s ?? "");
 const opt = (value, text, sel) => h("option", { value, textContent: text, selected: sel });
 
 /** [user@]host:path in scp form; its first group is the host. */
@@ -32,11 +35,36 @@ const REMOTE = /^((?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s[\]]+)):(.+)$/;
 /** The last `n` characters of `s`, after an ellipsis when cut. */
 const tailOf = (s, n) => (s.length > n ? `…${s.slice(1 - n)}` : s);
 
-/** {daemon, roots, history} of the server: its directories when it is the daemon. */
+/** `/api/daemon`: {daemon, roots, workspaces, history, install, updates}. */
 const daemonInfo = async () => (await fetch("/api/daemon", { cache: "no-store" })).json();
 
-/** Group-by field id from a declared default: "subfolder", "parent", "config.<key>", or a bare config key. */
-const normalizeField = (f) => (["subfolder", "parent", "dir"].includes(f) || f.startsWith("config.") ? f : `config.${f}`);
+const CONFIG_FIELD = "config."; // prefix of a group-by field id naming a config key
+const PATH_FIELD = "path"; // group-by entry that nests the sidebar by folder and draws every run
+const METRIC_SORT = "metric:"; // prefix of a sort key naming a metric
+
+/** Group-by field id from a declared default: "path", "subfolder", "parent", "dir", "config.<key>", or a bare config
+ * key. */
+const normalizeField = (f) => ([PATH_FIELD, "subfolder", "parent", "dir"].includes(f) || f.startsWith(CONFIG_FIELD) ? f : CONFIG_FIELD + f);
+
+/** State a group's dot shows: running while any member runs, else crashed or failed if any member did, else
+ * finished. */
+function groupState(runs) {
+  const has = new Set(runs.map((r) => r.meta.state));
+  return ["running", "crashed", "failed", "finished"].find((s) => has.has(s)) ?? "";
+}
+
+/** "2 running · 5 finished": how many runs are in each state. */
+function stateCounts(runs) {
+  const n = new Map();
+  for (const r of runs) n.set(r.meta.state, (n.get(r.meta.state) ?? 0) + 1);
+  return [...n].map(([s, k]) => `${k} ${s}`).join(" · ");
+}
+
+/** Group-by fields with `id` toggled; "path" stands alone, so choosing it or another field drops the other kind. */
+function toggleField(sel, id) {
+  if (sel.includes(id)) return sel.filter((x) => x !== id);
+  return id === PATH_FIELD ? [id] : [...sel.filter((x) => x !== PATH_FIELD), id];
+}
 
 function fmtAny(v) {
   if (typeof v === "number") return fmt(v);
@@ -143,12 +171,25 @@ function grown(a, n) {
   return b;
 }
 
-/** What the run filter matches: name, path, tags and key=value config entries. */
-const FILTER_HINT = "name search, or a WHERE clause: lr = 0.001 and seed in (0, 1), algo like 'pp%', state = running";
-/** Header controls of a section with subsections: a link to each (opening and scrolling to it) and a button
- * folding or unfolding everything inside the section. */
-function subsectionControls(sec, subs) {
-  const stop = (f) => (e) => (e.preventDefault(), e.stopPropagation(), f(e));
+/** Tooltip of the filter box. */
+const FILTER_HINT = "name search, or a WHERE clause: lr = 0.001 and seed in (0, 1), algo like 'pp%', state = running, visible = true";
+/** A click handler that keeps the click from folding the section whose header holds the control. */
+const stop = (f) => (e) => (e.preventDefault(), e.stopPropagation(), f(e));
+
+/** A button showing an inline SVG icon. */
+function iconButton(className, title, svg, onclick) {
+  const b = h("button", { className, title, onclick });
+  b.innerHTML = svg;
+  return b;
+}
+
+/** A panel's name within its section: the key after the section's path. */
+const shortName = (key, sec) => (key.startsWith(sec.id + "/") ? key.slice(sec.id.length + 1) : key);
+
+/** Header controls of a section: on one line (cut with an ellipsis), a link to each subsection (opening and scrolling
+ * to it) and to each hidden panel (showing it again); then, with subsections, a button folding or unfolding
+ * everything inside. */
+function sectionControls(sec, subs, show) {
   const open = (d) => {
     d.parentElement.open = true;
     d.open = true;
@@ -159,16 +200,21 @@ function subsectionControls(sec, subs) {
     const fold = inner.some((d) => d.open);
     for (const d of inner) d.open = !fold;
   };
-  return [h("span", { className: "sublinks" }, ...sec.children.map((x, i) => h("button", { className: "linkish", title: `open ${x.id}`,
-            textContent: `${x.title} (${x.n})`, onclick: stop(() => open(subs[i])) }))),
-          h("button", { className: "subfold", onclick: stop(all) })];
+  const links = [...sec.children.map((x, i) => h("button", { className: "linkish", title: `open ${x.id}`, textContent: `${x.title} (${x.n})`,
+                   onclick: stop(() => open(subs[i])) })),
+                 ...sec.hidden.map(([key]) => h("button", { className: "linkish hiddenlink", title: `show ${key} (hidden)`,
+                   textContent: shortName(key, sec), onclick: stop(() => show(key)) }))];
+  return [links.length ? h("span", { className: "sublinks" }, ...links) : null,
+          subs.length ? h("button", { className: "subfold", onclick: stop(all) }) : null].filter(Boolean);
 }
 
 /** Sorted copy of a section and its subsections: panels by name, subsections by sectionCmp. */
 function orderSection(sec) {
   const byName = (a, b) => cmpNames(a[0], b[0]);
   const children = [...sec.children.values()].map(orderSection).sort(sectionCmp);
-  return { ...sec, items: sec.items.sort(byName), children, media: sec.items.every(([, kind]) => kind === "media") && children.every((c) => c.media) };
+  const panels = [...sec.items, ...sec.hidden];
+  return { ...sec, items: sec.items.sort(byName), hidden: sec.hidden.sort(byName), children,
+           media: panels.every(([, kind]) => kind === "media") && children.every((c) => c.media) };
 }
 
 /** Sections with charts before media-only ones, then by name. */
@@ -296,7 +342,7 @@ document.addEventListener("wheel", (e) => window.app?.scrollTip(e), { passive: f
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (menu.el && !menu.el.hidden) return menu.close();
-  if (window.app?.opts.chart) window.app.focusChart("");
+  if (window.app?.opts.chart) window.app.showChartAlone("");
 });
 
 /** Scroll keys move the chart pane unless a text field, select, slider, menu or dialog has focus. */
@@ -357,7 +403,17 @@ class App {
 
   /** Grouped rendering: group-by fields chosen and the scope is more than one run. */
   get grouped() {
-    return this.opts.group.length > 0 && !this.scopeIsRun;
+    return this.hasGroups && !this.scopeIsRun;
+  }
+
+  /** Whether runs are grouped by fields, rather than listed flat or by folder ("path"). */
+  get hasGroups() {
+    return this.opts.group.length > 0 && !this.byPath;
+  }
+
+  /** Whether the sidebar nests runs by folder. */
+  get byPath() {
+    return this.opts.group[0] === PATH_FIELD;
   }
 
   get scopeIsRun() {
@@ -369,7 +425,7 @@ class App {
     const o = this.opts, p = this.panelCfg[key] || {};
     return {
       smooth: p.smooth ?? 0,
-      xmode: p.x === "runtime" ? 1 : 0,
+      xmode: p.x === "runtime" ? X_RUNTIME : X_STEP,
       logx: p.logx ?? false,
       logy: p.logy ?? false,
       xmin: p.xmin ?? null,
@@ -395,10 +451,12 @@ class App {
     this.panelCfg = store.get(`panels:${root}`, {});
     this.collapsed = new Set(store.get(`collapsed:${root}`, []));
     this.pins = store.get(`pins:${root}`, []);
+    this.hiddenPanels = new Set(store.get(`hiddenPanels:${root}`, []));
     this.bindControls();
     await this.refreshTree();
     await this.loadScope();
     setInterval(() => this.refreshTree().then(() => this.renderCrumbs()), 15000);
+    if (USE_GL) (window.requestIdleCallback ?? setTimeout)(() => renderer()); // its setup, ~0.2 s, while nothing is drawing
   }
 
   /** Under the daemon, its state (else null), and the trex brand opening its panel. False when it tracks nothing,
@@ -608,7 +666,7 @@ class App {
   /** Write the options to the URL hash: a new history entry when `push` (navigation), else in place. */
   saveHash(push = false) {
     const q = new URLSearchParams();
-    const defaults = { center: "median", band: "ci", x: "step", sort: "created", dir: "desc" };
+    const defaults = { center: "median", band: "ci", sort: "created", dir: "desc" };
     for (const [k, v] of Object.entries(this.opts)) {
       const s = k === "focus" ? (v.length ? JSON.stringify(v) : "") : Array.isArray(v) ? v.join(",") : v === true ? "1" : v;
       if ((s && defaults[k] !== s) || (k === "group" && this.groupInHash())) q.set(k, s);
@@ -683,7 +741,7 @@ class App {
     const side = () => {
       sideRaf = 0;
       const [a, b] = this.sideWin || [0, 0], aside = $("aside");
-      const top = $("#runTable").getBoundingClientRect().top - aside.getBoundingClientRect().top + aside.scrollTop;
+      const top = this.sideTop();
       const first = (aside.scrollTop - top) / SIDE_ROW, last = first + aside.clientHeight / SIDE_ROW;
       if (first < a + 10 && a > 0 || last > b - 10 && b < (this.sideRows || []).length) this.renderSideWindow();
     };
@@ -760,7 +818,7 @@ class App {
       if (path.length && !(path.length === 1 && this.rootName === "/")) path.push(h("span", { className: "sep", textContent: "/" }));
     };
     const seg = (text, target, { current, siblingsOf, cls }) => {
-      const open = target !== o.path ? () => this.setPath(target) : depth ? () => this.focusLevel(0) : () => this.focusChart("");
+      const open = target !== o.path ? () => this.setPath(target) : depth ? () => this.focusLevel(0) : () => this.showChartAlone("");
       const s = h("span", { className: "seg" + (current ? " current" : "") + (cls ? ` ${cls}` : "") },
         h("button", { className: "crumb", title: target || "/", onclick: current ? null : open }, text));
       if (siblingsOf != null) s.append(h("button", { className: "chev", textContent: "▾", title: "switch to a sibling",
@@ -779,7 +837,7 @@ class App {
     parts.forEach((p, i) => seg(p, parts.slice(0, i + 1).join("/"),
       { current: i === parts.length - 1 && !depth && !chart, siblingsOf: parts.slice(0, i).join("/") }));
     o.focus.forEach((level, i) => {
-      const current = i === depth - 1 && !chart, open = i === depth - 1 ? () => this.focusChart("") : () => this.focusLevel(i + 1);
+      const current = i === depth - 1 && !chart, open = i === depth - 1 ? () => this.showChartAlone("") : () => this.focusLevel(i + 1);
       sep();
       path.push(h("span", { className: "seg fchip" + (current ? " current" : "") },
         h("button", { className: "crumb", title: "an opened group", onclick: current ? null : open }, this.focusLabel(level))));
@@ -787,7 +845,7 @@ class App {
     if (chart) {
       path.push(h("span", { className: "sep", textContent: "›" }),
         h("span", { className: "seg current fchip" }, h("span", { className: "crumb" }, `chart: ${o.chart}`),
-          h("button", { className: "chev", textContent: "×", title: "back to all charts (Esc)", onclick: () => this.focusChart("") })));
+          h("button", { className: "chev", textContent: "×", title: "back to all charts (Esc)", onclick: () => this.showChartAlone("") })));
     } else if (depth) {
       // an opened group has no children to open
     } else if (!this.scopeIsRun && this.children(o.path).length) {
@@ -894,24 +952,26 @@ class App {
     return p.startsWith(s + "/") ? p.slice(s.length + 1) : p;
   }
 
-  /** Selectable group-by fields: subfolder, parent folder, and config keys that vary across the filtered runs. */
+  /** Selectable group-by fields: path (the folder hierarchy), subfolder, parent folder, and config keys that vary
+   * across the filtered runs. */
   groupFields() {
     const runs = this.runList.filter((r) => r.match);
     const distinct = (get) => new Set(runs.map((r) => JSON.stringify(get(r) ?? null))).size;
-    const fields = [{ id: "subfolder", label: "subfolder", n: distinct((r) => this.subfolder(r)) },
+    const fields = [{ id: PATH_FIELD, label: "path", n: distinct((r) => r.meta.parent), unit: "folders" },
+                    { id: "subfolder", label: "subfolder", n: distinct((r) => this.subfolder(r)) },
                     { id: "parent", label: "parent folder", n: distinct((r) => r.meta.parent) },
                     ...(runs.some((r) => r.meta.dir) ? [{ id: "dir", label: "tracked dir", n: distinct((r) => r.meta.dir) }] : [])];
     const keys = new Set();
     for (const r of runs) for (const k of Object.keys(r.meta.config || {})) keys.add(k);
     for (const k of [...keys].sort()) {
       const n = distinct((r) => r.meta.config?.[k]);
-      if (n > 1) fields.push({ id: `config.${k}`, label: k, n });
+      if (n > 1) fields.push({ id: CONFIG_FIELD + k, label: k, n });
     }
     return fields;
   }
 
   fieldLabel(id) {
-    return { subfolder: "subfolder", parent: "parent folder", dir: "tracked dir" }[id] ?? id.slice(7);
+    return { [PATH_FIELD]: "path", subfolder: "subfolder", parent: "parent folder", dir: "tracked dir" }[id] ?? id.slice(CONFIG_FIELD.length);
   }
 
   /** First path component of a run below the current folder (the run's own name if it sits directly in it). */
@@ -933,9 +993,9 @@ class App {
     menu.list(anchor, {
       title: "group by (click to toggle)", search: true,
       items: this.groupFields().map((f) => ({
-        label: f.label, sub: `${f.n} values`, active: sel.includes(f.id),
+        label: f.label, sub: `${f.n} ${f.unit ?? "values"}`, active: sel.includes(f.id),
         onpick: () => {
-          this.setGroup(sel.includes(f.id) ? sel.filter((x) => x !== f.id) : [...sel, f.id]);
+          this.setGroup(toggleField(sel, f.id));
           this.groupByMenu(anchor);
         },
       })),
@@ -988,10 +1048,10 @@ class App {
   }
 
   groupValue(r, fields = this.opts.group) {
-    if (!fields.length) return null;
+    if (!fields.length || fields[0] === PATH_FIELD) return null;
     const m = r.meta;
     return fields.map((f) => {
-      const v = f === "subfolder" ? this.subfolder(r) : f === "parent" ? this.rel(m.parent) : f === "dir" ? m.dir : m.config?.[f.slice(7)];
+      const v = f === "subfolder" ? this.subfolder(r) : f === "parent" ? this.rel(m.parent) : f === "dir" ? m.dir : m.config?.[f.slice(CONFIG_FIELD.length)];
       return v == null ? "∅" : typeof v === "object" ? JSON.stringify(v) : String(v);
     }).join(" · ");
   }
@@ -1016,6 +1076,7 @@ class App {
   computeRuns() {
     const o = this.opts, match = this.runFilterFn(), runs = [...this.data.runs.values()];
     for (const r of runs) {
+      r.visible = !this.hidden.has(r.id);
       r.match = match(r);
       r.gval = this.groupValue(r);
       r.focused = o.focus.every(([fields, value]) => this.groupValue(r, fields) === value);
@@ -1027,7 +1088,7 @@ class App {
       r.shown = r.inFocus && (!this.hidden.has(r.id) || isRun);
     }
     runs.sort((a, b) => this.compare(this.sortValue(a), this.sortValue(b)) || (b.meta.created || 0) - (a.meta.created || 0));
-    this.groups = o.group.length ? this.buildGroups(runs) : new Map();
+    this.groups = this.hasGroups ? this.buildGroups(runs) : new Map();
     this.assignColors(runs);
     this.runList = runs;
   }
@@ -1036,7 +1097,7 @@ class App {
   assignColors(runs) {
     let ci = 0;
     for (const r of runs) {
-      r.color = this.opts.group.length ? this.groups.get(r.gval)?.color ?? "#999"
+      r.color = this.hasGroups ? this.groups.get(r.gval)?.color ?? "#999"
         : r.shown ? PALETTE[ci++ % PALETTE.length] : PALETTE[hashStr(r.id) % PALETTE.length];
     }
   }
@@ -1070,7 +1131,7 @@ class App {
     return true;
   }
 
-  /** Series to draw for a metric: one per shown run, or one per group (list of column ids). */
+  /** {cols, color, label, run | group} per shown run, or per group, of a metric. */
   linesFor(key) {
     const out = [];
     if (!this.grouped) {
@@ -1122,8 +1183,8 @@ class App {
   sortValue(r) {
     const k = this.opts.sort, m = r.meta, s = m.summary || {};
     const v = k === "created" ? m.created : k === "name" ? m.name : k === "state" ? m.state
-      : k === "step" ? s._step : k === "runtime" ? s._runtime : k.startsWith("metric:") ? s[k.slice(7)] : m.created;
-    if (typeof v === "string" && k.startsWith("metric:")) return Number(v);
+      : k === "step" ? s._step : k === "runtime" ? s._runtime : k.startsWith(METRIC_SORT) ? s[k.slice(METRIC_SORT.length)] : m.created;
+    if (typeof v === "string" && k.startsWith(METRIC_SORT)) return asNumber(v) ?? NaN;
     return v;
   }
 
@@ -1150,10 +1211,10 @@ class App {
   /** The sort fields (base ones, then each metric's last value) and the sort box showing the current one. */
   renderSortOptions() {
     const base = [["created", "created"], ["name", "name"], ["state", "state"], ["step", "steps"], ["runtime", "runtime"],
-                  ["size", this.opts.group.length ? "group size" : "folder size"]];
+                  ["size", this.hasGroups ? "group size" : "folder size"]];
     const metrics = [...this.data.keys.keys()].sort(cmpNames);
     this.sortFields = [...base.map(([value, label]) => ({ value, label, metric: false })),
-                       ...metrics.map((k) => ({ value: `metric:${k}`, label: k, metric: true }))];
+                       ...metrics.map((k) => ({ value: METRIC_SORT + k, label: k, metric: true }))];
     if (!this.sortFields.some((f) => f.value === this.opts.sort)) this.opts.sort = "created";
     const box = $("#sortBy");
     if (document.activeElement !== box) box.value = this.sortLabel();
@@ -1249,7 +1310,7 @@ class App {
 
   /** Candidates for a completion context: [{label, insert, sub}]. */
   completions(ctx) {
-    if (ctx.kind === "field") return this.filterFields().map((f) => ({ label: f, insert: /^[A-Za-z_][\w./:-]*$/.test(f) ? f : `"${f.replaceAll('"', '""')}"` }));
+    if (ctx.kind === "field") return this.filterFields().map((f) => ({ label: f, insert: fieldText(f) }));
     if (ctx.kind === "joiner") return ["and", "or"].map((w) => ({ label: w, insert: w }));
     if (ctx.kind === "operator") {
       const ops = /\bnot\s*$/i.test($("#runFilter").value.slice(0, ctx.from)) ? ["in (", "like"]
@@ -1266,7 +1327,7 @@ class App {
     const cfg = new Set();
     for (const r of this.data.runs.values()) for (const k of Object.keys(r.meta.config || {})) cfg.add(k);
     this.fieldsFor = this.data.runs.size + "#" + this.data.keys.size;
-    this.fieldList = ["name", "path", "parent", "state", "tags", "dir", "step", "runtime", "created",
+    this.fieldList = ["name", "path", "parent", "state", "visible", "tags", "dir", "step", "runtime", "created",
                       ...[...cfg].sort(cmpNames), ...[...this.data.keys.keys()].sort(cmpNames).map((k) => `summary.${k}`)];
     return this.fieldList;
   }
@@ -1325,7 +1386,7 @@ class App {
   renderRunTable() {
     this.renderSortOptions();
     const rows = []; // row factories in display order
-    const metric = this.opts.sort.startsWith("metric:") ? this.opts.sort.slice(7) : null;
+    const metric = this.opts.sort.startsWith(METRIC_SORT) ? this.opts.sort.slice(METRIC_SORT.length) : null;
     const fmtVal = (v) => (v == null ? "" : typeof v === "number" ? fmt(v) : String(v));
     const saveHidden = () => store.set(`hidden:${this.data.rootKey}`, [...this.hidden]);
     const setHidden = (runs, hide) => {
@@ -1345,7 +1406,7 @@ class App {
         h("td", {}, h("input", { type: "checkbox", checked: !this.hidden.has(r.id), onchange: (e) => setHidden([r], !e.target.checked) })),
         h("td", {}, h("span", { className: "sw", style: `background:${r.color}` })),
         h("td", { className: "name", title: r.id, style: `padding-left:${4 + depth * 14}px` },
-          h("a", { href: "#", textContent: esc(r.meta.name), onclick: (e) => {
+          h("a", { href: "#", textContent: r.meta.name ?? "", onclick: (e) => {
             e.preventDefault();
             this.setPath(r.id);
           } })),
@@ -1364,14 +1425,15 @@ class App {
         h("td", {}, h("input", { type: "checkbox", checked: vis > 0, indeterminate: vis > 0 && vis < members.length,
           onchange: (e) => setHidden(members, !e.target.checked) })),
         h("td", {}, color ? h("span", { className: "sw", style: `background:${color}` }) : h("span", { className: "folder", textContent: "▤" })),
-        h("td", { className: "gname", colSpan: 2, title: label, style: `padding-left:${4 + depth * 14}px` }, label,
+        h("td", { className: "gname", title: label, style: `padding-left:${4 + depth * 14}px` }, label,
           h("span", { className: "gcount", textContent: ` ${members.length}` })),
+        h("td", { className: "stc" }, h("span", { className: `dot ${groupState(members)}`, title: stateCounts(members) })),
         h("td", { className: "num val", textContent: metric ? fmtVal(this.groupSortValue(members, label)) : "" }),
         h("td", { className: "num" }, h("button", { className: "gfocus", textContent: "open ›", title: openTitle, onclick: onOpen })));
     };
     const inScope = this.runList.filter((r) => r.match && r.inFocus);
     const heads = [];
-    if (this.opts.group.length) {
+    if (this.hasGroups) {
       const scopeSet = new Set(inScope);
       for (const g of this.groups.values()) {
         const members = g.runs.filter((r) => scopeSet.has(r));
@@ -1383,7 +1445,7 @@ class App {
           openTitle: "open this group", onOpen: () => this.openGroup(g.name) }), { id: key }));
         if (open) for (const r of members) rows.push(Object.assign(() => runRow(r, 0), { id: r.id }));
       }
-    } else {
+    } else if (this.byPath) {
       const walk = (node, depth) => {
         const dirs = [...node.dirs.values()].map((d) => [d, this.groupSortValue(d.all, d.name)])
           .sort((a, b) => this.compare(a[1], b[1]) || cmpNames(a[0].name, b[0].name));
@@ -1398,7 +1460,7 @@ class App {
         for (const r of node.runs) rows.push(Object.assign(() => runRow(r, depth), { id: r.id }));
       };
       walk(this.buildTree(inScope), 0);
-    }
+    } else for (const r of inScope) rows.push(Object.assign(() => runRow(r, 0), { id: r.id }));
     this.sideRows = rows;
     this.renderSideWindow();
     const shown = this.runList.filter((r) => r.shown).length;
@@ -1418,10 +1480,16 @@ class App {
     ha.onclick = () => setHidden(inScope, anyVisible);
   }
 
+  /** Offset of the run table within the sidebar's scrolled content. */
+  sideTop() {
+    const aside = $("aside");
+    return $("#runTable").getBoundingClientRect().top - aside.getBoundingClientRect().top + aside.scrollTop;
+  }
+
   /** Build only the sidebar rows near the scroll position; spacer rows stand in for the rest. */
   renderSideWindow() {
-    const aside = $("aside"), table = $("#runTable"), rows = this.sideRows || [];
-    const top = table.getBoundingClientRect().top - aside.getBoundingClientRect().top + aside.scrollTop;
+    const aside = $("aside"), rows = this.sideRows || [];
+    const top = this.sideTop();
     const a = Math.max(0, Math.floor((aside.scrollTop - top) / SIDE_ROW) - 30);
     const b = Math.min(rows.length, a + Math.ceil(aside.clientHeight / SIDE_ROW) + 60);
     const spacer = (n) => h("tr", { className: "spacer" }, h("td", { colSpan: 7, style: `height:${n * SIDE_ROW}px` }));
@@ -1445,9 +1513,7 @@ class App {
       else c[k] = v;
       if (Object.keys(c).length) this.panelCfg[key] = c;
       else delete this.panelCfg[key];
-      store.set(`panels:${this.data.rootKey}`, this.panelCfg);
-      for (const c of this.chartsOf(key)) c.dirty = true;
-      this.schedule(true);
+      this.savePanelCfg(key);
     };
     const num = (k) => h("input", { type: "number", step: "any", placeholder: "auto", value: cfg()[k] ?? "",
       onchange: (e) => set(k, e.target.value === "" ? null : +e.target.value) });
@@ -1479,9 +1545,7 @@ class App {
       h("div", { className: "actions" },
         h("button", { textContent: "reset chart", onclick: () => {
           delete this.panelCfg[key];
-          store.set(`panels:${this.data.rootKey}`, this.panelCfg);
-          for (const c of this.chartsOf(key)) c.dirty = true;
-          this.schedule(true);
+          this.savePanelCfg(key);
           this.panelSettings(chart, anchor);
         } }),
         h("button", { textContent: "close", onclick: () => menu.close() })),
@@ -1491,7 +1555,13 @@ class App {
     menu.open(anchor, form);
   }
 
-  // ---- panels ----
+  /** Persist the per-chart settings after a change to `key`'s, and redraw its charts. */
+  savePanelCfg(key) {
+    store.set(`panels:${this.data.rootKey}`, this.panelCfg);
+    for (const c of this.chartsOf(key)) c.dirty = true;
+    this.schedule(true);
+  }
+
   // ---- panels ----
 
   keyFilterFn() {
@@ -1507,23 +1577,27 @@ class App {
 
   renderPanels() {
     const sections = this.panelSections(), root = $("#panels"), closed = store.get("closedSections", {});
+    this.sectionEls = new Map();
     const sectionBtn = h("button", { className: "sectionsToggle" });
     let nsec = 0;
     const walk = (secs) => secs.forEach((x) => ((nsec += 1), walk(x.children)));
     walk(sections);
     const count = sections.filter((x) => x.id !== PINNED).reduce((n, x) => n + x.n, 0);
-    const els = [$("#infoPanel"), h("div", { className: "panelbar" }, sectionBtn,
-      h("span", { className: "muted", textContent: `${nsec} sections · ${count} panels` }))];
+    this.panelCount = h("span", { className: "muted" });
+    this.panelCountText = `${nsec} sections · ${count} panels`;
+    this.renderPanelCount();
+    const els = [$("#infoPanel"), h("div", { className: "panelbar" }, sectionBtn, this.panelCount)];
     els.push(...sections.map((x) => this.sectionEl(x, closed)));
     sectionBtn.addEventListener("click", () => {
       const open = [...root.querySelectorAll("details.section")].some((d) => d.open);
       for (const d of root.querySelectorAll("details.section")) d.open = !open;
     });
     root.replaceChildren(...els);
-    const focus = this.opts.chart && this.charts.get(this.opts.chart);
-    root.classList.toggle("focus", !!focus);
-    if (focus) {
-      root.append(h("div", { className: "focusview" }, focus.el));
+    if (this.opts.chart && this.data.keys.has(this.opts.chart)) this.panelEl(this.opts.chart, "metric");
+    const alone = this.opts.chart && this.charts.get(this.opts.chart);
+    root.classList.toggle("alone", !!alone);
+    if (alone) {
+      root.append(h("div", { className: "aloneview" }, alone.el));
       root.scrollTop = 0;
     }
     this.updateSectionsToggle();
@@ -1531,28 +1605,91 @@ class App {
     this.renderMedia();
   }
 
-  /** A foldable section: its panels, then its subsections; whether it is folded is remembered by its path. Its
-   * header stays in view while scrolling, links to its subsections and folds or unfolds all of them. */
+  /** A foldable section: its shown panels, then its subsections; whether it is folded is remembered by its path. Its
+   * header stays in view while scrolling, opens the section's menu, links to its subsections and hidden panels, and
+   * folds or unfolds all of its subsections. */
   sectionEl(sec, closed, depth = 0) {
     const grid = sec.items.length ? h("div", { className: "grid" }, ...sec.items.map(([key, kind, pinned]) => this.panelEl(key, kind, pinned))) : null;
     const subs = sec.children.map((x) => this.sectionEl(x, closed, depth + 1));
+    const head = h("summary", {});
     const el = h("details", { className: "section", style: `--depth:${depth}`, open: !closed[sec.id], ontoggle: (e) => {
       const c = store.get("closedSections", {});
       c[sec.id] = !e.target.open;
       store.set("closedSections", c);
       this.updateSectionsToggle();
-    } }, h("summary", {}, h("span", { className: "stitle", textContent: `${sec.title} (${sec.n})` }),
-      ...(subs.length ? subsectionControls(sec, subs) : [])), ...[grid, ...subs].filter(Boolean));
+    } }, head, ...[grid, ...subs].filter(Boolean));
+    const s = { sec, subs, el, head, grid };
+    this.renderSectionHead(s);
+    this.sectionEls.set(sec.id, s);
     return el;
+  }
+
+  /** A section's header: its title, its menu button, and the links and fold button of `sectionControls`. */
+  renderSectionHead({ sec, subs, head }) {
+    head.replaceChildren(h("span", { className: "stitle", textContent: `${sec.title} (${sec.n})` }),
+      iconButton("secmenu", "show or hide this section's panels, fold or unfold its subsections", MENU_ICON, stop(() => this.sectionMenu(sec.id))),
+      ...sectionControls(sec, subs, (key) => this.togglePanel(key)));
+  }
+
+  /** "N sections · M panels", with how many are hidden. */
+  renderPanelCount() {
+    const hidden = [...this.hiddenPanels].filter((k) => this.data.keys.has(k) || this.data.media.has(k)).length;
+    this.panelCount.textContent = this.panelCountText + (hidden ? ` · ${hidden} hidden` : "");
+  }
+
+  /** The menu of a section: its panels (checked when shown; picking one hides or shows it) and its subsections
+   * (checked when unfolded; picking one folds or unfolds it). */
+  sectionMenu(id) {
+    const s = this.sectionEls?.get(id), anchor = s?.el.querySelector(":scope > summary .secmenu");
+    if (!anchor) return menu.close();
+    const { sec, subs } = s, again = () => this.sectionMenu(id);
+    const panels = [...sec.items, ...sec.hidden].sort((a, b) => cmpNames(a[0], b[0]));
+    const items = [...panels.map(([key, kind]) => ({ label: shortName(key, sec), sub: kind === "media" ? "media" : "chart",
+                     icon: this.hiddenPanels.has(key) ? " " : "✓", onpick: () => (this.togglePanel(key), again()) })),
+                   ...sec.children.map((x, i) => ({ label: `${x.title}/`, sub: `${x.n} panels`, icon: subs[i].open ? "✓" : " ",
+                     onpick: () => ((subs[i].open = !subs[i].open), again()) }))];
+    menu.list(anchor, { title: `${sec.title}: shown panels, open subsections`, items, search: items.length > 12 });
+  }
+
+  /** Hide a panel (its section's header then links to it) or show it again, scrolling to it. Only the panel and the
+   * headers of the sections holding it change, so the rest of the view stays where it is. */
+  togglePanel(key) {
+    const show = this.hiddenPanels.delete(key);
+    if (!show) this.hiddenPanels.add(key);
+    store.set(`hiddenPanels:${this.data.rootKey}`, [...this.hiddenPanels]);
+    for (const s of this.sectionEls.values()) {
+      const from = show ? s.sec.hidden : s.sec.items, i = from.findIndex(([k]) => k === key);
+      if (i < 0) continue;
+      const [item] = from.splice(i, 1);
+      (show ? s.sec.items : s.sec.hidden).push(item);
+      for (const list of [s.sec.items, s.sec.hidden]) list.sort((a, b) => cmpNames(a[0], b[0]));
+      show ? this.insertPanel(s, item) : this.removePanel(s, item);
+      this.renderSectionHead(s);
+    }
+    this.renderPanelCount();
+    if (show) requestAnimationFrame(() => (this.charts.get(key) ?? this.mediaPanels.get(key))?.el.scrollIntoView({ block: "nearest" }));
+  }
+
+  /** Put a panel back into its section's grid, in name order (making the grid if the section had none shown). */
+  insertPanel(s, [key, kind, pinned]) {
+    const el = this.panelEl(key, kind, pinned), i = s.sec.items.findIndex(([k]) => k === key), next = s.sec.items[i + 1];
+    if (!s.grid) s.head.after((s.grid = h("div", { className: "grid" })));
+    s.grid.insertBefore(el, next ? this.panelEl(...next) : null);
+  }
+
+  /** Take a panel out of its section's grid (and the grid out of the section once empty). */
+  removePanel(s, [key, kind, pinned]) {
+    this.panelEl(key, kind, pinned).remove();
+    if (s.grid && !s.grid.childElementCount) s.grid.remove(), (s.grid = null);
   }
 
   /** Sections of the shown runs' panels passing the chart filter, in display order: pinned charts (in pin order; each also
    * stays in its own section), "charts" (keys without a slash), then a section per key prefix, nested by path,
-   * media-only sections last at each level. A section is {id (its path), title, items: [[key, kind, pinned]],
-   * children, n (panels in it and below)}. */
+   * media-only sections last at each level. A section is {id (its path), title, items: [[key, kind, pinned]] shown,
+   * hidden: the same for its hidden panels, children, n (panels in it and below, hidden ones too)}. */
   panelSections() {
     const kf = this.keyFilterFn(), top = new Map(), pins = [];
-    const node = (id, title) => ({ id, title, items: [], children: new Map(), n: 0 });
+    const node = (id, title) => ({ id, title, items: [], hidden: [], children: new Map(), n: 0 });
     const add = (key, kind) => {
       if (!kf(key)) return;
       if (kind === "metric" && this.pins.includes(key)) pins.push([key, kind, true]);
@@ -1564,14 +1701,16 @@ class App {
         n = n.children.get(parts[i]);
         n.n++;
       }
-      n.items.push([key, kind, false]);
+      (this.hiddenPanels.has(key) ? n.hidden : n.items).push([key, kind, false]);
     };
     for (const k of this.data.keys.keys()) if (!this.scopeKeys || this.scopeKeys.has(k)) add(k, "metric");
     for (const k of this.data.media.keys()) if (!this.scopeKeys || this.scopeKeys.has(k)) add(k, "media");
     const pinOrder = new Map(this.pins.map((k, i) => [k, i]));
     pins.sort((a, b) => pinOrder.get(a[0]) - pinOrder.get(b[0]));
     const sorted = [...top.values()].map(orderSection).sort((a, b) => (a.id !== "charts") - (b.id !== "charts") || sectionCmp(a, b));
-    return pins.length ? [{ id: PINNED, title: "pinned", items: pins, children: [], n: pins.length }, ...sorted] : sorted;
+    const pinned = { id: PINNED, title: "pinned", items: pins.filter(([k]) => !this.hiddenPanels.has(k)),
+                     hidden: pins.filter(([k]) => this.hiddenPanels.has(k)), children: [], n: pins.length };
+    return pins.length ? [pinned, ...sorted] : sorted;
   }
 
   /** The chart or media panel of `key` (the pinned section's own copy when `pinned`), created on first use. */
@@ -1605,7 +1744,7 @@ class App {
   }
 
   /** Show one chart filling the chart pane, as a level of the path bar ("" = all charts). */
-  focusChart(key) {
+  showChartAlone(key) {
     if ((this.opts.chart || "") === key) return;
     this.opts.chart = key;
     this.saveHash(true);
@@ -1742,20 +1881,20 @@ class App {
     this.setXRange(null);
   }
 
-  /** Value tooltip: every row by value, in a list TIP_ROWS tall centred on `near` (the line nearest the pointer). */
-  tip(e, chart, xs, rows, near = -1) {
+  /** Value tooltip: every row by value, in a list TIP_ROWS tall centered on `near` (the line nearest the pointer). */
+  tip(e, chart, heading, rows, near = -1) {
     if (!e) return ($("#tip").hidden = true);
-    this.tipView = { e, chart, xs, rows, near };
+    this.tipView = { e, chart, heading, rows, near };
     this.renderTip();
   }
 
   /** The tooltip beside the pointer: a heading, the scrolling list of rows, and a hint. */
   renderTip() {
-    const t = $("#tip"), v = this.tipView, { e, chart, xs, rows, near } = v;
+    const t = $("#tip"), v = this.tipView, { e, chart, heading, rows, near } = v;
     v.body = h("div", {});
     v.list = h("div", { className: "tlist", style: `height:${Math.min(rows.length, TIP_ROWS) * TIP_ROW_PX}px`, onscroll: () => this.tipWindow() }, v.body);
     v.a = v.b = -1;
-    t.replaceChildren(h("div", { className: "th", textContent: `${chart?.key} · ${xs}` }), v.list, h("div", { className: "tf" }));
+    t.replaceChildren(h("div", { className: "th", textContent: `${chart?.key} · ${heading}` }), v.list, h("div", { className: "tf" }));
     this.tipFooter();
     t.hidden = false;
     v.body.style.paddingBottom = `${rows.length * TIP_ROW_PX}px`; // the list's full height, so it can scroll to `near`
@@ -1842,8 +1981,8 @@ class App {
     const r = this.data.runs.get(id);
     if (!r) return;
     let opened = false;
-    if (this.opts.group.length) opened = this.collapsed.delete(`group:${r.gval}`);
-    else {
+    if (this.hasGroups) opened = this.collapsed.delete(`group:${r.gval}`);
+    else if (this.byPath) {
       const rel = this.rel(id), parts = rel === "." ? [] : rel.split("/").slice(0, -1);
       let p = this.opts.path;
       for (const part of parts) {
@@ -1862,9 +2001,8 @@ class App {
     if (rebuild || !this.sideRows) this.renderRunTable();
     const i = (this.sideRows || []).findIndex((f) => f.id === id);
     if (i < 0) return;
-    const aside = $("aside"), table = $("#runTable");
-    const top = table.getBoundingClientRect().top - aside.getBoundingClientRect().top + aside.scrollTop;
-    aside.scrollTop = top + i * SIDE_ROW - aside.clientHeight / 2 + SIDE_ROW / 2;
+    const aside = $("aside");
+    aside.scrollTop = this.sideTop() + i * SIDE_ROW - aside.clientHeight / 2 + SIDE_ROW / 2;
     this.renderSideWindow();
   }
 
@@ -1911,7 +2049,8 @@ class MediaPanel {
     this.stepLabel = h("span", { className: "muted" });
     this.grid = h("div", { className: "mgrid" });
     this.el = h("div", { className: "panel media" },
-      h("div", { className: "ptitle" }, h("span", { textContent: key }), this.slider, this.stepLabel), this.grid);
+      h("div", { className: "ptitle" }, h("span", { textContent: key }), this.slider, this.stepLabel,
+        iconButton("hide", "hide (its section's header links to it)", HIDE_ICON, () => app.togglePanel(key))), this.grid);
     this.el._media = this;
   }
 

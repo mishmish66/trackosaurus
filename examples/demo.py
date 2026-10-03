@@ -27,13 +27,13 @@ td { text-align: right; }
 </style>"""
 
 
-def report(lr, seed, step, values):
+def report(lr: float, seed: int, step: int, values: dict[str, float]) -> str:
     """A small HTML summary of a run at `step`."""
     rows = "".join(f"<tr><th>{k}</th><td>{v:.3g}</td></tr>" for k, v in values.items())
     return f"{REPORT_STYLE}<h3>lr {lr} · seed {seed} · step {step}</h3><table>{rows}</table>"
 
 
-def fake_run(dest, lr, seed, steps, delay, media_every, width):
+def fake_run(dest: Path, lr: float, seed: int, steps: int, delay: float, media_every: int, width: int) -> None:
     rng = random.Random(seed * 1000 + int(lr * 1e5))
     run = trex.init(dest, config={"lr": lr, "seed": seed, "model": {"width": width, "depth": 4}}, tags=["demo"],
                     info={"git": {"sha": "3f9c2e1", "branch": "main", "dirty": seed == 1},
@@ -61,7 +61,7 @@ def fake_run(dest, lr, seed, steps, delay, media_every, width):
     run.finish()
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("dest", type=Path)
     ap.add_argument("--seeds", type=int, default=3)

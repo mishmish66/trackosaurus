@@ -21,6 +21,8 @@ from trex import update
 from trex.cli import field_columns, main, where_test
 from trex.format import connect_ro
 
+from helpers import committed_rows, wait_for
+
 
 @pytest.fixture
 def runs(tmp_path, monkeypatch):
@@ -43,6 +45,14 @@ def runs(tmp_path, monkeypatch):
 def run_json(capsys, *argv):
     main([*map(str, argv), "--json"])
     return json.loads(capsys.readouterr().out)
+
+
+def test_every_run_is_visible_outside_the_ui_and_runs_filter_by_state(runs, capsys):
+    every = run_json(capsys, "ls", runs)
+    assert len(run_json(capsys, "ls", runs, "-w", "visible = true")) == len(every) > 0
+    assert run_json(capsys, "ls", runs, "-w", "visible = false") == []
+    states = {r["state"] for r in every}
+    assert [len(run_json(capsys, "ls", runs, "-w", f"state = {s}")) for s in states] == [sum(r["state"] == s for r in every) for s in states]
 
 
 def test_ls_filters_sorts_and_limits(runs, capsys):
@@ -133,7 +143,7 @@ def test_refuses_to_index_home(capsys):
     ("config.flag = true", {"config": {"flag": True}}, True),
     ("config.name ~ '^ad'", {"config": {"name": "adam"}}, True),
     ("config.name !~ '^ad'", {"config": {"name": "adam"}}, False),
-    ("summary.loss < 1", {"summary": {"loss": "NaN"}}, False),
+    ("summary.loss < 1", {"summary": {"loss": "nan"}}, False),
     ("info.notes is null", {"info": {}}, True),
     ("state = running", {"state": "running"}, True),
 ])
@@ -262,7 +272,7 @@ def test_diff_compares_info_and_lists_equal_keys_with_all(runs, capsys):
 def test_tail_follow_streams_new_rows_until_the_run_ends(tmp_path, capsys):
     run = trex.init(tmp_path / "live", commit_interval=0.02)
     run.log({"loss": 0.0}, step=0)
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(tmp_path / "live") == 1)
 
     def write():
         for s in range(1, 4):
@@ -323,7 +333,7 @@ def test_unknown_options_are_usage_errors(capsys):
 
 
 RECORD = cast(Q.Record, {"path": "a/r", "name": "r", "state": "finished", "config": {"lr": 0.1, "both": "config", "opt/name": "adam"},
-                         "summary": {"loss": "NaN", "both": 2.0, "acc": 0.5}, "info": {"git": {"sha": "abc"}, "a.b": 1}})
+                         "summary": {"loss": "nan", "both": 2.0, "acc": 0.5}, "info": {"git": {"sha": "abc"}, "a.b": 1}})
 
 
 @pytest.mark.parametrize("field,want", [
@@ -336,7 +346,7 @@ def test_fields_resolve_config_first_then_summary_with_prefixes_and_nested_info(
 
 
 def test_summary_markers_are_numbers():
-    assert str(Q.get(RECORD, "loss")) == "nan" and Q.num("-Infinity") == -math.inf and Q.num("abc") is None and Q.num(True) == 1.0
+    assert str(Q.get(RECORD, "loss")) == "nan" and Q.num("-inf") == -math.inf and Q.num("abc") is None and Q.num(True) == 1.0
 
 
 @pytest.mark.parametrize("clause,want", [("name > q", True), ("name < q", False), ("name >= r", True), ("config.both < d", True)])

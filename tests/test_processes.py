@@ -7,30 +7,17 @@ import signal
 import socket
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 import pytest
 
-import trex
-
-
-def write_run(d, n=5):
-    run = trex.init(d, commit_interval=0.05)
-    for i in range(n):
-        run.log({"x": float(i)}, step=i)
-    run.finish()
+from helpers import get_json, post_json, write_run
 
 
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
-
-
-def get_json(url):
-    with urllib.request.urlopen(url, timeout=10) as r:
-        return json.loads(r.read())
 
 
 @pytest.fixture
@@ -98,7 +85,7 @@ def test_restarted_daemon_serves_the_directories_it_had(tmp_path, env):
 
 
 def test_output_to_a_closed_pipe_ends_without_a_traceback(tmp_path, env):
-    write_run(tmp_path / "r", 20000)
+    write_run(tmp_path / "r", 20000, metrics=lambda i: {"x": float(i)})
     p = subprocess.Popen(trex_cmd("series", tmp_path / "r", "-k", "x"), env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True)
     assert p.stdout and p.stderr
@@ -142,11 +129,6 @@ def forge(tmp_path):
     return f"git+file://{bare}", push
 
 
-def post_json(url):
-    with urllib.request.urlopen(urllib.request.Request(url, data=b"{}", method="POST"), timeout=600) as r:
-        return json.loads(r.read())
-
-
 @pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv")
 def test_update_installs_the_newest_commit_and_the_restarted_daemon_runs_it(tmp_path, env, forge):
     source, push = forge
@@ -166,12 +148,12 @@ def test_update_installs_the_newest_commit_and_the_restarted_daemon_runs_it(tmp_
         info = get_json(api)
         assert info["updates"] == {"source": source, "available": True, "reason": ""}
         new = push()
-        body = post_json(f"{api}/update")
+        body = post_json(f"{api}/update", timeout=600)[1]
         assert body["updated"] and body["to"]["commit"] == new != body["from"]["commit"] == info["install"]["commit"]
         assert p.wait(timeout=60) == 75
         p = start_daemon()
         assert get_json(api)["install"]["commit"] == new
-        assert post_json(f"{api}/update")["updated"] is False
+        assert post_json(f"{api}/update", timeout=600)[1]["updated"] is False
     finally:
         if p.poll() is None:
             assert interrupt(p) == 0

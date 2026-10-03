@@ -2,14 +2,15 @@
     rowmeta(seq0, n, step_lo, step_hi, data)   data: f64 step[n], f64 t[n] (seconds since creation)
     chunk(key_id, seq0, data)                  per metric in the commit: u32 dense, u32 m,
                                                u16 pos[m] padded to 8 (unless dense), f64 value[m]
-Readers find rows by the commits that overlap them, so a writer may merge adjacent commits (`merge`).
+Readers find rows by the commits that overlap them, so a writer may merge adjacent commits (`prepare_merge`,
+`apply_merge`).
 """
 
 import sqlite3
 import struct
 import sys
 from array import array
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Final, NamedTuple
 
 import numpy as np
@@ -19,6 +20,12 @@ type Floats = npt.NDArray[np.float64]
 
 type CommitRow = tuple[float, float, Mapping[str, float]]
 """One row of a commit: (step, seconds since the run was created, {metric name: value})."""
+
+type RowMeta = tuple[int, int, float, float, bytes]
+"""(seq0, n, step_lo, step_hi, data)"""
+
+type KeyChunk = tuple[int, bytes]
+"""(key id, chunk)"""
 
 
 class Row(NamedTuple):
@@ -45,11 +52,12 @@ type _FloatView = memoryview[float]
 class Chunk(NamedTuple):
     """One metric's values in one commit; `positions` (rows within the commit) is None when dense."""
 
-    dense: bool
     positions: _IntView | None
     values: _FloatView
 
+
 MAX_ROWS: Final = 65535
+_HEAD: Final = struct.Struct("<II")  # chunk header: dense, m
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS keys(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
@@ -64,7 +72,7 @@ if sys.byteorder != "little":
     raise ImportError("trex chunks require a little-endian host")
 
 
-def encode(rows: Sequence[CommitRow], ids: dict[str, int]) -> tuple[tuple[int, float, float, bytes], list[tuple[int, bytes]]]:
+def encode(rows: Sequence[CommitRow], ids: dict[str, int]) -> tuple[tuple[int, float, float, bytes], list[KeyChunk]]:
     """(rowmeta fields, [(key id, chunk)]) of a commit; new names are added to `ids`."""
     n = len(rows)
     if not 0 < n <= MAX_ROWS:
@@ -89,19 +97,21 @@ def encode(rows: Sequence[CommitRow], ids: dict[str, int]) -> tuple[tuple[int, f
 def _blob(positions: bytes | None, m: int, values: bytes) -> bytes:
     """A chunk of `m` values: dense (one per row of its commit) when `positions` is None."""
     if positions is None:
-        return struct.pack("<II", 1, m) + values
-    return struct.pack("<II", 0, m) + positions + b"\0" * (-len(positions) % 8) + values
+        return _HEAD.pack(1, m) + values
+    return _HEAD.pack(0, m) + positions + b"\0" * (-len(positions) % 8) + values
+
+
+def _values_offset(dense: bool, m: int) -> int:
+    """Offset of the f64 values in a chunk of `m` values."""
+    return 8 if dense else 8 + -(-2 * m // 8) * 8
 
 
 def decode(blob: bytes) -> Chunk:
     """One chunk's layout, as memoryviews into `blob` (positions u16, values f64)."""
-    dense, m = struct.unpack_from("<II", blob, 0)
+    dense, m = _HEAD.unpack_from(blob)
     mv = memoryview(blob)
-    if dense:
-        return Chunk(True, None, mv[8:].cast("d"))
-    pos = mv[8: 8 + 2 * m].cast("H")
-    off = 8 + -(-2 * m // 8) * 8
-    return Chunk(False, pos, mv[off:].cast("d"))
+    pos = None if dense else mv[8: 8 + 2 * m].cast("H")
+    return Chunk(pos, mv[_values_offset(dense, m):].cast("d"))
 
 
 type Insert = tuple[str, tuple[int | float | str | bytes, ...]]
@@ -114,17 +124,6 @@ def inserts(seq0: int, rows: Sequence[CommitRow], ids: dict[str, int]) -> list[I
     (n, lo, hi, meta), parts = encode(rows, ids)
     return [*(("keys", (kid, k)) for k, kid in ids.items() if kid >= known), ("rowmeta", (seq0, n, lo, hi, meta)),
             *(("chunk", (kid, seq0, b)) for kid, b in parts)]
-
-
-def write(c: sqlite3.Connection, seq0: int, rows: Sequence[CommitRow], ids: dict[str, int]) -> int:
-    """Insert a commit inside the caller's transaction; returns its row count."""
-    for table, values in inserts(seq0, rows, ids):
-        c.execute(f"INSERT INTO {INSERT_INTO[table]} VALUES ({', '.join('?' * len(values))})", values)
-    return len(rows)
-
-
-INSERT_INTO: Final = {"keys": "keys(id, name)", "rowmeta": "rowmeta(seq0, n, step_lo, step_hi, data)",
-                      "chunk": "chunk(key_id, seq0, data)"}
 
 
 def key_names(c: sqlite3.Connection) -> dict[int, str]:
@@ -164,13 +163,12 @@ def metric(c: sqlite3.Connection, key_id: int, start: int = 0, stop: int | None 
     for seq0, n, meta, blob in c.execute(q, args):
         rm = np.frombuffer(meta, dtype="<f8")
         s, t = rm[:n], rm[n:]
-        dense, m = struct.unpack_from("<II", blob, 0)
+        dense, m = _HEAD.unpack_from(blob)
+        v = np.frombuffer(blob, dtype="<f8", offset=_values_offset(dense, m))
         if dense:
-            v = np.frombuffer(blob, dtype="<f8", offset=8)
             idx = None
         else:
             idx = np.frombuffer(blob, dtype="<u2", count=m, offset=8)
-            v = np.frombuffer(blob, dtype="<f8", offset=8 + -(-2 * m // 8) * 8)
             s, t = s[idx], t[idx]
         lo, hi = max(start - seq0, 0), (stop - seq0) if stop is not None else n
         if lo > 0 or hi < n:
@@ -207,6 +205,31 @@ def rows(c: sqlite3.Connection, start: int = 0, stop: int | None = None) -> list
     return out
 
 
+def join_rowmeta(parts: Iterable[tuple[int, bytes]]) -> bytes:
+    """Rowmeta data of consecutive commits ((rows, data), in row order) as one: every step, then every time."""
+    steps: list[bytes] = []
+    times: list[bytes] = []
+    for k, d in parts:
+        steps.append(d[: 8 * k])
+        times.append(d[8 * k: 16 * k])
+    return b"".join(steps) + b"".join(times)
+
+
+def merged_rowmeta(metas: Sequence[RowMeta]) -> RowMeta:
+    """The rowmeta row of consecutive commits merged into one."""
+    return (metas[0][0], sum(m[1] for m in metas), min(m[2] for m in metas), max(m[3] for m in metas),
+            join_rowmeta((m[1], m[4]) for m in metas))
+
+
+def last_step_and_time(c: sqlite3.Connection, rows: int) -> tuple[float, float] | None:
+    """Step and time of row `rows - 1`, from the commit that ends there; None when none does."""
+    r: tuple[int, bytes] | None = c.execute("SELECT n, data FROM rowmeta WHERE seq0 + n = ?", (rows,)).fetchone()
+    if r is None:
+        return None
+    n, data = r
+    mv = memoryview(data).cast("d")
+    return mv[n - 1], mv[2 * n - 1]
+
 
 class Merge(NamedTuple):
     """Commits holding exactly rows [seq0, stop), read and rebuilt as one commit by `prepare_merge`."""
@@ -216,8 +239,8 @@ class Merge(NamedTuple):
     commits: list[tuple[int, int]]  # (seq0, rows) of the commits it replaces
     first_id: int  # the replaced commits' chunks have rowids from here on
     replaced_chunks: int
-    rowmeta: tuple[int, int, float, float, bytes]
-    chunks: list[tuple[int, bytes]]  # (key id, chunk) of the merged commit
+    rowmeta: RowMeta
+    chunks: list[KeyChunk]  # of the merged commit
     values: int
 
 
@@ -228,7 +251,7 @@ def prepare_merge(c: sqlite3.Connection, seq0: int, stop: int, first_id: int = 0
     n = stop - seq0
     if not 0 < n <= MAX_ROWS:
         raise ValueError(f"a commit holds 1..{MAX_ROWS} rows")
-    metas: list[tuple[int, int, float, float, bytes]] = c.execute(
+    metas: list[RowMeta] = c.execute(
         "SELECT seq0, n, step_lo, step_hi, data FROM rowmeta WHERE seq0 >= ? AND seq0 < ? ORDER BY seq0", (seq0, stop)).fetchall()
     at = seq0
     for s, k, *_ in metas:
@@ -240,17 +263,14 @@ def prepare_merge(c: sqlite3.Connection, seq0: int, stop: int, first_id: int = 0
     parts: list[tuple[int, int, bytes]] = c.execute(
         "SELECT key_id, seq0, data FROM chunk WHERE id >= ? AND seq0 >= ? AND seq0 < ? ORDER BY key_id, seq0",
         (first_id, seq0, stop)).fetchall()
-    steps = b"".join(d[: 8 * k] for _, k, _, _, d in metas)
-    times = b"".join(d[8 * k: 16 * k] for _, k, _, _, d in metas)
-    rowmeta = (seq0, n, min(m[2] for m in metas), max(m[3] for m in metas), steps + times)
     sizes = {s: k for s, k, *_ in metas}
-    merged: list[tuple[int, bytes]] = []
+    merged: list[KeyChunk] = []
     values = 0
     for kid, group in _by_key(parts):
         blob = merge_chunks(group, sizes, seq0, n)
         merged.append((kid, blob))
-        values += struct.unpack_from("<II", blob)[1]
-    return Merge(seq0, stop, [(s, k) for s, k, *_ in metas], first_id, len(parts), rowmeta, merged, values)
+        values += _HEAD.unpack_from(blob)[1]
+    return Merge(seq0, stop, [(s, k) for s, k, *_ in metas], first_id, len(parts), merged_rowmeta(metas), merged, values)
 
 
 def apply_merge(c: sqlite3.Connection, m: Merge) -> int:
@@ -267,13 +287,6 @@ def apply_merge(c: sqlite3.Connection, m: Merge) -> int:
     first: int = c.execute("SELECT coalesce(max(id), 0) + 1 FROM chunk").fetchone()[0]
     c.executemany("INSERT INTO chunk(key_id, seq0, data) VALUES (?, ?, ?)", [(kid, m.seq0, blob) for kid, blob in m.chunks])
     return first
-
-
-def merge(c: sqlite3.Connection, seq0: int, stop: int) -> int:
-    """`prepare_merge` and `apply_merge` inside the caller's write transaction; returns how many commits it replaced."""
-    m = prepare_merge(c, seq0, stop)
-    apply_merge(c, m)
-    return len(m.commits)
 
 
 def merge_chunks(parts: Sequence[tuple[int, bytes]], sizes: Mapping[int, int], seq0: int, n: int) -> bytes:
@@ -300,13 +313,13 @@ def _dense(parts: Sequence[tuple[int, bytes]], sizes: Mapping[int, int], n: int)
     """The merged chunk when every part is dense and together they fill all `n` rows, else None."""
     total = 0
     for s, blob in parts:
-        dense, m = struct.unpack_from("<II", blob)
-        if not dense or m != sizes[s] or len(blob) != 8 + 8 * m:
+        dense, m = _HEAD.unpack_from(blob)
+        if not dense or m != sizes[s] or len(blob) != _values_offset(True, m) + 8 * m:
             return None
         total += m
     if total != n:
         return None
-    return struct.pack("<II", 1, n) + b"".join(blob[8:] for _, blob in parts)
+    return _HEAD.pack(1, n) + b"".join(blob[8:] for _, blob in parts)
 
 
 def _merged(parts: Sequence[tuple[int, bytes]], seq0: int, n: int) -> tuple[bytes, npt.NDArray[np.int64], Floats]:
@@ -317,8 +330,8 @@ def _merged(parts: Sequence[tuple[int, bytes]], seq0: int, n: int) -> tuple[byte
     pos_bytes: list[bytes] = []
     val_bytes: list[bytes] = []
     for _, blob in parts:
-        dense, m = struct.unpack_from("<II", blob)
-        off = 8 if dense else 8 + -(-2 * m // 8) * 8
+        dense, m = _HEAD.unpack_from(blob)
+        off = _values_offset(dense, m)
         counts.append(m)
         sparse.append(not dense)
         if not dense:

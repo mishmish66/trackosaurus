@@ -4,9 +4,16 @@
 /** `flags` bits accepted by prep, agg and yrange; IQM (agg only) adds the interquartile mean. */
 export const LOGY = 1, RAW = 2, LOGX = 4, IQM = 8;
 
+/** `xmode` values: x is the step, or the runtime. */
+export const X_STEP = 0, X_RUNTIME = 1;
+
 /** Per-bin statistics returned by agg, in output order (stat-major). */
 export const STATS = ["mean", "std", "n", "min", "max", "median", "q25", "q75", "medlo", "medhi", "iqm", "iqmse", "iqmh"];
 export const NSTAT = STATS.length;
+/** Row of each statistic in agg's output. */
+const S = Object.freeze(Object.fromEntries(STATS.map((k, i) => [k, i])));
+const IQM_ROWS = [S.iqm, S.iqmse, S.iqmh];
+const OTHER_ROWS = STATS.map((_, j) => j).filter((j) => j !== S.n && !IQM_ROWS.includes(j)); // all but n and IQM_ROWS
 
 /** One metric of one run: points (step, value, runtime) in sequence order. */
 export class Col {
@@ -56,12 +63,12 @@ export class Col {
   /** [min, max, smallest positive] of x; null if empty. */
   extent(xmode) {
     if (!this.n) return null;
-    const k = xmode === 0 ? 0 : 3;
+    const k = xmode === X_STEP ? 0 : 3;
     return [this.ext[k], this.ext[k + 1], this.ext[k + 2]];
   }
 
   xs(xmode) {
-    return xmode === 0 ? this.s : this.t;
+    return xmode === X_STEP ? this.s : this.t;
   }
 
   /** Debiased EMA decaying by alpha^(dx / scale) per point; incremental; non-finite values pass through. */
@@ -149,9 +156,9 @@ function upperBound(a, n, x) {
 }
 
 /** Index range of points that can touch [x0, x1] (transformed x), plus one neighbor per side. */
-function visibleRange(c, xmode, x0, x1, logx) {
+export function visibleRange(c, xmode, x0, x1, logx) {
   const xs = c.xs(xmode), n = c.n;
-  if (!c.sorted[xmode === 0 ? 0 : 1]) return [0, n];
+  if (!c.sorted[xmode]) return [0, n];
   const a = logx ? 10 ** x0 : x0, b = logx ? 10 ** x1 : x1;
   return [Math.max(0, lowerBound(xs, n, a) - 1), Math.min(n, upperBound(xs, n, b) + 1)];
 }
@@ -298,11 +305,6 @@ export function medianCiCoverage(n) {
   return 1 - 2 * cdf;
 }
 
-function quantile(s, n, q) {
-  const h = (n - 1) * q, i = Math.floor(h), f = h - i;
-  return i + 1 < n ? s[i] * (1 - f) + s[i + 1] * f : s[i];
-}
-
 /** Bins of width a power of two at whole multiples of it, covering [x0, x1] with at most `most` + 2 bins:
  * {g0 (first edge), dx (width), bins}. Edges do not move as the range grows. */
 export function binGrid(x0, x1, most) {
@@ -335,7 +337,7 @@ function binColumn(c, xmode, ys, x0, x1, bins, logx, { sum, cnt }, vals, r, R) {
   cnt.fill(0);
   for (let i = lo; i < hi; i++) {
     const x = tx(xs[i], logx), y = ys[i];
-    if (!(x >= x0 && x <= x1) || !Number.isFinite(y)) continue;
+    if (!(x >= x0 && x <= x1) || y !== y) continue;
     const b = Math.min(bins - 1, Math.floor((x - x0) * per));
     sum[b] += y;
     cnt[b] += 1;
@@ -354,47 +356,74 @@ function binColumn(c, xmode, ys, x0, x1, bins, logx, { sum, cnt }, vals, r, R) {
   }
 }
 
-/** STATS of the values in `s` (NaN: no value; reordered) into bin b of `out`; the IQM's only when `iqm`. */
-function binStats(s, out, bins, b, iqm) {
-  let m = 0, sum = 0, lo = Infinity, hi = -Infinity;
+/** Counts of a bin's values: finite ones (moved to the front of the bin), their sum and range, and infinities. */
+const part = { m: 0, sum: 0, lo: 0, hi: 0, neg: 0, pos: 0 };
+
+/** Move the finite values of `s` to its front, counting them and its infinities into `part`; NaN is no value. */
+function partition(s) {
+  let m = 0, sum = 0, lo = Infinity, hi = -Infinity, neg = 0, pos = 0;
   for (let i = 0; i < s.length; i++) {
     const v = s[i];
-    if (v !== v) continue;
-    s[m++] = v;
-    sum += v;
-    if (v < lo) lo = v;
-    if (v > hi) hi = v;
+    if (v === Infinity) pos++;
+    else if (v === -Infinity) neg++;
+    else if (v === v) {
+      s[m++] = v;
+      sum += v;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
   }
-  out[2 * bins + b] = m;
-  if (!m || !iqm) for (let j = 10; j < NSTAT; j++) out[j * bins + b] = NaN;
-  if (!m) {
-    for (const j of [0, 1, 3, 4, 5, 6, 7, 8, 9]) out[j * bins + b] = NaN;
-    return;
-  }
-  const mean = sum / m;
-  let v2 = 0;
-  for (let i = 0; i < m; i++) v2 += (s[i] - mean) ** 2;
-  out[b] = mean;
-  out[bins + b] = m > 1 ? Math.sqrt(v2 / (m - 1)) : 0;
-  out[3 * bins + b] = lo;
-  out[4 * bins + b] = hi;
-  const k = medianCiRank(m), h50 = (m - 1) * 0.5, h25 = (m - 1) * 0.25, h75 = (m - 1) * 0.75, g = Math.floor(m / 4);
-  const n = wantRanks(m, [k - 1, m - k, h50, h50 + 1, h25, h25 + 1, h75, h75 + 1, g, m - g - 1]);
-  orderStats(s, m, lo, hi, 0, 0, n, 0);
-  out[5 * bins + b] = quantileOf(h50, m);
-  out[6 * bins + b] = quantileOf(h25, m);
-  out[7 * bins + b] = quantileOf(h75, m);
-  out[8 * bins + b] = rankValue(k - 1);
-  out[9 * bins + b] = rankValue(m - k);
-  if (iqm) iqmStats(s, m, g, rankValue(g), rankValue(m - g - 1), out, bins, b);
+  (part.m = m), (part.sum = sum), (part.lo = lo), (part.hi = hi), (part.neg = neg), (part.pos = pos);
 }
 
-/** Interquartile mean of the m values in `s` (the mean of ranks [g, m - g), g = floor(m / 4)), whose values at
- * ranks g and m - g - 1 are lo and hi; with Yuen's standard error (from the winsorized variance) and the count h
- * it keeps, whose t quantile on h - 1 degrees of freedom gives its 95% CI. */
-function iqmStats(s, m, g, lo, hi, out, bins, b) {
-  const h = m - 2 * g;
-  let le = 0, mid = 0, nmid = 0, wsum = 0;
+/** STATS of the values in `s` (NaN: no value; reordered) into bin b of `out`; the IQM's only when `iqm`. Infinities
+ * count as values: the mean is infinite (NaN with both signs), the spread NaN, and order statistics see them at the
+ * ends. */
+function binStats(s, out, bins, b, iqm) {
+  partition(s);
+  const { m, sum, lo, hi, neg, pos } = part, n = neg + m + pos;
+  out[S.n * bins + b] = n;
+  if (!n || !iqm) for (const j of IQM_ROWS) out[j * bins + b] = NaN;
+  if (!n) {
+    for (const j of OTHER_ROWS) out[j * bins + b] = NaN;
+    return;
+  }
+  const mean = (sum + (pos ? Infinity : 0) + (neg ? -Infinity : 0)) / n;
+  let v2 = 0;
+  for (let i = 0; i < m; i++) v2 += (s[i] - mean) ** 2;
+  out[S.mean * bins + b] = mean;
+  out[S.std * bins + b] = n === 1 ? 0 : neg || pos ? NaN : Math.sqrt(v2 / (n - 1));
+  out[S.min * bins + b] = neg ? -Infinity : lo;
+  out[S.max * bins + b] = pos ? Infinity : hi;
+  const k = medianCiRank(n), h50 = (n - 1) * 0.5, h25 = (n - 1) * 0.25, h75 = (n - 1) * 0.75, g = Math.floor(n / 4);
+  resolveRanks(s, wantRanks(n, [k - 1, n - k, h50, h50 + 1, h25, h25 + 1, h75, h75 + 1, g, n - g - 1]));
+  out[S.median * bins + b] = quantileOf(h50, n);
+  out[S.q25 * bins + b] = quantileOf(h25, n);
+  out[S.q75 * bins + b] = quantileOf(h75, n);
+  out[S.medlo * bins + b] = rankValue(k - 1);
+  out[S.medhi * bins + b] = rankValue(n - k);
+  if (iqm) iqmStats(s, g, rankValue(g), rankValue(n - g - 1), out, bins, b);
+}
+
+/** The values at ranks want[0, count) of the bin `part` describes: the infinities at either end, the finite values
+ * (the first part.m of `s`) by exact order statistics. */
+function resolveRanks(s, count) {
+  const { m, lo, hi, neg } = part;
+  let w0 = 0, w1 = count;
+  while (w0 < count && want[w0] < neg) got[w0++] = -Infinity;
+  while (w1 > w0 && want[w1 - 1] >= neg + m) got[--w1] = Infinity;
+  if (w1 > w0) orderStats(s, m, lo, hi, neg, w0, w1, 0);
+}
+
+/** Interquartile mean of the bin `part` describes (the mean of ranks [g, n - g), g = floor(n / 4)), whose values at
+ * ranks g and n - g - 1 are lo and hi; with Yuen's standard error (from the winsorized variance) and the count h
+ * it keeps, whose t quantile on h - 1 degrees of freedom gives its 95% CI. Infinite (NaN with both signs, error NaN)
+ * when the kept ranks reach an infinity. */
+function iqmStats(s, g, lo, hi, out, bins, b) {
+  const { m, neg, pos } = part, n = neg + m + pos, h = n - 2 * g;
+  out[S.iqmh * bins + b] = h;
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return infiniteIqm(lo, hi, h, out, bins, b);
+  let le = neg, mid = 0, nmid = 0, wsum = neg * lo + pos * hi;
   for (let i = 0; i < m; i++) {
     const v = s[i];
     if (v <= lo) le++;
@@ -403,12 +432,18 @@ function iqmStats(s, m, g, lo, hi, out, bins, b) {
   }
   const nlo = lo === hi ? h : le - g; // copies of lo, then of hi, fill what is left of the window
   const iqm = lo === hi ? lo : (mid + lo * nlo + hi * (h - nmid - nlo)) / h;
-  const wmean = wsum / m;
-  let w2 = 0;
+  const wmean = wsum / n;
+  let w2 = neg * (lo - wmean) ** 2 + pos * (hi - wmean) ** 2;
   for (let i = 0; i < m; i++) w2 += ((s[i] < lo ? lo : s[i] > hi ? hi : s[i]) - wmean) ** 2;
-  out[10 * bins + b] = iqm;
-  out[11 * bins + b] = h > 1 ? Math.sqrt(w2 / (h * (h - 1))) : 0;
-  out[12 * bins + b] = h;
+  out[S.iqm * bins + b] = iqm;
+  out[S.iqmse * bins + b] = h > 1 ? Math.sqrt(w2 / (h * (h - 1))) : 0;
+}
+
+/** The IQM of a kept window from lo to hi that reaches an infinity: that infinity (NaN when it reaches both), error
+ * NaN. */
+function infiniteIqm(lo, hi, h, out, bins, b) {
+  out[S.iqm * bins + b] = lo === -Infinity ? (hi === Infinity ? NaN : -Infinity) : hi;
+  out[S.iqmse * bins + b] = h > 1 ? NaN : 0;
 }
 
 const want = new Int32Array(10), got = new Float64Array(10); // the ranks orderStats resolves, and their values
@@ -437,7 +472,7 @@ function rankValue(r) {
 /** The interpolated quantile at fractional rank h of m sorted values, from the resolved ranks. */
 function quantileOf(h, m) {
   const i = Math.floor(h), f = h - i;
-  return i + 1 < m ? rankValue(i) * (1 - f) + rankValue(i + 1) * f : rankValue(i);
+  return f && i + 1 < m ? rankValue(i) * (1 - f) + rankValue(i + 1) * f : rankValue(i);
 }
 
 const HIST = 1024; // buckets per histogram pass of orderStats
@@ -515,7 +550,7 @@ export function nearest(c, xmode, x, alpha, scale) {
   const xs = c.xs(xmode), n = c.n;
   if (!n) return null;
   let i;
-  if (c.sorted[xmode === 0 ? 0 : 1]) {
+  if (c.sorted[xmode]) {
     const j = lowerBound(xs, n, x);
     i = j === 0 ? 0 : j === n || x - xs[j - 1] <= xs[j] - x ? j - 1 : j;
   } else {

@@ -28,9 +28,13 @@ run.finish()                                    # also at exit; an uncaught exce
 ## Explore
 
 - `trex serve runs` opens the UI at http://127.0.0.1:13898; it stays fast with 10,000 runs.
-- Group by folder or config key: median, mean or IQM lines with 95% CI, IQR or min/max bands.
+- Runs are listed flat; group by `path` to nest them by folder, or by subfolder or config key for median, mean or
+  IQM lines with 95% CI, IQR or min/max bands.
 - Drag to zoom, hover for values, Shift to pin them and scroll; ⚙ sets smoothing and axes per metric.
-- Filter by name or a SQL WHERE clause (`lr = 0.001 and seed in (0, 1)`), in the UI or `trex ls -w`; `trex --help` lists the rest.
+- Hide a chart or media panel with its eye button: its section's header links to it, and the section's ⋯ menu shows
+  or hides its panels and folds or unfolds its subsections.
+- Filter by name or a SQL WHERE clause (`lr = 0.001 and seed in (0, 1)`, `state = running`, `visible = true` for the
+  checked runs), in the UI or `trex ls -w`; `trex --help` lists the rest.
 
 ## Daemon
 
@@ -40,7 +44,7 @@ run.finish()                                    # also at exit; an uncaught exce
 - Add `host:path` for another machine: trex runs there over ssh with `uvx`, so it needs only uv.
 - On a cluster, use a data-transfer node (`xfer:/scratch/me/runs`); jobs on any node stream live.
 - `trex systemd-unit` or `trex launchd-plist` (macOS) gives a service with an update button in the `trex` panel.
-- `trex compact DIR` shrinks runs written before compaction: their commits merged, the rows unchanged.
+- `trex compact DIR` merges the commits of runs logged a few rows per commit (written before the writer merged them); rows are unchanged.
 
 ## Limits
 

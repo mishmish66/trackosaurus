@@ -65,9 +65,10 @@ def tile_range(level: int, index: int) -> tuple[float, float]:
 
 
 def build(steps: Floats, values: Floats, times: Floats, level: int, index: int) -> bytes:
-    """Tile (level, index) of the points; non-finite values are left out."""
+    """Tile (level, index) of the points; NaN values are left out, and a bucket holding an infinite value has an
+    infinite mean (NaN with both signs), as its min or max say."""
     lo, hi = tile_range(level, index)
-    keep = (steps >= lo) & (steps < hi) & np.isfinite(values)
+    keep = (steps >= lo) & (steps < hi) & ~np.isnan(values)
     s, v, t = steps[keep], values[keep], times[keep]
     if not s.size:
         e = np.empty(0)
@@ -80,8 +81,10 @@ def build(steps: Floats, values: Floats, times: Floats, level: int, index: int) 
     n = np.diff(np.r_[starts, b.size])
     bucket = b[starts]
     soff = np.add.reduceat(s - lo, starts) / n / 2.0 ** level - bucket
+    with np.errstate(invalid="ignore"):  # inf and -inf in one bucket make its mean NaN
+        mean = np.add.reduceat(v, starts) / n
     return _encode(level, index, bucket.astype(np.uint16), np.minimum.reduceat(v, starts), np.maximum.reduceat(v, starts),
-                   np.add.reduceat(v, starts) / n, np.add.reduceat(t, starts) / n, soff, n)
+                   mean, np.add.reduceat(t, starts) / n, soff, n)
 
 
 def coarsen(blobs: Sequence[bytes], up: int) -> list[bytes]:
@@ -108,7 +111,8 @@ def coarsen(blobs: Sequence[bytes], up: int) -> list[bytes]:
     nn = np.add.reduceat(n, starts)
     bucket = a[starts]
     mn, mx = np.minimum.reduceat(joined("min"), starts), np.maximum.reduceat(joined("max"), starts)
-    mean = np.add.reduceat(joined("mean") * n, starts) / nn
+    with np.errstate(invalid="ignore"):  # inf and -inf in one bucket make its mean NaN
+        mean = np.add.reduceat(joined("mean") * n, starts) / nn
     tmean = np.add.reduceat(joined("tmean") * n, starts) / nn
     soff = np.add.reduceat(step * n, starts) / nn / 2.0 ** level - bucket
     out: list[bytes] = []
@@ -129,7 +133,7 @@ def _encode(level: int, index: int, bucket: npt.NDArray[np.uint16], mn: Floats, 
 
 
 def decode(blob: bytes) -> Tile:
-
+    """The tile `blob` encodes; ValueError unless it is one."""
     if blob[:4] != MAGIC:
         raise ValueError("bad tile magic")
     level, index, count, _ = struct.unpack_from("<iqII", blob, 4)

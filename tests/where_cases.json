@@ -1,9 +1,9 @@
 {
   "runs": {
     "a": {"name": "ppo_seed0", "path": "sweep/ppo_seed0", "state": "finished", "lr": 0.001, "seed": 0, "algo": "PPO", "tags": ["baseline", "v2"], "loss": 0.25, "flag": true, "notes": "first"},
-    "b": {"name": "ppo_seed1", "path": "sweep/ppo_seed1", "state": "running", "lr": 0.0015, "seed": 1, "algo": "PPO", "tags": ["v2"], "loss": "NaN", "flag": false},
+    "b": {"name": "ppo_seed1", "path": "sweep/ppo_seed1", "state": "running", "lr": 0.0015, "seed": 1, "algo": "PPO", "tags": ["v2"], "loss": "nan", "flag": false},
     "c": {"name": "sac_seed0", "path": "other/sac_seed0", "state": "crashed", "lr": 0.01, "seed": 0, "algo": "SAC", "tags": [], "loss": 1.5, "steps": 100},
-    "d": {"name": "sac_debug", "path": "other/sac_debug", "state": "finished", "lr": "1e-3", "seed": 2, "algo": "sac", "loss": "Infinity", "steps": 1000, "opt/name": "adam's"}
+    "d": {"name": "sac_debug", "path": "other/sac_debug", "state": "finished", "lr": "1e-3", "seed": 2, "algo": "sac", "loss": "inf", "steps": 1000, "opt/name": "adam's"}
   },
   "cases": [
     ["lr = 0.001", ["a", "d"]],
@@ -44,7 +44,10 @@
     ["missing is null", ["a", "b", "c", "d"]],
     ["loss < 1", ["a"]],
     ["loss > 1", ["c", "d"]],
-    ["loss = NaN", []],
+    ["loss = nan", []],
+    ["loss = inf", ["d"]],
+    ["loss > 1e308", ["d"]],
+    ["loss < inf", ["a", "c"]],
     ["flag = true", ["a"]],
     ["flag = false", ["b"]],
     ["flag != true", ["b", "c", "d"]],

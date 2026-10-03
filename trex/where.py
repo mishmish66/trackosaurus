@@ -19,11 +19,11 @@ from typing import Final, NamedTuple, cast
 
 type Getter = Callable[[str], object]
 type Test = Callable[[Getter], bool]
-type Literal = float | str | bool | None
+type Operand = float | str | bool | None
 
 _TOKEN: Final = re.compile(r"""\s*(?:('(?:[^']|'')*')|("(?:[^"]|"")*")|(>=|<=|!=|<>|==|!~|[=<>~(),])|([^\s'"=<>!~(),]+)|(\S))""")
 _NUMBER: Final = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
-_MARKERS: Final = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
+_MARKERS: Final = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
 _KEYWORDS: Final = frozenset({"and", "or", "not", "in", "like", "is", "null", "true", "false"})
 _COMPARE: Final = frozenset({"=", "==", "!=", "<>", "<", "<=", ">", ">=", "~", "!~"})
 
@@ -82,7 +82,7 @@ def _is_kw(t: Token | None, *words: str) -> bool:
 
 
 def as_number(v: object) -> float | None:
-    """A number, or the text of one (including the markers "NaN", "Infinity", "-Infinity"); else None."""
+    """A number, or the text of one (including the markers "nan", "inf", "-inf"); else None."""
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
@@ -104,7 +104,7 @@ def text_of(v: object) -> str:
     if isinstance(v, (int, float)):
         if math.isfinite(v) and float(v).is_integer() and abs(v) < 1e16:
             return str(int(v))
-        return "NaN" if math.isnan(v) else "Infinity" if v == math.inf else "-Infinity" if v == -math.inf else repr(float(v))
+        return repr(float(v))
     return json.dumps(v, separators=(",", ":"))
 
 
@@ -116,16 +116,16 @@ def _any(v: object, f: Callable[[object], bool]) -> bool:
     return f(v)
 
 
-def _equal(v: object, lit: Literal) -> bool:
+def _equal(v: object, lit: Operand) -> bool:
     if isinstance(v, bool) and isinstance(lit, bool):
         return v == lit
     a, b = as_number(v), as_number(lit)
     if a is not None and b is not None:
-        return a == b or abs(a - b) <= 1e-12 * max(abs(a), abs(b))
+        return a == b or (math.isfinite(a - b) and abs(a - b) <= 1e-12 * max(abs(a), abs(b)))
     return text_of(v) == text_of(lit)
 
 
-def _order(v: object, lit: Literal, op: str) -> bool:
+def _order(v: object, lit: Operand, op: str) -> bool:
     a, b = as_number(v), as_number(lit)
     if a is not None and b is not None:
         return _ordered(a, b, op)
@@ -198,7 +198,7 @@ class _Parser:
             return t.text
         raise ValueError(f"expected a field, got {t.text!r}")
 
-    def value(self) -> Literal:
+    def value(self) -> Operand:
         t = self.take()
         if t.kind == "str":
             return t.text
@@ -248,7 +248,7 @@ class _Parser:
         return lambda g: _any(g(f), lambda v: any(_equal(v, x) for x in values))
 
 
-def _operator(f: str, op: str, lit: Literal) -> Test:
+def _operator(f: str, op: str, lit: Operand) -> Test:
     if lit is None and op in ("=", "==", "!=", "<>"):
         return lambda g: (g(f) is None) == (op in ("=", "=="))
     if op in ("=", "=="):

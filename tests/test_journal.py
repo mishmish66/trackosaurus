@@ -6,9 +6,11 @@ import numpy as np
 import pytest
 
 import trex
-from trex import chunks, journal
+from trex import chunks, journal, query
 from trex.format import DB, SCHEMA, connect_ro
 from trex.index import Explorer
+
+from helpers import committed_rows, readback, wait_for
 
 
 @pytest.fixture(autouse=True)
@@ -17,17 +19,10 @@ def journaled(tmp_path, monkeypatch):
     monkeypatch.setenv("TREX_REPLICAS", str(tmp_path / "replicas"))
 
 
-def content(c):
-    """What readers see of a run: meta, metric names, media and every row (NaN-safe); not how commits are laid out."""
-    tables = {t: sorted(c.execute(f"SELECT * FROM {t}").fetchall()) for t in ("meta", "keys", "media")}
-    rows = [(r.seq, r.step, r.t, sorted((k, repr(v)) for k, v in r.values.items())) for r in chunks.rows(c)]
-    return {**tables, "rows": rows}
-
-
 def replica_of(d):
     c = sqlite3.connect(journal.sync(d, SCHEMA))
     try:
-        return content(c)
+        return readback(c)
     finally:
         c.close()
 
@@ -35,7 +30,7 @@ def replica_of(d):
 def stored(d):
     c = sqlite3.connect(d / DB)
     try:
-        return content(c)
+        return readback(c)
     finally:
         c.close()
 
@@ -55,7 +50,7 @@ def test_replaying_the_journal_rebuilds_the_runs_rows_meta_and_media(tmp_path):
     assert (d / journal.JOURNAL).exists() and replica_of(d) == stored(d)
 
 
-def test_a_compacted_run_and_its_replica_hold_the_same_rows(tmp_path):
+def test_a_merged_run_and_its_replica_hold_the_same_rows(tmp_path):
     d = tmp_path / "r"
     run = trex.init(d, commit_interval=0.001)
     for i in range(120):
@@ -72,7 +67,7 @@ def test_a_live_journaled_run_is_read_from_its_replica(tmp_path):
     d = tmp_path / "r"
     run = trex.init(d, commit_interval=0.02)
     log_some(run, 10)
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(d) == 10)
     assert (d / (DB + "-wal")).exists()
     c = connect_ro(d)
     try:
@@ -81,7 +76,7 @@ def test_a_live_journaled_run_is_read_from_its_replica(tmp_path):
     finally:
         c.close()
     log_some(run, 5, start=10)
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(d) == 15)
     c = connect_ro(d)
     try:
         assert chunks.row_count(c) == 15
@@ -181,14 +176,14 @@ def test_the_explorer_follows_a_live_journaled_run(tmp_path):
     root = tmp_path / "runs"
     run = trex.init(root / "r", commit_interval=0.02)
     log_some(run, 50)
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(root / "r") == 50)
     ex = Explorer(root, tmp_path / "cache")
     ex.rewalk()
     ex.poll()
     assert ex.run_meta("r")["seq"] == 50
     log_some(run, 30, start=50)
     run.log_image("img", np.zeros((4, 4, 3), np.uint8), step=60)
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(root / "r") == 80 and len(query.read_media(root / "r")) == 1)
     ex.poll()
     meta = ex.run_meta("r")
     assert (meta["seq"], meta["mseq"]) == (80, 1)

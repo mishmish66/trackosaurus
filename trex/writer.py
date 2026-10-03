@@ -54,7 +54,7 @@ type VideoInput = str | os.PathLike[str] | bytes | bytearray | ArrayLike
 type FinalState = Literal["finished", "failed"]
 
 FAN_IN: Final = 8  # commits merged into one at a time
-SEALED: Final = FAN_IN ** 6  # values of a commit that compaction leaves as it is
+SEALED: Final = FAN_IN ** 6  # values of a commit that merging leaves as it is
 MERGE_VALUES: Final = 1 << 20  # values one merge may write
 
 
@@ -77,12 +77,12 @@ def merge_plan(tail: Sequence[tuple[int, int]]) -> int | None:
 
 
 def sealed(rows: int, values: int) -> bool:
-    """Whether compaction leaves a commit as it is."""
+    """Whether merging leaves a commit as it is."""
     return values >= SEALED or 2 * rows > chunks.MAX_ROWS
 
 
 class _Tail(NamedTuple):
-    """A commit compaction may merge."""
+    """A commit this session may merge."""
 
     seq0: int
     rows: int
@@ -204,36 +204,43 @@ class Run:
         self.id, self.name, self.created = str(meta["id"]), str(meta["name"]), as_float(meta["created"]) or 0.0
         self._journal: journal.Writer | None = None
         self._journaled: dict[str, str] = {}
-        if journal.wanted(self.dir):
-            try:
-                self._journal = journal.Writer(self.dir, self.id, self._seq, self._mseq, lambda: _snapshot(c))
-                self._journal.append(self._meta_ops(meta), self._seq, self._mseq)
-            except OSError as e:
-                self._journal_failed(e)
+        self._open_journal(c, meta)
         c.close()
         self._next_step: float = int(last) + 1 if last is not None else 0
+        self._pending_lock = threading.Lock()  # guards _rows, _media, _summary and _info
         self._summary = as_dict(meta.get("summary"))
         self._info = as_dict(meta["info"])
         self._rows: list[_Row] = []
         self._media: list[_Media] = []
-        self._tail: list[_Tail] = []  # this session's commits that compaction may merge, oldest first
+        self._tail: list[_Tail] = []  # this session's commits that may be merged, oldest first
         self._tail_lock = threading.Lock()
-        self._compact_wake = threading.Event()
-        self._compacting = True
-        self._compactor = threading.Thread(target=self._compact_loop, name=f"trex-compact-{self.name}", daemon=True)
-        self._compactor.start()
-        self._lock = threading.Lock()
-        self._wake = threading.Event()
+        self._commit_wake = threading.Event()
+        self._merge_wake = threading.Event()
         self._stop = False
         self._state: FinalState | None = None
         self._failed = False
         self._finished = False
         self._error: Exception | None = None
-        self._thread = threading.Thread(target=self._loop, name=f"trex-{self.name}", daemon=True)
-        self._thread.start()
+        self._start_threads()
         self._prev_hook = sys.excepthook
         sys.excepthook = self._excepthook
         atexit.register(self.finish)
+
+    def _open_journal(self, c: sqlite3.Connection, meta: Mapping[str, JSONValue]) -> None:
+        """Start journaling the run in `c` when `journal.wanted` says so."""
+        if not journal.wanted(self.dir):
+            return
+        try:
+            self._journal = journal.Writer(self.dir, self.id, self._seq, self._mseq, lambda: _snapshot(c))
+            self._journal.append(self._meta_ops(meta), self._seq, self._mseq)
+        except OSError as e:
+            self._journal_failed(e)
+
+    def _start_threads(self) -> None:
+        self._committer = threading.Thread(target=self._commit_loop, name=f"trex-commit-{self.name}", daemon=True)
+        self._merger = threading.Thread(target=self._merge_loop, name=f"trex-merge-{self.name}", daemon=True)
+        self._committer.start()
+        self._merger.start()
 
     def __enter__(self) -> Self:
         return self
@@ -256,19 +263,19 @@ class Run:
             if n is not None:
                 row[k] = n
         if row:
-            with self._lock:
+            with self._pending_lock:
                 self._rows.append(_Row(step, time.time() if timestamp is None else timestamp, row))
 
     def info(self, info: Mapping[str, object] | None = None, **kv: object) -> None:
         """Merge notes into the run's info."""
         new = _jsonify({**(info or {}), **kv})
         assert isinstance(new, dict)
-        with self._lock:
+        with self._pending_lock:
             self._info.update(new)
 
     def summary(self, **kv: object) -> None:
         """Set values shown with the run, e.g. final scores."""
-        with self._lock:
+        with self._pending_lock:
             self._summary.update({k: _jsonify(v) for k, v in kv.items()})
 
     def log_image(self, key: str, image: ImageInput, step: float | None = None) -> None:
@@ -311,10 +318,10 @@ class Run:
         self._finished = True
         self._state = state or ("failed" if self._failed else "finished")
         self._stop = True
-        self._compact_wake.set()
-        self._wake.set()
-        self._compactor.join(timeout)
-        self._thread.join(timeout)
+        self._merge_wake.set()
+        self._commit_wake.set()
+        self._merger.join(timeout)
+        self._committer.join(timeout)
         if sys.excepthook == self._excepthook:
             sys.excepthook = self._prev_hook
         if self._error:
@@ -325,7 +332,7 @@ class Run:
     def _add_media(self, key: str, step: float | None, kind: MediaKind, ext: str, data: bytes) -> None:
         if step is None:
             step = max(self._next_step - 1, 0)
-        with self._lock:
+        with self._pending_lock:
             self._media.append(_Media(key, step, time.time(), kind, ext, data))
 
     def _write_media_file(self, ext: str, data: bytes) -> str:
@@ -359,16 +366,16 @@ class Run:
         print(f"[trex] journal of {self.dir} failed, so other hosts stop seeing this run's updates: {e!r}", file=sys.stderr)
 
     def _commit(self, c: sqlite3.Connection, final_state: FinalState | None = None) -> None:
-        with self._lock:
+        with self._pending_lock:
             rows, self._rows = self._rows, []
             media, self._media = self._media, []
             summary = dict(self._summary)
             info = dict(self._info)
         files = [(m.key, m.step, m.time, m.kind, self._write_media_file(m.ext, m.data), len(m.data)) for m in media]
+        parts = [(self._seq + i, rows[i: i + chunks.MAX_ROWS]) for i in range(0, len(rows), chunks.MAX_ROWS)]
         ops: list[journal.Op] = []
-        for i in range(0, len(rows), chunks.MAX_ROWS):
-            part = [(float(r.step), r.time - self.created, r.values) for r in rows[i: i + chunks.MAX_ROWS]]
-            ops += chunks.inserts(self._seq + i, part, self._ids)
+        for seq0, part in parts:
+            ops += chunks.inserts(seq0, [(float(r.step), r.time - self.created, r.values) for r in part], self._ids)
         ops += [("media", (self._mseq + i, float(s), t, k, kind, f, n)) for i, (k, s, t, kind, f, n) in enumerate(files)]
         meta: dict[str, JSONValue] = {"heartbeat": time.time(), "summary": summary, "info": info}
         if final_state:
@@ -379,11 +386,9 @@ class Run:
         c.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [(k, json.dumps(v)) for k, v in meta.items()])
         c.execute("COMMIT")
         with self._tail_lock:
-            for i in range(0, len(rows), chunks.MAX_ROWS):
-                part = rows[i: i + chunks.MAX_ROWS]
-                self._tail.append(_Tail(self._seq + i, len(part), sum(len(r.values) for r in part), first_id))
+            self._tail += [_Tail(seq0, len(part), sum(len(r.values) for r in part), first_id) for seq0, part in parts]
         if rows:
-            self._compact_wake.set()
+            self._merge_wake.set()
         self._seq += len(rows)
         self._mseq += len(files)
         if self._journal is not None:
@@ -392,24 +397,23 @@ class Run:
             except OSError as e:
                 self._journal_failed(e)
 
-    def _compact_loop(self) -> None:
+    def _merge_loop(self) -> None:
         """Merge this session's newest commits as `merge_plan` says, apart from the commit thread: each merge is read
         and checked outside any write lock, then swapped in by one short transaction, so commits wait only for the
-        swap. The run file holds the same rows whatever happens; a failed merge stops compaction for the run, and
+        swap. The run file holds the same rows whatever happens; a failed merge stops merging for the run, and
         stopping the run abandons a merge not yet swapped in. The journal keeps the commits as written."""
         c: sqlite3.Connection | None = None
         try:
-            while self._compacting:
-                self._compact_wake.wait()
-                self._compact_wake.clear()
+            while True:
+                self._merge_wake.wait()
+                self._merge_wake.clear()
                 if self._stop:
                     return
                 c = c or connect_rw(self.dir)
-                while self._compacting and not self._stop and self._merge_next(c):
+                while not self._stop and self._merge_next(c):
                     pass
         except Exception as e:
-            self._compacting = False
-            print(f"[trex] compaction of {self.dir} stopped; its rows are unchanged: {e!r}", file=sys.stderr)
+            print(f"[trex] merging of {self.dir} stopped; its rows are unchanged: {e!r}", file=sys.stderr)
         finally:
             if c is not None:
                 c.close()
@@ -444,12 +448,12 @@ class Run:
                 del self._tail[: i + 1]
         return True
 
-    def _loop(self) -> None:
+    def _commit_loop(self) -> None:
         c = connect_rw(self.dir)
         try:
             while True:
-                self._wake.wait(self.commit_interval)
-                self._wake.clear()
+                self._commit_wake.wait(self.commit_interval)
+                self._commit_wake.clear()
                 stop = self._stop
                 self._commit(c, self._state if stop else None)
                 if stop:
@@ -467,7 +471,7 @@ def _snapshot(c: sqlite3.Connection) -> list[journal.Op]:
     """Inserts that rebuild the run in `c`."""
     ops: list[journal.Op] = []
     for table, cols in journal.TABLES.items():
-        ops += [(table, tuple(row)) for row in c.execute(f"SELECT {cols[cols.index('(') + 1:-1]} FROM {table}")]
+        ops += [(table, tuple(row)) for row in c.execute(f"SELECT {', '.join(cols)} FROM {table}")]
     return ops
 
 

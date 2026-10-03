@@ -1,3 +1,4 @@
+import math
 import json
 from pathlib import Path
 
@@ -25,11 +26,18 @@ def test_where_reports_the_fields_it_reads():
     assert compile_where("ppo").fields == ["name", "path"]
 
 
-@pytest.mark.parametrize("v,want", [(1.0, "1"), (0.001, "0.001"), (True, "true"), ("x", "x"), ([1, "a"], '[1,"a"]'), (float("nan"), "NaN")])
+@pytest.mark.parametrize("v,want", [(1.0, "1"), (0.001, "0.001"), (True, "true"), ("x", "x"), ([1, "a"], '[1,"a"]'), (float("nan"), "nan"),
+                                    (float("inf"), "inf"), (float("-inf"), "-inf")])
 def test_values_are_matched_as_their_text(v, want):
     assert text_of(v) == want
 
 
-@pytest.mark.parametrize("v,want", [("1e-3", 0.001), (" 2 ", 2.0), ("Infinity", float("inf")), ("inf", None), (True, None), ("1_000", None)])
+@pytest.mark.parametrize("v,want", [("1e-3", 0.001), (" 2 ", 2.0), ("inf", float("inf")), ("-inf", float("-inf")), ("Infinity", None),
+                                    ("toString", None), (True, None), ("1_000", None)])
 def test_only_numbers_and_their_text_count_as_numbers(v, want):
     assert as_number(v) == want
+
+
+def test_nan_text_is_the_number_nan():
+    n = as_number("nan")
+    assert n is not None and math.isnan(n)

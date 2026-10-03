@@ -1,8 +1,10 @@
 // Line charts. Canvas 2D: each draw asks the kernel for a smoothed, pixel-decimated polyline (or
 // group aggregate) of just the visible x-range. WebGL (gl.js): every run's line stays on the GPU
 // and zoom is a transform; axes, labels and the hover overlay stay Canvas 2D.
-import { IQM, LOGX, LOGY, NSTAT, RAW, STATS, agg as kagg, binGrid, medianCiCoverage, nearest, prep as kprep, yrange } from "./kernel.js";
+import { IQM, LOGX, LOGY, RAW, STATS, X_RUNTIME, agg as kagg, binGrid, medianCiCoverage, nearest, prep as kprep, visibleRange,
+         yrange } from "./kernel.js";
 import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
+import { nonFiniteText } from "./where.js";
 
 /** Renderer choice: WebGL where available; `?gl=0` selects Canvas 2D. */
 const GL_PARAM = typeof location === "undefined" ? null : new URLSearchParams(location.search).get("gl");
@@ -11,7 +13,7 @@ const GPU_POINTS = 8e6; // points per line set kept at full resolution; larger s
 export const DENSITY_AUTO = 300; // "auto" draws a density heatmap above this many lines
 const DENSITY_TIP = 8; // runs listed by the density tooltip
 
-const M = { l: 52, r: 10, t: 6, b: 20 };
+const MARGIN = { l: 52, r: 10, t: 6, b: 20 };
 export const BAND_LABEL = { ci: "95% CI", iqr: "IQR", minmax: "min/max", std: "±std", stderr: "±stderr", none: "none" };
 const CLICK_MAX = 5; // px of movement below which a press is a click
 const BOX_MIN = 8; // px of vertical drag that turns an x zoom into a box zoom
@@ -28,7 +30,7 @@ function outBuf(pairs) {
 }
 
 export function fmt(v) {
-  if (!Number.isFinite(v)) return String(v);
+  if (!Number.isFinite(v)) return nonFiniteText(v);
   const a = Math.abs(v);
   if (a !== 0 && (a >= 1e5 || a < 1e-3)) return v.toExponential(2);
   return String(+v.toPrecision(4));
@@ -82,12 +84,13 @@ function durTicks(lo, hi, n) {
 }
 
 /** Smoothing reference width (x units per EMA step), quantized so streaming growth rarely invalidates caches. */
-function smoothScale(span) {
+export function smoothScale(span) {
   const s = span > 0 ? span / 1000 : 1;
   return 2 ** Math.round(Math.log2(s));
 }
 
-/** [lo, hi] per bin: order-statistic CI for the median, Student t for the mean; none for one run. */
+/** [lo, hi] per bin of `band` around `center`: ci (order-statistic for the median, Student t for the mean, Yuen's for
+ * the IQM), iqr, minmax, ±std, ±stderr; none for one run. */
 function bandOf(st, center, band, bins) {
   const lo = new Float64Array(bins), hi = new Float64Array(bins);
   const c = st[center];
@@ -117,7 +120,7 @@ function bandLabel(band, center, n) {
 }
 
 /** Tooltip heading for x: a runtime or a step. */
-const xLabel = (v, x) => (v.xmode === 1 ? fmtDur(x) : `step ${fmtSI(Math.round(x))}`);
+const xLabel = (v, x) => (v.xmode === X_RUNTIME ? fmtDur(x) : `step ${fmtSI(Math.round(x))}`);
 
 function dot(ctx, x, y, color) {
   ctx.fillStyle = color;
@@ -128,33 +131,6 @@ function dot(ctx, x, y, color) {
 
 /** Tooltip order: highest value first. */
 const byValue = (a, b) => (b.val > a.val ? 1 : b.val < a.val ? -1 : 0);
-
-function lowerBound(a, n, x) {
-  let lo = 0, hi = n;
-  while (lo < hi) {
-    const m = (lo + hi) >> 1;
-    if (a[m] < x) lo = m + 1;
-    else hi = m;
-  }
-  return lo;
-}
-
-function upperBound(a, n, x) {
-  let lo = 0, hi = n;
-  while (lo < hi) {
-    const m = (lo + hi) >> 1;
-    if (a[m] <= x) lo = m + 1;
-    else hi = m;
-  }
-  return lo;
-}
-
-/** Index range of column c that can touch [x0, x1] (transformed x), plus one neighbor per side. */
-function visibleRange(c, xmode, x0, x1, logx) {
-  if (!c.sorted[xmode === 0 ? 0 : 1]) return [0, c.n];
-  const xs = c.xs(xmode), a = logx ? 10 ** x0 : x0, b = logx ? 10 ** x1 : x1;
-  return [Math.max(0, lowerBound(xs, c.n, a) - 1), Math.min(c.n, upperBound(xs, c.n, b) + 1)];
-}
 
 /** Calls grow(y) with the min and max of valid y over points with transformed x in [x0, x1]. */
 function visibleY(c, xmode, ys, x0, x1, logx, logy, grow) {
@@ -408,7 +384,7 @@ function glView(chart, v, ox, oy) {
   return {
     off: [v.x0 - ox, v.y0 - oy],
     scale: [(chart.pw * dpr) / (v.x1 - v.x0), (chart.ph * dpr) / (v.y1 - v.y0)],
-    org: [M.l * dpr, (M.t + chart.ph) * dpr],
+    org: [MARGIN.l * dpr, (MARGIN.t + chart.ph) * dpr],
   };
 }
 
@@ -425,31 +401,32 @@ export class Chart {
     this.visible = false;
     this.el = document.createElement("div");
     this.el.className = "panel";
-    this.el.innerHTML = `<div class="ptitle"><span class="pname"></span><button class="pin" title="pin to the top"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M10.2 1.3l4.5 4.5-1.3 1.3-.8-.4-2.7 2.7.4 3.2-1.3 1.3-2.9-2.9-3.6 3.6H1.8v-.7l3.6-3.6-2.9-2.9 1.3-1.3 3.2.4 2.7-2.7-.4-.8z"/></svg></button><button class="full" title="show this chart large (Esc to go back)">⛶</button><button class="gear" title="chart settings">⚙</button></div>
-      <div class="pbody"><canvas></canvas><canvas class="ov"></canvas></div>`;
+    this.el.innerHTML = `<div class="ptitle"><span class="pname"></span><button class="pin" title="pin to the top"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M10.2 1.3l4.5 4.5-1.3 1.3-.8-.4-2.7 2.7.4 3.2-1.3 1.3-2.9-2.9-3.6 3.6H1.8v-.7l3.6-3.6-2.9-2.9 1.3-1.3 3.2.4 2.7-2.7-.4-.8z"/></svg></button><button class="hide" title="hide (its section's header links to it)"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M2.1 1.1 1 2.2l2.3 2.3C2.1 5.4 1.1 6.6.5 8c1.2 2.9 4 5 7.5 5 1.3 0 2.5-.3 3.6-.9l2.3 2.3 1.1-1.1L2.1 1.1zM8 11.5A3.5 3.5 0 0 1 4.5 8c0-.6.2-1.2.4-1.7l1.2 1.2V8a1.9 1.9 0 0 0 2.4 1.8l1.2 1.2c-.5.3-1.1.5-1.7.5zm7.5-3.5C14.3 5.1 11.5 3 8 3c-.9 0-1.8.2-2.6.5l1.3 1.3c.4-.2.9-.3 1.3-.3A3.5 3.5 0 0 1 11.5 8c0 .5-.1.9-.3 1.3l1.9 1.9c1-.8 1.9-1.9 2.4-3.2z"/></svg></button><button class="full" title="show this chart large (Esc to go back)">⛶</button><button class="gear" title="chart settings">⚙</button></div>
+      <div class="pbody"><canvas></canvas><canvas class="overlay"></canvas></div>`;
     this.el.querySelector(".pname").textContent = key;
     this.gear = this.el.querySelector(".gear");
     this.gear.addEventListener("click", (e) => app.panelSettings(this, e.currentTarget));
-    this.el.querySelector(".full").addEventListener("click", () => this.toggleFullscreen());
+    this.el.querySelector(".full").addEventListener("click", () => this.toggleShownAlone());
     this.pinBtn = this.el.querySelector(".pin");
     this.pinBtn.addEventListener("click", () => app.togglePin(this.key));
+    this.el.querySelector(".hide").addEventListener("click", () => app.togglePanel(this.key));
     this.body = this.el.querySelector(".pbody");
-    [this.cv, this.ov] = this.el.querySelectorAll("canvas");
+    [this.canvas, this.overlay] = this.el.querySelectorAll("canvas");
     this.el._chart = this;
     this.drag = null;
     this.yzoom = null; // [y0, y1] in data space from a box drag on this chart
-    this.ov.addEventListener("mousemove", (e) => {
+    this.overlay.addEventListener("mousemove", (e) => {
       this.hoverEvent = e;
       this.hoverRaf ||= requestAnimationFrame(() => {
         this.hoverRaf = 0;
         if (this.hoverEvent) this.hover(this.hoverEvent);
       });
     });
-    this.ov.addEventListener("mouseleave", () => {
+    this.overlay.addEventListener("mouseleave", () => {
       this.hoverEvent = null;
       this.unhover();
     });
-    this.ov.addEventListener("mousedown", (e) => {
+    this.overlay.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
       this.drag = { x: e.offsetX, y: e.offsetY };
       const up = (ev) => {
@@ -466,14 +443,14 @@ export class Chart {
     this.pinBtn.title = on ? "unpin" : "pin to the top";
   }
 
-  /** Whether this chart is the focused chart (and so draws regardless of scroll visibility). */
+  /** Whether this chart is shown alone (and so draws regardless of scroll visibility). */
   get full() {
     return this.app.opts.chart === this.key;
   }
 
-  /** Focus this chart (or, when focused, go back to all charts). */
-  toggleFullscreen() {
-    this.app.focusChart(this.full ? "" : this.key);
+  /** Show this chart alone (or, when it is, go back to all charts). */
+  toggleShownAlone() {
+    this.app.showChartAlone(this.full ? "" : this.key);
   }
 
   resize() {
@@ -488,20 +465,20 @@ export class Chart {
   /** Give the canvases backing stores of the chart's size (allocated only for drawn charts). */
   fitCanvases() {
     const dpr = devicePixelRatio || 1, W = Math.round(this.w * dpr), H = Math.round(this.h * dpr);
-    for (const c of [this.cv, this.ov]) if (c.width !== W || c.height !== H) (c.width = W), (c.height = H);
+    for (const c of [this.canvas, this.overlay]) if (c.width !== W || c.height !== H) (c.width = W), (c.height = H);
   }
 
   /** Free the canvas backing stores of a chart scrolled out of view; it redraws when back. */
   releaseCanvases() {
-    for (const c of [this.cv, this.ov]) if (c.width) (c.width = 0), (c.height = 0);
+    for (const c of [this.canvas, this.overlay]) if (c.width) (c.width = 0), (c.height = 0);
     this.dirty = true;
   }
 
   get pw() {
-    return Math.max(10, this.w - M.l - M.r);
+    return Math.max(10, this.w - MARGIN.l - MARGIN.r);
   }
   get ph() {
-    return Math.max(10, this.h - M.t - M.b);
+    return Math.max(10, this.h - MARGIN.t - MARGIN.b);
   }
 
   /** Query the kernel for everything this chart draws. */
@@ -536,7 +513,7 @@ export class Chart {
     const faint = v.alpha > 0;
     const density = r.density && (o.render === "density" || (o.render === "auto" && groups.length > DENSITY_AUTO));
     const p = { ...v, pw: this.pw, vx0: v.x0, vx1: v.x1 };
-    const g = (this.glState ||= { main: new LineSet(r, false), faint: new LineSet(r, true), tmp: new Points(r) });
+    const g = this.glLines(r);
     const cols = groups.map((ln) => ln.cols[0]);
     const ok = g.main.sync(cols, p) && (!faint || density || g.faint.sync(cols, p));
     this.uploadMs = g.main.uploadMs + (faint && !density ? g.faint.uploadMs : 0);
@@ -559,9 +536,9 @@ export class Chart {
   /** One center line with its band per group, from per-bin group statistics; they set the y range, which a band
    * widens by at most BAND_REACH of it. */
   linesGrouped(groups, allCols, v, o, yr) {
-    let dens = 0;
-    for (const c of allCols) dens = Math.max(dens, c.len);
-    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / 2), dens)));
+    let longest = 0;
+    for (const c of allCols) longest = Math.max(longest, c.len);
+    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / 2), longest)));
     const stats = (cols, raw) => {
       const a = kagg(cols, v.xmode, g0, g0 + bins * dx, bins, (v.logx ? LOGX : 0) | (raw ? RAW : 0) | (o.center === "iqm" ? IQM : 0), v.alpha, v.scale);
       return Object.fromEntries(STATS.map((k, i) => [k, a.subarray(i * bins, (i + 1) * bins)]));
@@ -623,6 +600,11 @@ export class Chart {
     return USE_GL ? renderer() : null;
   }
 
+  /** This chart's GPU line sets, created on first use. */
+  glLines(r) {
+    return (this.glState ||= { main: new LineSet(r, false), faint: new LineSet(r, true), tmp: new Points(r) });
+  }
+
   /** Free this chart's GPU data. */
   dispose() {
     const g = this.glState;
@@ -633,8 +615,8 @@ export class Chart {
   /** Draw bands and lines of `view` through WebGL onto ctx (device px, clipped to the plot). */
   drawGL(ctx, view) {
     const r = renderer(), dpr = devicePixelRatio || 1;
-    r.begin(this.cv.width, this.cv.height, [M.l * dpr, M.t * dpr, this.pw * dpr, this.ph * dpr]);
-    const g = (this.glState ||= { main: new LineSet(r, false), faint: new LineSet(r, true), tmp: new Points(r) });
+    r.begin(this.canvas.width, this.canvas.height, [MARGIN.l * dpr, MARGIN.t * dpr, this.pw * dpr, this.ph * dpr]);
+    const g = this.glLines(r);
     if (view.gpu) {
       const { main, faint } = g;
       r.touch(main.pts);
@@ -684,24 +666,24 @@ export class Chart {
   px(x) {
     const v = this.view;
     const fx = v.logx ? Math.log10(x) : x;
-    return M.l + ((fx - v.x0) / (v.x1 - v.x0)) * this.pw;
+    return MARGIN.l + ((fx - v.x0) / (v.x1 - v.x0)) * this.pw;
   }
   py(y) {
     const v = this.view;
     const fy = v.logy ? Math.log10(y) : y;
-    return M.t + this.ph - ((fy - v.y0) / (v.y1 - v.y0)) * this.ph;
+    return MARGIN.t + this.ph - ((fy - v.y0) / (v.y1 - v.y0)) * this.ph;
   }
   /** Data-space y at a canvas pixel. */
   yAt(py) {
     const v = this.view;
-    const fy = v.y0 + ((M.t + this.ph - py) / this.ph) * (v.y1 - v.y0);
+    const fy = v.y0 + ((MARGIN.t + this.ph - py) / this.ph) * (v.y1 - v.y0);
     return v.logy ? 10 ** fy : fy;
   }
 
   /** Data-space x at a canvas pixel. */
   xAt(px) {
     const v = this.view;
-    const fx = v.x0 + ((px - M.l) / this.pw) * (v.x1 - v.x0);
+    const fx = v.x0 + ((px - MARGIN.l) / this.pw) * (v.x1 - v.x0);
     return v.logx ? 10 ** fx : fx;
   }
 
@@ -720,19 +702,19 @@ export class Chart {
     this.gear.classList.toggle("on", this.app.hasPanelOverrides(this.key));
     if (!this.w) return;
     this.fitCanvases();
-    const dpr = devicePixelRatio || 1, ctx = this.cv.getContext("2d");
+    const dpr = devicePixelRatio || 1, ctx = this.canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.w, this.h);
     const view = (this.view = this.next);
     const css = getComputedStyle(document.documentElement);
     ctx.font = "10px system-ui, sans-serif";
     ctx.fillStyle = css.getPropertyValue("--muted");
-    if (!view) return ctx.fillText("no data", M.l + 4, M.t + 14);
+    if (!view) return ctx.fillText("no data", MARGIN.l + 4, MARGIN.t + 14);
     this.drawAxes(ctx, view, css.getPropertyValue("--grid"));
     if (view.gl) return this.drawGL(ctx, view);
     ctx.save();
     ctx.beginPath();
-    ctx.rect(M.l, M.t, this.pw, this.ph);
+    ctx.rect(MARGIN.l, MARGIN.t, this.pw, this.ph);
     ctx.clip();
     if (view.o.band !== "none") for (const ln of view.lines) if (ln.lo) this.drawBand(ctx, ln);
     ctx.lineJoin = "round";
@@ -751,17 +733,17 @@ export class Chart {
     for (const t of view.logy ? logTicks(view.y0, view.y1, ny) : niceTicks(view.y0, view.y1, ny)) {
       const y = Math.round(this.py(view.logy ? 10 ** t : t)) + 0.5;
       ctx.beginPath();
-      ctx.moveTo(M.l, y);
-      ctx.lineTo(M.l + this.pw, y);
+      ctx.moveTo(MARGIN.l, y);
+      ctx.lineTo(MARGIN.l + this.pw, y);
       ctx.stroke();
-      ctx.fillText(fmt(view.logy ? +(10 ** t).toPrecision(6) : t), M.l - 4, y);
+      ctx.fillText(fmt(view.logy ? +(10 ** t).toPrecision(6) : t), MARGIN.l - 4, y);
     }
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
     const nx = Math.max(2, Math.floor(this.pw / 80));
     const xt = view.logx ? logTicks(view.x0, view.x1, nx).map((d) => +(10 ** d).toPrecision(6))
-      : view.xmode === 1 ? durTicks(view.x0, view.x1, nx) : niceTicks(view.x0, view.x1, nx);
-    for (const t of xt) ctx.fillText(view.xmode === 1 ? fmtDur(t) : fmtSI(t), this.px(t), M.t + this.ph + 4);
+      : view.xmode === X_RUNTIME ? durTicks(view.x0, view.x1, nx) : niceTicks(view.x0, view.x1, nx);
+    for (const t of xt) ctx.fillText(view.xmode === X_RUNTIME ? fmtDur(t) : fmtSI(t), this.px(t), MARGIN.t + this.ph + 4);
   }
 
   stroke(ctx, xy, color, width, alpha) {
@@ -813,11 +795,11 @@ export class Chart {
     if (!v || this.app.tipPinned) return;
     this.app.hovered = this;
     this.lastX = e.offsetX;
-    const dpr = devicePixelRatio || 1, ctx = this.ov.getContext("2d");
+    const dpr = devicePixelRatio || 1, ctx = this.overlay.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.w, this.h);
     if (this.drag) return this.drawDragBox(ctx, e);
-    if (e.offsetX < M.l || e.offsetX > M.l + this.pw) return this.unhover();
+    if (e.offsetX < MARGIN.l || e.offsetX > MARGIN.l + this.pw) return this.unhover();
     const x = this.xAt(e.offsetX);
     this.crosshair(ctx, e.offsetX);
     if (v.density) return this.hoverDensity(e, ctx, x);
@@ -837,8 +819,8 @@ export class Chart {
   crosshair(ctx, px) {
     ctx.strokeStyle = "rgba(127,127,127,0.6)";
     ctx.beginPath();
-    ctx.moveTo(px + 0.5, M.t);
-    ctx.lineTo(px + 0.5, M.t + this.ph);
+    ctx.moveTo(px + 0.5, MARGIN.t);
+    ctx.lineTo(px + 0.5, MARGIN.t + this.ph);
     ctx.stroke();
   }
 
@@ -846,7 +828,7 @@ export class Chart {
     const d = this.drag, w = Math.abs(e.offsetX - d.x), h = Math.abs(e.offsetY - d.y);
     ctx.fillStyle = "rgba(127,127,127,0.2)";
     if (h >= BOX_MIN) ctx.fillRect(Math.min(d.x, e.offsetX), Math.min(d.y, e.offsetY), w, h);
-    else ctx.fillRect(Math.min(d.x, e.offsetX), M.t, w, this.ph);
+    else ctx.fillRect(Math.min(d.x, e.offsetX), MARGIN.t, w, this.ph);
   }
 
   /** Tooltip row of a group line at x: its center, band and count in that bin. */
@@ -873,7 +855,7 @@ export class Chart {
     let best = null;
     for (const r of rows) if (Math.abs(r.py - y) < Math.abs((best?.py ?? Infinity) - y)) best = r;
     if (best) {
-      const ctx = this.ov.getContext("2d");
+      const ctx = this.overlay.getContext("2d");
       ctx.strokeStyle = best.ln.color;
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -911,12 +893,11 @@ export class Chart {
     if (ln.lo) (xy = ln.xy), (n = ln.xy.length >> 1);
     else {
       xy = outBuf(Math.ceil(this.pw) * 4 + 1024);
-      const flags = (v.logy ? LOGY : 0) | (v.logx ? LOGX : 0);
-      n = kprep(ln.cols[0], v.xmode, v.x0, v.x1, this.pw, flags, v.alpha, v.scale, xy).n;
+      n = kprep(ln.cols[0], v.xmode, v.x0, v.x1, this.pw, v.flags, v.alpha, v.scale, xy).n;
     }
     ctx.save();
     ctx.beginPath();
-    ctx.rect(M.l, M.t, this.pw, this.ph);
+    ctx.rect(MARGIN.l, MARGIN.t, this.pw, this.ph);
     ctx.clip();
     ctx.strokeStyle = ln.color;
     ctx.lineWidth = width;
@@ -927,22 +908,18 @@ export class Chart {
 
   /** Overlay showing the pinned crosshair with one line emphasized (null: none). */
   highlight(ln) {
-    if (!this.view || !this.ov.width) return;
-    const dpr = devicePixelRatio || 1, ctx = this.ov.getContext("2d");
+    if (!this.view || !this.overlay.width) return;
+    const dpr = devicePixelRatio || 1, ctx = this.overlay.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.w, this.h);
-    ctx.strokeStyle = "rgba(127,127,127,0.6)";
-    ctx.beginPath();
-    ctx.moveTo(this.lastX + 0.5, M.t);
-    ctx.lineTo(this.lastX + 0.5, M.t + this.ph);
-    ctx.stroke();
+    this.crosshair(ctx, this.lastX);
     if (ln) this.traceLine(ctx, ln, 3);
   }
 
   unhover() {
     if (this.app.hovered === this) this.app.hovered = null;
     if (this.app.tipPinned) return;
-    if (this.ov.width) this.ov.getContext("2d").clearRect(0, 0, this.ov.width, this.ov.height);
+    if (this.overlay.width) this.overlay.getContext("2d").clearRect(0, 0, this.overlay.width, this.overlay.height);
     this.app.tip(null);
   }
 
@@ -951,9 +928,9 @@ export class Chart {
     const d = this.drag;
     this.drag = null;
     if (!d || !this.view) return;
-    const r = this.ov.getBoundingClientRect();
-    const ox = Math.min(Math.max(e.clientX - r.left, M.l), M.l + this.pw);
-    const oy = Math.min(Math.max(e.clientY - r.top, M.t), M.t + this.ph);
+    const r = this.overlay.getBoundingClientRect();
+    const ox = Math.min(Math.max(e.clientX - r.left, MARGIN.l), MARGIN.l + this.pw);
+    const oy = Math.min(Math.max(e.clientY - r.top, MARGIN.t), MARGIN.t + this.ph);
     const dx = Math.abs(ox - d.x), dy = Math.abs(oy - d.y);
     this.unhover();
     if (dx < CLICK_MAX && dy < CLICK_MAX) return this.resetAxes();

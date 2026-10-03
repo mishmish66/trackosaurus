@@ -31,12 +31,12 @@ from typing import Final, NamedTuple, cast
 JOURNAL: Final = "trex.journal"
 NETWORK_FS: Final = frozenset({"nfs", "nfs4", "cifs", "smb3", "smbfs", "lustre", "gpfs", "ceph", "beegfs", "glusterfs",
                                "fuse.sshfs", "9p", "afs", "fuse.glusterfs", "fuse.ceph", "wekafs", "panfs"})
-TABLES: Final = {  # replayed with INSERT OR REPLACE
-    "meta": "meta(key, value)",
-    "keys": "keys(id, name)",
-    "rowmeta": "rowmeta(seq0, n, step_lo, step_hi, data)",
-    "chunk": "chunk(key_id, seq0, data)",
-    "media": "media(seq, step, t, key, kind, file, size)",
+TABLES: Final[dict[str, tuple[str, ...]]] = {  # columns of each table, replayed with INSERT OR REPLACE
+    "meta": ("key", "value"),
+    "keys": ("id", "name"),
+    "rowmeta": ("seq0", "n", "step_lo", "step_hi", "data"),
+    "chunk": ("key_id", "seq0", "data"),
+    "media": ("seq", "step", "t", "key", "kind", "file", "size"),
 }
 _HEAD: Final = struct.Struct("<I")
 
@@ -148,9 +148,9 @@ class Writer:
 
 def replay(c: sqlite3.Connection, ops: Sequence[Sequence[object]]) -> None:
     for table, values in ops:
-        cols = TABLES[str(table)]
+        t = str(table)
         vals = [_value(v) for v in cast(Sequence[object], values)]
-        c.execute(f"INSERT OR REPLACE INTO {cols} VALUES ({', '.join('?' * len(vals))})", vals)
+        c.execute(f"INSERT OR REPLACE INTO {t}({', '.join(TABLES[t])}) VALUES ({', '.join('?' * len(vals))})", vals)
 
 
 def replica_dir() -> Path:

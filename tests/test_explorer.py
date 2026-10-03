@@ -1,3 +1,4 @@
+import functools
 import http.client as http_client
 import json
 import os
@@ -25,14 +26,15 @@ from trex.index import Explorer
 from trex.server import bind, check_root, serve
 from trex.server import urls as server_urls
 
+import helpers
+from helpers import committed_rows, get_json, request, wait_for, write_commit
 
-def write_run(d, n, finish=True, **kw):
-    run = trex.init(d, commit_interval=0.05, **kw)
-    for i in range(n):
-        run.log({"loss": 1.0 / (i + 1), "odd": i} if i % 2 else {"loss": 1.0 / (i + 1)}, step=i)
-    if finish:
-        run.finish()
-    return run
+
+def loss_and_odd(i):
+    return {"loss": 1.0 / (i + 1), "odd": i} if i % 2 else {"loss": 1.0 / (i + 1)}
+
+
+write_run = functools.partial(helpers.write_run, metrics=loss_and_odd)
 
 
 def drain(sub):
@@ -69,7 +71,7 @@ def write_chunked(d, commits, state="finished", created=1000.0):
     c.execute("BEGIN")
     c.executemany("INSERT INTO meta VALUES (?, ?)", [(k, json.dumps(v)) for k, v in meta.items()])
     for rows in commits:
-        seq += chunks.write(c, seq, rows, ids)
+        seq += write_commit(c, seq, rows, ids)
     c.execute("COMMIT")
     c.close()
 
@@ -116,7 +118,7 @@ def index_dump(ex):
     """Everything the index stores, without access and build times."""
     c = sqlite3.connect(ex.db_path)
     out = {t: c.execute(f"SELECT * FROM {t} ORDER BY 1, 2").fetchall() for t in ("runs", "media")}
-    out["tiles"] = c.execute("SELECT path, key, level, idx, top, seq, data FROM tiles ORDER BY 1, 2, 3, 4").fetchall()
+    out["tiles"] = c.execute("SELECT path, key, level, idx, kind, seq, data FROM tiles ORDER BY 1, 2, 3, 4").fetchall()
     c.close()
     out["runs"] = [(p, {k: v for k, v in json.loads(s).items() if k != "tiles_t"}) for p, s in out["runs"]]
     return out
@@ -210,7 +212,7 @@ def test_cached_tile_is_rebuilt_only_when_new_rows_reach_its_step_range(root, tm
     run = trex.init(root / "r", commit_interval=0.01)
     for i in range(3000):
         run.log({"loss": float(i)}, step=i)
-    time.sleep(0.1)
+    assert wait_for(lambda: committed_rows(root / "r") == 3000)
     ex = explorer(root, tmp_path)
     early, edge = ["r", "loss", 0, 0], ["r", "loss", 0, 11]
     ex.tiles([early, edge])
@@ -237,8 +239,8 @@ def test_tile_cache_evicts_least_recently_used_finer_tiles_and_keeps_top_tiles(r
     for i in range(1, 15):
         ex.tiles([["r", "loss", 0, i]])
     c = sqlite3.connect(ex.db_path)
-    cached = c.execute("SELECT level, idx FROM tiles WHERE top = 0 ORDER BY idx").fetchall()
-    stored = c.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE top = 0").fetchone()[0]
+    cached = c.execute("SELECT level, idx FROM tiles WHERE kind = 0 ORDER BY idx").fetchall()
+    stored = c.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE kind = 0").fetchone()[0]
     c.close()
     assert stored <= 4 * size and (0, 14) in cached and (0, 0) not in cached
     assert ex.tiles([["r", "loss", "top"]]) == top
@@ -247,7 +249,7 @@ def test_tile_cache_evicts_least_recently_used_finer_tiles_and_keeps_top_tiles(r
 def test_live_run_streams_contiguous_rows_and_refreshes_top_tiles_on_finish(root, tmp_path):
     run = trex.init(root / "live", commit_interval=0.05)
     run.log({"x": 0})
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(root / "live") == 1)
     ex = explorer(root, tmp_path)
     sub = ex.hub.subscribe("")
     seen = ex.run_meta("live")["seq"]
@@ -273,11 +275,11 @@ def test_live_run_streams_contiguous_rows_and_refreshes_top_tiles_on_finish(root
 def test_growing_run_top_tiles_refresh_after_the_refresh_interval(root, tmp_path, monkeypatch):
     run = trex.init(root / "r", commit_interval=0.01)
     run.log({"x": 0.0}, step=0)
-    time.sleep(0.1)
+    assert wait_for(lambda: committed_rows(root / "r") == 1)
     ex = explorer(root, tmp_path)
     for i in range(1, 100):
         run.log({"x": float(i)}, step=i)
-    time.sleep(0.1)
+    assert wait_for(lambda: committed_rows(root / "r") == 100)
     ex.poll()
     assert (ex.run_meta("r")["seq"], ex.run_meta("r")["tiles_seq"]) == (100, 1)
     monkeypatch.setattr(trex_index, "TOP_REFRESH", 0.0)
@@ -288,11 +290,11 @@ def test_growing_run_top_tiles_refresh_after_the_refresh_interval(root, tmp_path
 
 def test_silent_running_run_becomes_crashed_with_complete_top_tiles(root, tmp_path, monkeypatch):
     run = write_run(root / "r", 10, finish=False)
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(root / "r") == 10)
     ex = explorer(root, tmp_path)
     for i in range(10, 20):
         run.log({"loss": 0.0}, step=i)
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(root / "r") == 20)
     ex.poll()
     assert ex.run_meta("r")["state"] == "running" and ex.run_meta("r")["tiles_seq"] == 10
     monkeypatch.setattr(trex_index, "CRASH_AFTER", 0.0)
@@ -315,7 +317,7 @@ def test_pool_and_inline_indexing_produce_identical_index(root, tmp_path, monkey
             run.log_html("report", f"<p>{i}</p>")
             run.log_image("img", b"\x89PNG\r\n\x1a\n" + bytes(range(64)), step=3)
             run.finish()
-    time.sleep(0.2)
+    assert wait_for(lambda: [committed_rows(root / "sweep" / f"writer{i}") for i in range(6)] == [1100 + 400 * i for i in range(6)])
     before = {p: sorted(x.name for x in p.iterdir()) for p in root.glob("sweep/*")}
     inline = explorer(root, tmp_path, workers=1, cache="inline")
     monkeypatch.setattr(trex_index, "INLINE_BYTES", 0)
@@ -324,7 +326,7 @@ def test_pool_and_inline_indexing_produce_identical_index(root, tmp_path, monkey
     monkeypatch.setattr(Explorer, "_sync_pool", lambda self, todo: (pooled.append(len(todo)), real(self, todo)))
     pool = explorer(root, tmp_path, workers=4, cache="pool")
     assert pooled == [12]
-    assert len(inline.state) == 12
+    assert len(inline.records) == 12
     a, b = index_dump(inline), index_dump(pool)
     assert a == b
     assert {p: sorted(x.name for x in p.iterdir()) for p in root.glob("sweep/*")} == before
@@ -337,7 +339,7 @@ def test_pool_and_inline_indexing_produce_identical_index(root, tmp_path, monkey
 def test_live_rows_are_contiguous_while_the_writer_commits(root, tmp_path):
     run = trex.init(root / "live", commit_interval=0.01)
     run.log({"x": 0.0}, step=0)
-    time.sleep(0.1)
+    assert wait_for(lambda: committed_rows(root / "live") == 1)
     ex = explorer(root, tmp_path)
     sub = ex.hub.subscribe("")
     seen = ex.run_meta("live")["seq"]
@@ -395,12 +397,12 @@ def test_http_stream_sends_rows_beyond_top_tiles_then_live_rows(http, root):
     ex, url = http
     run = trex.init(root / "s" / "r", commit_interval=0.05)
     run.log({"x": 0})
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(root / "s" / "r") == 1)
     ex.rewalk()
     ex.poll()
     for i in range(1, 3):
         run.log({"x": i})
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(root / "s" / "r") == 3)
     ex.poll()
     r = urllib.request.urlopen(f"{url}/api/stream?path=s", timeout=5)
 
@@ -416,12 +418,12 @@ def test_http_stream_sends_rows_beyond_top_tiles_then_live_rows(http, root):
     assert next_event() == ("rows", {"run": "s/r", "seq0": 1, "rows": [[1.0, pytest.approx(0, abs=5), {"x": 1}],
                                                                         [2.0, pytest.approx(0, abs=5), {"x": 2}]]})
     run.log({"x": 3, "bad": float("inf")})
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(root / "s" / "r") == 4)
     ex.poll()
     ev, data = next_event()
     while ev == "run":
         ev, data = next_event()
-    assert ev == "rows" and data["seq0"] == 3 and data["rows"][0][2] == {"x": 3, "bad": "Infinity"}
+    assert ev == "rows" and data["seq0"] == 3 and data["rows"][0][2] == {"x": 3, "bad": "inf"}
     run.finish()
     r.close()
 
@@ -498,17 +500,9 @@ def test_refuses_to_crawl_home_or_filesystem_root():
 
 
 @pytest.fixture
-def http(root, tmp_path):
+def http(root, tmp_path, http_server):
     ex = Explorer(root, tmp_path / "cache")
-    srv = serve(ex, "127.0.0.1", 0)
-    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-    yield ex, f"http://127.0.0.1:{srv.server_address[1]}"
-    srv.shutdown()
-
-
-def get(url, headers=None):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {})) as r:
-        return r.status, dict(r.headers), r.read()
+    return ex, http_server(serve(ex, "127.0.0.1", 0))
 
 
 def test_http_scopes_runs_by_folder_and_serves_media_with_ranges(http, root):
@@ -520,15 +514,14 @@ def test_http_scopes_runs_by_folder_and_serves_media_with_ranges(http, root):
     run.finish()
     ex.rewalk()
     ex.poll()
-    body = json.loads(get(f"{url}/api/runs?path=b")[2])
+    body = get_json(f"{url}/api/runs?path=b")
     assert [r["id"] for r in body["runs"]] == ["b/r2"]
     (m,) = body["media"]
     assert m[:5] == ["b/r2", 0, 2.0, "img", "image"]
-    status, headers, data = get(f"{url}/m/{urllib.parse.quote('b/r2', safe='')}/{m[5]}", {"Range": "bytes=8-15"})
+    status, headers, data = request(f"{url}/m/{urllib.parse.quote('b/r2', safe='')}/{m[5]}", headers={"Range": "bytes=8-15"})
     assert status == 206 and data == png[8:16] and "immutable" in headers["Cache-Control"]
-    with pytest.raises(urllib.error.HTTPError):
-        get(f"{url}/m/{urllib.parse.quote('b/r2', safe='')}/media/..%2F..%2Ftrex.sqlite")
-    assert [p for p, _ in json.loads(get(f"{url}/api/tree")[2])] == ["a/r1", "b/r2"]
+    assert request(f"{url}/m/{urllib.parse.quote('b/r2', safe='')}/media/..%2F..%2Ftrex.sqlite")[0] == 404
+    assert [p for p, _ in get_json(f"{url}/api/tree")] == ["a/r1", "b/r2"]
 
 
 def test_indexing_never_creates_files_in_closed_run_directories(root, tmp_path):
@@ -567,10 +560,10 @@ def test_summary_is_the_last_logged_value_of_each_metric_including_non_finite(ro
     run = trex.init(root / "r", commit_interval=0.05)
     run.log({"a": 1.0, "b": float("inf"), "early": 7}, step=0)
     run.log({"a": 2.0, "c": 3.0}, step=1)
-    time.sleep(0.2)
+    assert wait_for(lambda: committed_rows(root / "r") == 2)
     ex = explorer(root, tmp_path)
     assert {k: ex.run_meta("r")["summary"][k] for k in ("a", "b", "c", "early", "_step")} == \
-        {"a": 2.0, "b": "Infinity", "c": 3.0, "early": 7.0, "_step": 1.0}
+        {"a": 2.0, "b": "inf", "c": 3.0, "early": 7.0, "_step": 1.0}
     for i in range(2, 3000):
         run.log({"a": float(i), "c": -float("inf") if i == 2999 else 1.0}, step=i, timestamp=run.created + 0.5 * i)
     run.log({"a": float("nan")}, step=5000, timestamp=run.created + 9000.0)
@@ -579,18 +572,9 @@ def test_summary_is_the_last_logged_value_of_each_metric_including_non_finite(ro
     ex.poll()
     s = ex.run_meta("r")["summary"]
     assert {k: s[k] for k in ("a", "b", "c", "early", "final", "_step", "_runtime")} == \
-        {"a": "NaN", "b": "Infinity", "c": "-Infinity", "early": 7.0, "final": 0.5, "_step": 5000.0, "_runtime": 9000.0}
+        {"a": "nan", "b": "inf", "c": "-inf", "early": 7.0, "final": 0.5, "_step": 5000.0, "_runtime": 9000.0}
     fresh = explorer(root, tmp_path, cache="cache2")
     assert fresh.run_meta("r")["summary"] == s
-
-def request(url, data=None, headers=None):
-    """(status, headers, body) for any status."""
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers or {})) as r:
-            return r.status, dict(r.headers), r.read()
-    except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read()
-
 
 def test_http_static_files_revalidate_by_etag_and_compress_on_request(http):
     _, url = http
@@ -742,7 +726,7 @@ def test_close_stops_polling_ends_subscriptions_and_closes_connections(root, tmp
     with pytest.raises(sqlite3.ProgrammingError):
         c.execute("SELECT 1")
     with pytest.raises(sqlite3.ProgrammingError):
-        ex.w.execute("SELECT 1")
+        ex._writer.execute("SELECT 1")
 
 
 def test_a_shared_tile_budget_evicts_the_least_recently_used_tiles_of_any_explorer(tmp_path, monkeypatch):
@@ -766,8 +750,8 @@ def test_a_shared_tile_budget_evicts_the_least_recently_used_tiles_of_any_explor
     def cached(ex):
         c = sqlite3.connect(ex.db_path)
         try:
-            idx = [i for (i,) in c.execute("SELECT idx FROM tiles WHERE top = 0 ORDER BY idx")]
-            return idx, c.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE top = 0").fetchone()[0]
+            idx = [i for (i,) in c.execute("SELECT idx FROM tiles WHERE kind = 0 ORDER BY idx")]
+            return idx, c.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE kind = 0").fetchone()[0]
         finally:
             c.close()
 
@@ -816,3 +800,19 @@ def test_close_returns_while_a_long_scan_finishes_and_the_scan_writes_nothing(ro
     assert poller is not None
     poller.join(5)
     assert not poller.is_alive() and not errors and "[trex]" not in capfd.readouterr().err
+
+
+def test_a_failed_index_pass_is_logged_and_polling_continues(root, tmp_path, monkeypatch, capfd):
+    write_run(root / "r", 3)
+    apply, calls = Explorer.apply, []
+
+    def fail_once(self, results):
+        calls.append(len(results))
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        apply(self, results)
+
+    monkeypatch.setattr(Explorer, "apply", fail_once)
+    ex = Explorer(root, tmp_path / "cache").start()
+    assert wait_for(lambda: ex.runs("")["runs"], timeout=10)
+    assert ex.ready.is_set() and "index pass failed" in capfd.readouterr().err

@@ -7,11 +7,11 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 
 | path | what |
 |---|---|
-| `trex/format.py` | the run file: `trex.sqlite` schema (format 3), `connect_rw`, `connect_ro`. The contract between writer and readers. |
+| `trex/format.py` | the run file: `trex.sqlite` schema (format 3), `connect_rw`, `connect_ro`, `snapshot`. The contract between writer and readers. |
 | `trex/journal.py` | commit journal for runs on network filesystems: `Writer` (append + fsync), `records`, `sync` (replay into a local replica) |
 | `trex/chunks.py` | per-metric chunk codec: each commit is one `rowmeta` row (steps, times) plus one `chunk` per metric present; `prepare_merge` / `apply_merge` rewrite adjacent commits as one |
 | `trex/tiles.py` | envelope pyramid tiles (min, max, mean, mean step, mean runtime and count per bucket), `top_tiles`, `build`, `coarsen`, `decode` |
-| `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread, and a compactor thread that merges small commits |
+| `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread, and a merge thread that merges small commits |
 | `trex/media.py` | PNG/MP4 encoding for logged arrays (numpy and ffmpeg imported lazily) |
 | `trex/index.py` | `Explorer`: crawl, per-run scans (inline or process pool), index cache, top tiles, on-demand finer tiles with a size-bounded cache, event hub |
 | `trex/server.py` | read-only HTTP + SSE for the UI: `/api/runs`, `/api/tiles`, `/api/rows`, `/api/stream`, media |
@@ -27,7 +27,7 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/`; the user guide is the `trex` and `trex.daemon` docstrings (Markdown) |
 | `docs/media/` | the docs' video tour and its poster image (left out of the sdist); the README embeds the same video, uploaded to GitHub |
-| `tests/` | pytest suites (`test_processes.py` runs real `trex` processes), the node kernel tests, and the browser smoke test |
+| `tests/` | pytest suites (`test_processes.py` runs real `trex` processes; shared helpers in `helpers.py` and `conftest.py`), the node tests, the cross-language cases (`where_cases.json`, `shared_cases.json`), and the browser smoke test |
 
 Runtime dependencies: Python ≥ 3.12, numpy, and Typer for the CLI (ffmpeg only to log frame arrays
 as video). The UI loads no external scripts, and the server is standard library.
@@ -40,7 +40,7 @@ uv run pyright                                            # types: strict for th
 uv run pytest                                             # all suites, one worker per CPU (-n0: serially)
 uv run pytest --cov                                       # the same with branch coverage, subprocesses included; fails below 94%
 uv run python docs/build.py                               # pdoc pages into site/
-node --test tests/*.test.mjs                              # JS kernel and complexity (node >= 18)
+node --test tests/*.test.mjs                              # JS kernel, shared cases, complexity and unused variables (node >= 18)
 uv run --with playwright python tests/browser_smoke.py    # headless UI on its own throwaway server; fails below 92% UI line coverage
 uv run python examples/demo.py /tmp/runs && uv run trex serve /tmp/runs
 ```
@@ -59,7 +59,7 @@ them WebGL falls back to software and timings mean nothing.
 ## How data flows
 
 - **Run file** (`trex.sqlite`, SQLite in WAL mode, plus `media/`): `meta`, `media`, `keys`,
-  `rowmeta(seq0, n, step_lo, step_hi, steps|times)` and `chunk(key_id, seq0, values)`. One commit
+  `rowmeta(seq0, n, step_lo, step_hi, data: steps then times)` and `chunk(key_id, seq0, data: values)`. One commit
   of at most 65535 rows is one `rowmeta` row and one chunk per metric logged in it, so reading one
   metric is an index range scan. A second writer thread merges the session's newest small commits
   (`writer.merge_plan`: `FAN_IN` commits of a value tier at a time, at most `MERGE_VALUES` values, and
@@ -126,14 +126,15 @@ them WebGL falls back to software and timings mean nothing.
 - **Sequence numbers are contiguous.** Rows and media are numbered 0, 1, 2, … per run; readers stop
   at a gap. The browser holds rows `[tiles_seq, seq)` of each running run and resyncs on any gap
   or count mismatch.
-- **Events follow commits, in order.** `Explorer._apply` publishes after the index transaction
+- **Events follow commits, in order.** `Explorer.apply` publishes after the index transaction
   commits. A run's `run` event comes after the rows and media it counts (a new run's comes
   first); the browser treats a `run` event whose counts it has not reached as lost data.
 - **Cache versions.** Bump `CACHE_VERSION` in `index.py` whenever what the index stores, or how it
   derives it, changes. Bump the IndexedDB version in `data.js` when the stored entries or their
   keys change. Older caches are then rebuilt instead of silently misread.
 - **Shared formats across languages.** Change all of these together:
-  - tile encoding: `tiles.py` and `decodeTile` in `static/data.js`;
+  - tile encoding: `tiles.py` and `decodeTile` in `static/data.js`. Buckets leave NaN out and keep ±inf (a bucket's
+    mean is then infinite, NaN with both signs);
   - tile response framing: `post_tiles` in `server.py` and `unframe` in `static/data.js`;
   - local bucket merging: `tiles.coarsen` and `Data.rebuild` (count-weighted means). Points are drawn
     at their bucket's mean step, never the bucket center;
@@ -141,9 +142,16 @@ them WebGL falls back to software and timings mean nothing.
     `Col.ensureSmooth`, `plot.js` `smoothScale`, `query.py` `twema`/`smooth_scale`;
   - group statistics (order-statistic median CI, Student-t mean CI, interquartile mean of ranks
     [floor(n/4), n - floor(n/4)) with Yuen's CI): `kernel.js` `agg` / `medianCiRank` / `iqmStats`, `plot.js` `bandOf`,
-    `query.py` `stats` / `_iqm`;
+    `query.py` `stats` / `_iqm`. NaN is no value; ±inf are values (the mean infinite or NaN, the spread NaN, order
+    statistics and the IQM finite while the infinities fall outside their ranks);
+  - non-finite numbers as text: "nan", "inf", "-inf" (`index.wire`, `cli.jsonable`, `where`'s markers,
+    `where.js` `nonFiniteText`);
   - run filters and field names: `where.py` and `static/where.js` (`compileWhere`, `runField`), `query.py` `get`;
     both suites run the cases in `tests/where_cases.json`.
+
+  Tile encoding, smoothing and group statistics are checked across languages by `tests/shared_cases.json`, which
+  `tests/test_shared_cases.py` writes from the Python side (`TREX_WRITE_CASES=1`) and `tests/shared_cases.test.mjs`
+  reads.
 - **Other sites cannot use the server.** `Handler._refusal` answers only requests whose Host is an
   IP address, `localhost`, this machine's name or an `--allow-host` name (DNS rebinding), and
   refuses a POST whose Origin is not its Host. The UI sends no cross-origin requests.
@@ -182,13 +190,14 @@ The 10k-run view is the benchmark; interactions should reach the next painted fr
 ## Conventions
 
 - Cyclomatic complexity is at most 15 per function, Python (radon) and UI JS (eslint's
-  `complexity` rule); `tests/test_complexity.py` and `tests/complexity.test.mjs` enforce it. Split
+  `complexity` rule); `tests/test_complexity.py` and `tests/complexity.test.mjs` enforce it, the latter also refusing
+  unused variables in the UI. Split
   a function by what it does into named steps; keep hot inner loops in one function.
 
 - Python via `uv run`; never bare `python`. Stdlib and numpy first. Adding a runtime dependency
   needs a very good reason.
 - Types: every function is annotated. The logging API (`writer.py`) and the format modules
-  (`format`, `chunks`, `tiles`, `media`) pass pyright strict; the rest passes standard. Use PEP 695
+  (`format`, `chunks`, `journal`, `tiles`, `media`) pass pyright strict; the rest passes standard. Use PEP 695
   `type` aliases and generics, `X | None`, built-in generics, `TypedDict`/`NamedTuple` for records
   that cross modules or processes, and `Final` for constants. Narrow JSON read from run files with
   the `format.as_*` helpers rather than casts. No `# pyright: ignore` in `trex/`.

@@ -4,18 +4,19 @@
 
 const TOKEN = /\s*(?:('(?:[^']|'')*')|("(?:[^"]|"")*")|(>=|<=|!=|<>|==|!~|[=<>~(),])|([^\s'"=<>!~(),]+)|(\S))/y;
 const NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
-const MARKERS = { NaN: NaN, Infinity: Infinity, "-Infinity": -Infinity };
+const MARKERS = { nan: NaN, inf: Infinity, "-inf": -Infinity };
 const KEYWORDS = new Set(["and", "or", "not", "in", "like", "is", "null", "true", "false"]);
+const IDENTIFIER = /^[A-Za-z_][\w./:-]*$/;
 const COMPARE = new Set(["=", "==", "!=", "<>", "<", "<=", ">", ">=", "~", "!~"]);
 
 const PLAIN_FIELDS = {
   path: (r) => r.meta.id, step: (r) => r.meta.summary?._step, runtime: (r) => r.meta.summary?._runtime,
-  rows: (r) => r.seq, media: (r) => r.mseq,
+  rows: (r) => r.seq, media: (r) => r.mseq, visible: (r) => r.visible ?? true,
   ...Object.fromEntries(["name", "parent", "state", "created", "updated", "tags", "dir"].map((k) => [k, (r) => r.meta[k]])),
 };
 const FIELD_PREFIXES = { config: "config", c: "config", summary: "summary", s: "summary", metric: "summary", m: "summary", info: "info" };
 
-/** A field of a UI run ({meta, seq, mseq}), as the CLI reads it: a plain one, config.K (c.), summary.K (s., metric., m.), info.A.B, or a
+/** A field of a UI run ({meta, seq, mseq, visible: its sidebar checkbox}), as the CLI reads it: a plain one, config.K (c.), summary.K (s., metric., m.), info.A.B, or a
  * bare key (config, then summary); null when missing. */
 export function runField(r, field) {
   const v = rawField(r, field);
@@ -139,22 +140,30 @@ function spans(text) {
 export function literal(v) {
   const t = textOf(v);
   if (typeof v === "number" || typeof v === "boolean") return t;
-  return /^[A-Za-z_][\w./:-]*$/.test(t) && !KEYWORDS.has(t.toLowerCase()) && !NUMBER.test(t) ? t : `'${t.replaceAll("'", "''")}'`;
+  return IDENTIFIER.test(t) && !KEYWORDS.has(t.toLowerCase()) && !NUMBER.test(t) ? t : `'${t.replaceAll("'", "''")}'`;
 }
 
-/** A number, or the text of one (including the markers "NaN", "Infinity", "-Infinity"); else null. */
+/** A field as the filter language writes it: bare when it is a plain word, else double-quoted. */
+export function fieldText(name) {
+  return IDENTIFIER.test(name) ? name : `"${name.replaceAll('"', '""')}"`;
+}
+
+/** A number, or the text of one (including the markers "nan", "inf", "-inf"); else null. */
 export function asNumber(v) {
   if (typeof v === "number") return v;
   if (typeof v !== "string") return null;
-  if (v in MARKERS) return MARKERS[v];
+  if (Object.hasOwn(MARKERS, v)) return MARKERS[v];
   return NUMBER.test(v.trim()) ? Number(v) : null;
 }
+
+/** "nan", "inf" or "-inf": how a non-finite number is written everywhere. */
+export const nonFiniteText = (v) => (v !== v ? "nan" : v > 0 ? "inf" : "-inf");
 
 /** The text a value is matched as: strings as they are, true/false, integers without a point, JSON otherwise. */
 export function textOf(v) {
   if (typeof v === "string") return v;
   if (typeof v === "boolean") return v ? "true" : "false";
-  if (typeof v === "number") return Number.isNaN(v) ? "NaN" : String(v);
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : nonFiniteText(v);
   return JSON.stringify(v);
 }
 
@@ -163,7 +172,7 @@ const any = (v, f) => (v == null ? false : Array.isArray(v) ? v.some((x) => x !=
 function equal(v, lit) {
   if (typeof v === "boolean" && typeof lit === "boolean") return v === lit;
   const a = asNumber(v), b = asNumber(lit);
-  if (a !== null && b !== null) return a === b || Math.abs(a - b) <= 1e-12 * Math.max(Math.abs(a), Math.abs(b));
+  if (a !== null && b !== null) return a === b || (Number.isFinite(a - b) && Math.abs(a - b) <= 1e-12 * Math.max(Math.abs(a), Math.abs(b)));
   return textOf(v) === textOf(lit);
 }
 

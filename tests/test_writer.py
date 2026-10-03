@@ -13,6 +13,8 @@ import trex
 from trex import chunks
 from trex.format import connect_ro, key_names, row_count
 
+from helpers import commit_count, wait_for
+
 
 def rows_of(d):
     c = connect_ro(d)
@@ -45,9 +47,7 @@ def test_logs_contiguous_rows_with_flattened_scalars_and_nonfinite(tmp_path):
 def test_rows_become_visible_to_readers_within_the_commit_interval(tmp_path):
     run = trex.init(tmp_path / "r", commit_interval=0.2)
     run.log({"x": 1})
-    deadline = time.time() + 2
-    while not rows_of(tmp_path / "r") and time.time() < deadline:
-        time.sleep(0.05)
+    assert wait_for(lambda: rows_of(tmp_path / "r"), timeout=2)
     assert len(rows_of(tmp_path / "r")) == 1
     assert meta_of(tmp_path / "r")["state"] == "running"
     run.finish()
@@ -111,14 +111,6 @@ def expected_rows(n):
     return [(i, float(i), {"loss": i + 0.5, **({"eval": -float(i)} if i % 7 == 0 else {})}) for i in range(n)]
 
 
-def commit_count(d):
-    c = connect_ro(d)
-    try:
-        return c.execute("SELECT count(*) FROM rowmeta").fetchone()[0]
-    finally:
-        c.close()
-
-
 def test_small_commits_are_merged_as_the_run_goes(tmp_path, monkeypatch):
     merges = []
     apply = chunks.apply_merge
@@ -130,7 +122,7 @@ def test_small_commits_are_merged_as_the_run_goes(tmp_path, monkeypatch):
     assert len(merges) >= 10 and commit_count(tmp_path / "r") < 3 * trex.writer.FAN_IN
 
 
-def test_a_failing_merge_stops_compaction_and_leaves_every_row(tmp_path, monkeypatch, capsys):
+def test_a_failing_merge_stops_merging_and_leaves_every_row(tmp_path, monkeypatch, capsys):
     def broken(c, m):
         c.execute("DELETE FROM rowmeta WHERE seq0 >= ? AND seq0 < ?", (m.seq0, m.stop))
         raise OSError("disk full")
@@ -140,7 +132,7 @@ def test_a_failing_merge_stops_compaction_and_leaves_every_row(tmp_path, monkeyp
     log_one_row_per_commit(run, 40)
     run.finish()
     assert rows_of(tmp_path / "r") == expected_rows(40)
-    assert "compaction of" in capsys.readouterr().err
+    assert "merging of" in capsys.readouterr().err
 
 
 def check_killed_run(d):
@@ -324,7 +316,7 @@ def test_writer_errors_are_raised_by_finish_and_never_by_log(tmp_path, monkeypat
     monkeypatch.setattr(trex.writer.Run, "_commit", broken)
     run = trex.init(tmp_path / "r", commit_interval=0.01)
     run.log({"loss": 1.0})
-    time.sleep(0.1)
+    assert wait_for(lambda: run._error is not None)
     run.log({"loss": 2.0})
     with pytest.raises(RuntimeError, match="disk full"):
         run.finish()

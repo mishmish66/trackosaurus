@@ -10,31 +10,13 @@ import pytest
 import trex
 from trex import chunks, compact
 from trex.cli import main
-from trex.format import DB, connect_ro, connect_rw
+from trex.format import DB, connect_rw
 
-
-def readback(d):
-    """Everything readers see of a run: meta, metric names, media, rows and every metric's points (NaN-safe)."""
-    c = connect_ro(d)
-    try:
-        tables = {t: sorted(c.execute(f"SELECT * FROM {t}").fetchall()) for t in ("meta", "keys", "media")}
-        rows = [(r.seq, r.step, r.t, sorted((k, repr(v)) for k, v in r.values.items())) for r in chunks.rows(c)]
-        points = {name: [a.tobytes() for a in chunks.metric(c, kid)] for kid, name in chunks.key_names(c).items()}
-        return tables, rows, points
-    finally:
-        c.close()
-
-
-def commits(d):
-    c = connect_ro(d)
-    try:
-        return c.execute("SELECT count(*) FROM rowmeta").fetchone()[0]
-    finally:
-        c.close()
+from helpers import commit_count, readback_run
 
 
 @pytest.fixture
-def uncompacted(monkeypatch):
+def unmerged(monkeypatch):
     monkeypatch.setattr(trex.writer, "merge_plan", lambda tail: None)
 
 
@@ -49,19 +31,19 @@ def small_commit_run(d, n=200):
     run.finish()
 
 
-def test_compacting_a_finished_run_keeps_everything_readers_see_in_few_commits(tmp_path, uncompacted):
+def test_compacting_a_finished_run_keeps_everything_readers_see_in_few_commits(tmp_path, unmerged):
     d = tmp_path / "r"
     small_commit_run(d)
-    before, many = readback(d), commits(d)
+    before, many = readback_run(d), commit_count(d)
     r = compact.compact(d)
-    assert readback(d) == before and commits(d) == r.commits_after == 1 and r.commits_before == many > 50
+    assert readback_run(d) == before and commit_count(d) == r.commits_after == 1 and r.commits_before == many > 50
     assert r.bytes_after < r.bytes_before and sorted(p.name for p in d.iterdir()) == ["media", DB]
 
 
-def test_a_run_another_process_has_open_is_refused_and_left_as_it_was(tmp_path, uncompacted):
+def test_a_run_another_process_has_open_is_refused_and_left_as_it_was(tmp_path, unmerged):
     d = tmp_path / "r"
     small_commit_run(d, 30)
-    before, many = readback(d), commits(d)
+    before, many = readback_run(d), commit_count(d)
     holder = subprocess.Popen([sys.executable, "-c", textwrap.dedent(f"""
         import time
         from trex.format import connect_rw
@@ -77,7 +59,7 @@ def test_a_run_another_process_has_open_is_refused_and_left_as_it_was(tmp_path, 
     finally:
         holder.kill()
         holder.wait()
-    assert readback(d) == before and commits(d) == many and not (d / compact.TMP).exists()
+    assert readback_run(d) == before and commit_count(d) == many and not (d / compact.TMP).exists()
 
 
 def test_a_killed_writers_run_is_compacted_with_the_rows_in_its_wal(tmp_path):
@@ -94,16 +76,16 @@ def test_a_killed_writers_run_is_compacted_with_the_rows_in_its_wal(tmp_path):
     """)
     assert subprocess.run([sys.executable, "-c", code]).returncode == -9
     assert (d / (DB + "-wal")).exists()
-    before = readback(d)
+    before = readback_run(d)
     compact.compact(d)
-    assert readback(d) == before and [r[3] for r in before[1]] == [[("x", repr(float(i)))] for i in range(300)]
-    assert commits(d) == 1 and not (d / (DB + "-wal")).exists()
+    assert readback_run(d) == before and [r[3] for r in before["rows"]] == [[("x", repr(float(i)))] for i in range(300)]
+    assert commit_count(d) == 1 and not (d / (DB + "-wal")).exists()
 
 
-def test_a_compaction_that_fails_partway_leaves_the_run_as_it_was(tmp_path, uncompacted, monkeypatch):
+def test_a_compaction_that_fails_partway_leaves_the_run_as_it_was(tmp_path, unmerged, monkeypatch):
     d = tmp_path / "r"
     small_commit_run(d, 60)
-    before, many, size = readback(d), commits(d), (d / DB).stat().st_size
+    before, many, size = readback_run(d), commit_count(d), (d / DB).stat().st_size
     calls = [0]
     merge = chunks.merge_chunks
 
@@ -116,11 +98,11 @@ def test_a_compaction_that_fails_partway_leaves_the_run_as_it_was(tmp_path, unco
     monkeypatch.setattr(chunks, "merge_chunks", fail_on_the_second_metric)
     with pytest.raises(OSError, match="disk full"):
         compact.compact(d)
-    assert readback(d) == before and commits(d) == many and (d / DB).stat().st_size == size
+    assert readback_run(d) == before and commit_count(d) == many and (d / DB).stat().st_size == size
     assert not (d / compact.TMP).exists()
 
 
-def test_a_compacted_run_takes_new_rows_and_merges_them(tmp_path, uncompacted, monkeypatch):
+def test_a_compacted_run_takes_new_rows_and_merges_them(tmp_path, unmerged, monkeypatch):
     d = tmp_path / "r"
     small_commit_run(d, 40)
     compact.compact(d)
@@ -130,11 +112,11 @@ def test_a_compacted_run_takes_new_rows_and_merges_them(tmp_path, uncompacted, m
         run.log({"loss": i + 0.5}, step=i)
         time.sleep(0.002)
     run.finish()
-    rows = readback(d)[1]
-    assert [r[0] for r in rows] == list(range(140)) and commits(d) < 20
+    rows = readback_run(d)["rows"]
+    assert [r[0] for r in rows] == list(range(140)) and commit_count(d) < 20
 
 
-def test_compact_command_reports_each_run_and_skips_open_ones(tmp_path, uncompacted, capsys):
+def test_compact_command_reports_each_run_and_skips_open_ones(tmp_path, unmerged, capsys):
     for name in ("a", "b/c"):
         small_commit_run(tmp_path / "runs" / name, 30)
     held = connect_rw(tmp_path / "runs" / "b" / "c")

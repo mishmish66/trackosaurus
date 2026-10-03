@@ -12,3 +12,8 @@ test("an empty answer for a finer tile drops the tile it replaces and frees its 
   assert.equal(d.setFine(e, "3|2", [], 20), false);
   assert.equal(d.fineBytes, 40);
 });
+
+test("a tail of 200000 rows reports its first step without overflowing the stack", () => {
+  const tail = Array.from({ length: 200000 }, (_, i) => [i + 5, i, { x: i }]);
+  assert.equal(new Data({}).tailOf({ tail }, "x").s0, 5);
+});

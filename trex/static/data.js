@@ -2,9 +2,10 @@
 // cache, and the SSE stream. Each (run, metric) column is built from the best tiles present plus the
 // rows streamed since its kept tiles [tiles_seq, seq); a gap or a missed heartbeat resyncs the run.
 
-import { Col, crc32 } from "./kernel.js";
+import { Col, X_STEP, crc32 } from "./kernel.js";
+import { asNumber } from "./where.js";
 
-const num = (v) => (typeof v === "number" ? v : Number(v));
+const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
 
 /** URL prefix of what the page shows: a daemon's tracked directory ("/r/<name>") or workspace ("/w/<name>"), else "". */
 export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/[rw]\/[^/]+(?=\/)/) || [""])[0];
@@ -70,6 +71,13 @@ function bucketSpan(tiles) {
   return [lo, hi];
 }
 
+/** Whether tile request x asks for a kept tier ("top" or "overview"), not a finer tile. */
+const isKept = (x) => typeof x[2] === "string";
+
+/** Metadata of a run known only by its id until it is resynced. */
+const placeholderMeta = (id, seq = 0, mseq = 0) =>
+  ({ id, seq, mseq, tiles_seq: 0, keys: [], summary: {}, config: {}, tags: [], name: id, state: "running" });
+
 /** Whether run r logs metric `key` (a set kept in step with r.meta.keys). */
 function hasKey(r, key) {
   if (r.keyList !== r.meta.keys) {
@@ -86,7 +94,7 @@ const idb = {
   async open() {
     try {
       this.db = await new Promise((ok, bad) => {
-        const r = indexedDB.open("trex", 5);
+        const r = indexedDB.open("trex", 6);
         r.onupgradeneeded = () => {
           for (const s of [...r.result.objectStoreNames]) r.result.deleteObjectStore(s);
           r.result.createObjectStore("tiles").createIndex("at", "at");
@@ -279,20 +287,28 @@ class Entry {
 export class Data {
   constructor(ui) {
     this.ui = ui; // {runs(), data(keys, run|null), keys(), media(key), status(text), conn(live), replan()}
-    this.probes = new Map();
-    this.puts = [];
+    this.info = null; // /api/info of what the page shows
+    this.gen = 0; // bumped by `close`; work begun under an older generation is dropped
+    this.probes = new Map(); // metric -> whether its IndexedDB read finished
+    this.idbQueue = []; // top tiles awaiting their IndexedDB write
+    this.putTimer = null; // pending `writePuts`
     this.rebuildQ = new Map(); // "run\0key" -> [run, key] awaiting rebuildSoon
     this.rebuildT = 0;
     this.runs = new Map();
     this.keys = new Map(); // metric key -> number of runs having it
+    this.keysVer = 0; // bumped whenever `keys` changes
+    this.newKeys = false; // a metric appeared since the UI was last told
+    this.keyRunsSrc = null; // the run list `keyRuns` was made from...
+    this.keyRunsVer = -1; // ...at this `keysVer`
+    this.keyRuns = new Map(); // metric -> the runs of `keyRunsSrc` that log it
     this.media = new Map(); // media key -> Map(runId -> records sorted by step)
     this.folders = {}; // folder path -> info dict from its trex_info.json
     this.scope = null;
     this.rootKey = "";
-    this.es = null;
+    this.stream = null; // EventSource of /api/stream
     this.queue = [];
     this.inflight = new Set(); // request ids
-    this.posts = 0;
+    this.posts = 0; // POSTs in flight
     this.fineBytes = 0;
     this.touched = new Set();
     this.stats = { requests: 0, tiles: 0, bytes: 0, idbHits: 0, rows: 0 };
@@ -306,8 +322,8 @@ export class Data {
   }
 
   close() {
-    if (this.es) this.es.close();
-    this.es = null;
+    if (this.stream) this.stream.close();
+    this.stream = null;
     this.runs.clear();
     this.keys.clear();
     this.media.clear();
@@ -315,22 +331,23 @@ export class Data {
     this.queue = [];
     this.inflight.clear();
     this.fineBytes = 0;
-    this.probes = new Map(); // metric -> whether its IndexedDB read finished
-    this.puts = [];
+    this.probes = new Map();
+    this.idbQueue = [];
     this.rebuildQ.clear();
-    this.gen = (this.gen || 0) + 1;
+    this.gen++;
   }
 
   newRun(meta) {
     const r = { id: meta.id, meta, seq: meta.tiles_seq ?? 0, mseq: meta.mseq, cols: new Map(), tiles: new Map(),
-                tail: [], tailSeq0: meta.tiles_seq ?? 0, syncing: false, pending: [], hbExpect: null, resyncs: 0 };
+                tail: [], tailSeq0: meta.tiles_seq ?? 0, pending: [], hbExpect: null, resyncs: 0, resyncInFlight: false,
+                holding: false }; // holding: events wait in `pending` until a resync finishes
     this.runs.set(r.id, r);
     this.countKeys(r, meta.keys || [], 1);
     return r;
   }
 
   countKeys(r, keys, d) {
-    this.keysVer = (this.keysVer || 0) + 1;
+    this.keysVer++;
     for (const k of keys) {
       const c = (this.keys.get(k) || 0) + d;
       if (c > 0) this.keys.set(k, c);
@@ -399,7 +416,7 @@ export class Data {
     const ranges = runs.map((r) => this.stepRange(r, d));
     let overlap = 0, lo = Infinity, hi = -Infinity;
     for (const g of ranges) if (g) (overlap += g[1] - g[0]), (lo = Math.min(lo, g[0])), (hi = Math.max(hi, g[1]));
-    const span = d.zoomed && d.xmode === 0 ? d.x1 - d.x0 : hi - lo; // steps across the chart
+    const span = d.zoomed && d.xmode === X_STEP ? d.x1 - d.x0 : hi - lo; // steps across the chart
     const pxPerBucket = runs.length > d.coarseAbove ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET;
     const chart = {
       d, span, ovNeed: [], topNeed: [], fineQ: tiers[2], probed: this.probed(d.key), overview: runs.length > OVERVIEW_MIN_RUNS,
@@ -480,7 +497,7 @@ export class Data {
     if (!e || !e.span) return null;
     let [lo, hi] = e.span;
     if (!d.zoomed) return [lo, hi];
-    if (d.xmode === 0) [lo, hi] = [Math.max(lo, d.x0), Math.min(hi, d.x1)];
+    if (d.xmode === X_STEP) [lo, hi] = [Math.max(lo, d.x0), Math.min(hi, d.x1)];
     else {
       const c = r.cols.get(d.key);
       if (!c || !c.n) return null;
@@ -574,27 +591,28 @@ export class Data {
 
   /** Queue top tiles for IndexedDB. */
   cachePut(r, key, seq, parts) {
-    this.puts.push([`${this.idbPrefix(key)}${r.id}\0${r.meta.uid}`, seq, parts]);
+    this.idbQueue.push([`${this.idbPrefix(key)}${r.id}\0${r.meta.uid}`, seq, parts]);
     if (!this.putTimer) this.putTimer = setTimeout(() => this.writePuts(), 500);
   }
 
   /** Write queued tiles in small transactions, once no fetch is pending. */
   async writePuts() {
-    while (this.puts.length) {
+    while (this.idbQueue.length) {
       if (this.posts || this.queue.length) {
         await new Promise((ok) => setTimeout(ok, 300));
         continue;
       }
       const at = Date.now();
-      await idb.putMany("tiles", this.puts.splice(0, IDB_CHUNK).map(([k, seq, parts]) =>
+      await idb.putMany("tiles", this.idbQueue.splice(0, IDB_CHUNK).map(([k, seq, parts]) =>
         [k, { seq, bufs: parts.map(([b, o, n]) => b.slice(o, o + n)), at }]));
     }
     this.putTimer = null;
   }
 
   async fetchBatch(want) {
-    const gen = this.gen, seqs = want.map(([r, , a]) => (typeof a === "string" ? r.meta.tiles_seq : r.seq));
-    const buf = await this.post(`${BASE}/api/tiles`, want.map(([r, k, a, b]) => (typeof a === "string" ? [r.id, k, a] : [r.id, k, a, b])));
+    const gen = this.gen, seqs = want.map((x) => (isKept(x) ? x[0].meta.tiles_seq : x[0].seq));
+    const reqs = want.map((x) => (isKept(x) ? [x[0].id, x[1], x[2]] : [x[0].id, x[1], x[2], x[3]]));
+    const buf = await this.post(`${BASE}/api/tiles`, reqs);
     const lists = buf && this.parse(() => unframe(buf, want.length));
     if (!lists) return this.retry(gen, want);
     if (gen !== this.gen) return;
@@ -653,8 +671,8 @@ export class Data {
   }
 
   /** Install the tiles answering request x (parts as from `unframe`). */
-  apply([r, key, a, b], parts, seq) {
-    const e = this.runs.get(r.id) === r && r.tiles.get(key);
+  apply(x, parts, seq) {
+    const [r, key, a, b] = x, e = this.runs.get(r.id) === r && r.tiles.get(key);
     if (!e) return;
     let tiles;
     try {
@@ -665,7 +683,7 @@ export class Data {
     }
     const changed = a === "top" ? this.setTop(r, e, tiles, seq) : a === "overview" ? this.setOverview(r, e, tiles, seq)
       : this.setFine(e, `${a}|${b}`, tiles, seq);
-    if (typeof a !== "string" && (changed || !tiles.length)) {
+    if (!isKept(x)) {
       if (!tiles.length) e.empty.add(`${a}|${b}`);
       this.pruneTail(r);
       if (this.showFine(e) || changed) this.rebuild(r, key);
@@ -771,8 +789,12 @@ export class Data {
   tailOf(r, key) {
     if (!r.tail.length) return NO_TAIL;
     const s = [], v = [], t = [];
-    for (const [step, rt, d] of r.tail) if (key in d) s.push(step), v.push(num(d[key])), t.push(rt);
-    return { s, v, t, n: s.length, s0: s.length ? Math.min(...s) : Infinity };
+    let s0 = Infinity;
+    for (const [step, rt, d] of r.tail) if (key in d) {
+      s.push(step), v.push(num(d[key])), t.push(rt);
+      if (step < s0) s0 = step;
+    }
+    return { s, v, t, n: s.length, s0 };
   }
 
   /** Tell the UI which charts changed since the last flush. */
@@ -786,9 +808,9 @@ export class Data {
 
   /** Discard a run's rows and tiles and reload it from its current server state. */
   async resync(r) {
-    if (r.resyncing) return;
-    r.resyncing = true;
-    r.syncing = true;
+    if (r.resyncInFlight) return;
+    r.resyncInFlight = true;
+    r.holding = true;
     const delay = Math.min(30000, 500 * 2 ** r.resyncs++);
     if (r.resyncs > 1) await new Promise((ok) => setTimeout(ok, delay));
     try {
@@ -804,8 +826,8 @@ export class Data {
       r.tailSeq0 = r.seq = from;
       this.appendRows(r, rows);
       for (const e of r.tiles.values()) (e.topSeq = -1), (e.sig = null);
-      r.resyncing = false;
-      r.syncing = false;
+      r.resyncInFlight = false;
+      r.holding = false;
       r.resyncs = 0;
       const pending = r.pending;
       r.pending = [];
@@ -814,7 +836,7 @@ export class Data {
       this.ui.data(new Set(r.tiles.keys()), null);
     } catch (e) {
       console.warn(`resync ${r.id} failed`, e);
-      r.resyncing = false;
+      r.resyncInFlight = false;
       setTimeout(() => this.resync(r), delay);
     }
   }
@@ -823,7 +845,7 @@ export class Data {
 
   openStream() {
     const es = new EventSource(`${BASE}/api/stream?path=${encodeURIComponent(this.scope)}`);
-    this.es = es;
+    this.stream = es;
     for (const kind of ["rows", "run", "media", "delete", "hb", "folder"]) {
       es.addEventListener(kind, (e) => this.dispatch(kind, JSON.parse(e.data)));
     }
@@ -851,12 +873,12 @@ export class Data {
       return;
     }
     if (!r) {
-      r = this.newRun({ id, mseq: 0, seq: 0, tiles_seq: 0, keys: [], summary: {}, config: {}, tags: [], name: id, state: "running" });
+      r = this.newRun(placeholderMeta(id));
       r.pending.push([kind, ev]);
       this.resync(r);
       return;
     }
-    if (r.syncing) {
+    if (r.holding) {
       r.pending.push([kind, ev]);
       return;
     }
@@ -914,7 +936,7 @@ export class Data {
       this.setMeta(r, { ...meta, summary: { ...meta.summary, ...summary } });
       if (meta.tiles_seq !== before) this.ui.data(new Set(r.tiles.keys()), null);
       // The stream is ordered, so every row and media item this meta counts has already been delivered.
-      if (!r.syncing && (r.seq < meta.seq || r.mseq < meta.mseq)) {
+      if (!r.holding && (r.seq < meta.seq || r.mseq < meta.mseq)) {
         console.warn(`run ${r.id}: meta says ${meta.seq},${meta.mseq}, have ${r.seq},${r.mseq}`);
         this.resync(r);
       }
@@ -927,10 +949,10 @@ export class Data {
     for (const [id, [seq, mseq]] of Object.entries(seqs)) {
       const r = this.runs.get(id);
       if (!r) {
-        this.dispatch("run", { id, seq, mseq, tiles_seq: 0, keys: [], summary: {}, config: {}, tags: [], name: id, state: "running" });
+        this.dispatch("run", placeholderMeta(id, seq, mseq));
         continue;
       }
-      if (r.syncing) continue;
+      if (r.holding) continue;
       const e = r.hbExpect;
       if (e && (r.seq < e[0] || r.mseq < e[1])) {
         console.warn(`run ${id}: heartbeat says ${e}, have ${r.seq},${r.mseq}`);

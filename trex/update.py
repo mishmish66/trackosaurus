@@ -73,9 +73,14 @@ def updates(env: Mapping[str, str] = os.environ, prefix: Path | None = None) -> 
     the trex that `uv tool install` replaces."""
     source = env.get("TREX_SOURCE") or None
     prefix = (prefix or Path(sys.prefix)).resolve()
-    reason = ("TREX_SOURCE is not set" if source is None else
-              "not running as a service (see `trex systemd-unit`, `trex launchd-plist`)" if not service(env) else
-              f"this trex ({prefix}) is not the uv tool install ({tool_env()})" if tool_env() != prefix else "")
+    if source is None:
+        reason = "TREX_SOURCE is not set"
+    elif not service(env):
+        reason = "not running as a service (see `trex systemd-unit`, `trex launchd-plist`)"
+    elif tool_env() != prefix:
+        reason = f"this trex ({prefix}) is not the uv tool install ({tool_env()})"
+    else:
+        reason = ""
     return {"source": source, "available": not reason, "reason": reason}
 
 

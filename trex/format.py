@@ -9,6 +9,8 @@ Any folder may hold trex_info.json: notes about it.
 
 import os
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Final, Literal
 
@@ -16,7 +18,7 @@ from . import chunks, journal
 from .chunks import key_names, row_count
 
 __all__ = ["DB", "FORMAT", "INFO_FILE", "SCHEMA", "JSONValue", "MediaKind", "RunState", "as_dict", "as_float",
-           "as_run_state", "as_str", "as_str_list", "connect_ro", "connect_rw", "key_names", "row_count"]
+           "as_run_state", "as_str", "as_str_list", "connect_ro", "connect_rw", "key_names", "row_count", "snapshot"]
 
 DB: Final = "trex.sqlite"
 INFO_FILE: Final = "trex_info.json"
@@ -56,6 +58,17 @@ def connect_ro(run_dir: str | os.PathLike[str]) -> sqlite3.Connection:
     c = sqlite3.connect(f"file:{db}?{mode}", uri=True, isolation_level=None, timeout=30)
     c.execute("PRAGMA query_only=1")
     return c
+
+
+@contextmanager
+def snapshot(run_dir: str | os.PathLike[str]) -> Generator[sqlite3.Connection, None, None]:
+    """A read-only connection inside one read transaction."""
+    c = connect_ro(run_dir)
+    try:
+        c.execute("BEGIN")
+        yield c
+    finally:
+        c.close()
 
 
 # ---- narrowing stored JSON values ----

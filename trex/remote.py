@@ -127,6 +127,8 @@ class Remote:
             self.state, self.error = "unreachable", str(e)
             return False
         self._proc = proc
+        if self._closed.is_set():
+            _end(proc)
         assert proc.stdout is not None and proc.stderr is not None
         errors: collections.deque[str] = collections.deque(maxlen=20)
         drain = threading.Thread(target=lambda: errors.extend(line.rstrip() for line in proc.stderr or []), daemon=True)

@@ -15,6 +15,8 @@ LOCK_TIMEOUT: Final = 1.0  # seconds to wait for other connections to the run to
 
 
 class Compacted(NamedTuple):
+    """Commits and bytes of a run before and after `compact`."""
+
     commits_before: int
     commits_after: int
     bytes_before: int
@@ -34,29 +36,27 @@ def compact(run_dir: Path) -> Compacted:
     tmp.unlink(missing_ok=True)
     before = _size(run_dir)
     src = _exclusive(db)
-    dst: sqlite3.Connection | None = None
     try:
         src.execute("PRAGMA journal_mode=DELETE")  # folds the WAL in and removes it, so none outlives the old file
         groups, commits = _groups(src)
-        dst = _build(src, tmp, groups)
-        _verify(src, dst)
-        dst.execute("PRAGMA locking_mode=EXCLUSIVE")
-        dst.execute("BEGIN EXCLUSIVE")
-        dst.execute("COMMIT")
-        _fsync(tmp)
-        os.replace(tmp, db)
-        _fsync(run_dir)
-    except BaseException:
-        if dst is not None:
+        dst = sqlite3.connect(tmp, isolation_level=None)
+        try:
+            _build(src, dst, groups)
+            _verify(src, dst)
+            dst.execute("PRAGMA locking_mode=EXCLUSIVE")
+            dst.execute("BEGIN EXCLUSIVE")
+            dst.execute("COMMIT")
+            _fsync(tmp)
+            os.replace(tmp, db)
+            _fsync(run_dir)
+        finally:
             dst.close()
-            dst = None
+    except BaseException:
         tmp.unlink(missing_ok=True)
         src.execute("PRAGMA journal_mode=WAL")
         raise
     finally:
         src.close()
-        if dst is not None:
-            dst.close()
     return Compacted(commits, len(groups), before, _size(run_dir))
 
 
@@ -92,9 +92,8 @@ def _groups(c: sqlite3.Connection) -> tuple[list[list[tuple[int, int]]], int]:
     return groups, len(commits)
 
 
-def _build(src: sqlite3.Connection, tmp: Path, groups: list[list[tuple[int, int]]]) -> sqlite3.Connection:
-    """The run rewritten into `tmp`, one commit per group."""
-    dst = sqlite3.connect(tmp, isolation_level=None)
+def _build(src: sqlite3.Connection, dst: sqlite3.Connection, groups: list[list[tuple[int, int]]]) -> None:
+    """Write the run into the empty database `dst`, one commit per group."""
     dst.execute("PRAGMA synchronous=FULL")
     dst.executescript(SCHEMA)
     dst.execute("BEGIN")
@@ -102,7 +101,6 @@ def _build(src: sqlite3.Connection, tmp: Path, groups: list[list[tuple[int, int]
     _write_rowmeta(src, dst, groups)
     _write_chunks(src, dst, groups)
     dst.execute("COMMIT")
-    return dst
 
 
 def _copy_tables(src: sqlite3.Connection, dst: sqlite3.Connection) -> None:
@@ -117,12 +115,8 @@ def _write_rowmeta(src: sqlite3.Connection, dst: sqlite3.Connection, groups: lis
     """One rowmeta row per group: its rows' steps, then their times."""
     metas = src.execute("SELECT seq0, n, step_lo, step_hi, data FROM rowmeta ORDER BY seq0")
     for members in groups:
-        part = [next(metas) for _ in members]
-        steps = b"".join(d[: 8 * k] for _, k, _, _, d in part)
-        times = b"".join(d[8 * k: 16 * k] for _, k, _, _, d in part)
         dst.execute("INSERT INTO rowmeta(seq0, n, step_lo, step_hi, data) VALUES (?, ?, ?, ?, ?)",
-                    (members[0][0], sum(k for _, k, *_ in part), min(m[2] for m in part), max(m[3] for m in part),
-                     steps + times))
+                    chunks.merged_rowmeta([next(metas) for _ in members]))
 
 
 def _write_chunks(src: sqlite3.Connection, dst: sqlite3.Connection, groups: list[list[tuple[int, int]]]) -> None:
@@ -155,8 +149,7 @@ def _verify(src: sqlite3.Connection, dst: sqlite3.Connection) -> None:
 
 def _steps(c: sqlite3.Connection) -> bytes:
     """Every row's step then time, in row order."""
-    out = [(d[: 8 * k], d[8 * k: 16 * k]) for k, d in c.execute("SELECT n, data FROM rowmeta ORDER BY seq0")]
-    return b"".join(s for s, _ in out) + b"".join(t for _, t in out)
+    return chunks.join_rowmeta(c.execute("SELECT n, data FROM rowmeta ORDER BY seq0"))
 
 
 def _size(run_dir: Path) -> int:

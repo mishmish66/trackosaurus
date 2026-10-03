@@ -6,6 +6,8 @@ import pytest
 
 from trex import chunks, tiles
 
+from helpers import merge, readback, write_commit
+
 
 @pytest.fixture
 def db(tmp_path):
@@ -20,7 +22,7 @@ def write_commits(c, commits):
     seq = 0
     for rows in commits:
         c.execute("BEGIN")
-        seq += chunks.write(c, seq, rows, ids)
+        seq += write_commit(c, seq, rows, ids)
         c.execute("COMMIT")
     return ids
 
@@ -62,14 +64,6 @@ def test_commit_size_is_bounded():
         chunks.encode([(0.0, 0.0, {"a": 1})] * (chunks.MAX_ROWS + 1), {})
 
 
-def readback(c):
-    """Every row and every metric's points as readers see them, NaN-safe."""
-    names = chunks.key_names(c)
-    rows = [(r.seq, r.step, r.t, sorted((k, repr(v)) for k, v in r.values.items())) for r in chunks.rows(c)]
-    points = {names[k]: tuple(a.tobytes() for a in chunks.metric(c, k)) for k in names}
-    return chunks.row_count(c), rows, points
-
-
 SPARSE = [[(float(i), i / 2, {"loss": 1 / (i + 1), **({"eval": float(i)} if i % 3 == 0 else {}),
                                 **({"acc": math.nan} if i % 5 == 1 else {})}) for i in range(start, start + n)]
           for start, n in ((0, 1), (1, 3), (4, 1), (5, 7), (12, 2), (14, 1), (15, 9))]
@@ -81,30 +75,30 @@ def commits_of(c):
 
 def test_merging_commits_keeps_every_row_and_metric(db):
     write_commits(db, SPARSE)
-    before = readback(db)
+    before = readback(db, tables=("keys",))
     for seq0, stop in ((1, 5), (5, 14), (0, 24)):
         db.execute("BEGIN")
-        replaced = chunks.merge(db, seq0, stop)
+        replaced = merge(db, seq0, stop)
         db.execute("COMMIT")
-        assert replaced > 1 and readback(db) == before
+        assert replaced > 1 and readback(db, tables=("keys",)) == before
     assert commits_of(db) == [(0, 24)]
     assert db.execute("SELECT count(*) FROM chunk").fetchone()[0] == 3
 
 
 def test_merge_refuses_ranges_that_are_not_whole_contiguous_commits(db):
     write_commits(db, SPARSE)
-    before, layout = readback(db), commits_of(db)
+    before, layout = readback(db, tables=("keys",)), commits_of(db)
     for seq0, stop in ((0, 3), (2, 5), (1, 6), (20, 30), (5, 5)):
         db.execute("BEGIN")
         with pytest.raises(ValueError):
-            chunks.merge(db, seq0, stop)
+            merge(db, seq0, stop)
         db.execute("ROLLBACK")
-    assert readback(db) == before and commits_of(db) == layout
+    assert readback(db, tables=("keys",)) == before and commits_of(db) == layout
 
 
 def test_a_merge_that_would_change_any_value_is_refused(db, monkeypatch):
     write_commits(db, SPARSE)
-    before, layout = readback(db), commits_of(db)
+    before, layout = readback(db, tables=("keys",)), commits_of(db)
     good = chunks._merged
 
     def flip_last_value(parts, seq0, n):
@@ -114,9 +108,9 @@ def test_a_merge_that_would_change_any_value_is_refused(db, monkeypatch):
     monkeypatch.setattr(chunks, "_merged", flip_last_value)
     db.execute("BEGIN")
     with pytest.raises(RuntimeError, match="read back"):
-        chunks.merge(db, 0, 24)
+        merge(db, 0, 24)
     db.execute("ROLLBACK")
-    assert readback(db) == before and commits_of(db) == layout
+    assert readback(db, tables=("keys",)) == before and commits_of(db) == layout
 
 
 def test_a_merge_is_refused_once_its_commits_changed(db):
@@ -125,14 +119,14 @@ def test_a_merge_is_refused_once_its_commits_changed(db):
     m = chunks.prepare_merge(db, 5, 24)
     db.execute("COMMIT")
     db.execute("BEGIN")
-    chunks.merge(db, 5, 14)
+    merge(db, 5, 14)
     db.execute("COMMIT")
-    before, layout = readback(db), commits_of(db)
+    before, layout = readback(db, tables=("keys",)), commits_of(db)
     db.execute("BEGIN")
     with pytest.raises(RuntimeError, match="changed"):
         chunks.apply_merge(db, m)
     db.execute("ROLLBACK")
-    assert readback(db) == before and commits_of(db) == layout
+    assert readback(db, tables=("keys",)) == before and commits_of(db) == layout
 
 
 def test_tile_buckets_hold_min_max_mean_and_mean_step_of_their_points():
@@ -167,11 +161,13 @@ def test_parent_envelope_contains_children():
             assert parent.bucket[k] == pb and parent.min[k] <= mn and parent.max[k] >= mx
 
 
-def test_tiles_skip_non_finite_values_and_empty_tiles_are_valid():
-    steps = np.array([0.0, 1.0, 2.0])
-    vals = np.array([1.0, np.nan, np.inf])
-    t = tiles.decode(tiles.build(steps, vals, steps, 0, 0))
-    assert list(t.bucket) == [0] and list(t.n) == [1]
+def test_tiles_leave_out_nan_keep_infinities_and_empty_tiles_are_valid():
+    steps = np.arange(6.0)
+    vals = np.array([1.0, np.nan, np.inf, -np.inf, np.inf, 2.0])
+    t = tiles.decode(tiles.build(steps, vals, steps, 1, 0))
+    assert list(t.bucket) == [0, 1, 2] and list(t.n) == [1, 2, 2]
+    assert t.mean[0] == 1.0 and math.isnan(t.mean[1]) and t.mean[2] == np.inf
+    assert (t.min[1], t.max[1]) == (-np.inf, np.inf) and (t.min[2], t.max[2]) == (2.0, np.inf)
     assert tiles.decode(tiles.build(steps, vals, steps, 0, 5)).bucket.size == 0
 
 
@@ -217,8 +213,8 @@ def test_sparse_points_are_placed_at_their_mean_step_not_the_bucket_center():
 def test_row_count_stops_at_the_first_gap_between_commits(db):
     ids = {}
     db.execute("BEGIN")
-    chunks.write(db, 0, TRAIN_EVAL[0], ids)
-    chunks.write(db, 10, TRAIN_EVAL[1], ids)
+    write_commit(db, 0, TRAIN_EVAL[0], ids)
+    write_commit(db, 10, TRAIN_EVAL[1], ids)
     db.execute("COMMIT")
     assert chunks.row_count(db) == len(TRAIN_EVAL[0])
 

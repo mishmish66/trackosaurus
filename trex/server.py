@@ -19,10 +19,10 @@ from typing import TYPE_CHECKING, Any, Final, cast
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import remote, update
-from .daemon import root_url, workspace_url
+from .daemon import resolve_root, root_url, workspace_url
 from .remote import Remote
-from .workspace import Far, Workspace
-from .index import Explorer, dumps, sse
+from .workspace import HEARTBEAT, Far, Workspace
+from .index import Explorer, TileKind, dumps, sse
 
 if TYPE_CHECKING:
     from .daemon import Roots
@@ -36,7 +36,6 @@ PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
 HOP_HEADERS: Final = frozenset({"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
                                 "proxy-authorization", "proxy-authenticate"})
 ROOT_PREFIX: Final = re.compile(r"/([rw])/([^/]+)(/.*)?")  # a tracked directory's (r) or workspace's (w) URLs
-HB_INTERVAL: Final = 10.0  # seconds of stream silence after which a heartbeat is sent
 MAX_TILE_REQUESTS: Final = 4096
 RESTART_DELAY: Final = 0.5  # seconds between answering an update and restarting, so the answer is sent
 CTYPES: Final = {
@@ -136,9 +135,9 @@ class Handler(BaseHTTPRequestHandler):
         that names no tracked directory or workspace, or lacks its trailing slash. The daemon's own root is the
         view of every tracked directory."""
         self._ex = self.srv.explorer
-        pm = ROOT_PREFIX.fullmatch(path) if self.srv.roots is not None else None
         if self.srv.roots is None:
             return path
+        pm = ROOT_PREFIX.fullmatch(path)
         if pm is None:
             self._ex = self.srv.roots.everything()
             return path
@@ -298,13 +297,15 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", r"/api/daemon")
     def daemon(self, q: Query) -> None:
-        """{daemon, roots: [{name, root, url}], history: [root], install, updates}: whether this is the daemon,
-        its directories, the remembered ones it does not serve, the trex it runs, and whether it can update."""
+        """{daemon, roots: [{name, root, url, state, error}], workspaces: [{name, url, members}], history: [root],
+        install, updates}: whether this is the daemon, its directories and workspaces, the remembered directories it
+        does not serve, the trex it runs, and whether it can update."""
         roots = self.srv.roots
-        self._json({"daemon": roots is not None, "roots": roots.served() if roots else [],
-                    "workspaces": roots.workspace_list() if roots else [],
-                    "history": roots.history() if roots else [], "install": update.RUNNING if roots else None,
-                    "updates": update.updates() if roots else None})
+        if roots is None:
+            return self._json({"daemon": False, "roots": [], "workspaces": [], "history": [], "install": None,
+                               "updates": None})
+        self._json({"daemon": True, "roots": roots.served(), "workspaces": roots.workspace_list(),
+                    "history": roots.history(), "install": update.RUNNING, "updates": update.updates()})
 
     @property
     def daemon_roots(self) -> "Roots":
@@ -325,12 +326,9 @@ class Handler(BaseHTTPRequestHandler):
         Response: {name, url}, or 400 with {error} for a path it refuses or a remote that fails to start."""
         roots, path = self.daemon_roots, self.body_field("path").strip()
         try:
-            if remote.parse(path):
-                name = roots.add_remote(path)
-            elif not Path(path).expanduser().is_absolute():
+            if not remote.parse(path) and not Path(path).expanduser().is_absolute():
                 raise ValueError(f"{path} is not an absolute path or host:path")
-            else:
-                name = roots.add(resolve_root(path, force=False))
+            name = roots.track(path)
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
         self._json({"name": name, "url": root_url(name)})
@@ -406,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", r"/api/rows")
     def rows(self, q: Query) -> None:
-        self.send(self.ex.rows_json(q["path"], int(q.get("from", 0)))[0].encode(), "application/json", compress=True)
+        self.send(self.ex.rows_json(q["path"], int(q.get("from", 0))).encode(), "application/json", compress=True)
 
     @route("POST", r"/api/tiles")
     def post_tiles(self, q: Query) -> None:
@@ -414,11 +412,7 @@ class Handler(BaseHTTPRequestHandler):
         want = json.loads(self.body())
         if not isinstance(want, list) or len(want) > MAX_TILE_REQUESTS:
             raise ValueError(f"expected a list of at most {MAX_TILE_REQUESTS} tile requests")
-        out = []
-        for blobs in self.ex.tiles(want):
-            out.append(len(blobs).to_bytes(4, "little"))
-            for b in blobs:
-                out += [len(b).to_bytes(4, "little"), b]
+        out = [part for blobs in self.ex.tiles(want) for part in _framed(blobs)]
         self.send(b"".join(out), "application/octet-stream", headers={"Cache-Control": "no-store"},
                   compress=not self._loopback())
 
@@ -429,13 +423,12 @@ class Handler(BaseHTTPRequestHandler):
         req = json.loads(self.body())
         if not isinstance(req, dict) or req.get("kind") not in ("top", "overview"):
             raise ValueError("expected {key, kind: top|overview, scope}")
-        entries = self.ex.tile_bundle(str(req["key"]), req["kind"], str(req.get("scope", "")))
+        kind: TileKind = "top" if req["kind"] == "top" else "overview"
+        entries = self.ex.tile_bundle(str(req["key"]), kind, str(req.get("scope", "")))
         out = [len(entries).to_bytes(4, "little")]
         for path, blobs in entries:
             p = path.encode()
-            out += [len(p).to_bytes(4, "little"), p, b"\0" * (-len(p) % 4), len(blobs).to_bytes(4, "little")]
-            for b in blobs:
-                out += [len(b).to_bytes(4, "little"), b]
+            out += [len(p).to_bytes(4, "little"), p, b"\0" * (-len(p) % 4), *_framed(blobs)]
         self.send(b"".join(out), "application/octet-stream", headers={"Cache-Control": "no-store"},
                   compress=not self._loopback())
 
@@ -454,18 +447,12 @@ class Handler(BaseHTTPRequestHandler):
         ex = self.ex
         sub = ex.hub.subscribe(prefix)
         try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.close_connection = True
+            self._event_stream_headers()
             self.wfile.write(b"retry: 2000\n\n" + b"".join(ex.backfill(prefix)))
             while not sub.dead:
                 msgs = []
                 try:
-                    msgs.append(sub.q.get(timeout=HB_INTERVAL))
+                    msgs.append(sub.q.get(timeout=HEARTBEAT))
                     while len(msgs) < 2000:
                         msgs.append(sub.q.get_nowait())
                 except queue.Empty:
@@ -498,6 +485,14 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             stop.set()
+
+
+def _framed(blobs: Sequence[bytes]) -> list[bytes]:
+    """`blobs` as sent: u32 count, (u32 length, blob)*."""
+    out = [len(blobs).to_bytes(4, "little")]
+    for b in blobs:
+        out += [len(b).to_bytes(4, "little"), b]
+    return out
 
 
 class Server(ThreadingHTTPServer):
@@ -591,17 +586,6 @@ def urls(servers: Sequence[Server]) -> list[str]:
     return out
 
 
-def resolve_root(root: str | os.PathLike[str], force: bool) -> Path:
-    """`root` resolved; ValueError for a non-directory, or for / and $HOME (whose crawl would sweep a whole
-    machine or home directory) unless `force`."""
-    r = Path(root).expanduser().resolve()
-    if not r.is_dir():
-        raise ValueError(f"{root} is not a directory")
-    if not force and r in (Path("/"), Path.home().resolve()):
-        raise ValueError(f"refusing to crawl {r}; point trex at a runs directory (or pass --force)")
-    return r
-
-
 def check_root(root: str | os.PathLike[str], force: bool) -> Path:
     """`resolve_root`, exiting with its error."""
     try:
@@ -609,8 +593,3 @@ def check_root(root: str | os.PathLike[str], force: bool) -> Path:
     except ValueError as e:
         sys.exit(f"trex: {e}")
 
-
-if __name__ == "__main__":
-    from .cli import main
-
-    main()

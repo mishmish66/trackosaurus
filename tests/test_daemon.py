@@ -2,25 +2,18 @@ import http.client as http_client
 import json
 import socket
 import threading
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 import pytest
 
-import trex
 from trex import daemon, server
 from trex.cli import main
 from trex.daemon import ControlServer, Roots, unique_names
 from trex.index import Explorer
 
-
-def write_run(d, n=5):
-    run = trex.init(d, commit_interval=0.05)
-    for i in range(n):
-        run.log({"loss": 1.0 / (i + 1)}, step=i)
-    run.finish()
+from helpers import get_json, post_json, request, wait_for, write_run
 
 
 @pytest.fixture
@@ -46,11 +39,8 @@ def roots(tmp_path, state):
 
 
 @pytest.fixture
-def http(roots):
-    srv = server.serve(None, "127.0.0.1", 0, roots)
-    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-    yield f"http://127.0.0.1:{srv.server_address[1]}"
-    srv.shutdown()
+def http(roots, http_server):
+    return http_server(server.serve(None, "127.0.0.1", 0, roots))
 
 
 @pytest.fixture
@@ -62,14 +52,10 @@ def control(roots, state):
     c.server_close()
 
 
-def get(url):
+def final_url(url):
+    """The URL a GET ends at after redirects."""
     with urllib.request.urlopen(url) as r:
-        return r.status, r.geturl(), r.read()
-
-
-def post(url, body):
-    with urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")) as r:
-        return json.loads(r.read())
+        return r.geturl()
 
 
 def ready(roots, name):
@@ -113,39 +99,30 @@ def test_daemon_serves_each_directory_under_its_prefix(roots, dirs, http):
     names = [r["name"] for r in roots.served()]
     for n in names:
         ready(roots, n)
-    info = json.loads(get(f"{http}/api/daemon")[2])
+    info = get_json(f"{http}/api/daemon")
     assert info["daemon"] and [r["url"] for r in info["roots"]] == ["/r/runs%3Ca%3E/", "/r/runs%3Cb%3E/"]
     for n, d in zip(names, dirs, strict=True):
-        assert json.loads(get(f"{http}/r/{urllib.parse.quote(n)}/api/info")[2])["root"] == str(d)
-        assert [r["id"] for r in json.loads(get(f"{http}/r/{urllib.parse.quote(n)}/api/runs")[2])["runs"]] == ["r1"]
-    assert get(f"{http}/r/runs%3Ca%3E")[1] == f"{http}/r/runs%3Ca%3E/"
-    assert get(f"{http}/r/nope/")[1] == f"{http}/"
-    assert sorted(r["id"] for r in json.loads(get(f"{http}/api/runs")[2])["runs"]) == ["runs<a>/r1", "runs<b>/r1"]
+        assert get_json(f"{http}/r/{urllib.parse.quote(n)}/api/info")["root"] == str(d)
+        assert [r["id"] for r in get_json(f"{http}/r/{urllib.parse.quote(n)}/api/runs")["runs"]] == ["r1"]
+    assert final_url(f"{http}/r/runs%3Ca%3E") == f"{http}/r/runs%3Ca%3E/"
+    assert final_url(f"{http}/r/nope/") == f"{http}/"
+    assert sorted(r["id"] for r in get_json(f"{http}/api/runs")["runs"]) == ["runs<a>/r1", "runs<b>/r1"]
 
 
 def test_removing_a_directory_stops_serving_it_without_touching_its_files(roots, dirs, http, state):
     before = sorted(p.relative_to(dirs[0]) for p in dirs[0].rglob("*"))
     name = roots.add(dirs[0])
     ready(roots, name)
-    assert post(f"{http}/api/daemon/remove", {"name": name}) == {"ok": True}
-    with pytest.raises(urllib.error.HTTPError) as e:
-        get(f"{http}/r/{name}/api/runs")
-    assert e.value.code == 404
+    assert post_json(f"{http}/api/daemon/remove", {"name": name}) == (200, {"ok": True})
+    assert request(f"{http}/r/{name}/api/runs")[0] == 404
     assert json.loads((state / "roots.json").read_text()) == {"tracked": [], "workspaces": []}
     assert sorted(p.relative_to(dirs[0]) for p in dirs[0].rglob("*")) == before
 
 
-def test_standalone_server_has_no_daemon_routes(tmp_path, dirs):
-    ex = Explorer(dirs[0], tmp_path / "cache")
-    srv = server.serve(ex, "127.0.0.1", 0)
-    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-    url = f"http://127.0.0.1:{srv.server_address[1]}"
-    try:
-        assert json.loads(get(f"{url}/api/daemon")[2]) == {"daemon": False, "roots": [], "workspaces": [], "history": [], "install": None, "updates": None}
-        with pytest.raises(urllib.error.HTTPError):
-            post(f"{url}/api/daemon/remove", {"name": "runs"})
-    finally:
-        srv.shutdown()
+def test_standalone_server_has_no_daemon_routes(tmp_path, dirs, http_server):
+    url = http_server(server.serve(Explorer(dirs[0], tmp_path / "cache"), "127.0.0.1", 0))
+    assert get_json(f"{url}/api/daemon") == {"daemon": False, "roots": [], "workspaces": [], "history": [], "install": None, "updates": None}
+    assert post_json(f"{url}/api/daemon/remove", {"name": "runs"})[0] == 404
 
 
 def test_control_socket_adds_directories_and_reports_status(control, roots, dirs):
@@ -192,15 +169,6 @@ def test_servers_without_a_port_take_the_next_free_one(monkeypatch):
             srv.server_close()
 
 
-def post_status(url, body):
-    """(status, JSON body) for any status."""
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")) as r:
-            return r.status, json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read())
-
-
 def test_added_and_removed_directories_are_remembered_most_recent_first_across_restarts(roots, dirs, tmp_path, state):
     for d in dirs:
         roots.add(d)
@@ -230,33 +198,27 @@ def test_clearing_history_keeps_served_directories(roots, dirs, tmp_path, state)
 
 
 def test_http_add_serves_a_directory_and_history_can_be_cleared(roots, dirs, http):
-    assert post_status(f"{http}/api/daemon/add", {"path": str(dirs[0])}) == (200, {"name": "runs", "url": "/r/runs/"})
+    assert post_json(f"{http}/api/daemon/add", {"path": str(dirs[0])}) == (200, {"name": "runs", "url": "/r/runs/"})
     ready(roots, "runs")
-    assert json.loads(get(f"{http}/r/runs/api/runs")[2])["runs"][0]["id"] == "r1"
-    assert post(f"{http}/api/daemon/remove", {"name": "runs"}) == {"ok": True}
-    assert json.loads(get(f"{http}/api/daemon")[2])["history"] == [str(dirs[0])]
-    assert post(f"{http}/api/daemon/history/clear", {}) == {"ok": True}
-    assert json.loads(get(f"{http}/api/daemon")[2])["history"] == []
+    assert get_json(f"{http}/r/runs/api/runs")["runs"][0]["id"] == "r1"
+    assert post_json(f"{http}/api/daemon/remove", {"name": "runs"}) == (200, {"ok": True})
+    assert get_json(f"{http}/api/daemon")["history"] == [str(dirs[0])]
+    assert post_json(f"{http}/api/daemon/history/clear") == (200, {"ok": True})
+    assert get_json(f"{http}/api/daemon")["history"] == []
 
 
 @pytest.mark.parametrize("path,message", [
     ("runs", "not an absolute path"), ("~", "refusing to crawl"), ("/", "refusing to crawl"), ("/no/such/dir", "not a directory"),
 ])
 def test_http_add_refuses_relative_home_root_and_missing_paths(roots, http, path, message):
-    status, body = post_status(f"{http}/api/daemon/add", {"path": path})
+    status, body = post_json(f"{http}/api/daemon/add", {"path": path})
     assert status == 400 and message in body["error"] and roots.served() == []
 
 
-def test_standalone_server_refuses_daemon_changes(tmp_path, dirs):
-    ex = Explorer(dirs[0], tmp_path / "cache")
-    srv = server.serve(ex, "127.0.0.1", 0)
-    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-    url = f"http://127.0.0.1:{srv.server_address[1]}"
-    try:
-        for path, body in [("add", {"path": str(dirs[1])}), ("history/clear", {})]:
-            assert post_status(f"{url}/api/daemon/{path}", body)[0] == 404
-    finally:
-        srv.shutdown()
+def test_standalone_server_refuses_daemon_changes(tmp_path, dirs, http_server):
+    url = http_server(server.serve(Explorer(dirs[0], tmp_path / "cache"), "127.0.0.1", 0))
+    for path, body in [("add", {"path": str(dirs[1])}), ("history/clear", {})]:
+        assert post_json(f"{url}/api/daemon/{path}", body)[0] == 404
 
 
 def raw(url, method="GET", headers=None, body=None):
@@ -288,7 +250,7 @@ def test_unknown_directories_and_workspaces_redirect_home_without_being_cached(r
     finally:
         conn.close()
     roots.set_workspace("nope", [])
-    assert get(f"{http}/w/nope/")[1] == f"{http}/w/nope/"
+    assert final_url(f"{http}/w/nope/") == f"{http}/w/nope/"
 
 
 @pytest.mark.parametrize("host", ["evil.example.com", "evil.example.com:80", "localhost.evil.example.com"])
@@ -305,13 +267,9 @@ def test_requests_by_address_localhost_or_machine_name_are_served(http, host):
     assert status == 200 and body["daemon"]
 
 
-def test_allowed_host_names_are_served(roots):
-    srv = server.serve(None, "127.0.0.1", 0, roots, allow=["Box.Tailnet.ts.net"])
-    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-    try:
-        assert raw(f"http://127.0.0.1:{srv.server_address[1]}/api/daemon", headers={"Host": "box.tailnet.ts.net"})[0] == 200
-    finally:
-        srv.shutdown()
+def test_allowed_host_names_are_served(roots, http_server):
+    url = http_server(server.serve(None, "127.0.0.1", 0, roots, allow=["Box.Tailnet.ts.net"]))
+    assert raw(f"{url}/api/daemon", headers={"Host": "box.tailnet.ts.net"})[0] == 200
 
 
 @pytest.mark.parametrize("origin", ["https://evil.example.com", "http://127.0.0.1:1", "null"])
@@ -333,11 +291,4 @@ def test_daemon_directories_share_one_tile_budget(roots, dirs):
     a, b = (roots.get(roots.add(d)) for d in dirs)
     assert a.budget is b.budget is roots.budget and roots.budget.members == [a, b]
     roots.remove("runs<a>")
-    assert wait_closed(a) and roots.budget.members == [b]
-
-
-def wait_closed(ex, timeout=10.0):
-    end = time.time() + timeout
-    while not ex._closed and time.time() < end:
-        time.sleep(0.02)
-    return ex._closed
+    assert wait_for(lambda: a._closed, 10) and roots.budget.members == [b]

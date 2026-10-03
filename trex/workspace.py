@@ -6,25 +6,25 @@ root view), each member is a top-level folder named for it. Every run gets a `di
 A workspace answers the same requests as an Explorer (`runs`, `tiles`, ...), by asking each member.
 """
 
+import contextlib
 import http.client
 import json
 import queue
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Any, Final
 from urllib.parse import quote
 
-from .index import Explorer, dumps, sse_text
+from .index import Explorer, TileKind, dumps, sse_text
 from .remote import Remote
 
-HEARTBEAT: Final = 10.0  # seconds of quiet after which a local member's stream sends a heartbeat
+HEARTBEAT: Final = 10.0  # seconds of stream silence after which a heartbeat is sent
 OWNERS_TTL: Final = 2.0  # seconds a workspace trusts its map of which member holds which path
 STREAM_READ_TIMEOUT: Final = 3 * HEARTBEAT  # seconds without a byte after which a member's stream is reopened
 
-type Event = tuple[str, str]  # (kind, JSON text)
+type SseEvent = tuple[str, str]  # (kind, JSON text)
 
 
 class Unavailable(Exception):
@@ -43,22 +43,19 @@ class Local:
         out = self.ex.run(path)
         return {"run": out["run"], "media": [list(m) for m in out["media"]]}
 
-    def paths(self) -> list[str]:
-        return [p for p, _ in self.ex.tree()]
-
     def tree(self) -> list[list[str]]:
         return [[p, s] for p, s in self.ex.tree()]
 
-    def rows(self, path: str, frm: int) -> str:
-        return self.ex.rows_json(path, frm)[0]
+    def rows(self, path: str, start: int) -> str:
+        return self.ex.rows_json(path, start)
 
     def tiles(self, requests: Sequence[Sequence[object]]) -> list[list[bytes]]:
         return self.ex.tiles(requests)
 
-    def bundle(self, key: str, kind: str, scope: str) -> list[tuple[str, list[bytes]]]:
-        return self.ex.tile_bundle(key, "top" if kind == "top" else "overview", scope)
+    def tile_bundle(self, key: str, kind: TileKind, scope: str) -> list[tuple[str, list[bytes]]]:
+        return self.ex.tile_bundle(key, kind, scope)
 
-    def events(self, prefix: str, stop: threading.Event) -> Iterator[Event]:
+    def events(self, prefix: str, stop: threading.Event) -> Generator[SseEvent, None, None]:
         """Backfill, then live events and a heartbeat after each quiet HEARTBEAT, until `stop`."""
         sub = self.ex.hub.subscribe(prefix)
         try:
@@ -109,22 +106,19 @@ class Far:
     def run(self, path: str) -> dict[str, Any]:
         return json.loads(self._call("GET", f"/api/run?path={quote(path)}"))
 
-    def paths(self) -> list[str]:
-        return [p for p, _ in json.loads(self._call("GET", "/api/tree"))]
-
     def tree(self) -> list[list[str]]:
         return json.loads(self._call("GET", "/api/tree"))
 
-    def rows(self, path: str, frm: int) -> str:
-        return self._call("GET", f"/api/rows?path={quote(path)}&from={frm}").decode()
+    def rows(self, path: str, start: int) -> str:
+        return self._call("GET", f"/api/rows?path={quote(path)}&from={start}").decode()
 
     def tiles(self, requests: Sequence[Sequence[object]]) -> list[list[bytes]]:
         return unframe_tiles(self._call("POST", "/api/tiles", json.dumps(list(map(list, requests))).encode()), len(requests))
 
-    def bundle(self, key: str, kind: str, scope: str) -> list[tuple[str, list[bytes]]]:
+    def tile_bundle(self, key: str, kind: TileKind, scope: str) -> list[tuple[str, list[bytes]]]:
         return unframe_bundle(self._call("POST", "/api/tiles/bundle", json.dumps({"key": key, "kind": kind, "scope": scope}).encode()))
 
-    def events(self, prefix: str, stop: threading.Event) -> Iterator[Event]:
+    def events(self, prefix: str, stop: threading.Event) -> Generator[SseEvent, None, None]:
         """The remote server's stream, reopened when it drops, until `stop`."""
         while not stop.is_set():
             if self.remote.state != "connected":
@@ -157,7 +151,7 @@ class Far:
 type Member = Local | Far
 
 
-def parse_sse(text: str) -> Iterator[Event]:
+def parse_sse(text: str) -> Iterator[SseEvent]:
     """The events of SSE text."""
     for block in text.split("\n\n"):
         kind, data = "", []
@@ -215,8 +209,8 @@ class Workspace:
         if self.nested or (not force and time.time() - self._owners_at < OWNERS_TTL):
             return
         owners: dict[str, list[str]] = {}
-        for m, paths in zip(self.members, self._each(lambda m: m.paths()), strict=True):
-            for p in paths or []:
+        for m, tree in zip(self.members, self._each(lambda m: m.tree()), strict=True):
+            for p, _ in tree or []:
                 owners.setdefault(p, []).append(m.name)
         with self._lock:
             self._owners, self._owners_at = owners, time.time()
@@ -251,14 +245,7 @@ class Workspace:
 
     def _each[T](self, fn: Callable[[Member], T]) -> list[T | None]:
         """fn(member) for every member in parallel; None for a member that is unavailable."""
-
-        def safe(m: Member) -> T | None:
-            try:
-                return fn(m)
-            except (Unavailable, KeyError):
-                return None
-
-        return list(self._pool.map(safe, self.members))
+        return list(self._pool.map(lambda m: _try(lambda: fn(m)), self.members))
 
     def _scope(self, prefix: str) -> list[tuple[Member, str]]:
         """The members and their prefixes that a workspace folder or run covers."""
@@ -318,9 +305,9 @@ class Workspace:
         out = m.run(mp)
         return {"run": self._rename(m, out["run"]), "media": [[path, *r[1:]] for r in out["media"]]}
 
-    def rows_json(self, path: str, frm: int) -> tuple[str, int]:
+    def rows_json(self, path: str, start: int) -> str:
         m, mp = self.resolve(path)
-        return _with_run(m.rows(mp, frm), mp, path), 0
+        return _with_run(m.rows(mp, start), mp, path)
 
     def tiles(self, requests: Sequence[Sequence[object]]) -> list[list[bytes]]:
         groups: dict[str, list[int]] = {}
@@ -346,26 +333,25 @@ class Workspace:
                 out[i] = tiles
         return out
 
-    def tile_bundle(self, key: str, kind: str, scope: str) -> list[tuple[str, list[bytes]]]:
+    def tile_bundle(self, key: str, kind: TileKind, scope: str) -> list[tuple[str, list[bytes]]]:
         parts = self._scope(scope)
-        bodies = list(self._pool.map(lambda mp: _try(lambda: mp[0].bundle(key, kind, mp[1])), parts))
+        bodies = list(self._pool.map(lambda mp: _try(lambda: mp[0].tile_bundle(key, kind, mp[1])), parts))
         out: list[tuple[str, list[bytes]]] = []
         for (m, _), body in zip(parts, bodies, strict=True):
             out += [(self.ws_id(m, p), tiles) for p, tiles in body or []]
         return out
 
-    def media_member(self, run: str) -> tuple[Member, str]:
-        return self.resolve(run)
-
-    def events(self, prefix: str, stop: threading.Event) -> Iterator[bytes]:
+    def events(self, prefix: str, stop: threading.Event) -> Generator[bytes, None, None]:
         """Every member's stream under `prefix`, run ids renamed, as SSE messages; until `stop`."""
         self._refresh(force=True)
         q: queue.Queue[bytes] = queue.Queue(maxsize=20000)
 
         def pump(m: Member, mp: str) -> None:
             try:
-                for kind, data in m.events(mp, stop):
-                    q.put(sse_text(kind, self._rename_event(m, kind, data)))
+                with contextlib.closing(m.events(mp, stop)) as events:
+                    for kind, data in events:
+                        if not _put(q, sse_text(kind, self._rename_event(m, kind, data)), stop):
+                            return
             except (Unavailable, OSError):
                 pass
 
@@ -407,12 +393,18 @@ def _try[T](fn: Callable[[], T]) -> T | None:
         return None
 
 
+def _put(q: queue.Queue[bytes], msg: bytes, stop: threading.Event) -> bool:
+    """Queue `msg` unless `stop` is set first; whether it was queued."""
+    while not stop.is_set():
+        try:
+            q.put(msg, timeout=0.5)
+            return True
+        except queue.Full:
+            pass
+    return False
+
+
 def _with_run(text: str, old: str, new: str) -> str:
     """A `rows` event's JSON with its run renamed (the run is its first field)."""
     head = f'{{"run":{dumps(old)}'
     return f'{{"run":{dumps(new)}' + text[len(head):] if text.startswith(head) else text
-
-
-def local_path(m: Member, path: str, file: str) -> Path | None:
-    """The media file of a local member's run; None for a remote member."""
-    return m.ex.media_path(path, file) if isinstance(m, Local) else None
