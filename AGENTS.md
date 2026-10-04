@@ -78,21 +78,20 @@ them WebGL falls back to software and timings mean nothing.
   count-weighted, as `bucketize` would make them) and `cut` (a block, or some runs).
 - **Index** (`<cache>/<hash of root>/index.sqlite`): per-run metadata, last values, metric names, media, and each
   run's *kept* buckets of every metric: one array at the finest level whose blocks are as wide as the run
-  (`buckets.kept_level`), so at most two blocks. Growing runs get new kept buckets every `KEPT_REFRESH` seconds
+  (`buckets.level_for`), so at most two blocks. Growing runs get new kept buckets every `KEPT_REFRESH` seconds
   (`TREX_KEPT_REFRESH`) and when they finish or crash. The index never holds a full copy of the data.
 - **Server**: `POST /api/buckets {key, level, index, scope | runs, which}` answers one block of one metric for a
   list of runs, or for the runs of a folder in state `which` (`all`, `finished`, `running`), as a bucket array
   (`Explorer.buckets_body`). A run that keeps its buckets at the level or finer is merged from them: a finished run
   from its metric's merged level (`Explorer._level`: every finished run's kept buckets decoded at once,
   `buckets.stack`, merged on threads), a running one from its kept buckets read from the index. A run that keeps
-  coarser buckets has the block built from its run file (`build_block`, on a process pool beyond `INLINE_BUILDS`) and
-  cached in the index up to `TREX_BLOCK_CACHE_MB` across all of a process's Explorers (`BlockBudget`; least recently
-  used evicted); a cached block stays valid while later rows lie beyond its step range. The levels from a metric's
+  coarser buckets has the block built from its run file (`build_block`, on a process pool beyond `INLINE_BUILDS`).
+  The levels from a metric's
   coarsest kept one to `LEVELS_AHEAD` above it are merged ahead of requests and saved beside the index
   (`<cache>/levels/`, `SavedLevels`), at most once a metric every `LEVELS_SAVE_EVERY` seconds and up to
   `TREX_LEVELS_MB` (least recently used deleted), and memory-mapped by a later Explorer whose finished runs and their
   kept buckets are the same (`Explorer._finished`). A folder's finished-run blocks are kept in memory
-  (`ANSWER_CACHE_BYTES`) until those runs change (`_gens`), and `/api/runs` answers until what it holds changes
+  (`Explorer._memo`, a `Memo` of `MEMO_BYTES` that also holds stacks and merged levels) until those runs change (`_gens`), and `/api/runs` answers until what it holds changes
   (`_view_gen`). `/api/info` states `server.PROTOCOL`; a page of another (`data.js` PROTOCOL) says so beside the
   status.
 - **Daemon**: one server, one `Explorer` (or `Remote`) per tracked directory. A directory's URLs are its
@@ -139,9 +138,9 @@ them WebGL falls back to software and timings mean nothing.
   shows none yet, else the two levels below its finest over the steps it shows. Fetched blocks wait in the store.
 - **Rendering**: WebGL2 by default (`?gl=0` selects Canvas 2D). Above 300 lines a chart draws a
   density heatmap. No upload overwrites GPU data a queued draw may read: each draw's line table
-  takes fresh rows of the table texture (`Renderer.bind`), and a changed column moves to a new slot
-  (`LineSet.update`); only appends past a column's drawn points are written in place. Charts then
-  never depend on how a driver orders uploads against earlier draws.
+  takes fresh rows of the table texture (`Renderer.bind`), and columns, which never change once built, each take a
+  slot of their own after the others (`LineSet.update`). Charts then never depend on how a driver orders uploads
+  against earlier draws.
 
 ## Invariants (things that break silently if ignored)
 

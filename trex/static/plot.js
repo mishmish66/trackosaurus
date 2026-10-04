@@ -185,14 +185,13 @@ function visibleY(c, xmode, ys, x0, x1, logx, logy, grow) {
 }
 
 const extents = new WeakMap(); // Col -> {key: ext}
-/** [xmin, xmax (transformed), ymin, ymax] over a column's valid points, extended incrementally. */
+/** [xmin, xmax (transformed), ymin, ymax] over a column's valid points, kept per transform key. */
 function colExtent(c, xmode, ys, logx, logy, key) {
   let m = extents.get(c);
   if (!m) extents.set(c, (m = {}));
-  let e = m[key];
-  if (!e || e.n > c.n) e = m[key] = { n: 0, x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity };
-  const xs = c.xs(xmode);
-  for (let i = e.n; i < c.n; i++) {
+  if (m[key]) return m[key];
+  const e = (m[key] = { x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity }), xs = c.xs(xmode);
+  for (let i = 0; i < c.n; i++) {
     const x = xs[i], xt = logx ? (x > 0 ? Math.log10(x) : NaN) : x, y = ys[i];
     if (!Number.isFinite(xt) || !Number.isFinite(y) || (logy && !(y > 0))) continue;
     if (xt < e.x0) e.x0 = xt;
@@ -200,15 +199,14 @@ function colExtent(c, xmode, ys, logx, logy, key) {
     if (y < e.y0) e.y0 = y;
     if (y > e.y1) e.y1 = y;
   }
-  e.n = c.n;
   return e;
 }
 
-/** Writes points (xs[i], ys[i]) for i in [from, to) as f32 relative to (ox, oy) in transformed
- * space at dst point `at`; invalid points become line breaks. */
-function fillPoints(xs, xstep, ys, ystep, from, to, dst, at, ox, oy, logx, logy) {
+/** Writes points (xs[i], ys[i]) for i in [0, n) as f32 relative to (ox, oy) in transformed space at dst point `at`;
+ * invalid points become line breaks. */
+function fillPoints(xs, xstep, ys, ystep, n, dst, at, ox, oy, logx, logy) {
   let k = 2 * at;
-  for (let i = from; i < to; i++) {
+  for (let i = 0; i < n; i++) {
     const x = xs[i * xstep], y = ys[i * ystep];
     const xt = logx ? (x > 0 ? Math.log10(x) : NaN) : x;
     if (Number.isFinite(xt) && Number.isFinite(y) && (!logy || y > 0)) {
@@ -305,7 +303,7 @@ class LineSet {
     this.r = r;
     this.raw = raw;
     this.pts = new Points(r);
-    this.slots = new Map(); // Col -> {off, cap, n, ver}
+    this.slots = new Map(); // Col -> {off, n}
     this.key = null;
     this.win = null; // [w0, w1] transformed x when decimated
     this.table = new Table(64);
@@ -332,16 +330,15 @@ class LineSet {
     return p.vx0 >= w0 && p.vx1 <= w1 && (this.R * (p.vx1 - p.vx0)) / (w1 - w0) >= p.pw;
   }
 
-  /** Bring the columns that changed up to date; false if a rebuild is needed instead. */
+  /** Upload the columns not yet here; false if a rebuild is needed instead. */
   updateStale(cols, p, alpha) {
-    const stale = cols.filter((c) => this.slots.get(c)?.ver !== c.n);
+    const stale = cols.filter((c) => !this.slots.has(c));
     return stale.length <= 256 && stale.every((c) => this.update(c, p, alpha));
   }
 
   build(cols, p, alpha, key) {
     this.key = key;
     this.slots.clear();
-    this.garbage = 0;
     let total = 0;
     for (const c of cols) total += c.n;
     this.win = null;
@@ -364,21 +361,16 @@ class LineSet {
     }
     if (!(this.oy === this.oy)) this.oy = 0;
     let bound = 0;
-    for (const c of cols) bound += this.bound(c) + this.slack(c.n);
+    for (const c of cols) bound += this.bound(c);
     staging = pointBuffer(staging, bound);
     let at = 0;
     for (const c of cols) {
       const n = this.convert(c, p, alpha, staging, at);
-      const cap = n + this.slack(n);
-      this.slots.set(c, { off: at, cap, n, ver: c.n });
-      at += cap;
+      this.slots.set(c, { off: at, n });
+      at += n;
     }
     this.next = at;
     return this.pts.upload(staging, at, Math.ceil(at * 1.25) + 4096);
-  }
-
-  slack(n) {
-    return this.win ? 16 + (n >> 4) : 16 + (n >> 3);
   }
 
   /** Upper bound on points written by convert. */
@@ -387,40 +379,28 @@ class LineSet {
   }
 
   /** Writes column c's points (all, or decimated over the window) at `at`; returns the count. */
-  convert(c, p, alpha, dst, at, from = 0) {
+  convert(c, p, alpha, dst, at) {
     c.ensureSmooth(alpha, p.scale, p.xmode);
     if (!this.win) {
-      fillPoints(c.xs(p.xmode), 1, c.ys(alpha, false), 1, from, c.n, dst, at, this.ox, this.oy, p.logx, p.logy);
-      return c.n - from;
+      fillPoints(c.xs(p.xmode), 1, c.ys(alpha, false), 1, c.n, dst, at, this.ox, this.oy, p.logx, p.logy);
+      return c.n;
     }
     const out = outBuf(4 * this.R + 1024);
     const flags = (p.logy ? LOGY : 0) | (p.logx ? LOGX : 0) | (alpha > 0 ? 0 : RAW);
     const r = kprep(c, p.xmode, this.win[0], this.win[1], this.R, flags, alpha, p.scale, out);
-    fillPoints(out, 2, out.subarray(1), 2, 0, r.n, dst, at, this.ox, this.oy, p.logx, p.logy);
+    fillPoints(out, 2, out.subarray(1), 2, r.n, dst, at, this.ox, this.oy, p.logx, p.logy);
     return r.n;
   }
 
-  /** Append to one column, or rewrite it in a new slot at the end: points a draw may have read are never
-   * overwritten. False if a rebuild is needed. */
+  /** Upload a new column in a slot after the others, so points a draw may have read are never overwritten. False if
+   * a rebuild is needed. */
   update(c, p, alpha) {
-    const s = this.slots.get(c);
-    if (!this.win && s && c.n > s.ver && c.n <= s.cap) {
-      const k = c.n - s.ver;
-      scratchPts = pointBuffer(scratchPts, k);
-      this.convert(c, p, alpha, scratchPts, 0, s.ver);
-      this.pts.write(s.off + s.ver, scratchPts, k);
-      s.n = s.ver = c.n;
-      return true;
-    }
     scratchPts = pointBuffer(scratchPts, this.bound(c));
     const n = this.convert(c, p, alpha, scratchPts, 0);
-    const cap = n + this.slack(n);
-    if (this.next + cap > this.pts.cap) return false;
-    if (s) this.garbage += s.cap;
-    if (this.garbage > this.next / 2) return false;
+    if (this.next + n > this.pts.cap) return false;
     this.pts.write(this.next, scratchPts, n);
-    this.slots.set(c, { off: this.next, cap, n, ver: c.n });
-    this.next += cap;
+    this.slots.set(c, { off: this.next, n });
+    this.next += n;
     return true;
   }
 

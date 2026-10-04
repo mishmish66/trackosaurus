@@ -39,7 +39,7 @@ from typing import Final, TypedDict, cast
 from urllib.parse import quote
 
 from . import remote
-from .index import BlockBudget, Explorer
+from .index import Explorer
 from .remote import Remote
 from .workspace import Far, Local, Workspace
 
@@ -131,7 +131,6 @@ class Roots:
         self.entries: dict[str, Explorer | Remote] = {}  # by spec: path, or host:path
         self.workspaces: dict[str, list[str]] = {}  # name -> member specs
         self._views: dict[str, Workspace] = {}
-        self.budget = BlockBudget()
         try:
             saved = json.loads(self.history_path.read_text())
         except (FileNotFoundError, ValueError):
@@ -167,7 +166,7 @@ class Roots:
         spec = str(root.resolve())
         with self.lock:
             if spec not in self.entries:
-                self.entries[spec] = Explorer(Path(spec), self.cache, budget=self.budget).start()
+                self.entries[spec] = Explorer(Path(spec), self.cache).start()
                 self._changed(spec)
             return self.names()[spec]
 

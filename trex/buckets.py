@@ -117,12 +117,6 @@ def blocks(level: int, lo: float, hi: float) -> range:
     return range(math.floor(lo / w), math.floor(hi / w) + 1)
 
 
-def kept_level(lo: float, hi: float) -> int:
-    """The level a run keeps its buckets at: the finest whose blocks are as wide as its steps [lo, hi], which then lie
-    in at most two of them."""
-    return level_for(hi - lo)
-
-
 def block_range(level: int, index: int) -> tuple[float, float]:
     """[lo, hi) steps of block `index` of `level`."""
     w = 2.0 ** level * BLOCK
@@ -279,10 +273,11 @@ def stack(paths: Sequence[str], blobs: Sequence[bytes]) -> Stack:
 
 
 def kept(steps: Floats, values: Floats, times: Floats, seq: int) -> bytes:
-    """A run's rows `seq` (steps, values, runtimes) as the bucket array it keeps: at `kept_level` of its steps."""
+    """A run's rows `seq` (steps, values, runtimes) as the bucket array it keeps: at the finest level whose blocks are
+    as wide as its steps (`level_for`), which then lie in at most two of them."""
     if not steps.size:
         return encode(0, 0, [""], [seq], empty())
-    level = kept_level(float(steps.min()), float(steps.max()))
+    level = level_for(float(steps.max() - steps.min()))
     b = bucketize(steps, values, times, level)
     return encode(level, int(b.bucket[0]) // BLOCK if b.run.size else 0, [""], [seq], b)
 

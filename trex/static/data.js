@@ -185,7 +185,7 @@ export class Data {
     this.prefetching = false;
     this.planned = null; // inputs of the last plan
     this.touched = new Set();
-    this.stats = { requests: 0, bytes: 0, rows: 0 };
+    this.stats = { requests: 0, bytes: 0 };
   }
 
   async init() {
@@ -778,7 +778,6 @@ export class Data {
       summary._runtime = row[1];
     }
     r.seq = ev.seq0 + rows.length;
-    this.stats.rows += rows.length - Math.max(0, skip);
     const known = new Set(r.meta.keys || []), fresh = [...keys].filter((k) => !known.has(k));
     if (fresh.length) {
       this.countKeys(r, fresh, 1);

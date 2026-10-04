@@ -287,8 +287,7 @@ def test_changes_from_the_ui_itself_or_without_an_origin_are_allowed(roots, dirs
     assert len(roots.served()) == 2
 
 
-def test_daemon_directories_share_one_block_budget(roots, dirs):
+def test_removing_a_directory_closes_its_explorer_and_leaves_the_others(roots, dirs):
     a, b = (roots.get(roots.add(d)) for d in dirs)
-    assert a.budget is b.budget is roots.budget and roots.budget.members == [a, b]
     roots.remove("runs<a>")
-    assert wait_for(lambda: a._closed, 10) and roots.budget.members == [b]
+    assert wait_for(lambda: a._closed, 10) and not b._closed

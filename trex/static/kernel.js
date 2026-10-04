@@ -17,19 +17,6 @@ const S = Object.freeze(Object.fromEntries(STATS.map((k, i) => [k, i])));
 /** One metric of one run: points (step, value, runtime, and the count of rows each stands for when `w` is set) in
  * sequence order. */
 export class Col {
-  constructor() {
-    this.n = 0;
-    this.s = new Float64Array(64);
-    this.v = new Float64Array(64);
-    this.t = new Float64Array(64);
-    this.w = null;
-    this.sorted = [true, true];
-    this.ext = [Infinity, -Infinity, Infinity, Infinity, -Infinity, Infinity]; // min, max, min positive: steps then runtimes
-    this.sm = null;
-    this.smKey = null;
-    this.smState = null;
-  }
-
   get len() {
     return this.n;
   }
@@ -38,7 +25,7 @@ export class Col {
    * for one row each), sorted as `sorted` says ([by step, by runtime]); its extents are not tracked. */
   static view(s, v, t, n, sorted, w = null) {
     const c = Object.create(Col.prototype);
-    Object.assign(c, { n, s, v, t, w, sorted, ext: null, sm: null, smKey: null, smState: null });
+    Object.assign(c, { n, s, v, t, w, sorted, ext: null, sm: null, smKey: null });
     return c;
   }
 
@@ -47,27 +34,9 @@ export class Col {
   static adopt(s, v, t, n, w = null) {
     const c = Object.create(Col.prototype);
     Object.assign(c, { n, s, v, t, w, sorted: [true, true], ext: [Infinity, -Infinity, Infinity, Infinity, -Infinity, Infinity],
-                       sm: null, smKey: null, smState: null });
-    track(c, s, t, n, -Infinity, -Infinity);
+                       sm: null, smKey: null });
+    track(c);
     return c;
-  }
-
-  /** Append points; s, v, t are equal-length array-likes. */
-  push(s, v, t) {
-    const n = s.length, need = this.n + n;
-    if (need > this.s.length) {
-      const cap = Math.max(need, this.s.length * 2);
-      for (const k of ["s", "v", "t"]) {
-        const a = new Float64Array(cap);
-        a.set(this[k].subarray(0, this.n));
-        this[k] = a;
-      }
-    }
-    track(this, s, t, n, this.n ? this.s[this.n - 1] : -Infinity, this.n ? this.t[this.n - 1] : -Infinity);
-    this.s.set(s, this.n);
-    this.v.set(v, this.n);
-    this.t.set(t, this.n);
-    this.n = need;
   }
 
   /** [min, max, smallest positive] of x; null if empty. */
@@ -81,23 +50,17 @@ export class Col {
     return xmode === X_STEP ? this.s : this.t;
   }
 
-  /** Debiased EMA decaying by alpha^(dx / scale) per point; incremental; non-finite values pass through. */
+  /** Debiased EMA decaying by alpha^(dx / scale) per point, kept per (alpha, scale, xmode); non-finite values pass
+   * through. */
   ensureSmooth(alpha, scale, xmode) {
     if (alpha <= 0) return;
     if (!(scale > 0)) scale = 1;
     const key = `${alpha}|${scale}|${xmode}`;
-    if (this.smKey !== key || !this.sm) {
-      this.sm = new Float64Array(this.s.length);
-      this.smKey = key;
-      this.smState = { done: 0, acc: 0, deb: 0, last: NaN };
-    } else if (this.sm.length < this.n) {
-      const a = new Float64Array(this.s.length);
-      a.set(this.sm.subarray(0, this.smState.done));
-      this.sm = a;
-    }
-    const st = this.smState, xs = this.xs(xmode), v = this.v, sm = this.sm;
-    let { acc, deb, last } = st, lastDx = NaN, lastW = 0;
-    for (let i = st.done; i < this.n; i++) {
+    if (this.smKey === key) return;
+    this.smKey = key;
+    const xs = this.xs(xmode), v = this.v, sm = (this.sm = new Float64Array(this.n));
+    let acc = 0, deb = 0, last = NaN, lastDx = NaN, lastW = 0;
+    for (let i = 0; i < this.n; i++) {
       const x = xs[i], y = v[i];
       if (!Number.isFinite(y) || !Number.isFinite(x)) {
         sm[i] = y;
@@ -117,7 +80,6 @@ export class Col {
       last = x;
       sm[i] = acc / deb;
     }
-    Object.assign(st, { done: this.n, acc, deb, last });
   }
 
   ys(alpha, raw) {
@@ -148,7 +110,7 @@ export function columnStore(n) {
 }
 
 /** Note that column c holds the storage at `loc`, freed once c is collected. */
-export function holdStore(c, loc) {
+function holdStore(c, loc) {
   c.loc = loc;
   if (loc) finalizer.register(c, [loc.chunk, loc.size]);
 }
@@ -192,10 +154,11 @@ function release(id, size) {
   if (ch.live <= 0 && ch !== current && !spare.includes(ch)) spare.push(ch);
 }
 
-/** Extend c's sortedness and extents by n points (steps s, runtimes t) after a last point (ls, lt). */
-function track(c, s, t, n, ls, lt) {
-  const e = c.ext;
-  for (let i = 0; i < n; i++) {
+/** Column c's sortedness and extents. */
+function track(c) {
+  const e = c.ext, s = c.s, t = c.t;
+  let ls = -Infinity, lt = -Infinity;
+  for (let i = 0; i < c.n; i++) {
     const x = s[i], y = t[i];
     if (x < ls) c.sorted[0] = false;
     if (y < lt) c.sorted[1] = false;
@@ -389,14 +352,9 @@ export function binGrid(x0, x1, most) {
   return { g0: b0 * dx, dx, bins: Math.max(1, Math.floor(x1 / dx) + 1 - b0) };
 }
 
-/** Group statistics over `bins` x-bins of [x0, x1]: each column is averaged per bin and interpolated
- * across its gaps, then summarized. Returns NSTAT * bins values, stat-major (NaN where n = 0). Columns' bin means are
- * kept in `cache` (a BinCache) for the next call. */
-export function agg(cols, xmode, x0, x1, bins, flags, alpha, scale, cache = new BinCache()) {
-  return aggGroups([cols], xmode, x0, x1, bins, flags, alpha, scale, cache);
-}
-
-/** agg of each list of columns in `groups`, one after another in the result (NSTAT * bins values each). */
+/** Group statistics over `bins` x-bins of [x0, x1] of each list of columns in `groups`: each column is averaged per bin
+ * and interpolated across its gaps, then summarized. Returns NSTAT * bins values per group, one group after another,
+ * stat-major (NaN where n = 0). Columns' bin means are kept in `cache` (a BinCache) for the next call. */
 export function aggGroups(groups, xmode, x0, x1, bins, flags, alpha, scale, cache = new BinCache()) {
   let R = 0, most = 0;
   for (const g of groups) (R += g.length), (most = Math.max(most, g.length));
@@ -432,24 +390,21 @@ const BINNINGS = 4; // binnings a BinCache keeps: smoothed and raw, at two zooms
 const GATHER_BLOCK = 64; // columns agg gathers at a time
 
 /** Columns' per-bin means for one binning ({xmode, x0, x1, bins, flags, alpha, scale}), one slot per column (bin b of
- * slot k at v[k * bins + b]); a column's slot is reused while it has the same points. */
+ * slot k at v[k * bins + b]). */
 class Binning {
   constructor(p, cap) {
     this.p = p;
     this.cap = cap;
     this.v = new Float64Array(p.bins * cap);
-    this.at = new Map(); // column -> [slot, points binned]
+    this.at = new Map(); // column -> its slot
     const at = () => new Float64Array(p.bins);
     this.acc = { sum: at(), cnt: at(), pos: at(), neg: at() };
   }
 
-  /** Slots of `cols`, binning the columns not yet binned with their current points. */
+  /** Slots of `cols`, binning the columns not yet binned. */
   slots(cols) {
     const out = slotScratch(cols.length);
-    for (let r = 0; r < cols.length; r++) {
-      const c = cols[r], e = this.at.get(c);
-      out[r] = e && e[1] === c.n ? e[0] : this.bin(c, e ? e[0] : this.at.size);
-    }
+    for (let r = 0; r < cols.length; r++) out[r] = this.at.get(cols[r]) ?? this.bin(cols[r], this.at.size);
     return out;
   }
 
@@ -460,7 +415,7 @@ class Binning {
     const row = this.v.subarray(k * p.bins, (k + 1) * p.bins).fill(NaN);
     c.ensureSmooth(p.alpha, p.scale, p.xmode);
     binColumn(c, p.xmode, c.ys(p.alpha, (p.flags & RAW) !== 0), p.x0, p.x1, p.bins, (p.flags & LOGX) !== 0, this.acc, row);
-    this.at.set(c, [k, c.n]);
+    this.at.set(c, k);
     return k;
   }
 

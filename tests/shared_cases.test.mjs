@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { Col, IQM, STATS, X_STEP, agg, binRows, bucketPaths, bucketStep, bucketViews, buildColumn } from "../trex/static/kernel.js";
+import { Col, IQM, STATS, X_STEP, aggGroups, binRows, bucketPaths, bucketStep, bucketViews, buildColumn } from "../trex/static/kernel.js";
 import { smoothScale } from "../trex/static/plot.js";
 import { asNumber } from "../trex/static/where.js";
 
@@ -86,8 +86,7 @@ test("runs' buckets bin to the mean of their rows per bin, as Python bins the ro
 test("smoothing matches the Python time-weighted EMA, gaps passing through", () => {
   for (const c of CASES.smoothing) {
     assert.equal(smoothScale(c.span), c.scale);
-    const col = new Col();
-    col.push(c.xs, c.ys.map(nan), c.xs);
+    const col = Col.adopt(Float64Array.from(c.xs), Float64Array.from(c.ys.map(nan)), Float64Array.from(c.xs), c.xs.length);
     col.ensureSmooth(c.alpha, c.scale, X_STEP);
     c.smoothed.forEach((want, i) => close(col.sm[i], nan(want), `alpha ${c.alpha} point ${i}`));
   }
@@ -96,12 +95,8 @@ test("smoothing matches the Python time-weighted EMA, gaps passing through", () 
 test("group statistics of one bin match the Python ones", () => {
   const row = Object.fromEntries(STATS.map((k, i) => [k, i]));
   for (const c of CASES.stats) {
-    const cols = c.values.map((v) => {
-      const col = new Col();
-      col.push([0], [nan(v)], [0]);
-      return col;
-    });
-    const out = agg(cols, X_STEP, -1, 1, 1, IQM, 0, 1), at = `${c.values.length} values`;
+    const cols = c.values.map((v) => Col.adopt(Float64Array.of(0), Float64Array.of(nan(v)), Float64Array.of(0), 1));
+    const out = aggGroups([cols], X_STEP, -1, 1, 1, IQM, 0, 1), at = `${c.values.length} values`;
     assert.equal(out[row.n], c.n, at);
     if (!c.n) continue;
     for (const k of ["mean", "std", "median", "min", "max", "iqm"]) close(out[row[k]], nan(c[k]), `${at} ${k}`);

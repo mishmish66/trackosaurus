@@ -3,9 +3,7 @@ import assert from "node:assert/strict";
 import * as K from "../trex/static/kernel.js";
 
 function column(s, v, t = s) {
-  const c = new K.Col();
-  c.push(Float64Array.from(s), Float64Array.from(v), Float64Array.from(t));
-  return c;
+  return K.Col.adopt(Float64Array.from(s), Float64Array.from(v), Float64Array.from(t), s.length);
 }
 
 function twema(xs, ys, alpha, scale) {
@@ -37,31 +35,18 @@ test("crc32 matches the IEEE reference for all tail lengths", () => {
   }
 });
 
-test("time-weighted EMA matches reference, skips NaN, and extends incrementally", () => {
+test("time-weighted EMA matches reference and skips NaN, kept per smoothing", () => {
   const xs = [0, 1, 2, 5, 6], v = [1, 2, NaN, 4, 8];
   const c = column(xs, v);
-  const want = twema(xs, v, 0.9, 1);
-  for (let i = 0; i < 5; i++) {
-    const r = K.nearest(c, 0, xs[i], 0.9, 1);
-    if (Number.isNaN(want[i])) assert.ok(Number.isNaN(r.y));
-    else assert.ok(Math.abs(r.y - want[i]) < 1e-12, `${i}: ${r.y} vs ${want[i]}`);
-    assert.equal(r.raw, v[i]);
+  for (const [alpha, scale] of [[0.9, 1], [0.5, 2], [0.9, 1]]) {
+    const want = twema(xs, v, alpha, scale);
+    for (let i = 0; i < 5; i++) {
+      const r = K.nearest(c, 0, xs[i], alpha, scale);
+      if (Number.isNaN(want[i])) assert.ok(Number.isNaN(r.y));
+      else assert.ok(Math.abs(r.y - want[i]) < 1e-12, `${i}: ${r.y} vs ${want[i]}`);
+      assert.equal(r.raw, v[i]);
+    }
   }
-  c.push([7], [16], [7]);
-  assert.ok(Math.abs(K.nearest(c, 0, 7, 0.9, 1).y - twema([...xs, 7], [...v, 16], 0.9, 1)[5]) < 1e-12);
-});
-
-test("incremental smoothing across many growing pushes equals a full recompute", () => {
-  const n = 5000, xs = Array.from({ length: n }, (_, i) => i), ys = xs.map((x) => Math.sin(x / 40) + (x % 7) / 10);
-  const c = new K.Col();
-  for (let i = 0; i < n; i += 137) {
-    c.push(xs.slice(i, i + 137), ys.slice(i, i + 137), xs.slice(i, i + 137));
-    K.nearest(c, 0, i, 0.95, 3);
-  }
-  const want = twema(xs, ys, 0.95, 3);
-  for (const i of [0, 136, 137, 2500, n - 1]) assert.ok(Math.abs(K.nearest(c, 0, i, 0.95, 3).y - want[i]) < 1e-9);
-  assert.equal(c.len, n);
-  assert.deepEqual(c.extent(0), [0, n - 1, 1]);
 });
 
 test("smoothing window is in x units: sparse and dense series agree", () => {
@@ -96,7 +81,7 @@ test("prep breaks lines at NaN and at non-positive values in log mode", () => {
 });
 
 const stats = (a, bins) => Object.fromEntries(K.STATS.map((k, i) => [k, [...a.subarray(i * bins, (i + 1) * bins)]]));
-const aggOf = (cols, x0, x1, bins, flags = 0, alpha = 0) => stats(K.agg(cols, 0, x0, x1, bins, flags, alpha, 1), bins);
+const aggOf = (cols, x0, x1, bins, flags = 0, alpha = 0) => stats(K.aggGroups([cols], 0, x0, x1, bins, flags, alpha, 1), bins);
 
 test("agg averages within bins, then summarizes across runs", () => {
   const a = column([0, 1, 2, 3], [1, 3, 10, 10]);
@@ -177,15 +162,11 @@ test("yrange returns visible-value quantiles for outlier-robust axes", () => {
   assert.equal(K.yrange([c], 0, 200, 300, 0, 0, 1, 0, 1), null);
 });
 
-test("an adopted column equals one built by push, and keeps growing", () => {
+test("an adopted column knows its extents and whether its steps and runtimes rise", () => {
   const s = Float64Array.from([0, 2, 1, 3]), v = Float64Array.from([1, NaN, 3, 4]), t = Float64Array.from([0.5, 0.2, 1, 2]);
-  const a = K.Col.adopt(s.slice(), v.slice(), t.slice(), 3), b = new K.Col();
-  b.push(s.subarray(0, 3), v.subarray(0, 3), t.subarray(0, 3));
-  for (const c of [a, b]) c.push([5], [6], [7]);
-  assert.equal(a.n, b.n);
-  assert.deepEqual(a.sorted, b.sorted);
-  assert.deepEqual(a.ext, b.ext);
-  for (const k of ["s", "v", "t"]) assert.deepEqual([...a[k].subarray(0, a.n)], [...b[k].subarray(0, b.n)]);
+  const a = K.Col.adopt(s, v, t, 3), b = K.Col.adopt(s, v, Float64Array.from([0.1, 0.2, 0.3, 0.4]), 2);
+  assert.deepEqual([a.sorted, a.extent(0), a.extent(1)], [[false, false], [0, 2, 1], [0.2, 1, 0.2]]);
+  assert.deepEqual([b.sorted, b.extent(0), b.extent(1)], [[true, true], [0, 2, 2], [0.1, 0.2, 0.1]]);
 });
 
 test("agg's order statistics equal a full sort's for large groups with ties, clusters, outliers and gaps", () => {
@@ -228,7 +209,7 @@ test("agg's interquartile mean and Yuen standard error match a sort's, ties and 
       });
       cols.push(column(xs, ys));
     }
-    const s = stats(K.agg(cols, 0, 0, shapes.length, shapes.length, K.IQM, 0, 1), shapes.length);
+    const s = stats(K.aggGroups([cols], 0, 0, shapes.length, shapes.length, K.IQM, 0, 1), shapes.length);
     perBin.forEach((vals, b) => {
       const v = Float64Array.from(vals).sort(), m = v.length, g = Math.floor(m / 4), h = m - 2 * g;
       const iqm = v.slice(g, m - g).reduce((a, x) => a + x, 0) / h;
@@ -242,7 +223,7 @@ test("agg's interquartile mean and Yuen standard error match a sort's, ties and 
 });
 
 test("agg's interquartile mean agrees with the CLI's on a hand-checked group", () => {
-  const s = stats(K.agg([1, 2, 3, 4, 5, 6, 7, 8, 100].map((y) => column([0.5], [y])), 0, 0, 1, 1, K.IQM, 0, 1), 1);
+  const s = stats(K.aggGroups([[1, 2, 3, 4, 5, 6, 7, 8, 100].map((y) => column([0.5], [y]))], 0, 0, 1, 1, K.IQM, 0, 1), 1);
   assert.deepEqual([s.iqm[0], s.iqmh[0]], [5, 5]);
   assert.ok(Math.abs(s.iqmse[0] - Math.sqrt(26 / 20)) < 1e-12);
 });

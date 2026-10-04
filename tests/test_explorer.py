@@ -157,15 +157,6 @@ def same(a, b):
     return all(np.array_equal(x, y, equal_nan=x.dtype.kind == "f") for x, y in zip(a[1:], b[1:], strict=True))
 
 
-def stored(ex):
-    """(level, index) of every built block the index caches, in order."""
-    c = sqlite3.connect(ex.db_path)
-    try:
-        return c.execute("SELECT level, idx FROM fine ORDER BY level, idx").fetchall()
-    finally:
-        c.close()
-
-
 def test_a_finished_run_keeps_each_metrics_buckets_holding_every_finite_point(root, tmp_path):
     rows = mixed_rows(7053)
     write_chunked(root / "r", chunked(rows, [700, 1, 2000, 323, 1024, 5, 3000]))
@@ -176,7 +167,7 @@ def test_a_finished_run_keeps_each_metrics_buckets_holding_every_finite_point(ro
     for key in meta["keys"]:
         a = kept_of(ex, "r", key)
         steps = [s for s, _, d in rows if key in d]
-        assert a.level == bk.kept_level(min(steps), max(steps)) and list(a.seq) == [7053] and a.paths == [""]
+        assert a.level == bk.level_for(max(steps) - min(steps)) and list(a.seq) == [7053] and a.paths == [""]
         assert same(a.buckets, expected(rows, key, a.level))
         assert kept_n(ex, "r", key) == sum(1 for _, _, d in rows if key in d and np.isfinite(d[key]))
 
@@ -222,6 +213,29 @@ def test_a_scopes_finished_blocks_are_kept_until_its_finished_runs_change(root, 
     ex.rewalk()
     ex.poll()
     assert bk.decode(body()).paths == ["a/r2"]
+
+
+def test_a_memo_builds_a_value_once_while_others_wait_and_drops_the_least_recently_used():
+    memo, built, gate = trex_index.Memo(limit=10), [], threading.Event()
+
+    def build(v, nbytes=4):
+        gate.wait(5)
+        built.append(v)
+        return v, nbytes
+
+    got = []
+    threads = [threading.Thread(target=lambda: got.append(memo.get(("a",), 0, lambda: build("a")))) for _ in range(4)]
+    for th in threads:
+        th.start()
+    gate.set()
+    for th in threads:
+        th.join(5)
+    assert got == ["a"] * 4 and built == ["a"]
+    assert memo.get(("a",), 1, lambda: build("a1")) == "a1" and built == ["a", "a1"]
+    memo.get(("b",), 0, lambda: build("b"))
+    memo.get(("a",), 1, lambda: build("again"))
+    memo.get(("c",), 0, lambda: build("c"))
+    assert memo.get(("a",), 1, lambda: build("a2")) == "a1" and memo.get(("b",), 0, lambda: build("b2")) == "b2"
 
 
 def test_the_runs_body_follows_runs_added_and_folder_notes(root, tmp_path):
@@ -401,60 +415,33 @@ def test_http_buckets_answers_the_block_and_info_states_the_protocol(http, root)
         assert json.loads(r.read())["protocol"] == server.PROTOCOL
 
 
-def test_blocks_finer_than_a_run_keeps_are_built_from_its_file_and_served_from_cache(root, tmp_path, monkeypatch):
+def test_blocks_finer_than_a_run_keeps_are_built_from_its_file(root, tmp_path):
     rows = mixed_rows(5000)
     write_chunked(root / "r", chunked(rows, [1000] * 5))
     ex = explorer(root, tmp_path)
-    want = [("loss", 2, 3), ("lr", 0, 7), ("x", -1, 0), ("loss", 5, 99)]
-    first = [ex.buckets_body(k, lv, i, runs=["r"]) for k, lv, i in want]
-    for (k, lv, i), body in zip(want, first):
-        a = bk.decode(body)
+    for k, lv, i in [("loss", 2, 3), ("lr", 0, 7), ("x", -1, 0), ("loss", 5, 99)]:
+        a = block(ex, k, lv, i, runs=["r"])
         assert (a.paths, list(a.seq), a.level) == (["r"], [5000], lv) and same(of_run(a, "r"), expected(rows, k, lv, i))
-    assert wait_for(lambda: stored(ex) == [(-1, 0), (0, 7), (2, 3)])
-    monkeypatch.setattr(trex_index, "build_block", lambda *a: pytest.fail("a cached block was built again"))
-    assert [ex.buckets_body(k, lv, i, runs=["r"]) for k, lv, i in want] == first
     assert block(ex, "nope", 0, 0, runs=["r"]).paths == [] and block(ex, "loss", 0, 0, runs=["nope"]).paths == []
     with pytest.raises(ValueError):
         ex.buckets_body("loss", bk.MAX_LEVEL + 1, 0, runs=["r"])
 
 
-def test_a_cached_block_is_built_again_only_when_new_rows_reach_its_step_range(root, tmp_path, monkeypatch):
+def test_a_running_runs_finer_block_holds_its_newest_rows(root, tmp_path):
     run = trex.init(root / "r", commit_interval=0.01)
     for i in range(3000):
         run.log({"loss": float(i)}, step=i)
     assert wait_for(lambda: committed_rows(root / "r") == 3000)
     ex = explorer(root, tmp_path)
-    for i in (0, 11):
-        ex.buckets_body("loss", 0, i, runs=["r"])
-    assert wait_for(lambda: stored(ex) == [(0, 0), (0, 11)])
+    assert of_run(block(ex, "loss", 0, 11, runs=["r"]), "r").n.sum() == 3000 - 11 * bk.BLOCK
     for i in range(3000, 3500):
         run.log({"loss": float(i)}, step=i)
-    run.finish()
+    assert wait_for(lambda: committed_rows(root / "r") == 3500)
     ex.poll()
-    built = []
-    real = trex_index.build_block
-    monkeypatch.setattr(trex_index, "build_block", lambda *a: (built.append(a[2:]), real(*a))[1])
-    got = [block(ex, "loss", 0, i, runs=["r"]) for i in (0, 11)]
-    assert built == [(0, 11)]
+    a = block(ex, "loss", 0, 11, runs=["r"])
     s, v, t = run_points(root, "r", "loss")
-    for a, i in zip(got, (0, 11)):
-        assert same(of_run(a, "r"), bk.cut(bk.bucketize(s, v, t, 0), i * bk.BLOCK, (i + 1) * bk.BLOCK))
-    assert of_run(got[1], "r").n.sum() == 256 and list(got[1].seq) == [3500]
-
-
-def test_the_block_cache_evicts_the_least_recently_used_built_blocks_and_keeps_the_kept_buckets(root, tmp_path, monkeypatch):
-    write_run(root / "r", 4000)
-    ex = explorer(root, tmp_path)
-    kept = kept_blob(ex, "r", "loss")
-    ex.buckets_body("loss", 0, 0, runs=["r"])
-    assert wait_for(lambda: stored(ex) == [(0, 0)])
-    size = ex.cached_bytes
-    monkeypatch.setattr(trex_index, "BLOCK_CACHE_BYTES", 4 * size)
-    for i in range(1, 15):
-        ex.buckets_body("loss", 0, i, runs=["r"])
-        assert wait_for(lambda: (0, i) in stored(ex))
-    assert wait_for(lambda: ex.cached_bytes <= 4 * size and (0, 14) in stored(ex) and (0, 0) not in stored(ex))
-    assert kept_blob(ex, "r", "loss") == kept
+    assert same(of_run(a, "r"), bk.cut(bk.bucketize(s, v, t, 0), 11 * bk.BLOCK, 12 * bk.BLOCK)) and list(a.seq) == [3500]
+    run.finish()
 
 
 def test_live_run_streams_contiguous_rows_and_refreshes_its_kept_buckets_on_finish(root, tmp_path):
@@ -911,30 +898,6 @@ def test_close_stops_polling_ends_subscriptions_and_closes_connections(root, tmp
         c.execute("SELECT 1")
     with pytest.raises(sqlite3.ProgrammingError):
         ex._writer.execute("SELECT 1")
-
-
-def test_a_shared_block_budget_evicts_the_least_recently_used_blocks_of_any_explorer(tmp_path, monkeypatch):
-    roots = [tmp_path / "a", tmp_path / "b"]
-    for r in roots:
-        write_run(r / "r", 300)
-    clock = iter(range(1, 10_000))
-    monkeypatch.setattr(trex_index.time, "time", lambda: float(next(clock)))
-    probe = Explorer(roots[0], tmp_path / "probe")
-    probe.rewalk()
-    probe.poll()
-    probe.buckets_body("loss", -6, 0, runs=["r"])
-    assert wait_for(lambda: probe.cached_bytes > 0)
-    size = probe.cached_bytes
-    budget = trex_index.BlockBudget(limit=int(4.5 * size))
-    a, b = (Explorer(r, tmp_path / "cache", budget=budget) for r in roots)
-    for ex in (a, b):
-        ex.rewalk()
-        ex.poll()
-        for i in range(3):
-            ex.buckets_body("loss", -6, i, runs=["r"])
-            assert wait_for(lambda: (-6, i) in stored(ex))
-    assert wait_for(lambda: [i for _, i in stored(a)] == [2] and [i for _, i in stored(b)] == [0, 1, 2])
-    assert budget.used() == a.cached_bytes + b.cached_bytes <= 4.5 * size
 
 
 def slow_scans(monkeypatch, seconds):

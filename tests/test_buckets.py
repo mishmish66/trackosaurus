@@ -162,7 +162,7 @@ def test_a_stack_refuses_arrays_of_many_runs():
 def test_a_run_keeps_its_buckets_at_the_finest_level_whose_blocks_its_steps_fit_in_two():
     steps, values, times = rows(5000)
     a = bk.decode(bk.kept(steps, values, times, 5000))
-    assert a.level == bk.kept_level(steps.min(), steps.max()) and list(a.seq) == [5000]
+    assert a.level == bk.level_for(steps.max() - steps.min()) and list(a.seq) == [5000]
     assert len({int(x) // BLOCK for x in a.buckets.bucket}) <= 2
     assert_buckets(a.buckets, by_bucket(steps, values, times, a.level), a.level)
 
@@ -177,10 +177,9 @@ def test_a_built_block_holds_the_buckets_of_its_step_range():
 
 
 @pytest.mark.parametrize("lo,hi", [(0, 100), (250, 260), (255.5, 256.5), (1000, 5000), (-300, 300), (7, 7), (0, 2**40)])
-def test_a_kept_level_covers_the_steps_in_one_or_two_blocks_and_one_level_finer_would_not(lo, hi):
-    level = bk.kept_level(lo, hi)
-    assert 1 <= len(bk.blocks(level, lo, hi)) <= 2
-    assert level == bk.level_for(hi - lo) and bk.block_range(level, 0)[1] >= hi - lo
+def test_the_span_level_covers_the_steps_in_one_or_two_blocks(lo, hi):
+    level = bk.level_for(hi - lo)
+    assert 1 <= len(bk.blocks(level, lo, hi)) <= 2 and bk.block_range(level, 0)[1] >= hi - lo
 
 
 @pytest.mark.parametrize("k", range(-19, 60, 3))
