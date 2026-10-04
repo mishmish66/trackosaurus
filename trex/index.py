@@ -8,7 +8,6 @@ order per run.
 import hashlib
 import json
 import math
-import mmap
 import multiprocessing
 import os
 import queue
@@ -19,7 +18,6 @@ import struct
 import sys
 import threading
 import time
-import zlib
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
@@ -58,8 +56,6 @@ class MediaRecord(NamedTuple):
     key: str
     kind: MediaKind
     file: str
-    crc: int
-    size: int
 
 
 class KeptRecord(NamedTuple):
@@ -175,7 +171,7 @@ class RunView(TypedDict):
     run: RunMeta
     media: list[MediaRecord]
 
-CACHE_VERSION: Final = 12  # bump whenever what the index stores changes; older caches are rebuilt
+CACHE_VERSION: Final = 13  # bump whenever what the index stores changes; older caches are rebuilt
 CRASH_AFTER = 300.0  # seconds without a heartbeat after which a running run shows as crashed
 POLL: Final = 1.0  # seconds between polls of known runs
 REWALK: Final = 3.0  # seconds between walks of the root for new and removed runs
@@ -187,7 +183,6 @@ BATCH_SECONDS: Final = 0.5  # longest wait before committing a partial batch
 CLOSE_WAIT: Final = 5.0  # longest `close` waits for a scan in progress
 MEMO_BYTES = 1 << 30  # stacks, merged levels and answers an Explorer keeps in memory, least recently used dropped
 LEVELS_BYTES = int(os.environ.get("TREX_LEVELS_MB", "4096")) << 20  # saved merged levels an index keeps, least recently used deleted
-LEVELS_MAGIC: Final = b"TKL2"
 LEVELS_SAVE_EVERY = 60.0  # seconds between saves of one metric's merged levels
 LEVELS_AHEAD: Final = 3  # levels above a metric's coarsest kept level merged and saved ahead of requests
 INLINE_BUILDS: Final = 64  # blocks a request builds from run files without the process pool
@@ -201,7 +196,7 @@ TABLES: Final = {
     "cache": "CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, value TEXT)",
     "runs": "CREATE TABLE IF NOT EXISTS runs(path TEXT PRIMARY KEY, record TEXT NOT NULL)",
     "media": "CREATE TABLE IF NOT EXISTS media(path TEXT, seq INTEGER, step REAL, key TEXT, kind TEXT, file TEXT, "
-             "crc INTEGER, size INTEGER, PRIMARY KEY(path, seq)) WITHOUT ROWID",
+             "PRIMARY KEY(path, seq)) WITHOUT ROWID",
     # a run's buckets of a metric at the level it keeps them at (a one-run bucket array); seq: the rows they hold
     "kept": "CREATE TABLE IF NOT EXISTS kept(path TEXT, key TEXT, level INTEGER, seq INTEGER, data BLOB, PRIMARY KEY(key, path))",
     "kept_path": "CREATE INDEX IF NOT EXISTS kept_path ON kept(path)",
@@ -398,12 +393,9 @@ def _new_media(c: sqlite3.Connection, d: Path, path: str, mseq: int) -> list[Med
     for i, step, key, kind, file in c.execute("SELECT seq, step, key, kind, file FROM media WHERE seq >= ? ORDER BY seq", (mseq,)):
         if i != mseq + len(out):
             break
-        f = d / file
-        try:
-            size, crc = f.stat().st_size, zlib.crc32(f.read_bytes()) if kind == "html" else 0
-        except FileNotFoundError:
+        if not (d / file).is_file():
             break
-        out.append(MediaRecord(path, i, step, key, kind, file, crc, size))
+        out.append(MediaRecord(path, i, step, key, kind, file))
     return out
 
 
@@ -465,88 +457,24 @@ def _build_block_job(job: tuple[str, str, int, int]) -> tuple[bytes, int]:
     return build_block(*job)
 
 
-def _padded(a: npt.NDArray[np.generic]) -> list[bytes]:
-    return [a.tobytes(), b"\0" * (-a.nbytes % 8)]
-
-
-def _pad(n: int) -> int:
-    return -(-n // 8) * 8
-
-
-class SavedLevels(NamedTuple):
-    """A metric's merged levels saved beside the index, memory-mapped: its finished runs, the rows of each and the
-    level each keeps its buckets at, and where each merged level's buckets lie (offset, count)."""
-
-    paths: list[str]
-    seq: npt.NDArray[np.uint32]
-    level: npt.NDArray[np.int8]
-    buf: mmap.mmap
-    at: dict[int, tuple[int, int]]
-
-    @staticmethod
-    def pack(sig: bytes, st: Stack, parts: Mapping[int, Buckets]) -> bytes:
-        """`LEVELS_MAGIC`, u32 levels, u32 runs, u32 0, the 20-byte digest of the runs, u32 0, then per run its rows (u32)
-        and its level (i8); then per merged level: i64 level, u64 buckets, u32 first bucket per run and one past the
-        last, i64 bucket, f32 mean, f32 mean runtime, u32 count, u16 mean step offset; each array padded to 8 bytes."""
-        runs = len(st.paths)
-        out = [LEVELS_MAGIC, struct.pack("<III20sI", len(parts), runs, 0, sig, 0), *_padded(st.seq.astype("<u4")),
-               *_padded(st.level.astype(np.int8))]
-        for level, b in parts.items():
-            first = np.searchsorted(b.run, np.arange(runs + 1)).astype("<u4")
-            out += [struct.pack("<qQ", level, b.run.size), *_padded(first), *_padded(b.bucket.astype("<i8")),
-                    *_padded(b.mean.astype("<f4")), *_padded(b.tmean.astype("<f4")), *_padded(b.n.astype("<u4")),
-                    *_padded(b.soff.astype("<u2"))]
-        return b"".join(out)
-
-    @classmethod
-    def open(cls, f: Path, sig: bytes, paths: list[str]) -> "SavedLevels | None":
-        """The levels saved in `f`, None unless they are of runs `paths` with digest `sig`."""
-        with f.open("rb") as fh:
-            buf = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-        if buf[:4] != LEVELS_MAGIC:
-            raise ValueError("bad levels magic")
-        levels, runs, _, saved_sig, _ = struct.unpack_from("<III20sI", buf, 4)
-        if saved_sig != sig or runs != len(paths):
-            return None
-        off, at = 40 + _pad(4 * runs) + _pad(runs), dict[int, tuple[int, int]]()
-        for _ in range(levels):
-            level, count = struct.unpack_from("<qQ", buf, off)
-            at[level] = (off + 16, count)
-            off += 16 + _pad(4 * (runs + 1)) + 8 * count + 3 * _pad(4 * count) + _pad(2 * count)
-        if off != len(buf):
-            raise ValueError("levels length mismatch")
-        return cls(paths, np.frombuffer(buf, np.uint32, runs, 40), np.frombuffer(buf, np.int8, runs, 40 + _pad(4 * runs)), buf, at)
-
-    def part(self, level: int) -> Buckets:
-        """The buckets of `level`, viewing the file."""
-        off, count = self.at[level]
-        runs = len(self.paths)
-        first = np.frombuffer(self.buf, "<u4", runs + 1, off)
-        off += _pad(4 * (runs + 1))
-        bucket = np.frombuffer(self.buf, "<i8", count, off)
-        off += 8 * count
-        mean = np.frombuffer(self.buf, "<f4", count, off)
-        tmean = np.frombuffer(self.buf, "<f4", count, off + _pad(4 * count))
-        n = np.frombuffer(self.buf, "<u4", count, off + 2 * _pad(4 * count))
-        soff = np.frombuffer(self.buf, "<u2", count, off + 3 * _pad(4 * count))
-        run = np.repeat(np.arange(runs, dtype=np.int32), np.diff(first.astype(np.int64)))
-        return Buckets(run, bucket, mean, soff, tmean, n)
-
-
 def _bound_dir(d: Path, limit: int) -> None:
-    """Delete the least recently used files of `d` until the rest hold at most `limit` bytes."""
-    files: list[tuple[float, int, Path]] = []
-    for f in d.iterdir():
+    """Delete the least recently used entries of `d` (files, or directories of files) until the rest hold at most
+    `limit` bytes."""
+    entries: list[tuple[float, int, Path]] = []
+    for e in d.iterdir():
         try:
-            st = f.stat()
+            files = [e] if e.is_file() else list(e.iterdir())
+            entries.append((max(f.stat().st_mtime for f in files) if files else 0.0, sum(f.stat().st_size for f in files), e))
         except OSError:
             continue
-        files.append((st.st_mtime, st.st_size, f))
-    total = sum(x[1] for x in files)
-    for _, size, f in sorted(files, key=lambda x: x[0]):
+    total = sum(x[1] for x in entries)
+    for _, size, e in sorted(entries, key=lambda x: x[0]):
         if total <= limit:
             return
-        f.unlink(missing_ok=True)
+        if e.is_dir():
+            shutil.rmtree(e, ignore_errors=True)
+        else:
+            e.unlink(missing_ok=True)
         total -= size
 
 
@@ -584,6 +512,15 @@ def _record(r: ScanResult, cur: RunRecord | None) -> RunRecord:
 
 def _bytes_of(sig: Sig) -> int:
     return sig[1] + sig[3]
+
+
+class Finished(NamedTuple):
+    """The finished runs logging a metric, in path order, the rows of each its kept buckets hold, and a digest of them
+    and their kept buckets."""
+
+    paths: list[str]
+    seq: npt.NDArray[np.uint32]
+    sig: bytes
 
 
 class Memo:
@@ -916,7 +853,7 @@ class Explorer:
             ev.append(("delete", {"run": path}))
             cur = None
         if r["media"]:
-            self._writer.executemany("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?,?,?)", r["media"])
+            self._writer.executemany("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)", r["media"])
         st = _record(r, cur)
         was, done = cur is not None and cur["state"] != "running", st["state"] != "running"  # finished before, and now
         if (r["kept"] is not None and done) or was != done:
@@ -969,7 +906,7 @@ class Explorer:
         c = self.reader()
         try:
             media = [MediaRecord(*m) for m in c.execute(
-                "SELECT path, seq, step, key, kind, file, crc, size FROM media WHERE ? = '' OR path = ? OR (path > ? AND path < ?) "
+                "SELECT path, seq, step, key, kind, file FROM media WHERE ? = '' OR path = ? OR (path > ? AND path < ?) "
                 "ORDER BY path, seq", (prefix, prefix, prefix + "/", prefix + "0"))]  # "0" follows "/"
         finally:
             self.release(c)
@@ -1084,14 +1021,15 @@ class Explorer:
         their saved levels when those are current, else from their stack."""
         saved = self._saved(key)
         if saved is not None:
-            return saved.paths, saved.level, saved.seq
+            fin = self._finished(key)
+            return fin.paths, np.load(saved / "levels.npy", mmap_mode="r"), fin.seq
         st = self._stack(key)
         return st.paths, st.level, st.seq
 
     def _positions(self, key: str) -> dict[str, int]:
         """Each finished run of `key` by its index in path order."""
         return self._memo.get(("positions", key), self._gens.get(key, 0),
-                              lambda: ({p: i for i, p in enumerate(self._finished(key)[0])}, 0))
+                              lambda: ({p: i for i, p in enumerate(self._finished(key).paths)}, 0))
 
     def _kept_of(self, key: str, paths: list[str]) -> Stack:
         """The kept buckets of `key` of runs `paths`, read from the index."""
@@ -1113,8 +1051,8 @@ class Explorer:
 
     def _merge_level(self, key: str, level: int) -> tuple[Buckets, int]:
         saved = self._saved(key)
-        if saved is not None and level in saved.at:
-            part = saved.part(level)
+        if saved is not None and (saved / f"L{level}-run.npy").exists():
+            part = Buckets(*(np.load(saved / f"L{level}-{name}.npy", mmap_mode="r") for name in Buckets._fields))
             return part, part.run.nbytes
         st = self._stack(key)
         part = self._merged(st, level, st.level <= level)
@@ -1143,7 +1081,7 @@ class Explorer:
         return self._memo.get(("stack", key), self._gens.get(key, 0), lambda: self._read_stack(key))
 
     def _read_stack(self, key: str) -> tuple[Stack, int]:
-        done, sig = self._finished(key)
+        done, _, sig = self._finished(key)
         c = self.reader()
         try:
             rows = dict(c.execute("SELECT path, data FROM kept WHERE key=?", (key,)).fetchall())
@@ -1161,15 +1099,15 @@ class Explorer:
         once every LEVELS_SAVE_EVERY seconds."""
         parts = {x: self._level(key, x) for x in levels}
         due = time.monotonic() - self._saved_at.get(key, -math.inf) >= LEVELS_SAVE_EVERY
-        if due and self._finished(key)[1] == sig and self._saved(key) is None:
+        if due and self._finished(key).sig == sig and self._saved(key) is None:
             self._saved_at[key] = time.monotonic()
             self._save_levels(key, sig, st, parts)
 
-    def _finished(self, key: str) -> tuple[list[str], bytes]:
-        """The finished runs logging `key`, in path order, and a digest of them and their kept buckets."""
+    def _finished(self, key: str) -> Finished:
+        """The finished runs logging `key` (`Finished`)."""
         return self._memo.get(("finished", key), self._gens.get(key, 0), lambda: (self._digest(key), 0))
 
-    def _digest(self, key: str) -> tuple[list[str], bytes]:
+    def _digest(self, key: str) -> Finished:
         with self.lock:
             done = [(p, rec["kept_seq"], rec["kept_t"]) for p, rec in self.records.items()
                     if rec["state"] != "running" and key in rec["keys"]]
@@ -1178,40 +1116,44 @@ class Explorer:
         h = hashlib.sha1(f"{CACHE_VERSION}\0{key}\0".encode())
         h.update("\0".join(paths).encode())
         h.update(np.array([(seq, t) for _, seq, t in done], np.float64).tobytes())
-        return paths, h.digest()
+        return Finished(paths, np.array([seq for _, seq, _ in done], np.uint32), h.digest())
 
-    def _levels_file(self, key: str) -> Path:
-        return self.cache_dir / "levels" / hashlib.sha1(key.encode()).hexdigest()[:20]
+    def _levels_dir(self, key: str, sig: bytes) -> Path:
+        return self.cache_dir / "levels" / f"{hashlib.sha1(key.encode()).hexdigest()[:20]}-{sig.hex()[:20]}"
 
-    def _saved(self, key: str) -> "SavedLevels | None":
-        """The merged levels of `key` an earlier build saved, when its finished runs and their kept buckets are the
-        same."""
+    def _saved(self, key: str) -> Path | None:
+        """The directory of the merged levels of `key` an earlier build saved (`_save_levels`) for its finished runs and
+        their kept buckets as they are."""
         return self._memo.get(("saved", key), self._gens.get(key, 0), lambda: (self._open_saved(key), 0))
 
-    def _open_saved(self, key: str) -> "SavedLevels | None":
-        paths, sig = self._finished(key)
-        f = self._levels_file(key)
+    def _open_saved(self, key: str) -> Path | None:
+        d = self._levels_dir(key, self._finished(key).sig)
         try:
-            saved = SavedLevels.open(f, sig, paths)
-            if saved is not None:
-                os.utime(f)
-        except READ_ERRORS:
-            saved = None
-        return saved
+            os.utime(d / "levels.npy")
+            return d
+        except OSError:
+            return None
 
     def _save_levels(self, key: str, sig: bytes, st: Stack, parts: Mapping[int, Buckets]) -> None:
-        """Write merged levels of `key` (`SavedLevels.pack`) beside the index, then delete the least recently used saved
-        levels beyond LEVELS_BYTES."""
-        f = self._levels_file(key)
-        f.parent.mkdir(exist_ok=True)
-        tmp = f.with_name(f"{f.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        """Write merged levels of `key` beside the index as numpy arrays (`.npy`, memory-mapped when read): each run's
+        kept level (`levels`) and each level's buckets (`L<level>-<field>`); then delete its levels saved for other runs
+        and the least recently used saved levels beyond LEVELS_BYTES."""
+        d = self._levels_dir(key, sig)
+        tmp = d.with_name(f"{d.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
-            tmp.write_bytes(SavedLevels.pack(sig, st, parts))
-            tmp.replace(f)
+            tmp.mkdir(parents=True)
+            for lv, b in parts.items():
+                for name, a in zip(Buckets._fields, b, strict=True):
+                    np.save(tmp / f"L{lv}-{name}.npy", a)
+            np.save(tmp / "levels.npy", st.level)  # last: a directory with it is complete
+            tmp.rename(d)
         except OSError:
-            tmp.unlink(missing_ok=True)
+            shutil.rmtree(tmp, ignore_errors=True)
             return
-        _bound_dir(f.parent, LEVELS_BYTES)
+        for old in d.parent.glob(f"{d.name.split('-')[0]}-*"):
+            if old != d:
+                shutil.rmtree(old, ignore_errors=True)
+        _bound_dir(d.parent, LEVELS_BYTES)
 
     def _build_many(self, paths: list[str], key: str, level: int, index: int) -> list[tuple[bytes, int]]:
         """(block, rows read) of block (level, index) of `key` for each run, from the run files: on a process pool when

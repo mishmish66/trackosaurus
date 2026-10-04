@@ -511,8 +511,6 @@ def interactions_smoke(page, url):
     page.goto(f"{url}/?gl=0#path=sweep&group=")
     page.wait_for_function(READY, timeout=30000)
     checks["Canvas 2D draws without WebGL"] = page.evaluate(f"!!{chart}.view && !{chart}.view.gl")
-    page.click("#clearCache")
-    page.wait_for_timeout(500)
     failed = [k for k, v in checks.items() if not v]
     print(f"interactions: {len(checks) - len(failed)}/{len(checks)} as intended" + (f"; not: {failed}" if failed else ""))
     return not failed

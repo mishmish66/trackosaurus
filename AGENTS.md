@@ -23,7 +23,7 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/query.py` | read-side queries for the CLI: records, field access, sorting, statistics, series |
 | `trex/where.py` | run filters: a SQL WHERE clause (or a name search) compiled to a test over a field getter |
 | `trex/cli.py` | `trex` command (Typer): `serve daemon systemd-unit launchd-plist ls groups keys tree show series tail media diff index compact` |
-| `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (block store, planner, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (bucket arrays, columns, smoothing, decimation, group stats, CRC-32), `pool.js` and `worker.js` (binning on workers over shared columns and bucket arrays, fetching into shared memory), `where.js` (run filters, run fields, filter completion); `index.html` |
+| `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (block store, planner, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (bucket arrays, columns, smoothing, decimation, group stats), `pool.js` and `worker.js` (binning on workers over shared columns and bucket arrays, fetching into shared memory), `where.js` (run filters, run fields, filter completion); `index.html` |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/`; the user guide is the `trex` and `trex.daemon` docstrings (Markdown) |
 | `docs/media/` | the docs' video tour and its poster image (left out of the sdist); the README embeds the same video, uploaded to GitHub |
@@ -88,7 +88,7 @@ them WebGL falls back to software and timings mean nothing.
   coarser buckets has the block built from its run file (`build_block`, on a process pool beyond `INLINE_BUILDS`).
   The levels from a metric's
   coarsest kept one to `LEVELS_AHEAD` above it are merged ahead of requests and saved beside the index
-  (`<cache>/levels/`, `SavedLevels`), at most once a metric every `LEVELS_SAVE_EVERY` seconds and up to
+  (`<cache>/levels/<metric>-<digest>/`, one `.npy` per array, memory-mapped when read), at most once a metric every `LEVELS_SAVE_EVERY` seconds and up to
   `TREX_LEVELS_MB` (least recently used deleted), and memory-mapped by a later Explorer whose finished runs and their
   kept buckets are the same (`Explorer._finished`). A folder's finished-run blocks are kept in memory
   (`Explorer._memo`, a `Memo` of `MEMO_BYTES` that also holds stacks and merged levels) until those runs change (`_gens`), and `/api/runs` answers until what it holds changes
@@ -155,9 +155,8 @@ them WebGL falls back to software and timings mean nothing.
 - **Events follow commits, in order.** `Explorer.apply` publishes after the index transaction
   commits. A run's `run` event comes after the rows and media it counts (a new run's comes
   first); the browser treats a `run` event whose counts it has not reached as lost data.
-- **Cache versions.** Bump `CACHE_VERSION` in `index.py` whenever what the index stores, or how it
-  derives it, changes. Bump the IndexedDB version in `data.js` when the stored entries or their
-  keys change. Older caches are then rebuilt instead of silently misread.
+- **Cache version.** Bump `CACHE_VERSION` in `index.py` whenever what the index stores, or how it
+  derives it, changes. An older index is then rebuilt instead of silently misread.
 - **Shared formats across languages.** Change all of these together:
   - bucket arrays: `buckets.py` and `bucketViews` in `static/kernel.js`. Buckets leave NaN out; a bucket's mean, mean
     step, mean runtime and count are of its finite values, or of its infinities when it has none (the mean then

@@ -2,14 +2,14 @@
 // stream. A run's column of a metric is built from its buckets in its chart's blocks (`buildColumn`) plus the rows
 // streamed since those buckets were made; a gap or a missed heartbeat resyncs the run.
 
-import { BLOCK, SHARED, adoptStore, bucketPaths, bucketStep, bucketViews, buildColumn, crc32, freeStore } from "./kernel.js";
+import { BLOCK, SHARED, adoptStore, bucketPaths, bucketStep, bucketViews, buildColumn, freeStore } from "./kernel.js";
 import { PARALLEL as WORKERS, fetchArrayOnWorker } from "./pool.js";
 import { asNumber } from "./where.js";
 
 const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
 
 /** What this page and the server say to each other (server.PROTOCOL); the page states a mismatch. */
-export const PROTOCOL = 4;
+export const PROTOCOL = 5;
 /** URL prefix of what the page shows: a daemon's tracked directory ("/r/<name>") or workspace ("/w/<name>"), else "". */
 export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/[rw]\/[^/]+(?=\/)/) || [""])[0];
 
@@ -28,7 +28,6 @@ const SCOPE_SHARE = 4; // ...when they are also at least 1 / SCOPE_SHARE of the 
 const RUNS_PER_REQUEST = 2000; // run ids one request names
 const REBUILD_SLICE_MS = 8; // column rebuilds per task, in ms
 const PREFETCH_IDLE_MS = 400; // quiet time before the next block fetched ahead
-const IDB_ENTRIES = 2000; // media blobs kept in IndexedDB
 export const LINE_PX_PER_BUCKET = 2; // chart width per bucket a line needs
 export const DENSITY_PX_PER_BUCKET = 8; // the same in a density heatmap or group statistics of many runs
 const NO_TAIL = Object.freeze({ s: [], v: [], t: [], q: [], n: 0 });
@@ -61,67 +60,6 @@ const clampLevel = (l) => Math.min(MAX_LEVEL, Math.max(MIN_LEVEL, l));
  * whose blocks are as wide as the span (buckets.level_for), coarser by whole levels, so that it changes only when the
  * span crosses a power of two, as a run's kept level does. */
 const levelFor = (span, buckets) => clampLevel(Math.ceil(Math.log2(Math.max(span, 2 ** MIN_LEVEL) / BLOCK)) + Math.ceil(Math.log2(BLOCK / Math.max(buckets, 1))));
-
-// ---- IndexedDB (media) -------------------------------------------------------
-
-const idb = {
-  db: null,
-  async open() {
-    try {
-      this.db = await new Promise((ok, bad) => {
-        const r = indexedDB.open("trex", 8);
-        r.onupgradeneeded = () => {
-          for (const s of [...r.result.objectStoreNames]) r.result.deleteObjectStore(s);
-          r.result.createObjectStore("blobs");
-        };
-        r.onsuccess = () => ok(r.result);
-        r.onerror = () => bad(r.error);
-        r.onblocked = () => bad(new Error("IndexedDB upgrade blocked by another tab"));
-      });
-    } catch (e) {
-      console.warn("IndexedDB unavailable; caching disabled", e);
-      this.db = null;
-    }
-  },
-  get(key) {
-    if (!this.db) return Promise.resolve(undefined);
-    return new Promise((ok) => {
-      const r = this.db.transaction("blobs", "readonly").objectStore("blobs").get(key);
-      r.onsuccess = () => ok(r.result);
-      r.onerror = () => ok(undefined);
-    });
-  },
-  put(key, value) {
-    if (!this.db) return;
-    this.db.transaction("blobs", "readwrite").objectStore("blobs").put(value, key);
-  },
-  /** Delete the oldest entries beyond `max`. */
-  prune(max) {
-    if (!this.db) return;
-    const os = this.db.transaction("blobs", "readwrite").objectStore("blobs");
-    os.count().onsuccess = (e) => {
-      let extra = e.target.result - max;
-      if (extra > 0) {
-        os.openKeyCursor().onsuccess = (ev) => {
-          const c = ev.target.result;
-          if (!c || extra-- <= 0) return;
-          os.delete(c.primaryKey);
-          c.continue();
-        };
-      }
-    };
-  },
-  clear() {
-    if (!this.db) return Promise.resolve();
-    return new Promise((ok) => {
-      const tx = this.db.transaction("blobs", "readwrite");
-      tx.objectStore("blobs").clear();
-      tx.oncomplete = tx.onerror = () => ok();
-    });
-  },
-};
-
-export const clearCache = () => idb.clear();
 
 const early = new Map(); // url -> its response, requested by `preload` and not yet taken
 
@@ -189,11 +127,10 @@ export class Data {
   }
 
   async init() {
-    const [info] = await Promise.all([getJSON(`${BASE}/api/info`), idb.open()]);
+    const info = await getJSON(`${BASE}/api/info`);
     this.info = info;
     this.rootKey = info.root;
     this.ui.protocol?.(info.protocol);
-    idb.prune(IDB_ENTRIES);
   }
 
   close() {
@@ -846,12 +783,12 @@ export class Data {
   }
 
   addMedia(rec) {
-    const [run, seq, step, key, kind, file, crc, size] = rec;
+    const [run, seq, step, key, kind, file] = rec;
     let m = this.media.get(key);
     if (!m) this.media.set(key, (m = new Map()));
     let list = m.get(run);
     if (!list) m.set(run, (list = []));
-    list.push({ run, seq, step, kind, file, crc, size });
+    list.push({ run, seq, step, kind, file });
     if (list.length > 1 && list[list.length - 2].step > step) list.sort((a, b) => a.step - b.step);
     return key;
   }
@@ -861,15 +798,5 @@ export class Data {
     if (rec[1] > r.mseq) return this.resync(r);
     r.mseq++;
     this.ui.media(this.addMedia(rec));
-  }
-
-  /** HTML media bytes, from cache or network, CRC-verified. */
-  async blob(rec) {
-    const c = await idb.get(rec.file);
-    if (c && c.crc === rec.crc && c.buf.byteLength === rec.size) return c.buf;
-    const buf = await (await fetch(mediaURL(rec))).arrayBuffer();
-    if (buf.byteLength !== rec.size || crc32(buf) !== rec.crc) throw new Error(`media ${rec.file} failed verification`);
-    idb.put(rec.file, { crc: rec.crc, buf });
-    return buf;
   }
 }

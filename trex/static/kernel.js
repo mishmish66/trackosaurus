@@ -1,5 +1,5 @@
 // Numeric kernel for the UI: resident metric columns (in memory shared with workers when the page is cross-origin
-// isolated), CRC-32, time-weighted EMA smoothing, per-pixel decimation, group aggregation, and axis quantiles. Pure JS
+// isolated), time-weighted EMA smoothing, per-pixel decimation, group aggregation, and axis quantiles. Pure JS
 // on typed arrays; it runs in the page and in its workers.
 
 /** `flags` bits accepted by prep, agg and yrange; IQM (agg only) adds the interquartile mean. */
@@ -944,36 +944,4 @@ export function nearest(c, xmode, x, alpha, scale) {
     for (let j = 1; j < n; j++) if (Math.abs(xs[j] - x) < Math.abs(xs[i] - x)) i = j;
   }
   return { i, x: xs[i], y: c.ys(alpha, false)[i], raw: c.v[i] };
-}
-
-const CRC = (() => {
-  const t = Array.from({ length: 8 }, () => new Uint32Array(256));
-  for (let i = 0; i < 256; i++) {
-    let c = i;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[0][i] = c >>> 0;
-  }
-  for (let k = 1; k < 8; k++) {
-    for (let i = 0; i < 256; i++) {
-      const p = t[k - 1][i];
-      t[k][i] = ((p >>> 8) ^ t[0][p & 0xff]) >>> 0;
-    }
-  }
-  return t;
-})();
-
-/** CRC-32 (IEEE, as zlib.crc32) of an ArrayBuffer or Uint8Array. */
-export function crc32(data) {
-  const buf = data instanceof Uint8Array ? data : new Uint8Array(data);
-  const [t0, t1, t2, t3, t4, t5, t6, t7] = CRC;
-  const n = buf.length, n8 = n - (n % 8);
-  let c = ~0, i = 0;
-  for (; i < n8; i += 8) {
-    const a = (c ^ (buf[i] | (buf[i + 1] << 8) | (buf[i + 2] << 16) | (buf[i + 3] << 24))) >>> 0;
-    const b = (buf[i + 4] | (buf[i + 5] << 8) | (buf[i + 6] << 16) | (buf[i + 7] << 24)) >>> 0;
-    c = t7[a & 0xff] ^ t6[(a >>> 8) & 0xff] ^ t5[(a >>> 16) & 0xff] ^ t4[a >>> 24] ^
-        t3[b & 0xff] ^ t2[(b >>> 8) & 0xff] ^ t1[(b >>> 16) & 0xff] ^ t0[b >>> 24];
-  }
-  for (; i < n; i++) c = t0[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  return ~c >>> 0;
 }

@@ -1,4 +1,4 @@
-import { BASE, Data, PROTOCOL, clearCache, getJSON, hasKey, mediaURL, preload } from "./data.js";
+import { BASE, Data, PROTOCOL, getJSON, hasKey, mediaURL, preload } from "./data.js";
 import { startWorkers } from "./pool.js";
 import { asNumber, compileWhere, completionContext, fieldText, literal, runField, textOf } from "./where.js";
 import { BAND_LABEL, Chart, DENSITY_AUTO, USE_GL, fmt, fmtDur, fmtSI } from "./plot.js";
@@ -771,10 +771,6 @@ class App {
     bind("#center", "center", "change", (e) => e.value, () => this.redrawAll());
     bind("#band", "band", "change", (e) => e.value, () => this.redrawAll());
     bind("#keyFilter", "keys", "input", (e) => e.value, throttle(() => this.renderPanels(), 150));
-    $("#clearCache").addEventListener("click", async () => {
-      await clearCache();
-      $("#status").textContent = "cache cleared";
-    });
     $("#resetZoom").addEventListener("click", () => this.resetZoom());
     this.bindGroupBox();
     this.bindSortBox();
@@ -2151,21 +2147,16 @@ class MediaPanel {
       f.color = r.color;
       const cap = h("figcaption", {}, h("span", { className: "sw", style: `background:${r.color}` }),
         `${r.meta.name} · step ${pick.step}`);
-      f.el.replaceChildren(cap, this.mediaEl(pick, f));
+      f.el.replaceChildren(cap, this.mediaEl(pick));
     }
     for (const [id, f] of this.figs) if (!keep.has(id)) (f.el.remove(), this.figs.delete(id));
   }
 
-  /** An image, video, or sandboxed HTML frame (loaded from the cache) for media item `pick` of figure f. */
-  mediaEl(pick, f) {
+  /** An image, video, or sandboxed HTML frame for media item `pick`. */
+  mediaEl(pick) {
     if (pick.kind === "image") return h("img", { src: mediaURL(pick), loading: "lazy", decoding: "async" });
     if (pick.kind === "video") return h("video", { src: mediaURL(pick), controls: true, muted: true, loop: true, preload: "metadata" });
-    const frame = h("iframe", { sandbox: "allow-scripts", loading: "lazy" }), want = pick.file;
-    this.app.data.blob(pick).then(
-      (buf) => f.file === want && (frame.srcdoc = new TextDecoder().decode(buf)),
-      (err) => (frame.srcdoc = `<pre>${String(err).replace(/</g, "&lt;")}</pre>`),
-    );
-    return frame;
+    return h("iframe", { src: mediaURL(pick), sandbox: "allow-scripts", loading: "lazy" });
   }
 }
 

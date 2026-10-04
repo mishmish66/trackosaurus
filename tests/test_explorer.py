@@ -363,21 +363,24 @@ def test_a_metric_saves_its_levels_at_most_once_every_levels_save_every(root, tm
     level = kept_of(ex, "a/r1", "loss").level + 1
     ex.buckets_body("loss", level, 0, "a", None, "finished")
     assert wait_for(lambda: saved_levels(ex))
-    f = ex.cache_dir / "levels" / saved_levels(ex)[0]
-    before = f.read_bytes()
+    d = ex.cache_dir / "levels" / saved_levels(ex)[0]
+    before = {f.name: f.read_bytes() for f in d.iterdir()}
     write_run(root / "a" / "r2", 3000)
     ex.rewalk()
     ex.poll()
     assert block(ex, "loss", level, 0, "a", which="finished").paths == ["a/r1", "a/r2"]
     time.sleep(0.5)
-    assert f.read_bytes() == before
+    assert saved_levels(ex) == [d.name] and {f.name: f.read_bytes() for f in d.iterdir()} == before
 
 
 def test_saved_levels_beyond_their_budget_go_least_recently_used_first(tmp_path):
     for i, name in enumerate(("old", "mid", "new")):
-        f = tmp_path / name
+        (tmp_path / name).mkdir()
+        f = tmp_path / name / "levels.npy"
         f.write_bytes(b"x" * 100)
         os.utime(f, (1000 + i, 1000 + i))
+    (tmp_path / "loose").write_bytes(b"x" * 10)
+    os.utime(tmp_path / "loose", (999, 999))
     trex_index._bound_dir(tmp_path, 250)
     assert sorted(f.name for f in tmp_path.iterdir()) == ["mid", "new"]
 
@@ -528,7 +531,7 @@ def test_pool_and_inline_indexing_produce_identical_index(root, tmp_path, monkey
     a, b = index_dump(inline), index_dump(pool)
     assert a == b
     assert {p: sorted(x.name for x in p.iterdir()) for p in root.glob("sweep/*")} == before
-    assert [m[4] for m in a["media"]] == ["html", "image"] and a["media"][0][6] == zlib.crc32(b"<p>1</p>")
+    assert [m[4] for m in a["media"]] == ["html", "image"]
     for path, st in a["runs"]:
         assert st["kept_seq"] == st["seq"]
         assert {k for p, k, *_ in a["kept"] if p == path} == set(st["keys"])

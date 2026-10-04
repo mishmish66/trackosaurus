@@ -39,7 +39,7 @@ HOP_HEADERS: Final = frozenset({"connection", "keep-alive", "transfer-encoding",
 ISOLATION: Final = {"Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp",
                     "Cross-Origin-Resource-Policy": "same-origin"}
 ROOT_PREFIX: Final = re.compile(r"/([rw])/([^/]+)(/.*)?")  # a tracked directory's (r) or workspace's (w) URLs
-PROTOCOL: Final = 4  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
+PROTOCOL: Final = 5  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
 WHICH: Final[dict[str, Which]] = {"all": "all", "finished": "finished", "running": "running"}
 RESTART_DELAY: Final = 0.5  # seconds between answering an update and restarting, so the answer is sent
 CTYPES: Final = {

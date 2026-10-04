@@ -18,23 +18,6 @@ function twema(xs, ys, alpha, scale) {
   });
 }
 
-function crcRef(buf) {
-  let c = ~0;
-  for (const b of buf) {
-    c ^= b;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  }
-  return ~c >>> 0;
-}
-
-test("crc32 matches the IEEE reference for all tail lengths", () => {
-  for (const n of [0, 1, 7, 8, 9, 1000, 65537]) {
-    const buf = Uint8Array.from({ length: n }, (_, i) => (i * 31 + 7) & 255);
-    assert.equal(K.crc32(buf), crcRef(buf));
-    assert.equal(K.crc32(buf.buffer), crcRef(buf));
-  }
-});
-
 test("time-weighted EMA matches reference and skips NaN, kept per smoothing", () => {
   const xs = [0, 1, 2, 5, 6], v = [1, 2, NaN, 4, 8];
   const c = column(xs, v);
