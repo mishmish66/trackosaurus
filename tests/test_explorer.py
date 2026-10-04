@@ -253,6 +253,77 @@ def test_a_slab_stays_while_running_runs_grow_and_changes_once_one_finishes(root
     assert tiles.decode_slab(ex.slab_body("loss", level, 0, "a")).paths == ["a/done", "a/live"]
 
 
+def saved_levels(ex):
+    d = ex.cache_dir / "levels"
+    return sorted(f.name for f in d.iterdir() if not f.name.endswith(".tmp")) if d.exists() else []
+
+
+def test_a_new_explorer_cuts_slabs_from_the_levels_an_earlier_one_saved(root, tmp_path, monkeypatch):
+    for name in ("a/r1", "a/r2", "b/r3"):
+        write_run(root / name, 3000)
+    ex = explorer(root, tmp_path)
+    level = tiles.decode(ex.tiles([["a/r1", "loss", "overview"]])[0][0]).level
+    want = {(lv, scope): ex.slab_body("loss", lv, 0, scope) for lv in (level, level - 1) for scope in ("", "a")}
+    assert wait_for(lambda: saved_levels(ex))
+    ex.close()
+
+    def unread(*_):
+        raise AssertionError("tiles decoded")
+    monkeypatch.setattr(tiles, "stack", unread)
+    again = explorer(root, tmp_path)
+    assert {k: again.slab_body("loss", *k[:1], 0, k[1]) for k in want} == want
+
+
+def test_saved_levels_are_left_unused_once_the_finished_runs_change(root, tmp_path):
+    for name in ("a/r1", "a/r2"):
+        write_run(root / name, 3000)
+    ex = explorer(root, tmp_path)
+    level = tiles.decode(ex.tiles([["a/r1", "loss", "overview"]])[0][0]).level
+    ex.slab_body("loss", level, 0, "a")
+    assert wait_for(lambda: saved_levels(ex))
+    ex.close()
+    write_run(root / "a" / "r3", 3000, metrics=lambda i: {"loss": 5.0})
+    again = explorer(root, tmp_path)
+    s = tiles.decode_slab(again.slab_body("loss", level, 0, "a"))
+    assert s.paths == ["a/r1", "a/r2", "a/r3"] and np.all(s.mean[s.first[2]:s.first[3]] == 5.0)
+
+
+def test_a_metric_saves_its_levels_at_most_once_every_levels_save_every(root, tmp_path, monkeypatch):
+    monkeypatch.setattr(trex_index, "LEVELS_SAVE_EVERY", 3600.0)
+    write_run(root / "a" / "r1", 3000)
+    ex = explorer(root, tmp_path)
+    level = tiles.decode(ex.tiles([["a/r1", "loss", "overview"]])[0][0]).level
+    ex.slab_body("loss", level, 0, "a")
+    assert wait_for(lambda: saved_levels(ex))
+    f = ex.cache_dir / "levels" / saved_levels(ex)[0]
+    before = f.read_bytes()
+    write_run(root / "a" / "r2", 3000)
+    ex.rewalk()
+    ex.poll()
+    assert tiles.decode_slab(ex.slab_body("loss", level, 0, "a")).paths == ["a/r1", "a/r2"]
+    time.sleep(0.5)
+    assert f.read_bytes() == before
+
+
+def test_saved_levels_beyond_their_budget_go_least_recently_used_first(tmp_path):
+    for i, name in enumerate(("old", "mid", "new")):
+        f = tmp_path / name
+        f.write_bytes(b"x" * 100)
+        os.utime(f, (1000 + i, 1000 + i))
+    trex_index._bound_dir(tmp_path, 250)
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["mid", "new"]
+
+
+def test_a_changed_cache_version_deletes_the_saved_levels(root, tmp_path, monkeypatch):
+    write_run(root / "a" / "r1", 3000)
+    ex = explorer(root, tmp_path)
+    ex.slab_body("loss", tiles.decode(ex.tiles([["a/r1", "loss", "overview"]])[0][0]).level, 0, "a")
+    assert wait_for(lambda: saved_levels(ex))
+    ex.close()
+    monkeypatch.setattr(trex_index, "CACHE_VERSION", trex_index.CACHE_VERSION + 1)
+    assert saved_levels(explorer(root, tmp_path)) == []
+
+
 def test_http_slab_answers_the_slab_and_info_states_the_protocol(http, root):
     ex, url = http
     write_run(root / "x" / "r1", 300)

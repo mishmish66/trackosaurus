@@ -115,8 +115,11 @@ them WebGL falls back to software and timings mean nothing.
 - **Slabs**: `/api/tiles/slab` answers slab (level, index) of one metric over the finished runs of a folder
   (`Explorer.slab_body`). Each metric's finished-run overview and top tiles are decoded once each (`Explorer._stack`),
   and their buckets merged per level (`Explorer._level`, `tiles.level_parts` on threads; from overview tiles where
-  they are fine enough), ahead of requests from the finest top level to the overview level; both are kept up to
-  `STACK_BYTES`. A slab is then cut from its merged level (`tiles.cut`) in a few milliseconds; runs whose top tiles
+  they are fine enough), ahead of requests from the overview level down to the finest top level; both are kept up to
+  `STACK_BYTES`. Those merged levels are saved beside the index (`<cache>/levels/`, `SavedLevels`: the finished runs'
+  digest, each run's overview level, the levels' buckets), at most once a metric every `LEVELS_SAVE_EVERY` seconds and
+  up to `TREX_LEVELS_MB` (least recently used deleted), and memory-mapped by a later Explorer whose finished runs and
+  their kept tiles are the same (`Explorer._finished`), so a restarted server cuts slabs without reading tiles. A slab is then cut from its merged level (`tiles.cut`) in a few milliseconds; runs whose top tiles
   are coarser than the level use their tile at that level, read from the index in one query or built from the run
   files on a process pool (`build_tile`) and cached. Slabs are kept like bundles until a finished run's tiles of that metric change
   (`_slab_gens`); running runs are left out. A chart of more than `DENSITY_AUTO` runs in step x without smoothing

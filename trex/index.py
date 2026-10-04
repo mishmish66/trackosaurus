@@ -1,5 +1,6 @@
 """Explorer index of a runs directory, in <cache_root>/<hash of root>/index.sqlite: run metadata, last
-values, kept tiles, a bounded cache of finer tiles, and media. A run is its path relative to the root.
+values, kept tiles, a bounded cache of finer tiles, and media; beside it, in levels/, the merged levels slabs are cut
+from. A run is its path relative to the root.
 Runs are scanned inline or in worker processes; the main process commits, then publishes events in
 order per run.
 """
@@ -7,9 +8,11 @@ order per run.
 import hashlib
 import json
 import math
+import mmap
 import multiprocessing
 import os
 import queue
+import shutil
 import signal
 import sqlite3
 import struct
@@ -190,6 +193,9 @@ TILE_CACHE_BYTES = int(os.environ.get("TREX_TILE_CACHE_MB", "4096")) << 20
 BUNDLE_CACHE_BYTES = 512 << 20  # framed tile bundles an Explorer keeps in memory, least recently used evicted
 RUNS_BODIES: Final = 8  # `runs` answers an Explorer keeps, by folder
 STACK_BYTES = 512 << 20  # decoded and merged top tiles of finished runs an Explorer keeps for slabs
+LEVELS_BYTES = int(os.environ.get("TREX_LEVELS_MB", "4096")) << 20  # saved merged levels an index keeps, least recently used deleted
+LEVELS_MAGIC: Final = b"TKL1"
+LEVELS_SAVE_EVERY = 60.0  # seconds between saves of one metric's merged levels
 INLINE_TILES: Final = 64  # finer tiles a slab builds without the process pool
 SLAB_THREADS: Final = min(8, os.cpu_count() or 1)  # threads building one slab from decoded top tiles
 PAGE_SIZE: Final = 16384
@@ -474,6 +480,82 @@ def _build_tile_job(job: tuple[str, str, int, int]) -> tuple[bytes, int]:
     return build_tile(*job)
 
 
+def _padded(a: npt.NDArray[np.generic]) -> list[bytes]:
+    return [a.tobytes(), b"\0" * (-a.nbytes % 8)]
+
+
+class SavedLevels(NamedTuple):
+    """A metric's merged levels saved beside the index, memory-mapped: its finished runs, each one's overview level, and
+    where each level's buckets lie (offset, count)."""
+
+    paths: list[str]
+    ov_level: npt.NDArray[np.int8]
+    buf: mmap.mmap
+    at: dict[int, tuple[int, int]]
+
+    @staticmethod
+    def pack(sig: bytes, runs: int, ov_level: npt.NDArray[np.int8], parts: Mapping[int, Buckets]) -> bytes:
+        """`LEVELS_MAGIC`, u32 levels, u32 runs, u32 0, the 20-byte digest of the runs, u32 0, i8 overview level per run;
+        then per level: i64 level, u64 buckets, u32 first bucket per run and one past the last, i64 bucket, f32 mean,
+        u32 count, u16 mean step offset; each array padded to 8 bytes."""
+        out = [LEVELS_MAGIC, struct.pack("<III20sI", len(parts), runs, 0, sig, 0), *_padded(ov_level.astype(np.int8))]
+        for level, b in parts.items():
+            first = np.searchsorted(b.run, np.arange(runs + 1)).astype("<u4")
+            out += [struct.pack("<qQ", level, b.run.size), *_padded(first), *_padded(b.bucket.astype("<i8")),
+                    *_padded(b.mean.astype("<f4")), *_padded(b.n.astype("<u4")), *_padded(b.soff.astype("<u2"))]
+        return b"".join(out)
+
+    @classmethod
+    def open(cls, f: Path, sig: bytes, paths: list[str]) -> "SavedLevels | None":
+        """The levels saved in `f`, None unless they are of runs `paths` with digest `sig`."""
+        with f.open("rb") as fh:
+            buf = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        if buf[:4] != LEVELS_MAGIC:
+            raise ValueError("bad levels magic")
+        levels, runs, _, saved_sig, _ = struct.unpack_from("<III20sI", buf, 4)
+        if saved_sig != sig or runs != len(paths):
+            return None
+        off, at = 40 + -(-runs // 8) * 8, dict[int, tuple[int, int]]()
+        for _ in range(levels):
+            level, count = struct.unpack_from("<qQ", buf, off)
+            at[level] = (off + 16, count)
+            off += 16 + -(-4 * (runs + 1) // 8) * 8 + 8 * count + 2 * -(-4 * count // 8) * 8 + -(-2 * count // 8) * 8
+        if off != len(buf):
+            raise ValueError("levels length mismatch")
+        return cls(paths, np.frombuffer(buf, np.int8, runs, 40), buf, at)
+
+    def part(self, level: int) -> Buckets:
+        """The buckets of `level`, viewing the file."""
+        off, count = self.at[level]
+        runs = len(self.paths)
+        first = np.frombuffer(self.buf, "<u4", runs + 1, off)
+        off += -(-4 * (runs + 1) // 8) * 8
+        bucket = np.frombuffer(self.buf, "<i8", count, off)
+        mean = np.frombuffer(self.buf, "<f4", count, off + 8 * count)
+        off += 8 * count + -(-4 * count // 8) * 8
+        n = np.frombuffer(self.buf, "<u4", count, off)
+        soff = np.frombuffer(self.buf, "<u2", count, off + -(-4 * count // 8) * 8)
+        run = np.repeat(np.arange(runs, dtype=np.int32), np.diff(first.astype(np.int64)))
+        return Buckets(run, bucket, mean, soff, n)
+
+
+def _bound_dir(d: Path, limit: int) -> None:
+    """Delete the least recently used files of `d` until the rest hold at most `limit` bytes."""
+    files: list[tuple[float, int, Path]] = []
+    for f in d.iterdir():
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        files.append((st.st_mtime, st.st_size, f))
+    total = sum(x[1] for x in files)
+    for _, size, f in sorted(files, key=lambda x: x[0]):
+        if total <= limit:
+            return
+        f.unlink(missing_ok=True)
+        total -= size
+
+
 def default_workers() -> int:
     """$TREX_WORKERS, else the CPU count up to 32."""
     env = os.environ.get("TREX_WORKERS")
@@ -586,6 +668,7 @@ class Explorer:
                     self._writer.execute(sql)
             self._writer.execute("INSERT OR REPLACE INTO cache VALUES ('version', ?)", (str(CACHE_VERSION),))
             self._writer.execute("COMMIT")
+            shutil.rmtree(self.cache_dir / "levels", ignore_errors=True)
         self._write_lock = threading.Lock()  # serializes every use of `_writer`
         self.lock = threading.Lock()
         self.hub = Hub()
@@ -604,6 +687,8 @@ class Explorer:
         self._kept_gen = 0  # bumped whenever kept tiles change
         self._slab_gens: dict[str, int] = {}  # metric -> bumped whenever a finished run's kept tiles of it change
         self._memo: OrderedDict[tuple[object, ...], tuple[int, object, int]] = OrderedDict()  # stacks and merged levels: (gen, value, bytes)
+        self._building: dict[tuple[object, ...], threading.Lock] = {}  # a lock per memo entry, held while it is built
+        self._saved_at: dict[str, float] = {}  # metric -> when its merged levels were last saved (monotonic)
         self._view_gen = 0  # bumped whenever what `runs` answers may change
         self._runs_bodies: OrderedDict[str, tuple[int, bytes]] = OrderedDict()
         self._bundles: OrderedDict[tuple[object, ...], tuple[int, bytes]] = OrderedDict()  # bundles and slabs
@@ -1040,28 +1125,40 @@ class Explorer:
     def _slab(self, key: str, level: int, index: int, scope: str) -> bytes:
         """Slab (level, index) of `key` under `scope`: cut from the merged level (`_level`) for runs whose top tiles
         are no finer than it, from their tiles at `level` (`_fine_tiles`) for the others."""
-        ov, ov_level = self._stack(key, OVERVIEW)
+        paths, ov_level = self._runs(key)
         top = ov_level.astype(np.int16) - OVERVIEW_UP
-        inside = np.fromiter((in_scope(p, scope) for p in ov.paths), bool, len(ov.paths))
+        inside = np.fromiter((in_scope(p, scope) for p in paths), bool, len(paths))
         idx = np.flatnonzero(inside).astype(np.int32)
         fine = idx[top[idx] > level]
-        at = np.full(len(ov.paths), -1, np.int32)
+        at = np.full(len(paths), -1, np.int32)
         at[idx] = np.arange(idx.size, dtype=np.int32)  # run index in the stacks -> in the slab
         parts = [tiles.cut(self._level(key, level), index, inside & (top <= level))]
         if fine.size:
-            fs = tiles.stack(self._fine_tiles([ov.paths[i] for i in fine], key, level, index))
+            fs = tiles.stack(self._fine_tiles([paths[i] for i in fine], key, level, index))
             f = tiles.slab_parts(fs, level, index)
             parts.append(f._replace(run=fine[f.run]))  # its runs as indices into the stacks
-        return tiles.encode_slab(level, index, [ov.paths[i] for i in idx], [p._replace(run=at[p.run]) for p in parts])
+        return tiles.encode_slab(level, index, [paths[i] for i in idx], [p._replace(run=at[p.run]) for p in parts])
+
+    def _runs(self, key: str) -> tuple[list[str], npt.NDArray[np.int8]]:
+        """The finished runs of `key` in path order, and each one's overview level: from its saved levels when they
+        are current, else from the overview stack."""
+        saved = self._saved(key)
+        if saved is not None:
+            return saved.paths, saved.ov_level
+        ov, ov_level = self._stack(key, OVERVIEW)
+        return ov.paths, ov_level
 
     def _level(self, key: str, level: int) -> Buckets:
         """The buckets of every finished run of `key` whose top tiles are no finer than `level`, merged at `level` from
         its overview tiles when they are no coarser, else from its top tiles (`tiles.level_parts`, on threads); kept as
         stacks are."""
-        gen, k = self._slab_gens.get(key, 0), ("level", key, level)
-        hit = self._memo_get(k, gen)
-        if hit is not None:
-            return cast(Buckets, hit)
+        return self._once(("level", key, level), self._slab_gens.get(key, 0), lambda: self._merge_level(key, level))
+
+    def _merge_level(self, key: str, level: int) -> tuple[Buckets, int]:
+        saved = self._saved(key)
+        if saved is not None and level in saved.at:
+            part = saved.part(level)
+            return part, part.run.nbytes
         ov, ov_level = self._stack(key, OVERVIEW)
         from_ov = np.flatnonzero(ov_level <= level).astype(np.int32)
         from_top = np.flatnonzero((ov_level > level) & (ov_level.astype(np.int16) - OVERVIEW_UP <= level)).astype(np.int32)
@@ -1069,8 +1166,7 @@ class Explorer:
         if from_top.size:
             parts = [*parts, *self._merged(self._stack(key, TOP)[0], level, from_top)]
         part = tiles.join_buckets(parts, ordered=not from_top.size)
-        self._memo_put(k, gen, part, sum(x.nbytes for x in part))
-        return part
+        return part, sum(x.nbytes for x in part)
 
     def _merged(self, st: Stack, level: int, runs: npt.NDArray[np.int32]) -> list[Buckets]:
         """`tiles.level_parts` of the runs `runs` of `st`, on threads over runs in order (numpy lets go of the GIL)."""
@@ -1080,13 +1176,11 @@ class Explorer:
     def _stack(self, key: str, kind: int) -> tuple[Stack, npt.NDArray[np.int8]]:
         """The finished runs' kept tiles of `kind` (TOP or OVERVIEW) of `key`, decoded (`tiles.stack`; runs in path
         order, the same for both kinds), and each run's level of them; kept while they stay the same. A new overview
-        stack gets the levels from the finest top level to its own merged, on a thread of its own."""
-        gen, k = self._slab_gens.get(key, 0), ("stack", key, kind)
-        hit = self._memo_get(k, gen)
-        if hit is not None:
-            return cast(tuple[Stack, npt.NDArray[np.int8]], hit)
-        with self.lock:
-            done = sorted(p for p, rec in self.records.items() if rec["state"] != "running" and key in rec["keys"])
+        stack gets the levels from its own to the finest top level merged and saved, on a thread of its own."""
+        return self._once(("stack", key, kind), self._slab_gens.get(key, 0), lambda: self._read_stack(key, kind))
+
+    def _read_stack(self, key: str, kind: int) -> tuple[tuple[Stack, npt.NDArray[np.int8]], int]:
+        done, sig = self._finished(key)
         c = self.reader()
         try:
             rows = c.execute("SELECT path, data FROM tiles WHERE key=? AND kind=? ORDER BY path, idx", (key, kind)).fetchall()
@@ -1098,11 +1192,85 @@ class Explorer:
         st = tiles.stack([(p, runs.get(p, [])) for p in done])
         lv = np.full(len(st.paths), tiles.MIN_LEVEL, np.int8)
         np.maximum.at(lv, st.run, st.level)
-        self._memo_put(k, gen, (st, lv), st.nbytes)
         if kind == OVERVIEW and lv.size:
-            levels = range(int(lv.max()) - OVERVIEW_UP, int(lv.max()) + 1)
-            threading.Thread(target=lambda: [self._level(key, x) for x in levels], name="trex-levels", daemon=True).start()
-        return st, lv
+            levels = range(int(lv.max()), int(lv.max()) - OVERVIEW_UP - 1, -1)  # coarsest first, as zooms ask
+            threading.Thread(target=self._merge_ahead, args=(key, sig, st.paths, lv, levels), name="trex-levels", daemon=True).start()
+        return (st, lv), st.nbytes
+
+    def _merge_ahead(self, key: str, sig: bytes, paths: list[str], ov_level: npt.NDArray[np.int8], levels: range) -> None:
+        """Merge `levels` of `key` and save them (`_save_levels`) while its finished runs stay those of `sig`, at most
+        once every LEVELS_SAVE_EVERY seconds."""
+        parts = {x: self._level(key, x) for x in levels}
+        due = time.monotonic() - self._saved_at.get(key, -math.inf) >= LEVELS_SAVE_EVERY
+        if due and self._finished(key)[1] == sig and self._saved(key) is None:
+            self._saved_at[key] = time.monotonic()
+            self._save_levels(key, sig, paths, ov_level, parts)
+
+    def _finished(self, key: str) -> tuple[list[str], bytes]:
+        """The finished runs logging `key`, in path order, and a digest of them and their kept tiles."""
+        gen = self._slab_gens.get(key, 0)
+        hit = self._memo_get(("finished", key), gen)
+        if hit is not None:
+            return cast(tuple[list[str], bytes], hit)
+        with self.lock:
+            done = [(p, rec["tiles_seq"], rec["tiles_t"]) for p, rec in self.records.items()
+                    if rec["state"] != "running" and key in rec["keys"]]
+        done.sort()
+        paths = [p for p, _, _ in done]
+        h = hashlib.sha1(f"{CACHE_VERSION}\0{key}\0".encode())
+        h.update("\0".join(paths).encode())
+        h.update(np.array([(seq, t) for _, seq, t in done], np.float64).tobytes())
+        out = paths, h.digest()
+        self._memo_put(("finished", key), gen, out, 0)
+        return out
+
+    def _levels_file(self, key: str) -> Path:
+        return self.cache_dir / "levels" / hashlib.sha1(key.encode()).hexdigest()[:20]
+
+    def _saved(self, key: str) -> "SavedLevels | None":
+        """The merged levels of `key` an earlier build saved, when its finished runs and their kept tiles are the same."""
+        gen = self._slab_gens.get(key, 0)
+        hit = self._memo_get(("saved", key), gen)
+        if hit is not None:
+            return hit if isinstance(hit, SavedLevels) else None
+        paths, sig = self._finished(key)
+        f = self._levels_file(key)
+        try:
+            saved = SavedLevels.open(f, sig, paths)
+            if saved is not None:
+                os.utime(f)
+        except READ_ERRORS:
+            saved = None
+        self._memo_put(("saved", key), gen, saved or False, 0)
+        return saved
+
+    def _save_levels(self, key: str, sig: bytes, paths: list[str], ov_level: npt.NDArray[np.int8], parts: Mapping[int, Buckets]) -> None:
+        """Write merged levels of `key` (`SavedLevels.pack`) beside the index, then delete the least recently used saved
+        levels beyond LEVELS_BYTES."""
+        f = self._levels_file(key)
+        f.parent.mkdir(exist_ok=True)
+        tmp = f.with_name(f"{f.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_bytes(SavedLevels.pack(sig, len(paths), ov_level, parts))
+            tmp.replace(f)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            return
+        _bound_dir(f.parent, LEVELS_BYTES)
+
+    def _once[T](self, k: tuple[object, ...], gen: int, build: Callable[[], tuple[T, int]]) -> T:
+        """build()'s value (and its bytes) kept under `k` at slab generation `gen`; built by one thread while others
+        asking for it wait."""
+        hit = self._memo_get(k, gen)
+        if hit is None:
+            with self._bundle_lock:
+                lock = self._building.setdefault(k, threading.Lock())
+            with lock:
+                hit = self._memo_get(k, gen)
+                if hit is None:
+                    hit, nbytes = build()
+                    self._memo_put(k, gen, hit, nbytes)
+        return cast(T, hit)
 
     def _memo_get(self, k: tuple[object, ...], gen: int) -> object | None:
         with self._bundle_lock:
