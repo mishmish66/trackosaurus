@@ -22,6 +22,7 @@ from pathlib import Path
 
 import json
 import math
+import statistics
 import os
 import urllib.request
 
@@ -44,6 +45,144 @@ for step in range(300):
 for r in runs:
     r.finish()
 """
+
+
+FLICKER_WRITER = """
+import math, random, sys, time, trex
+runs = [trex.init(f"{sys.argv[1]}/flicker/{g}/r{i}", commit_interval=0.1) for g in "ab" for i in range(3)]
+rngs = [random.Random(i) for i in range(len(runs))]
+def log(step):
+    for r, rng in zip(runs, rngs):
+        r.log({"loss": math.exp(-step / 200) + rng.gauss(0, 0.05)}, step=step)
+for step in range(260):
+    log(step)
+print("ready", flush=True)
+for step in range(260, 500):  # no power of two between: the top tiles keep their level
+    log(step)
+    time.sleep(0.04)
+for r in runs:
+    r.finish()
+"""
+
+MANY_WRITER = """
+import math, sys, trex
+from concurrent.futures import ThreadPoolExecutor
+def one(gi):
+    g, i = gi
+    r = trex.init(f"{sys.argv[1]}/many/{g}/r{i}", commit_interval=0.01)
+    for s in range(200):
+        r.log({"loss": math.exp(-s / 50) + (i % 7) * 0.01 + (0.1 if g == "b" else 0) + 0.02 * math.sin(s * (i + 1))}, step=s)
+    r.finish()
+with ThreadPoolExecutor(16) as pool:
+    list(pool.map(one, [(g, i) for g in "ab" for i in range(160)]))
+"""
+
+RECORD_DRAWS = """() => {
+  window.draws = [];
+  const C = [...app.charts.values()][0].constructor;
+  if (C.prototype.recorded) return;
+  C.prototype.recorded = true;
+  const draw = C.prototype.draw;
+  C.prototype.draw = function () {
+    draw.call(this);
+    const v = this.view;
+    if (!v || !this.w) return;
+    const lines = v.lines.map((ln) => {
+      const c = ln.cols?.[0], n = ln.xy ? ln.xy.length / 2 : c ? c.n : 0;
+      return [ln.run?.id ?? ln.group ?? ln.label, n, ln.xy ? ln.xy[ln.xy.length - 2] : c && c.n ? c.s[c.n - 1] : null];
+    });
+    draws.push({ key: this.key, paced: app.paced, y0: v.y0, y1: v.y1, lines });
+  };
+}"""
+
+
+def flicker_faults(draws):
+    """What a viewer would see flicker between consecutive draws of a chart: a line with fewer points or its end
+    further back, a line gone for a draw, and a streamed redraw shrinking the y axis."""
+    faults, by = [], {}
+    for d in draws:
+        by.setdefault(d["key"], []).append(d)
+    for key, ds in by.items():
+        for a, b in zip(ds, ds[1:]):
+            was = {l[0]: l for l in a["lines"]}
+            for k, n, tip in b["lines"]:
+                if k in was and (n < was[k][1] or (tip is not None and was[k][2] is not None and tip < was[k][2])):
+                    faults.append(f"{key} {k}: {was[k][1]} points to {n}, end {was[k][2]} to {tip}")
+            if b["paced"] and (b["y0"] > a["y0"] or b["y1"] < a["y1"]):
+                faults.append(f"{key}: y axis [{a['y0']:.4g}, {a['y1']:.4g}] to [{b['y0']:.4g}, {b['y1']:.4g}]")
+        for a, b, c in zip(ds, ds[1:], ds[2:]):
+            gone = {l[0] for l in a["lines"]} & {l[0] for l in c["lines"]} - {l[0] for l in b["lines"]}
+            faults += [f"{key} {k}: gone for a draw" for k in gone]
+    return faults
+
+
+def flicker_smoke(page, url, runs):
+    """Whether charts drawing runs that stream, line by line and grouped, never show a line shrink, its end move back
+    or vanish for a draw, nor a streamed redraw shrink the y axis."""
+    writer = subprocess.Popen([sys.executable, "-c", FLICKER_WRITER, str(runs)], stdout=subprocess.PIPE, text=True)
+    try:
+        writer.stdout.readline()
+        page.goto(f"{url}/?flicker#path=flicker&group=run")
+        page.wait_for_function("window.app && app.data.runs.size === 6 && [...app.charts.values()].some((c) => c.view)", timeout=30000)
+        page.evaluate(RECORD_DRAWS)
+        page.wait_for_timeout(3500)
+        lines = page.evaluate("draws")
+        page.evaluate("draws = []; app.setGroup('run~1')")
+        page.wait_for_timeout(3500)
+        groups = page.evaluate("draws")
+    finally:
+        writer.wait()
+    faults = flicker_faults(lines) + flicker_faults(groups)
+    print(f"flicker: {len(lines)} draws of lines, {len(groups)} of groups while 6 runs streamed; "
+          + (f"faults {faults[:5]}" if faults else "no line shrank, moved back or vanished, no streamed redraw shrank an axis"))
+    return len(lines) > 4 and len(groups) > 4 and not faults
+
+
+def many_value(group, i, step):
+    """What MANY_WRITER logs."""
+    return math.exp(-step / 50) + (i % 7) * 0.01 + (0.1 if group == "b" else 0) + 0.02 * math.sin(step * (i + 1))
+
+
+def group_medians(group, g0, dx, bins):
+    """Per bin of a grid, the median over a MANY_WRITER group's runs of each run's mean of its rows in the bin."""
+    out = []
+    for k in range(bins):
+        steps = [s for s in range(200) if g0 + k * dx <= s < g0 + (k + 1) * dx]
+        out.append(statistics.median(statistics.fmean(many_value(group, i, s) for s in steps) for i in range(160)) if steps else None)
+    return out
+
+
+def slab_smoke(page, url, runs):
+    """Whether a zoom of more runs than a chart draws one by one draws from slabs, as group statistics (each group's
+    median per bin of its runs' means of their rows) and as a heatmap, while `?shared=0` draws from columns; and
+    whether a server of another protocol is stated."""
+    subprocess.run([sys.executable, "-c", MANY_WRITER, str(runs)], check=True)
+    drawn = {}
+    for q in ("", "shared=0"):
+        page.goto(f"{url}/?slabs&{q}#path=many&group=run~1")
+        page.wait_for_function("window.app && app.data.runs.size === 320", timeout=60000)
+        page.wait_for_function(SETTLED, timeout=60000)
+        page.evaluate("app.setXRange([60, 140, 0])")
+        page.wait_for_timeout(300)
+        page.wait_for_function(SETTLED, timeout=60000)
+        drawn[q] = page.evaluate("""(() => { const c = app.charts.get('loss');
+            return [c.fromSlabs, c.view.lines.map((l) => [l.label.split(' ')[0], l.g0, l.dx, [...l.center]])]; })()""")
+    page.goto(f"{url}/?slabs#path=many&group=run")
+    page.wait_for_function("window.app && app.data.runs.size === 320", timeout=60000)
+    page.wait_for_function(SETTLED, timeout=60000)
+    page.evaluate("app.setXRange([60, 140, 0])")
+    page.wait_for_timeout(300)
+    page.wait_for_function(SETTLED, timeout=60000)
+    heat = page.evaluate("(() => { const c = app.charts.get('loss'); return [c.fromSlabs, c.view.density, c.view.lines.length]; })()")
+    page.evaluate("app.showProtocol(1)")
+    stated = page.evaluate("[!document.querySelector('#mismatch').hidden, document.querySelector('#mismatch').title]")
+    slabbed, lines = drawn[""]
+    off = [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
+    print(f"slabs: a zoom of 320 runs drew from slabs {slabbed} (with shared=0: {drawn['shared=0'][0]}), groups {[l[0] for l in lines]} of "
+          f"{len(lines[0][3]) if lines else 0} bins, at most {max(off, default=1):.2g} off their exact medians; heatmap from slabs {heat}; "
+          f"protocol 1 stated {stated}")
+    return (slabbed is True and drawn["shared=0"][0] is False and sorted(l[0] for l in lines) == ["a", "b"] and off and max(off) < 1e-5
+            and heat == [True, True, 320] and stated[0] and "the server 1" in stated[1])
 
 
 class JsCoverage:
@@ -131,28 +270,29 @@ def file_columns(run_dir):
 
 READY = ("window.app && app.data.runs.size > 0 && app.charts.size > 0 && !app.data.queue.length && !app.data.posts"
          " && [...app.charts.values()].some((c) => c.view)")
+SETTLED = READY + " && !app.data.busy && !app.round && !app.raf && !app.planTimer"
 
 
 def group_levels_smoke(page, url):
-    """Whether opening a group makes it a path level showing its runs ungrouped, a grouping inside it opens a
-    deeper level, and the path bar and back button return to each level with the grouping it had."""
-    state = """() => [app.opts.focus.length, app.opts.group.join(), app.grouped, app.runList.filter((r) => r.shown).length,
+    """Whether opening a group narrows the view to its runs, drawn as lines, a group nested inside it opens a deeper
+    level, and the path bar and back button return to each level, the group-by staying as set."""
+    state = """() => [app.opts.focus.length, app.opts.group, app.grouped, app.runList.filter((r) => r.shown).length,
         [...document.querySelectorAll('#crumbPath .crumb')].map((e) => e.textContent)]"""
     def ends(text):
         page.wait_for_function(f"[...document.querySelectorAll('#crumbPath .crumb')].at(-1)?.textContent === {json.dumps(text)}")
 
-    page.goto(f"{url}/?levels#path=sweep&group=config.lr")
+    page.goto(f"{url}/?levels#path=sweep&group=lr")
     page.wait_for_function(READY, timeout=30000)
-    sizes = page.evaluate("Object.fromEntries([...app.groups].map(([k, g]) => [k, g.runs.length]))")
+    sizes = page.evaluate("Object.fromEntries([...app.groups.values()].map((g) => [g.values.join(), g.runs.length]))")
     page.click("button.gfocus[title='open this group']")
     page.wait_for_function("app.opts.focus.length === 1")
-    lr = page.evaluate("app.opts.focus[0][1]")
+    lr = page.evaluate("app.opts.focus[0][1][0]")
     ends(f"lr: {lr}")
     opened = page.evaluate(state)
-    page.evaluate("app.setGroup(['config.seed'])")
+    page.evaluate("app.setGroup('lr / seed')")
     page.click("button.gfocus[title='open this group']")
     page.wait_for_function("app.opts.focus.length === 2")
-    seed = page.evaluate("app.opts.focus[1][1]")
+    seed = page.evaluate("app.opts.focus[1][1][0]")
     ends(f"seed: {seed}")
     nested = page.evaluate(state)
     both = page.evaluate(f"app.runList.filter((r) => String(r.meta.config.lr) === {json.dumps(lr)} && String(r.meta.config.seed) === {json.dumps(seed)}).length")
@@ -164,9 +304,9 @@ def group_levels_smoke(page, url):
     page.click("#crumbPath .crumb:text-is('sweep')")
     home = page.evaluate(state)[:3]
     print(f"group levels: opened lr {lr} {opened}; nested seed {seed} {nested}; up {up}; back {back}; folder {home}")
-    return (opened[:4] == [1, "", False, sizes[lr]] and opened[4][-2:] == ["sweep", f"lr: {lr}"]
-            and nested[:4] == [2, "", False, both] and nested[4][-3:] == ["sweep", f"lr: {lr}", f"seed: {seed}"]
-            and up[:3] == [1, "config.seed", True] and back == [2, ""] and home == [0, "config.lr", True])
+    return (opened[:4] == [1, "lr", False, sizes[lr]] and opened[4][-2:] == ["sweep", f"lr: {lr}"]
+            and nested[:4] == [2, "lr / seed", False, both] and nested[4][-3:] == ["sweep", f"lr: {lr}", f"seed: {seed}"]
+            and up[:3] == [1, "lr / seed", True] and back == [2, "lr / seed"] and home == [0, "lr / seed", True])
 
 
 def interactions_smoke(page, url):
@@ -268,10 +408,15 @@ def interactions_smoke(page, url):
     page.locator("#runTable tr:has(td.name a) input[type=checkbox]").last.uncheck()
     checks["a run's checkbox hides it"] = soon("app.runList.filter((r) => !r.shown).length === 1")
     page.locator("#runTable tr:has(td.name a) input[type=checkbox]").last.check()
-    page.click("#groupAdd")
-    page.fill("#menu input[type=search]", "see")
-    checks["group-by search narrows the fields"] = page.locator("#menu .mitem").count() == 1
+    page.click("#groupBy")
+    page.keyboard.press("Control+a")
+    page.keyboard.type("see")
+    checks["the group-by box completes fields"] = soon(
+        "JSON.stringify([...document.querySelectorAll('#menu .mitem .ml')].map((e) => e.textContent)) === '[\"seed\"]'")
     page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+    checks["leaving the group-by box applies it"] = soon("app.opts.group === 'see' && document.activeElement.id !== 'groupBy'")
+    page.evaluate("app.setGroup('')")
     page.locator("#panels").click(position={"x": 5, "y": 5})
     for k in ("End", "Home", "PageDown", "ArrowUp"):
         page.keyboard.press(k)
@@ -315,7 +460,7 @@ def interactions_smoke(page, url):
     checks["the sidebar keeps its width after a reload"] = page.evaluate(width) >= w0 + 100
     page.dblclick("#sideGrip")
     checks["double-clicking the grip resets the width"] = soon(f"{width} === {w0}")
-    page.goto(f"{url}/?iqm#path=sweep&group=config.lr&center=iqm")
+    page.goto(f"{url}/?iqm#path=sweep&group=lr&center=iqm")
     page.wait_for_function(READY, timeout=30000)
     plot()
     checks["IQM draws each group's interquartile mean with a CI band"] = soon(
@@ -327,7 +472,7 @@ def interactions_smoke(page, url):
     checks["the y axis follows the group lines; a band widens it by at most a quarter"] = (
         span[2] <= span[0] and span[3] >= span[1] and span[2] >= span[0] - reach - 0.05 * (span[1] - span[0] + 2 * reach)
         and span[3] <= span[1] + reach + 0.05 * (span[1] - span[0] + 2 * reach))
-    page.goto(f"{url}/?gl=0#path=sweep&group=config.lr")
+    page.goto(f"{url}/?gl=0#path=sweep&group=lr")
     page.wait_for_function(READY, timeout=30000)
     hover(plot())
     page.goto(f"{url}/?gl=0#path=sweep&group=")
@@ -370,7 +515,7 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         page.click("#menu button:text-is('save')")
         page.wait_for_url(f"{url}/w/both/")
         page.wait_for_function(READY, timeout=30000)
-        merged = page.evaluate("[app.data.runs.size, app.groupFields().some((f) => f.id === 'dir')]")
+        merged = page.evaluate("[app.data.runs.size, app.groupFieldItems().some((f) => f.label === 'dir')]")
         page.screenshot(path=str(out / "workspace.png"))
         page.click("#crumbPath .crumb:text-is('/')")
         page.wait_for_url(f"{url}/")
@@ -554,29 +699,32 @@ def hidden_panels_smoke(page, url):
 
 
 def grouping_modes_smoke(page, url):
-    """Whether the sidebar lists runs flat with nothing to group by, nests them by folder under "path" with a state dot
-    per folder, a field picked after "path" groups by that field alone, and `visible = true` leaves out unchecked
-    runs."""
+    """Whether runs group by their directory by default, one line per directory of several runs with a state dot;
+    `run~2 / run~1` nests directories, each named within its parent, and opening one opens that directory; `run`
+    lists the runs flat; and `visible = true` leaves out unchecked runs."""
     heads = "[...document.querySelectorAll('#runTable tr.grp .gname')].map((e) => e.firstChild.textContent)"
     runs = "document.querySelectorAll('#runTable tr:has(td.name a)').length"
 
-    def pick(label):
-        page.click(f"#menu .mitem:has(.ml:text-is('{label}'))")
+    def group_by(text):
+        page.fill("#groupBy", text)
+        page.keyboard.press("Escape")
+        page.keyboard.press("Escape")
+        page.wait_for_function(f"app.opts.group === {json.dumps(text)}")
 
-    page.goto(f"{url}/?modes#path=&group=")
+    page.goto(f"{url}/?modes#path=")
+    page.wait_for_function(READY, timeout=30000)
+    page.wait_for_function("document.querySelectorAll('#runTable tr.grp').length > 0")
+    dirs = [page.evaluate(heads), page.evaluate("app.grouped"), page.evaluate("[app.opts.group, location.hash.includes('group=')]")]
+    dots = page.evaluate("[...document.querySelectorAll('#runTable tr.grp td.stc .dot')].map((d) => [d.className, d.title])")
+    group_by("run~2 / run~1")
+    page.wait_for_function("[...document.querySelectorAll('#runTable tr.grp .gname')].some((e) => e.firstChild.textContent.startsWith('lr'))")
+    nested = [page.evaluate(heads), page.evaluate("app.grouped")]
+    page.click("#runTable tr.grp:has(td.gname[title='sweep/width128']) button.gfocus")
+    page.wait_for_function("app.opts.path === 'sweep/width128' && app.data.runs.size === 9 && document.querySelectorAll('#runTable tr.grp').length === 3")
+    opened = [page.evaluate("app.opts.focus.length"), page.evaluate(heads)]
+    page.goto(f"{url}/?modes#path=&group=run")
     page.wait_for_function(READY, timeout=30000)
     flat = [page.evaluate(heads), page.evaluate(runs), page.evaluate("app.grouped")]
-    page.click("#groupAdd")
-    pick("path")
-    page.wait_for_function("app.byPath && document.querySelectorAll('#runTable tr.grp').length > 0")
-    nested = [page.evaluate(heads), page.evaluate("app.grouped"), page.evaluate("location.hash.includes('group=path')")]
-    dots = page.evaluate("[...document.querySelectorAll('#runTable tr.grp td.stc .dot')].map((d) => [d.className, d.title])")
-    pick("lr")
-    page.wait_for_function("app.grouped && [...document.querySelectorAll('#runTable tr.grp .gname')].some((e) => /^0\\./.test(e.firstChild.textContent))")
-    by_lr = [page.evaluate("app.opts.group"), [h for h in page.evaluate(heads) if h.startswith("lr")]]
-    page.keyboard.press("Escape")
-    page.evaluate("app.setGroup([])")
-    page.wait_for_function(f"{runs} > 10")
     first = page.locator("#runTable tr:has(td.name a)").first
     name = first.locator("td.name").get_attribute("title")
     first.locator("input[type=checkbox]").uncheck()
@@ -587,11 +735,14 @@ def grouping_modes_smoke(page, url):
     page.keyboard.press("Escape")
     page.wait_for_function(f"[...document.querySelectorAll('#runTable td.name')].some((t) => t.title === {name!r})")
     page.locator(f"#runTable tr:has(td.name[title='{name}']) input[type=checkbox]").check()
-    print(f"grouping modes: flat {flat}; path {nested}, dots {dots[:3]}; then lr {by_lr}; visible = true leaves {filtered} of {flat[1]}")
-    return (flat[0] == [] and flat[1] > 10 and flat[2] is False and "sweep" in nested[0] and nested[1] is False and nested[2]
-            and by_lr[0] == ["config.lr"] and by_lr[1] == [] and len(dots) == len(nested[0])
-            and all(c.split()[1] in ("running", "finished", "crashed", "failed") and t for c, t in dots)
-            and filtered == [flat[1] - 1, flat[1] - 1])
+    print(f"grouping modes: run~1 {dirs}, dots {dots[:3]}; run~2 / run~1 {nested}, opened {opened}; run {flat}; "
+          f"visible = true leaves {filtered} of {flat[1]}")
+    lrs = ["lr0.001", "lr0.003", "lr0.01"]
+    return ("sweep/width128/lr0.001" in dirs[0] and dirs[1] is True and dirs[2] == ["run~1", False]
+            and len(dots) == len(dirs[0]) and all(c.split()[1] in ("running", "finished", "crashed", "failed") and t for c, t in dots)
+            and {"sweep/width128", "sweep/width512", *lrs} <= set(nested[0]) and nested[1] is True
+            and opened[0] == 0 and sorted(opened[1]) == lrs
+            and flat[0] == [] and flat[1] > 10 and flat[2] is False and filtered == [flat[1] - 1, flat[1] - 1])
 
 
 def hidden_runs_smoke(page, url):
@@ -636,11 +787,17 @@ def main():
     subprocess.run([sys.executable, str(REPO / "examples/demo.py"), str(runs / "sweep"), "--seeds", "3", "--steps", "1500"], check=True)
     subprocess.run([sys.executable, "-c", NESTED_WRITER, str(runs)], check=True)
     port = free_port()
-    env = {**os.environ, "TREX_DAEMON_DIR": str(tmp / "daemon")}
+    env = {**os.environ, "TREX_DAEMON_DIR": str(tmp / "daemon"), "TREX_TOP_REFRESH": "1"}
     server = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs), "--standalone", "--port", str(port),
                                "--cache", str(tmp / "cache")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     url = f"http://127.0.0.1:{port}"
-    ok = True
+    ok, failed = True, []
+
+    def check(name, passed):
+        if not passed:
+            failed.append(name)
+        return bool(passed)
+
     try:
         server.stdout.readline()
         with sync_playwright() as p:
@@ -653,20 +810,22 @@ def main():
             page.on("console", lambda m: m.type == "error" and errors.append(f"{m.type}: {m.text}"))
             page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
             ready = READY
-            for label, h in [("cold", "#path=sweep"), ("warm", "#path=sweep"), ("grouped", "#path=sweep&group=config.lr")]:
+            for label, h in [("cold", "#path=sweep"), ("warm", "#path=sweep"), ("grouped", "#path=sweep&group=lr")]:
                 page.goto(f"{url}/?{label}{h}")
                 page.wait_for_function(ready, timeout=30000)
                 page.wait_for_timeout(500)
                 print(f"{label}: {page.inner_text('#status')}")
                 page.screenshot(path=str(out / f"{label}.png"))
 
-            ok &= group_levels_smoke(page, url)
-            ok &= sections_smoke(page, url)
-            ok &= hidden_runs_smoke(page, url)
-            ok &= grouping_modes_smoke(page, url)
-            ok &= hidden_panels_smoke(page, url)
-            ok &= filter_smoke(page, url)
-            ok &= interactions_smoke(page, url)
+            ok &= check("group_levels_smoke", group_levels_smoke(page, url))
+            ok &= check("sections_smoke", sections_smoke(page, url))
+            ok &= check("hidden_runs_smoke", hidden_runs_smoke(page, url))
+            ok &= check("grouping_modes_smoke", grouping_modes_smoke(page, url))
+            ok &= check("hidden_panels_smoke", hidden_panels_smoke(page, url))
+            ok &= check("filter_smoke", filter_smoke(page, url))
+            ok &= check("interactions_smoke", interactions_smoke(page, url))
+            ok &= check("flicker_smoke", flicker_smoke(page, url, runs))
+            ok &= check("slab_smoke", slab_smoke(page, url, runs))
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])
             deadline = time.time() + 20
             while not (runs / "live").exists() and time.time() < deadline:
@@ -698,12 +857,12 @@ def main():
                 tiles = {k: t["n"] for k, t in c["tiles"].items()}
                 match = (c["seq"] == n and c["media"] == mseq and c["tail"] == 0 and tiles
                          and all(t["seq"] == n for t in c["tiles"].values()) and all(tiles[k] == finite.get(k, 0) for k in tiles))
-                ok &= bool(match)
+                ok &= check(f"live {rid}", match)
                 print(f"{rid}: client {c['seq']} rows / {c['media']} media / tile points {tiles}, "
                       f"file {n} / {mseq} / finite {finite}: {'match' if match else 'MISMATCH'}")
             print(f"dropped {client['dropped']} rows events; client {'converged' if ok else 'DIVERGED'}")
             server.terminate()
-            ok &= daemon_smoke(page, runs, tmp, env, out, errors)
+            ok &= check("daemon_smoke", daemon_smoke(page, runs, tmp, env, out, errors))
             coverage.take()
             coverage.add_node_tests()
             lines = coverage.report()
@@ -718,6 +877,8 @@ def main():
     finally:
         server.terminate()
         server.wait()
+    if failed:
+        print(f"failed: {', '.join(failed)}")
     if ok:
         shutil.rmtree(tmp)
     print(f"screenshots in {out}" + ("" if ok else f"; scratch data kept in {tmp}"))

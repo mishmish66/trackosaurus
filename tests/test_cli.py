@@ -79,10 +79,10 @@ def test_ls_paths_pipe_into_series_and_diff(runs, capsys, monkeypatch):
 
 
 def test_groups_report_center_and_order_statistic_ci(runs, capsys):
-    out = run_json(capsys, "groups", runs / "sweep", "-g", "subfolder", "-m", "loss")
-    assert [g["subfolder"] for g in out] == ["lr0.001", "lr0.01"]
+    out = run_json(capsys, "groups", runs / "sweep", "-g", "run~1", "-m", "loss")
+    assert [g["run~1"] for g in out] == ["lr0.001", "lr0.01"]
     for g in out:
-        lr = float(g["subfolder"][2:])
+        lr = float(g["run~1"][2:])
         vals = sorted(1.0 / (1 + lr * 99 * (s + 1)) for s in range(3))
         st = g["loss:stats"]
         assert g["runs"] == 3 and st["median"] == pytest.approx(statistics.median(vals))
@@ -253,8 +253,22 @@ def test_groups_table_goes_to_stdout_and_the_ci_note_to_stderr(runs, capsys):
 
 
 def test_groups_without_metrics_count_runs_per_group(runs, capsys):
-    out = run_json(capsys, "groups", runs, "-g", "subfolder")
-    assert [(g["subfolder"], g["runs"]) for g in out] == [("sweep", 6)]
+    out = run_json(capsys, "groups", runs, "-g", "run~2")
+    assert [(g["run~2"], g["runs"]) for g in out] == [("sweep", 6)]
+
+
+def test_groups_take_the_ui_group_by_expression(runs, capsys):
+    nested = run_json(capsys, "groups", runs, "-g", "run~2 / run~1")
+    assert [(g["run~2"], g["run~1"], g["runs"]) for g in nested] == [("sweep", "sweep/lr0.001", 3), ("sweep", "sweep/lr0.01", 3)]
+    alone = run_json(capsys, "groups", runs / "sweep", "-g", "run, config.lr")
+    assert sorted(g["run"] for g in alone) == sorted(f"lr{lr}/seed{s}" for lr in ("0.001", "0.01") for s in range(3))
+    assert all(g["runs"] == 1 and g["config.lr"] == float(g["run"][2:].split("/")[0]) for g in alone)
+
+
+def test_groups_default_to_the_declared_group_by_else_the_run_directory(runs, capsys):
+    assert [(g["run~1"], g["runs"]) for g in run_json(capsys, "groups", runs / "sweep")] == [("lr0.001", 3), ("lr0.01", 3)]
+    trex.folder_info(runs / "sweep", trex={"group_by": "config.lr"})
+    assert [(g["config.lr"], g["runs"]) for g in run_json(capsys, "groups", runs / "sweep" / "lr0.01")] == [(0.01, 3)]
 
 
 def test_show_lists_media_and_folder_notes(runs, capsys):

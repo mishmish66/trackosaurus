@@ -82,11 +82,10 @@ def main() -> None:
                     jobs.append((args.dest / f"width{width}" / f"lr{lr}" / f"seed{seed}", lr, seed, args.steps, 0.0, 1000, width))
     if args.live:
         trex.folder_info(args.dest, question="does a slow live run stream smoothly?", started=time.strftime("%Y-%m-%d %H:%M"))
-        trex.folder_info(args.dest / "sweep", trex={"group_by": ["subfolder"]})
     else:
         trex.folder_info(args.dest, question="how do width and learning rate interact?",
                          design={"widths": [128, 512], "lrs": [0.001, 0.003, 0.01], "seeds": args.seeds},
-                         trex={"group_by": ["subfolder"]})
+                         trex={"group_by": "run~2 / run~1"})
         for width in (128, 512):
             trex.folder_info(args.dest / f"width{width}", width=width, params_m=round(width * width * 4 / 1e6, 2))
     threads = [threading.Thread(target=fake_run, args=j) for j in jobs]

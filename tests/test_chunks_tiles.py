@@ -261,3 +261,35 @@ def test_tiles_of_the_span_level_are_the_narrowest_at_least_the_span_wide(k):
         level = tiles.level_for(span)
         assert 2.0 ** level * tiles.TILE >= span > 2.0 ** (level - 1) * tiles.TILE
         assert len(tiles.covering(level, 3 * base - span / 2, 3 * base + span / 2)) <= 2
+
+
+def test_a_slab_holds_each_runs_buckets_as_its_tiles_merged_to_the_slab_level():
+    rng = np.random.default_rng(3)
+    runs = []
+    for i, n in enumerate([300, 1700, 0, 4000]):
+        steps: np.ndarray = np.arange(n) * 1.5
+        values = rng.normal(size=n)
+        values[::13], values[5::41], values[7::43] = np.nan, np.inf, -np.inf
+        level, idx = tiles.top_tiles(0, max(steps[-1], 1) if n else 1)
+        runs.append((f"r{i}", [tiles.build(steps, values, steps * 0.25, level, k) for k in idx]))
+    level = max(tiles.decode(b).level for _, bs in runs for b in bs) + 1
+    for index in (0, 1):
+        s = tiles.decode_slab(tiles.slab(runs, level, index))
+        assert (s.level, s.index, s.paths) == (level, index, ["r0", "r1", "r2", "r3"])
+        for i, (_, blobs) in enumerate(runs):
+            up = level - tiles.decode(blobs[0]).level
+            want = [t for t in map(tiles.decode, tiles.coarsen(blobs, up)) if t.index == index and t.bucket.size]
+            got = slice(s.first[i], s.first[i + 1])
+            if not want:
+                assert s.first[i] == s.first[i + 1]
+                continue
+            t = want[0]
+            assert np.array_equal(s.bucket[got], t.bucket) and np.array_equal(s.n[got], t.n)
+            np.testing.assert_allclose(s.mean[got], t.mean, rtol=1e-6, atol=1e-6)
+            np.testing.assert_allclose(s.soff[got], t.soff, atol=1.0 / tiles.SOFF_SCALE)
+
+
+def test_a_slab_is_refused_tiles_coarser_than_it():
+    blob = tiles.build(np.arange(10.0), np.arange(10.0), np.arange(10.0), 3, 0)
+    with pytest.raises(ValueError):
+        tiles.slab([("r", [blob])], 2, 0)

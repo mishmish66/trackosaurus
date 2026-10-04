@@ -2,12 +2,15 @@
 // cache, and the SSE stream. Each (run, metric) column is built from the best tiles present plus the
 // rows streamed since its kept tiles [tiles_seq, seq); a gap or a missed heartbeat resyncs the run.
 
-import { Col, X_STEP, crc32 } from "./kernel.js";
+import { Col, X_STEP, adoptStore, columnStore, crc32, freeStore, holdStore, slabViews } from "./kernel.js";
+import { fetchSlabOnWorker } from "./pool.js";
 import { asNumber } from "./where.js";
 
 const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
 
 /** URL prefix of what the page shows: a daemon's tracked directory ("/r/<name>") or workspace ("/w/<name>"), else "". */
+/** What this page and the server say to each other (server.PROTOCOL); the page states a mismatch. */
+export const PROTOCOL = 3;
 export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/[rw]\/[^/]+(?=\/)/) || [""])[0];
 
 /** URL of a media record's file; content-addressed, so browsers cache it as immutable. */
@@ -18,18 +21,25 @@ const MIN_LEVEL = -20;
 const POINT_BUDGET = 1.5e6; // points per chart across all its runs
 const TOP_BUCKETS = 192; // typical non-empty buckets of a run's top tiles
 const BATCH = 512; // tile requests per POST
-const PARALLEL = 4; // POSTs in flight
+const PARALLEL = 5; // POSTs in flight: the browser's six connections to a host, less the stream's
 const FINE_BYTES = 256e6; // decoded finer tiles kept in memory
 const IDB_ENTRIES = 400000; // cached top-tile entries kept in IndexedDB
-const IDB_CHUNK = 400; // entries per IndexedDB write
+const IDB_SLICE_MS = 8; // IndexedDB writing per idle period
 const REBUILD_SLICE_MS = 8; // column rebuilds per task, in ms
 const OVERVIEW_UP = 2; // levels the server's overview tiles sit above the top tiles (index.OVERVIEW_UP)
 const OVERVIEW_MIN_RUNS = 300; // charts with more runs load overview tiles before top tiles
 const BUNDLE_MIN = 64; // runs of a chart missing a tier above which one bundle request fetches it...
 const BUNDLE_SHARE = 4; // ...when they are also at least 1 / BUNDLE_SHARE of the chart's runs
+const PREFETCH_BYTES = 256e6; // top tiles fetched ahead of a view's need, held until one asks for them
+const SLAB_BYTES = 384e6; // slabs kept in shared memory, the least recently used dropped beyond
+const SLAB_AHEAD_BYTES = 256e6; // of which fetched ahead of need
+const SLAB_KEEP_MS = 2000; // a slab used this recently is not dropped
+const SLAB_UP = 4; // levels coarser a view draws from while its slabs come
+const SLAB_TILE = 256; // buckets of a slab's step range (tiles.TILE)
+const PREFETCH_IDLE_MS = 400; // quiet time before the next prefetch
 const FINE_HOLD_MS = 10000; // tail rows a refetched finer tile needs are kept this long while it is fetched
-const LINE_PX_PER_BUCKET = 2; // chart width per bucket a line needs
-const DENSITY_PX_PER_BUCKET = 8; // the same in a density heatmap or group statistics of many runs
+export const LINE_PX_PER_BUCKET = 2; // chart width per bucket a line needs
+export const DENSITY_PX_PER_BUCKET = 8; // the same in a density heatmap or group statistics of many runs
 const FINE_TILES = 2048; // finer tiles one chart may need
 const NO_TAIL = Object.freeze({ s: [], v: [], t: [], n: 0, s0: Infinity });
 const NO_FINE = Object.freeze({ s: [], v: [], t: [], n: 0 });
@@ -71,15 +81,27 @@ function bucketSpan(tiles) {
   return [lo, hi];
 }
 
+/** Whether demand d draws run r from slabs, which then stand for its tiles: a finished run. */
+const slabbed = (d, r) => !!d.slabs && r.meta.state !== "running";
+
 /** Whether tile request x asks for a kept tier ("top" or "overview"), not a finer tile. */
 const isKept = (x) => typeof x[2] === "string";
 
 /** Metadata of a run known only by its id until it is resynced. */
+/** The next idle period of the main thread ({timeRemaining()}); without requestIdleCallback, a short slot later. */
+const idleTime = () => new Promise((ok) => {
+  if (typeof requestIdleCallback === "function") return requestIdleCallback(ok, { timeout: 5000 });
+  setTimeout(() => {
+    const t0 = performance.now();
+    ok({ timeRemaining: () => 8 - (performance.now() - t0) });
+  }, 200);
+});
+
 const placeholderMeta = (id, seq = 0, mseq = 0) =>
   ({ id, seq, mseq, tiles_seq: 0, keys: [], summary: {}, config: {}, tags: [], name: id, state: "running" });
 
 /** Whether run r logs metric `key` (a set kept in step with r.meta.keys). */
-function hasKey(r, key) {
+export function hasKey(r, key) {
   if (r.keyList !== r.meta.keys) {
     r.keyList = r.meta.keys;
     r.keySet = new Set(r.meta.keys || []);
@@ -128,6 +150,18 @@ const idb = {
       os.getAll(range).onsuccess = (e) => (vals = e.target.result);
       tx.oncomplete = () => ok(keys.map((k, i) => [k, vals[i]]));
       tx.onerror = tx.onabort = () => ok([]);
+    });
+  },
+  /** Put the entries `next()` returns ([key, value]) in one transaction, until it returns null. */
+  putEach(store, next) {
+    if (!this.db) {
+      while (next());
+      return Promise.resolve();
+    }
+    return new Promise((ok) => {
+      const tx = this.db.transaction(store, "readwrite"), os = tx.objectStore(store);
+      for (let e = next(); e; e = next()) os.put(e[1], e[0]);
+      tx.oncomplete = tx.onerror = tx.onabort = () => ok();
     });
   },
   putMany(store, entries) {
@@ -211,57 +245,91 @@ function unbundle(buf) {
 // ---- columns from tiles ----------------------------------------------------------
 
 /** Points of finer tiles (in tile order, so by step) before step s0: {s, v, t, n}. */
-function finePoints(fine, s0) {
+export function finePoints(fine, s0) {
   if (!fine.length) return NO_FINE;
   let cap = 0;
   for (const f of fine) cap += f.tile.count;
-  const s = new Float64Array(cap), v = new Float64Array(cap), t = new Float64Array(cap);
+  const s = new Float64Array(cap), v = new Float64Array(cap), t = new Float64Array(cap), k = new Float64Array(cap);
   let n = 0;
   for (const { tile } of fine) {
-    const w = 2 ** tile.level, base = tile.index * TILE, c = tile.count, { u16, f32 } = tile;
+    const w = 2 ** tile.level, base = tile.index * TILE, c = tile.count, { u16, f32, u32 } = tile;
     for (let i = 0; i < c; i++) {
       const x = (base + u16[tile.b + i] + f32[tile.f + 4 * c + i]) * w;
-      if (x < s0) (s[n] = x), (v[n] = f32[tile.f + 2 * c + i]), (t[n] = f32[tile.f + 3 * c + i]), n++;
+      if (x < s0) (s[n] = x), (v[n] = f32[tile.f + 2 * c + i]), (t[n] = f32[tile.f + 3 * c + i]), (k[n] = u32[tile.f + 5 * c + i]), n++;
     }
   }
-  return { s, v, t, n };
+  return { s, v, t, k, n };
 }
 
 const merged = new Float64Array(8); // buckets merged into one: value, step and runtime sums and count, of the finite buckets then of the rest
 
 /** A column: `src` tiles' buckets merged f-fold (count-weighted means of value, step and runtime, over the buckets
  * with a finite mean, or all of them when none has one, as `tiles.coarsen`; w0 is their bucket width) outside
- * `ranges`, the finer points `fp` inside them, then the tail rows. */
-export function buildColumn(src, f, w0, fp, ranges, tail) {
+ * `ranges`, the finer points `fp` inside them, then the tail rows, which the tiles do not hold, in buckets as tiles
+ * have them: merged into the same buckets, or with `fineW`, in buckets that wide after the finer points. */
+export function buildColumn(src, f, w0, fp, ranges, tail, fineW = 0) {
   let cap = tail.n + fp.n;
   for (const t of src) cap += t.count;
-  const all = new Float64Array(3 * cap), s = all.subarray(0, cap), v = all.subarray(cap, 2 * cap), tt = all.subarray(2 * cap);
+  const { view: all, loc } = columnStore(3 * cap), s = all.subarray(0, cap), v = all.subarray(cap, 2 * cap), tt = all.subarray(2 * cap);
+  const s0 = fineW ? tail.s0 : Infinity; // tile buckets from here on are left to the finer points and the tail
   let n = 0, fi = 0, ri = 0, cur = null;
   const emit = () => {
     const o = merged[3] > 0 ? 0 : 4, cnt = merged[o + 3], x = merged[o + 1] / cnt;
-    if (cur === null || !(cnt > 0) || !(x < tail.s0)) return;
+    if (cur === null || !(cnt > 0) || !(x < s0)) return;
     while (ri < ranges.length && ranges[ri][1] <= x) ri++;
     if (ri < ranges.length && x >= ranges[ri][0]) return;
     while (fi < fp.n && fp.s[fi] < x) (s[n] = fp.s[fi]), (v[n] = fp.v[fi]), (tt[n] = fp.t[fi]), n++, fi++;
     (s[n] = x), (v[n] = merged[o] / cnt), (tt[n] = merged[o + 2] / cnt), n++;
   };
+  const add = (bk, value, step, runtime, k) => {
+    const o = Number.isFinite(value) ? 0 : 4;
+    if (bk !== cur) emit(), (cur = bk), merged.fill(0);
+    merged[o] += value * k;
+    merged[o + 1] += step * k;
+    merged[o + 2] += runtime * k;
+    merged[o + 3] += k;
+  };
   for (const t of src) {
     const base = t.index * TILE, c = t.count, { u16, f32, u32 } = t, mo = t.f + 2 * c, to = t.f + 3 * c, so = t.f + 4 * c, no = t.f + 5 * c;
     for (let i = 0; i < c; i++) {
-      const bi = base + u16[t.b + i], bk = Math.floor(bi / f), k = u32[no + i], m = f32[mo + i], o = Number.isFinite(m) ? 0 : 4;
-      if (bk !== cur) emit(), (cur = bk), merged.fill(0);
-      merged[o] += m * k;
-      merged[o + 1] += (bi + f32[so + i]) * w0 * k;
-      merged[o + 2] += f32[to + i] * k;
-      merged[o + 3] += k;
+      const bi = base + u16[t.b + i];
+      add(Math.floor(bi / f), f32[mo + i], (bi + f32[so + i]) * w0, f32[to + i], u32[no + i]);
     }
   }
+  if (!fineW) for (let i = 0; i < tail.n; i++) if (tail.v[i] === tail.v[i]) add(Math.floor(tail.s[i] / (f * w0)), tail.v[i], tail.s[i], tail.t[i], 1);
   emit();
+  const last = fp.n && fi < fp.n ? fp.n - 1 : -1; // the last finer point, when it ends the column
   while (fi < fp.n) (s[n] = fp.s[fi]), (v[n] = fp.v[fi]), (tt[n] = fp.t[fi]), n++, fi++;
-  s.set(tail.s, n), v.set(tail.v, n), tt.set(tail.t, n);
-  const col = Col.adopt(s, v, tt, n + tail.n);
-  col.tailN = tail.n;
+  if (fineW) n = bucketRows(tail, fineW, s, v, tt, n, last >= 0 ? fp.k[last] : 0);
+  const col = Col.adopt(s, v, tt, n);
+  holdStore(col, loc && { ...loc, cap });
   return col;
+}
+
+/** Rows (tail: s, v, t) in buckets of width w, as tiles hold them (means of the finite values, or of the infinities
+ * when a bucket has none; NaN is no value), written at n onward; the new end. The bucket before n, of `k` values (0:
+ * none), takes the rows that fall in it. */
+function bucketRows(rows, w, s, v, tt, n, k) {
+  let cur = null;
+  merged.fill(0);
+  if (k > 0 && rows.n && Math.floor(s[n - 1] / w) === Math.floor(rows.s[0] / w)) {
+    const o = Number.isFinite(v[n - 1]) ? 0 : 4;
+    n--;
+    (cur = Math.floor(s[n] / w)), (merged[o] = v[n] * k), (merged[o + 1] = s[n] * k), (merged[o + 2] = tt[n] * k), (merged[o + 3] = k);
+  }
+  const emit = () => {
+    const o = merged[3] > 0 ? 0 : 4, cnt = merged[o + 3];
+    if (cnt > 0) (s[n] = merged[o + 1] / cnt), (v[n] = merged[o] / cnt), (tt[n] = merged[o + 2] / cnt), n++;
+    merged.fill(0);
+  };
+  for (let i = 0; i < rows.n; i++) {
+    const y = rows.v[i], bk = Math.floor(rows.s[i] / w), o = Number.isFinite(y) ? 0 : 4;
+    if (y !== y) continue;
+    if (bk !== cur) emit(), (cur = bk);
+    (merged[o] += y), (merged[o + 1] += rows.s[i]), (merged[o + 2] += rows.t[i]), (merged[o + 3] += 1);
+  }
+  emit();
+  return n;
 }
 
 // ---- per-run, per-metric tile state ------------------------------------------
@@ -277,6 +345,7 @@ class Entry {
     this.level = null; // level of the top tiles
     this.span = null; // [lo, hi] steps of this metric
     this.fine = new Map(); // "level|index" -> {tile, seq, used}
+    this.held = null; // top tiles fetched ahead, {parts, seq}, until a plan wants them
     this.want = null; // finer level the current view asks for
     this.need = []; // keys of the tiles at `want` the view needs
     this.empty = new Set(); // keys answered with no tile
@@ -289,13 +358,23 @@ class Entry {
 
 export class Data {
   constructor(ui) {
-    this.ui = ui; // {runs(), data(keys, run|null), keys(), media(key), status(text), conn(live), replan()}
+    this.ui = ui; // {runs(), data(keys, run|null, streamed), keys(), media(key), status(text), conn(live), replan(), idle(), ahead(),
+    //   protocol(server's)}
     this.info = null; // /api/info of what the page shows
     this.gen = 0; // bumped by `close`; work begun under an older generation is dropped
     this.probes = new Map(); // metric -> whether its IndexedDB read finished
     this.idbQueue = []; // top tiles awaiting their IndexedDB write
     this.putTimer = null; // pending `writePuts`
     this.rebuildQ = new Map(); // "run\0key" -> [run, key] awaiting rebuildSoon
+    this.version = 0; // bumped whenever runs, their metadata, tiles or rows change
+    this.held = 0; // bytes of top tiles held ahead of need (Entry.held)
+    this.slabs = new Map(); // "key|level|index" -> {key, level, index, loc, views, rowOf (run id -> row), bytes, used}
+    this.slabBytes = 0;
+    this.noSlabs = false; // the server answers no slabs (a workspace)
+    this.installing = 0; // installs of held tiles under way
+    this.prefetchT = 0;
+    this.prefetching = false;
+    this.planned = null; // inputs of the last plan
     this.rebuildT = 0;
     this.runs = new Map();
     this.keys = new Map(); // metric key -> number of runs having it
@@ -321,6 +400,7 @@ export class Data {
     const [info] = await Promise.all([getJSON(`${BASE}/api/info`), idb.open()]);
     this.info = info;
     this.rootKey = info.root;
+    this.ui.protocol?.(info.protocol);
     idb.prune(IDB_ENTRIES);
   }
 
@@ -334,6 +414,11 @@ export class Data {
     this.queue = [];
     this.inflight.clear();
     this.fineBytes = 0;
+    this.held = 0;
+    for (const sl of this.slabs.values()) freeStore(sl.loc);
+    this.slabs.clear();
+    this.slabBytes = 0;
+    clearTimeout(this.prefetchT);
     this.probes = new Map();
     this.idbQueue = [];
     this.rebuildQ.clear();
@@ -345,6 +430,7 @@ export class Data {
                 tail: [], tailSeq0: meta.tiles_seq ?? 0, pending: [], hbExpect: null, resyncs: 0, resyncInFlight: false,
                 holding: false }; // holding: events wait in `pending` until a resync finishes
     this.runs.set(r.id, r);
+    this.version++;
     this.countKeys(r, meta.keys || [], 1);
     return r;
   }
@@ -367,12 +453,14 @@ export class Data {
       this.countKeys(r, now, 1);
     }
     r.meta = { ...meta, keys: now };
+    this.version++;
   }
 
   dropRun(r) {
     this.countKeys(r, r.meta.keys || [], -1);
     for (const e of r.tiles.values()) for (const f of e.fine.values()) this.fineBytes -= f.tile.bytes;
     this.runs.delete(r.id);
+    this.version++;
   }
 
   /** Load every run under folder `path` (relative to the served root; "" = everything). */
@@ -399,11 +487,17 @@ export class Data {
   // ---- planning ----
 
   /** Replace the request queue for what the visible charts show:
-   * [{key, runs (by priority), xmode, zoomed, x0, x1, pw, coarseAbove (runs above which each needs only coarse
-   * buckets)}]. */
+   * [{key, runs (by priority), runsSig (a hash of the set of runs), xmode, zoomed, x0, x1, pw, coarseAbove (runs above
+   * which each needs only coarse buckets)}]. */
   plan(demands) {
+    const sig = [this.version, ...demands.map((d) => [d.key, d.xmode, d.zoomed, d.x0, d.x1, d.pw, d.coarseAbove, d.runsSig,
+                                                      d.slabs && `${d.slabs.level}:${d.slabs.indices}`].join("|"))].join("\n");
+    if (sig === this.planned && !this.queue.length) return this.inflight.size; // the same plan, all of it requested
+    this.planned = sig;
     const tiers = [[], [], []];
-    for (const d of demands) this.planChart(d, tiers);
+    const held = [];
+    for (const d of demands) this.needSlabs(d, tiers), held.push(...this.planChart(d, tiers));
+    this.installHeld(held);
     const q = [];
     for (const t of tiers) for (const x of t) if (!this.inflight.has(this.reqId(x))) q.push(x);
     this.queue = q;
@@ -413,16 +507,17 @@ export class Data {
     return n;
   }
 
-  /** Queue one chart's requests: kept tiers in tiers[0] (overview) and tiers[1] (top), finer tiles in tiers[2]. */
+  /** Queue one chart's requests: kept tiers in tiers[0] (overview) and tiers[1] (top), finer tiles in tiers[2]; the
+   * held top tiles it wants, as install items. */
   planChart(d, tiers) {
-    const runs = this.runsWith(d.runs, d.key);
+    const all = this.runsWith(d.runs, d.key), runs = d.slabs ? all.filter((r) => !slabbed(d, r)) : all;
     const ranges = runs.map((r) => this.stepRange(r, d));
     let overlap = 0, lo = Infinity, hi = -Infinity;
     for (const g of ranges) if (g) (overlap += g[1] - g[0]), (lo = Math.min(lo, g[0])), (hi = Math.max(hi, g[1]));
     const span = d.zoomed && d.xmode === X_STEP ? d.x1 - d.x0 : hi - lo; // steps across the chart
     const pxPerBucket = runs.length > d.coarseAbove ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET;
     const chart = {
-      d, span, ovNeed: [], topNeed: [], fineQ: tiers[2], probed: this.probed(d.key), overview: runs.length > OVERVIEW_MIN_RUNS,
+      d, span, ovNeed: [], topNeed: [], held: [], fineQ: tiers[2], probed: this.probed(d.key), overview: runs.length > OVERVIEW_MIN_RUNS,
       coarse: runs.length > d.coarseAbove, // merging stays at the budget's, whatever the zoom
       up: Math.max(0, Math.ceil(Math.log2((runs.length * TOP_BUCKETS) / POINT_BUDGET))), // local merging the budget needs
       // the level a run needs: buckets about pxPerBucket of chart width, within the point and finer-tile budgets
@@ -437,6 +532,7 @@ export class Data {
       if (need.length >= BUNDLE_MIN && need.length * BUNDLE_SHARE >= runs.length) tiers[tier].push(bundle);
       else for (const r of need) tiers[tier].push([r, d.key, kind]);
     }
+    return chart.held;
   }
 
   /** One run of a chart: which kept tier it needs, its local merging and finer level, and finer tiles to fetch. */
@@ -445,9 +541,11 @@ export class Data {
     let e = r.tiles.get(d.key);
     if (!e) r.tiles.set(d.key, (e = new Entry()));
     const L = g && e.level !== null && chart.span > 0 ? chart.level : null;
-    if (chart.probed) this.needKept(r, e, L, chart);
+    this.needKept(r, e, L, chart);
     const wasUp = e.up;
-    e.up = L === null || chart.coarse ? chart.up : Math.min(chart.up, Math.max(0, L - e.level));
+    // coarse buckets keep a merging one level above the budget's, so that views of more or fewer runs share columns
+    e.up = L === null ? chart.up : chart.coarse ? Math.min(Math.max(chart.up, wasUp), chart.up + 1)
+      : Math.min(chart.up, Math.max(0, L - e.level));
     e.want = L !== null && L < e.level && (d.zoomed || d.pw > 2 * TOP_BUCKETS) ? L : null;
     e.need = [];
     if (e.want !== null) this.needFine(r, e, g, chart);
@@ -473,12 +571,22 @@ export class Data {
   }
 
   /** Many-run charts start from overview tiles, fetching top tiles only where those are too coarse: by any level for
-   * a line, by two for coarse buckets (a heatmap's or group statistics'). */
+   * a line, by two for coarse buckets (a heatmap's or group statistics'). Until IndexedDB has answered for the
+   * metric's top tiles, every chart starts from overview tiles. */
   needKept(r, e, L, chart) {
-    const slack = chart.coarse ? 1 : 0;
-    const ts = r.meta.tiles_seq, wantTop = !chart.overview || !!e.top || (L !== null && L < e.level + OVERVIEW_UP - slack);
-    if (wantTop && (!e.top || e.topSeq !== ts)) chart.topNeed.push(r);
-    else if (!wantTop && (!e.ov || e.ovSeq !== ts)) chart.ovNeed.push(r);
+    const slack = chart.coarse ? 1 : 0, ts = r.meta.tiles_seq;
+    const wantTop = chart.probed && (!chart.overview || !!e.top || (L !== null && L < e.level + OVERVIEW_UP - slack));
+    if (wantTop) this.needTop(r, e, chart);
+    else if (!e.top && (!e.ov || e.ovSeq !== ts)) chart.ovNeed.push(r);
+  }
+
+  /** Top tiles for run r of a chart: none when it has current ones; the held ones when current (once: they stay held
+   * until installed); else a request. */
+  needTop(r, e, chart) {
+    const ts = r.meta.tiles_seq;
+    if (e.top && e.topSeq === ts) return;
+    if (e.held?.seq !== ts) return chart.topNeed.push(r);
+    if (!e.held.taken) chart.held.push([[r, chart.d.key, "top"], e.held.parts, ts]), (e.held.taken = true);
   }
 
 
@@ -518,14 +626,98 @@ export class Data {
 
   reqId(x) {
     if (x.bundle) return `\0bundle\0${x.key}\0${x.kind}`;
+    if (x.slab) return `\0slab\0${x.key}\0${x.level}\0${x.index}`;
     const [r, key, a, b] = x;
     return `${r.id}\0${key}\0${a}\0${b}`;
   }
 
-  /** One kept tier of one metric for every run of the scope; runs left out of the response have none. */
-  async fetchBundle(b) {
+  // ---- slabs ----
+
+  /** The slabs (level, indices) of `key` when all are here (each marked used), else null. */
+  slabsOf(key, level, indices) {
+    const out = indices.map((k) => this.slabs.get(`${key}|${level}|${k}`));
+    if (out.some((sl) => !sl)) return null;
+    const now = performance.now();
+    for (const sl of out) sl.used = now;
+    return out;
+  }
+
+  /** The finest slabs of `key` here covering steps [x0, x1], at `level` or up to SLAB_UP levels coarser (each marked
+   * used): {level, slabs}, or null. */
+  bestSlabs(key, level, x0, x1) {
+    for (let lv = level; lv <= level + SLAB_UP; lv++) {
+      const w = SLAB_TILE * 2 ** lv, k0 = Math.floor(x0 / w), k1 = Math.floor(x1 / w);
+      if (k1 - k0 >= SLAB_UP) continue;
+      const slabs = this.slabsOf(key, lv, Array.from({ length: k1 - k0 + 1 }, (_, i) => k0 + i));
+      if (slabs) return { level: lv, slabs };
+    }
+    return null;
+  }
+
+  /** [first, last] step of `key` in the slabs here, or null. */
+  slabExtent(key) {
+    let lo = Infinity, hi = -Infinity;
+    for (const sl of this.slabs.values()) if (sl.key === key && sl.ext) (lo = Math.min(lo, sl.ext[0])), (hi = Math.max(hi, sl.ext[1]));
+    return hi >= lo ? [lo, hi] : null;
+  }
+
+  /** Queue the slabs of demand d that are neither here nor requested, in tiers[0]. */
+  needSlabs(d, tiers) {
+    if (!d.slabs || this.noSlabs) return;
+    for (const index of d.slabs.indices) {
+      const x = { slab: true, key: d.key, level: d.slabs.level, index };
+      if (!this.slabs.has(`${x.key}|${x.level}|${index}`) && !this.inflight.has(this.reqId(x))) tiers[0].push(x);
+    }
+  }
+
+  /** Fetch slab x ({key, level, index}) into shared memory; `answered` is called once its response has arrived. */
+  async fetchSlab(x, answered) {
+    const gen = this.gen, got = await this.slabOnWorker(x);
+    answered();
+    if (!got || gen !== this.gen) return;
+    this.addSlab(x, got);
+    this.touched.add(x.key);
+    this.flush();
+  }
+
+  /** Slab x fetched by a worker ({buf, bytes, paths, ext}), or null; a server without slabs turns them off. */
+  async slabOnWorker({ key, level, index }) {
+    const url = new URL(`${BASE}/api/tiles/slab`, location.href).href;
+    const got = await fetchSlabOnWorker(url, JSON.stringify({ key, level, index, scope: this.scope }));
+    if (got.status === 404) this.noSlabs = true;
+    if (got.error) console.warn("slab fetch failed", got.error);
+    this.stats.bytes += got.bytes;
+    return got.buf ? got : null;
+  }
+
+  /** Keep a slab fetched into shared memory ({buf, bytes, paths, ext}) as slab x, dropping the least recently used
+   * beyond SLAB_BYTES. */
+  addSlab(x, { buf, bytes, paths, ext }) {
+    const { loc } = adoptStore(buf);
+    const id = `${x.key}|${x.level}|${x.index}`, old = this.slabs.get(id);
+    if (old) freeStore(old.loc), (this.slabBytes -= old.bytes);
+    this.slabs.set(id, { key: x.key, level: x.level, index: x.index, loc, views: slabViews(buf, 0), ext,
+                         rowOf: new Map(paths.map((p, i) => [p, i])), bytes, used: performance.now() });
+    this.slabBytes += bytes;
+    this.dropSlabs();
+  }
+
+  dropSlabs() {
+    const now = performance.now(), old = [...this.slabs].filter(([, sl]) => now - sl.used > SLAB_KEEP_MS).sort((a, b) => a[1].used - b[1].used);
+    for (const [id, sl] of old) {
+      if (this.slabBytes <= SLAB_BYTES) break;
+      freeStore(sl.loc);
+      this.slabBytes -= sl.bytes;
+      this.slabs.delete(id);
+    }
+  }
+
+  /** Fetch and install bundle b, one kept tier of one metric for every run of the scope (runs left out of the
+   * response have none); `answered` is called once its response has arrived. */
+  async fetchBundle(b, answered) {
     const gen = this.gen, seqs = new Map(b.runs.map((r) => [r, r.meta.tiles_seq]));
     const buf = await this.post(`${BASE}/api/tiles/bundle`, { key: b.key, kind: b.kind, scope: this.scope });
+    answered();
     const entries = buf && this.parse(() => unbundle(buf));
     if (!entries) return this.retry(gen, [b]);
     if (gen !== this.gen) return;
@@ -544,17 +736,137 @@ export class Data {
   async pump() {
     while (this.posts < PARALLEL && this.queue.length) {
       const batch = [];
-      if (this.queue[0].bundle) batch.push(this.queue.shift());
-      else while (this.queue.length && !this.queue[0].bundle && batch.length < BATCH) batch.push(this.queue.shift());
+      if (this.queue[0].bundle || this.queue[0].slab) batch.push(this.queue.shift());
+      else while (this.queue.length && !this.queue[0].bundle && !this.queue[0].slab && batch.length < BATCH) batch.push(this.queue.shift());
       for (const x of batch) this.inflight.add(this.reqId(x));
       this.posts++;
-      (batch[0].bundle ? this.fetchBundle(batch[0]) : this.fetchBatch(batch)).finally(() => {
+      let posted = true;
+      const answered = () => { // the next POST goes out while this answer installs
+        if (!posted) return;
+        posted = false;
         this.posts--;
-        for (const x of batch) this.inflight.delete(this.reqId(x));
-        if (!this.queue.length && !this.posts) this.ui.status(this.summary());
         this.pump();
+      };
+      const fetch = batch[0].slab ? this.fetchSlab(batch[0], answered) : batch[0].bundle ? this.fetchBundle(batch[0], answered)
+        : this.fetchBatch(batch, answered);
+      fetch.finally(() => {
+        answered();
+        for (const x of batch) this.inflight.delete(this.reqId(x));
+        if (!this.busy) this.ui.status(this.summary());
+        this.settle();
       });
     }
+  }
+
+  /** Whether tiles are queued, being fetched or installed, or columns await rebuilding. */
+  get busy() {
+    return this.queue.length > 0 || this.inflight.size > 0 || this.rebuildQ.size > 0 || this.installing > 0;
+  }
+
+  /** Tell the UI once the work for its last plan is done, then fetch ahead while nothing else is under way. */
+  settle() {
+    if (this.busy) return;
+    this.ui.idle();
+    clearTimeout(this.prefetchT);
+    this.prefetchT = setTimeout(() => this.prefetch(), PREFETCH_IDLE_MS);
+  }
+
+  // ---- fetching ahead ----
+
+  /** Fetch the next bundle a view may need (`nextAhead`), when the store is idle; then the one after. */
+  async prefetch() {
+    if (this.busy || this.prefetching) return;
+    const next = this.nextAhead();
+    if (!next) return;
+    const gen = this.gen;
+    this.prefetching = true;
+    try {
+      await this.fetchAhead(gen, next);
+    } finally {
+      this.prefetching = false;
+    }
+    if (gen === this.gen) this.settle();
+  }
+
+  /** What to fetch ahead: slabs zooms of visible charts would draw from, then for metrics without them top tiles of
+   * the metrics charts show, overview tiles of charts not loaded yet, and top tiles of the other metrics; tiers of
+   * running runs change, and are left to the views. */
+  nextAhead() {
+    const ahead = this.ui.ahead?.() || [];
+    const slab = this.slabAhead(ahead);
+    if (slab) return slab;
+    const lacking = (fn) => {
+      for (const { key, runs, slabs } of ahead) {
+        if (slabs.length) continue; // its zooms draw from slabs
+        const need = this.runsWith(runs, key).filter((r) => r.meta.state !== "running" && r.meta.tiles_seq > 0 && fn(r, r.tiles.get(key)));
+        if (need.length >= BUNDLE_MIN) return { key, runs: need };
+      }
+      return null;
+    };
+    const top = (r, e) => this.held < PREFETCH_BYTES && !(e?.top && e.topSeq === r.meta.tiles_seq) && e?.held?.seq !== r.meta.tiles_seq;
+    const shown = lacking((r, e) => e && (e.top || e.ov) && top(r, e));
+    if (shown) return { ...shown, kind: "top" };
+    const bare = lacking((r, e) => !e || !(e.top || e.ov));
+    if (bare) return { ...bare, kind: "overview" };
+    const rest = lacking(top);
+    return rest && { ...rest, kind: "top" };
+  }
+
+  /** The first slab a zoom of a visible chart would draw from that is not here, within SLAB_AHEAD_BYTES. */
+  slabAhead(ahead) {
+    if (this.noSlabs || this.slabBytes >= SLAB_AHEAD_BYTES) return null;
+    for (const { key, slabs } of ahead) {
+      for (const { level, indices } of slabs) {
+        const index = indices.find((k) => !this.slabs.has(`${key}|${level}|${k}`));
+        if (index !== undefined) return { slab: true, key, level, index };
+      }
+    }
+    return null;
+  }
+
+  /** Fetch one slab or bundle ahead: slabs are kept, overview tiles installed, top tiles held (Entry.held) until a
+   * plan wants them. */
+  async fetchAhead(gen, { slab, key, kind, runs, level, index }) {
+    if (slab) {
+      const got = await this.slabOnWorker({ key, level, index });
+      if (got && gen === this.gen) this.addSlab({ key, level, index }, got);
+      return;
+    }
+    const seqs = new Map(runs.map((r) => [r, r.meta.tiles_seq]));
+    const buf = await this.post(`${BASE}/api/tiles/bundle`, { key, kind, scope: this.scope });
+    const entries = buf && this.parse(() => unbundle(buf));
+    if (!entries || gen !== this.gen) return;
+    const items = [];
+    for (const [path, parts] of entries) {
+      const r = this.runs.get(path);
+      if (!seqs.has(r)) continue;
+      items.push([[r, key, kind], parts, seqs.get(r)]);
+      seqs.delete(r);
+    }
+    for (const [r, seq] of seqs) items.push([[r, key, kind], [], seq]);
+    if (kind === "overview") return this.install(gen, items);
+    for (const [[r], parts, seq] of items) {
+      let e = r.tiles.get(key);
+      if (!e) r.tiles.set(key, (e = new Entry()));
+      this.hold(e, { parts, seq });
+    }
+  }
+
+  /** Hold top tiles `h` ({parts, seq}) for entry e, or drop the ones it holds (h null). */
+  hold(e, h) {
+    const bytes = (x) => (x ? x.parts.reduce((n, [, , len]) => n + len, 0) : 0);
+    this.held += bytes(h) - bytes(e.held);
+    e.held = h;
+  }
+
+  /** Install held top tiles a plan wants: [[run, key, "top"], parts, seq] items, in slices as fetched ones are. */
+  installHeld(items) {
+    if (!items.length) return;
+    this.installing++;
+    this.install(this.gen, items).finally(() => {
+      this.installing--;
+      this.settle();
+    });
   }
 
   summary() {
@@ -586,6 +898,7 @@ export class Data {
         this.apply([r, key, "top"], v.bufs.map((b) => [b, 0, b.byteLength]), v.seq);
       }
       this.probes.set(key, true);
+      this.version++;
       this.flush();
       this.ui.replan();
     });
@@ -598,24 +911,31 @@ export class Data {
     if (!this.putTimer) this.putTimer = setTimeout(() => this.writePuts(), 500);
   }
 
-  /** Write queued tiles in small transactions, once no fetch is pending. */
+  /** Write queued tiles in the main thread's idle time, once no fetch is pending: one transaction per idle period. */
   async writePuts() {
     while (this.idbQueue.length) {
-      if (this.posts || this.queue.length) {
-        await new Promise((ok) => setTimeout(ok, 300));
-        continue;
-      }
-      const at = Date.now();
-      await idb.putMany("tiles", this.idbQueue.splice(0, IDB_CHUNK).map(([k, seq, parts]) =>
-        [k, { seq, bufs: parts.map(([b, o, n]) => b.slice(o, o + n)), at }]));
+      const idle = await idleTime();
+      if (this.busy) continue;
+      const at = Date.now(), q = this.idbQueue;
+      let i = 0;
+      const t0 = performance.now();
+      const done = idb.putEach("tiles", () => {
+        if (i >= q.length || idle.timeRemaining() < 2 || performance.now() - t0 > IDB_SLICE_MS) return null;
+        const [k, seq, parts] = q[i++];
+        return [k, { seq, bufs: parts.map(([b, o, n]) => b.slice(o, o + n)), at }];
+      });
+      q.splice(0, i);
+      await done;
     }
     this.putTimer = null;
   }
 
-  async fetchBatch(want) {
+  /** Fetch and install the tiles of requests `want`; `answered` is called once the response has arrived. */
+  async fetchBatch(want, answered) {
     const gen = this.gen, seqs = want.map((x) => (isKept(x) ? x[0].meta.tiles_seq : x[0].seq));
     const reqs = want.map((x) => (isKept(x) ? [x[0].id, x[1], x[2]] : [x[0].id, x[1], x[2], x[3]]));
     const buf = await this.post(`${BASE}/api/tiles`, reqs);
+    answered();
     const lists = buf && this.parse(() => unframe(buf, want.length));
     if (!lists) return this.retry(gen, want);
     if (gen !== this.gen) return;
@@ -656,21 +976,23 @@ export class Data {
     }, 1000);
   }
 
-  /** Apply [request, tile parts, seq] items in slices of REBUILD_SLICE_MS, so input is never blocked. */
+  /** Apply [request, tile parts, seq] items in slices of REBUILD_SLICE_MS, so input is never blocked. Tiles of
+   * running runs only are streamed data. */
   async install(gen, items) {
     let t0 = performance.now();
+    const live = items.every(([x]) => x[0].meta.state === "running");
     for (const [x, parts, seq] of items) {
       this.stats.tiles += parts.length;
       this.apply(x, parts, seq);
       if (x[2] === "top" && x[0].meta.state !== "running") this.cachePut(x[0], x[1], seq, parts);
       if (performance.now() - t0 > REBUILD_SLICE_MS) {
-        this.flush();
+        this.flush(live);
         await new Promise((ok) => setTimeout(ok, 0));
         if (gen !== this.gen) return;
         t0 = performance.now();
       }
     }
-    this.flush();
+    this.flush(live);
   }
 
   /** Install the tiles answering request x (parts as from `unframe`). */
@@ -684,6 +1006,7 @@ export class Data {
       console.warn(`run ${r.id} ${key}: ${err.message}`);
       return;
     }
+    if (a === "top" && e.held) this.hold(e, null);
     const changed = a === "top" ? this.setTop(r, e, tiles, seq) : a === "overview" ? this.setOverview(r, e, tiles, seq)
       : this.setFine(e, `${a}|${b}`, tiles, seq);
     if (!isKept(x)) {
@@ -742,14 +1065,15 @@ export class Data {
     // a finer tile holds rows [0, f.seq); rows from tailSeq0 on come from the tail
     const fine = e.shown === null ? [] : [...e.fine.values()].filter((f) => f.tile.level === e.shown && f.seq >= r.tailSeq0);
     fine.sort((a, b) => a.tile.index - b.tile.index);
-    const tail = this.tailOf(r, key);
+    const tail = this.tailOf(r, key, fine.length ? Math.max(...fine.map((f) => f.seq)) : e.top ? e.topSeq : e.ovSeq); // rows no tile shown holds
     const sig = [e.top ? e.topSeq : e.ovSeq, e.up, e.shown, fine.map((f) => `${f.tile.index}@${f.seq}`).join(), tail.n, tail.s0, srcUp];
     if (r.cols.has(key) && e.sig && sig.every((x, i) => x === e.sig[i])) return;
     e.sig = sig;
     const now = performance.now();
     for (const f of fine) f.used = now;
     const ranges = fine.map((f) => tileRange(f.tile.level, f.tile.index));
-    const c = buildColumn(e.top || e.ov, 2 ** Math.max(0, e.up - srcUp), 2 ** (e.level + srcUp), finePoints(fine, tail.s0), ranges, tail);
+    const c = buildColumn(e.top || e.ov, 2 ** Math.max(0, e.up - srcUp), 2 ** (e.level + srcUp), finePoints(fine, tail.s0), ranges, tail,
+                          fine.length ? 2 ** e.shown : 0);
     r.cols.set(key, c);
     this.touched.add(key);
   }
@@ -768,6 +1092,7 @@ export class Data {
       }
       this.flush();
       this.rebuildT = this.rebuildQ.size ? setTimeout(slice, 0) : 0;
+      this.settle();
     };
     this.rebuildT = setTimeout(slice, 0);
   }
@@ -788,12 +1113,14 @@ export class Data {
     }
   }
 
-  /** Points of `key` in the run's rows beyond its top tiles: {s, v, t, n, s0 (first step)}. */
-  tailOf(r, key) {
+  /** Points of `key` in the run's tail rows from sequence number `from` on: {s, v, t, n, s0 (first step)}. */
+  tailOf(r, key, from = -Infinity) {
     if (!r.tail.length) return NO_TAIL;
     const s = [], v = [], t = [];
     let s0 = Infinity;
-    for (const [step, rt, d] of r.tail) if (key in d) {
+    for (let i = from > -Infinity ? Math.max(0, from - r.tailSeq0) : 0; i < r.tail.length; i++) {
+      const [step, rt, d] = r.tail[i];
+      if (!(key in d)) continue;
       s.push(step), v.push(num(d[key])), t.push(rt);
       if (step < s0) s0 = step;
     }
@@ -801,12 +1128,14 @@ export class Data {
   }
 
   /** Tell the UI which charts changed since the last flush. */
-  flush() {
+  /** Tell the UI which metrics changed: `streamed` when by rows from live runs, else by work for its view. */
+  flush(streamed = false) {
     if (!this.touched.size) return;
+    this.version++;
     const keys = this.touched;
     this.touched = new Set();
     this.flushKeys();
-    this.ui.data(keys, null);
+    this.ui.data(keys, null, streamed);
   }
 
   /** Discard a run's rows and tiles and reload it from its current server state. */
@@ -836,7 +1165,7 @@ export class Data {
       r.pending = [];
       for (const [kind, ev] of pending) this.dispatch(kind, ev);
       this.ui.runs();
-      this.ui.data(new Set(r.tiles.keys()), null);
+      this.ui.data(new Set(r.tiles.keys()), null, true);
     } catch (e) {
       console.warn(`resync ${r.id} failed`, e);
       r.resyncInFlight = false;
@@ -852,7 +1181,10 @@ export class Data {
     for (const kind of ["rows", "run", "media", "delete", "hb", "folder"]) {
       es.addEventListener(kind, (e) => this.dispatch(kind, JSON.parse(e.data)));
     }
-    es.onopen = () => this.ui.conn(true);
+    es.onopen = () => {
+      this.ui.conn(true);
+      getJSON(`${BASE}/api/info`).then((i) => this.ui.protocol?.(i.protocol), () => {}); // a restarted server may be another trex
+    };
     es.onerror = () => this.ui.conn(false);
   }
 
@@ -925,7 +1257,7 @@ export class Data {
       if (e?.top || e?.ov) this.rebuild(r, k);
       else this.touched.add(k);
     }
-    this.flush();
+    this.flush(true);
   }
 
   onRunMeta(meta) {
@@ -937,7 +1269,7 @@ export class Data {
       const summary = r.meta.summary;
       const before = r.meta.tiles_seq;
       this.setMeta(r, { ...meta, summary: { ...meta.summary, ...summary } });
-      if (meta.tiles_seq !== before) this.ui.data(new Set(r.tiles.keys()), null);
+      if (meta.tiles_seq !== before) this.ui.data(new Set(r.tiles.keys()), null, true);
       // The stream is ordered, so every row and media item this meta counts has already been delivered.
       if (!r.holding && (r.seq < meta.seq || r.mseq < meta.mseq)) {
         console.warn(`run ${r.id}: meta says ${meta.seq},${meta.mseq}, have ${r.seq},${r.mseq}`);

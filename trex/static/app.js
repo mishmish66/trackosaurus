@@ -1,4 +1,5 @@
-import { BASE, Data, clearCache, mediaURL } from "./data.js";
+import { BASE, Data, PROTOCOL, clearCache, hasKey, mediaURL } from "./data.js";
+import { startWorkers } from "./pool.js";
 import { asNumber, compileWhere, completionContext, fieldText, literal, runField, textOf } from "./where.js";
 import { BAND_LABEL, Chart, DENSITY_AUTO, USE_GL, fmt, fmtDur, fmtSI } from "./plot.js";
 import { X_RUNTIME, X_STEP } from "./kernel.js";
@@ -38,13 +39,31 @@ const tailOf = (s, n) => (s.length > n ? `…${s.slice(1 - n)}` : s);
 /** `/api/daemon`: {daemon, roots, workspaces, history, install, updates}. */
 const daemonInfo = async () => (await fetch("/api/daemon", { cache: "no-store" })).json();
 
-const CONFIG_FIELD = "config."; // prefix of a group-by field id naming a config key
-const PATH_FIELD = "path"; // group-by entry that nests the sidebar by folder and draws every run
 const METRIC_SORT = "metric:"; // prefix of a sort key naming a metric
+const DEFAULT_GROUP = "run~1"; // a run's directory: runs logged side by side share a line
+const RUN_UP = /^run~(\d+)$/; // group-by field: the directory n levels above a run
 
-/** Group-by field id from a declared default: "path", "subfolder", "parent", "dir", "config.<key>", or a bare config
- * key. */
-const normalizeField = (f) => ([PATH_FIELD, "subfolder", "parent", "dir"].includes(f) || f.startsWith(CONFIG_FIELD) ? f : CONFIG_FIELD + f);
+/** Levels of a group-by expression "a, b / c": levels split on " / ", fields on ","; empty ones are dropped. */
+function parseGroupBy(text) {
+  return text.split(/\s+\/\s+/).map((l) => l.split(",").map((f) => f.trim()).filter(Boolean)).filter((l) => l.length);
+}
+
+const formatGroupBy = (levels) => levels.map((l) => l.join(", ")).join(" / ");
+
+/** The field the caret is in within a group-by expression: {from, to, prefix}. */
+function groupContext(text, caret) {
+  const before = text.slice(0, caret), level = before.lastIndexOf(" / ");
+  let from = Math.max(before.lastIndexOf(",") + 1, level < 0 ? 0 : level + 3);
+  while (from < caret && text[from] === " ") from++;
+  return { from, to: caret + text.slice(caret).search(/,|\s\/\s|$/), prefix: text.slice(from, caret) };
+}
+
+/** A group-tree node's label: its values, or a run~n directory relative to its parent's when that is a directory
+ * above it. */
+function nodeLabel(fields, values, parent) {
+  const dirs = [fields, parent.fields].every((f) => f.length === 1 && RUN_UP.test(f[0]));
+  return dirs && values[0].startsWith(parent.values[0] + "/") ? values[0].slice(parent.values[0].length + 1) : values.join(", ");
+}
 
 /** State a group's dot shows: running while any member runs, else crashed or failed if any member did, else
  * finished. */
@@ -58,12 +77,6 @@ function stateCounts(runs) {
   const n = new Map();
   for (const r of runs) n.set(r.meta.state, (n.get(r.meta.state) ?? 0) + 1);
   return [...n].map(([s, k]) => `${k} ${s}`).join(" · ");
-}
-
-/** Group-by fields with `id` toggled; "path" stands alone, so choosing it or another field drops the other kind. */
-function toggleField(sel, id) {
-  if (sel.includes(id)) return sel.filter((x) => x !== id);
-  return id === PATH_FIELD ? [id] : [...sel.filter((x) => x !== PATH_FIELD), id];
 }
 
 function fmtAny(v) {
@@ -232,7 +245,7 @@ function hashOpts(q) {
   return {
     path: q.get("path") || "",
     filter: q.get("filter") || "",
-    group: q.get("fgroup") ? [] : (q.get("group") || "").split(",").filter(Boolean),
+    group: q.get("group") ?? "",
     focus: focusOpt(q),
     chart: q.get("chart") || "",
     center: ["mean", "iqm"].includes(q.get("center")) ? q.get("center") : "median",
@@ -244,19 +257,25 @@ function hashOpts(q) {
 }
 const NAV_OPTS = ["path", "focus", "chart", "group"]; // changed by navigation, restored by back/forward
 
-/** Opened groups, outermost first: [[group-by fields, value], …] from `focus` (JSON), or a single `fgroup` of
- * `group`. */
+/** Opened groups, outermost first: [[fields of a group-by level, their values], …] from `focus` (JSON). */
 function focusOpt(q) {
-  if (q.get("fgroup")) return [[(q.get("group") || "").split(",").filter(Boolean), q.get("fgroup")]];
   try {
     const f = JSON.parse(q.get("focus") || "[]");
-    return Array.isArray(f) ? f.filter((l) => Array.isArray(l?.[0]) && typeof l[1] === "string") : [];
+    return Array.isArray(f) ? f.filter((l) => Array.isArray(l?.[0]) && Array.isArray(l?.[1])) : [];
   } catch {
     return [];
   }
 }
 
 const cmpNames = (a, b) => a.localeCompare(b, undefined, { numeric: true });
+const fieldTexts = new WeakMap(); // run metadata -> Map(group-by field -> its text)
+/** Whether shown run r may be drawn for `key` without a column: a finished run logging it, from slabs. */
+const fromSlabs = (r, key) => r.shown && r.meta.state !== "running" && hasKey(r, key);
+
+let runNums = 0;
+/** A number of its own for run r. */
+const runNum = (r) => (r.num ||= ++runNums);
+
 function hashStr(s) {
   let x = 2166136261;
   for (let i = 0; i < s.length; i++) x = Math.imul(x ^ s.charCodeAt(i), 16777619);
@@ -369,15 +388,17 @@ class App {
     const q = new URLSearchParams(location.hash.slice(1));
     this.opts = hashOpts(q);
     this.panelCfg = {};
-    this.groupFromHash = q.has("group") || q.has("fgroup");
-    this.groupSource = null;
+    this.groupFromHash = q.has("group");
     this.data = new Data({
       runs: throttle(() => this.onRuns(), 300),
-      data: (keys, r) => this.onData(keys, r),
+      data: (keys, r, streamed) => this.onData(keys, r, streamed),
       keys: throttle(() => this.renderPanels(), 300),
       media: (k) => this.onMedia(k),
       status: (t) => ($("#status").textContent = t),
       replan: () => this.replan(true),
+      idle: () => this.nextFrame(),
+      ahead: () => this.aheadOf(),
+      protocol: (n) => this.showProtocol(n),
       conn: (live) => {
         $("#conn").className = live ? "live" : "down";
         $("#conn").title = live ? "streaming" : "stream disconnected, retrying";
@@ -401,23 +422,15 @@ class App {
     );
   }
 
-  /** Grouped rendering: group-by fields chosen and the scope is more than one run. */
+  /** Grouped rendering: some group holds several runs, and the scope is more than one run. */
   get grouped() {
-    return this.hasGroups && !this.scopeIsRun;
+    return this.isGrouped && !this.scopeIsRun;
   }
 
-  /** Whether runs are grouped by fields, rather than listed flat or by folder ("path"). */
-  get hasGroups() {
-    return this.opts.group.length > 0 && !this.byPath;
-  }
-
-  /** Whether the sidebar nests runs by folder. */
-  get byPath() {
-    return this.opts.group[0] === PATH_FIELD;
-  }
-
+  /** Whether the path opened is a run, by the tree last fetched. */
   get scopeIsRun() {
-    return this.tree.some(([p]) => p === this.opts.path);
+    if (this.runPathsOf !== this.tree) (this.runPathsOf = this.tree), (this.runPaths = new Set(this.tree.map(([p]) => p)));
+    return this.runPaths.has(this.opts.path);
   }
 
   /** Effective display options for one chart: its overrides on top of the toolbar. */
@@ -444,6 +457,7 @@ class App {
   }
 
   async start() {
+    startWorkers();
     if (!(await this.enterDaemon())) return;
     await this.data.init();
     const root = this.data.rootKey;
@@ -456,7 +470,7 @@ class App {
     await this.refreshTree();
     await this.loadScope();
     setInterval(() => this.refreshTree().then(() => this.renderCrumbs()), 15000);
-    if (USE_GL) (window.requestIdleCallback ?? setTimeout)(() => renderer()); // its setup, ~0.2 s, while nothing is drawing
+    if (USE_GL) (window.requestIdleCallback ?? setTimeout)(() => renderer()); // its setup, ~0.2 s, while tiles load
   }
 
   /** Under the daemon, its state (else null), and the trex brand opening its panel. False when it tracks nothing,
@@ -632,35 +646,29 @@ class App {
     const name = this.data.info?.name || "trex";
     document.title = `${this.opts.path || name} · trex`;
     await this.data.loadScope(this.opts.path);
-    if (this.groupFromHash) {
-      this.groupFromHash = false;
-      this.groupSource = null;
-    } else {
-      [this.opts.group, this.groupSource] = this.resolveGroup(this.opts.path);
-      this.saveHash();
-    }
+    if (this.groupFromHash) this.groupFromHash = false;
+    else (this.opts.group = this.defaultGroup(this.opts.path)), this.saveHash();
     this.onRuns();
     this.renderPanels();
     if (this.opts.chart && !this.charts.has(this.opts.chart)) this.setOpt("chart", "");
     if (this.opts.chart) this.renderCrumbs();
   }
 
-  /** [fields, source] of the nearest saved or trex_info.json-declared group-by at or above a folder. */
-  resolveGroup(path) {
-    const saved = store.get(`groupby:${this.data.rootKey}`, {});
+  /** The group-by a folder's trex_info.json declares (`group_by`, an expression or a list of fields), or the nearest
+   * one above it; else DEFAULT_GROUP. */
+  defaultGroup(path) {
     const parts = path ? path.split("/") : [];
     for (let i = parts.length; i >= 0; i--) {
-      const p = parts.slice(0, i).join("/");
-      if (saved[p]) return [saved[p], { kind: "saved", path: p }];
-      const declared = this.data.folders[p]?.trex?.group_by;
-      if (Array.isArray(declared)) return [declared.map(normalizeField), { kind: "declared", path: p }];
+      const d = this.data.folders[parts.slice(0, i).join("/")]?.trex?.group_by;
+      if (typeof d === "string") return formatGroupBy(parseGroupBy(d));
+      if (Array.isArray(d)) return d.join(", ");
     }
-    return [[], null];
+    return DEFAULT_GROUP;
   }
 
   /** Whether the hash states the grouping: inside an opened group, or when it differs from the folder's default. */
   groupInHash() {
-    return this.opts.focus.length > 0 || this.opts.group.join() !== this.resolveGroup(this.opts.path)[0].join();
+    return this.opts.focus.length > 0 || this.opts.group !== this.defaultGroup(this.opts.path);
   }
 
   /** Write the options to the URL hash: a new history entry when `push` (navigation), else in place. */
@@ -669,7 +677,7 @@ class App {
     const defaults = { center: "median", band: "ci", sort: "created", dir: "desc" };
     for (const [k, v] of Object.entries(this.opts)) {
       const s = k === "focus" ? (v.length ? JSON.stringify(v) : "") : Array.isArray(v) ? v.join(",") : v === true ? "1" : v;
-      if ((s && defaults[k] !== s) || (k === "group" && this.groupInHash())) q.set(k, s);
+      if (k === "group" ? this.groupInHash() : s && defaults[k] !== s) q.set(k, s);
     }
     const url = "#" + q.toString();
     if (push && url !== location.hash) history.pushState(null, "", url);
@@ -692,7 +700,7 @@ class App {
     if (differs("focus") || (q.has("group") && differs("group"))) {
       this.opts.focus = next.focus;
       if (q.has("group")) this.opts.group = next.group;
-      else [this.opts.group, this.groupSource] = this.resolveGroup(this.opts.path);
+      else this.opts.group = this.defaultGroup(this.opts.path);
       this.onRuns();
     }
     if (next.chart !== this.opts.chart) {
@@ -767,7 +775,7 @@ class App {
       $("#status").textContent = "cache cleared";
     });
     $("#resetZoom").addEventListener("click", () => this.resetZoom());
-    $("#groupAdd").addEventListener("click", (e) => this.groupByMenu(e.currentTarget));
+    this.bindGroupBox();
     this.bindSortBox();
     $("#sortDir").addEventListener("click", () => {
       this.setOpt("dir", this.opts.dir === "asc" ? "desc" : "asc");
@@ -913,28 +921,25 @@ class App {
   }
 
 
-  /** Open a group: grouping by subfolder or parent folder alone makes it a folder (or run), so open that path;
-   * otherwise it becomes a level of the path, showing its runs ungrouped. */
-  openGroup(name) {
-    const [only, more] = this.opts.group, sub = this.opts.path ? `${this.opts.path}/${name}` : name;
-    if (!more && only === "subfolder") return this.setPath(sub);
-    if (!more && only === "parent" && name !== "." && name !== "∅") return this.setPath(sub);
+  /** Open a node of the group tree: its directory when every field on the way to it is a run~n, else one level of
+   * the path bar per node on the way, each a condition on its level's fields. */
+  openGroup(key) {
+    const chain = [];
+    for (let n = this.nodes?.get(key); n?.parent; n = n.parent) chain.unshift(n);
+    if (!chain.length) return;
     menu.close();
-    this.opts.focus = [...this.opts.focus, [this.opts.group, name]];
-    [this.opts.group, this.groupSource] = [[], null];
+    const ups = chain.flatMap((n) => n.fields).map((f) => RUN_UP.exec(f)?.[1]);
+    const dir = ups.every(Boolean) && chain.at(-1).runs[0].id.split("/").slice(0, -Math.min(...ups.map(Number))).join("/");
+    if (dir !== false && dir !== this.opts.path) return this.setPath(dir);
+    this.opts.focus = [...this.opts.focus, ...chain.map((n) => [n.fields, n.values])];
     this.saveHash(true);
     this.onRuns();
   }
 
-  /** Go back to the first `depth` opened groups (0: the folder), with the grouping that was on there. */
+  /** Go back to the first `depth` opened groups (0: the folder). */
   focusLevel(depth) {
     menu.close();
-    const o = this.opts, inner = o.focus[depth];
-    if (inner) {
-      o.group = inner[0];
-      const [fields, src] = depth ? [null, null] : this.resolveGroup(o.path);
-      this.groupSource = JSON.stringify(fields) === JSON.stringify(o.group) ? src : null;
-    }
+    const o = this.opts;
     o.focus = o.focus.slice(0, depth);
     o.chart = "";
     this.saveHash(true);
@@ -952,108 +957,113 @@ class App {
     return p.startsWith(s + "/") ? p.slice(s.length + 1) : p;
   }
 
-  /** Selectable group-by fields: path (the folder hierarchy), subfolder, parent folder, and config keys that vary
-   * across the filtered runs. */
-  groupFields() {
-    const runs = this.runList.filter((r) => r.match);
-    const distinct = (get) => new Set(runs.map((r) => JSON.stringify(get(r) ?? null))).size;
-    const fields = [{ id: PATH_FIELD, label: "path", n: distinct((r) => r.meta.parent), unit: "folders" },
-                    { id: "subfolder", label: "subfolder", n: distinct((r) => this.subfolder(r)) },
-                    { id: "parent", label: "parent folder", n: distinct((r) => r.meta.parent) },
-                    ...(runs.some((r) => r.meta.dir) ? [{ id: "dir", label: "tracked dir", n: distinct((r) => r.meta.dir) }] : [])];
-    const keys = new Set();
-    for (const r of runs) for (const k of Object.keys(r.meta.config || {})) keys.add(k);
-    for (const k of [...keys].sort()) {
-      const n = distinct((r) => r.meta.config?.[k]);
-      if (n > 1) fields.push({ id: CONFIG_FIELD + k, label: k, n });
+  /** A run's value of group-by field f, as text: `run` its id, `run~n` its directory n levels up (relative to the
+   * view), anything else the field as filters name it. */
+  fieldText(r, f) {
+    if (f === "run") return r.id;
+    const up = RUN_UP.exec(f);
+    if (up) return this.rel(r.id.split("/").slice(0, -Number(up[1])).join("/"));
+    let known = fieldTexts.get(r.meta);
+    if (!known) fieldTexts.set(r.meta, (known = new Map()));
+    let t = known.get(f);
+    if (t === undefined) {
+      const v = runField(r, f);
+      known.set(f, (t = v == null ? "∅" : typeof v === "object" ? JSON.stringify(v) : String(v)));
     }
-    return fields;
+    return t;
   }
 
-  fieldLabel(id) {
-    return { [PATH_FIELD]: "path", subfolder: "subfolder", parent: "parent folder", dir: "tracked dir" }[id] ?? id.slice(CONFIG_FIELD.length);
+  /** Fields to group by, with how many values each takes among the matching runs: run, run~n for each directory
+   * above them, then dir, state and the config keys whose value varies. */
+  groupFieldItems() {
+    if (this.groupItemsFor === this.runList) return this.groupItems;
+    const runs = this.runList.filter((r) => r.match), count = (f) => new Set(runs.map((r) => this.fieldText(r, f))).size;
+    const depth = Math.max(0, ...runs.map((r) => this.rel(r.id).split("/").length - 1));
+    const cfg = new Set();
+    for (const r of runs) for (const k of Object.keys(r.meta.config || {})) cfg.add(k);
+    const fields = ["run", ...Array.from({ length: depth }, (_, i) => `run~${i + 1}`), ...(runs.some((r) => r.meta.dir) ? ["dir"] : []),
+                    "state", ...[...cfg].sort(cmpNames)];
+    this.groupItemsFor = this.runList;
+    this.groupItems = fields.map((f) => [f, count(f)]).filter(([f, n]) => n > 1 || f.startsWith("run"))
+      .map(([f, n]) => ({ label: f, insert: f, tail: "", sub: `${n} value${n === 1 ? "" : "s"}` }));
+    return this.groupItems;
   }
 
-  /** First path component of a run below the current folder (the run's own name if it sits directly in it). */
-  subfolder(r) {
-    return this.rel(r.id).split("/")[0];
+  /** "fields: values" of an opened group. */
+  focusLabel([fields, values]) {
+    return `${fields.join(", ")}: ${values.join(", ")}`;
   }
 
-  groupFieldLabel(fields = this.opts.group) {
-    return fields.map((f) => this.fieldLabel(f)).join(" · ");
+  /** Group by expression `expr`, kept in its canonical form "a, b / c". */
+  setGroup(expr) {
+    const g = formatGroupBy(parseGroupBy(expr));
+    if (g === this.opts.group) return;
+    this.opts.group = g;
+    this.saveHash();
+    this.onRuns();
   }
 
-  /** "fields: value" of an opened group. */
-  focusLabel([fields, value]) {
-    return `${this.groupFieldLabel(fields)}: ${value}`;
+  /** The group-by box shows the expression in use, unless it is being edited. */
+  renderGroupBox() {
+    const box = $("#groupBy");
+    if (document.activeElement !== box) box.value = this.opts.group;
   }
 
-  groupByMenu(anchor) {
-    const sel = this.opts.group;
-    menu.list(anchor, {
-      title: "group by (click to toggle)", search: true,
-      items: this.groupFields().map((f) => ({
-        label: f.label, sub: `${f.n} ${f.unit ?? "values"}`, active: sel.includes(f.id),
-        onpick: () => {
-          this.setGroup(toggleField(sel, f.id));
-          this.groupByMenu(anchor);
-        },
-      })),
+  /** Nest the runs in view by the group-by's levels that take more than one value among them; a level holding `run`
+   * nests nothing, its runs being lines. Nodes are {key, label, fields, values (of their level), runs, children,
+   * parent}, in sort order (this.groupTree, this.nodes by key). When some leaf holds several runs, the leaves are the
+   * groups (this.groups), one line each, colored in label order. */
+  buildGroupTree(runs) {
+    const levels = parseGroupBy(this.opts.group);
+    const vals = runs.map((r) => levels.map((fields) => fields.map((f) => this.fieldText(r, f))));
+    const multi = levels.map((_, i) => new Set(vals.map((v) => v[i].join("\u0001"))).size > 1);
+    const shown = levels.flatMap((l, i) => (multi[i] && !l.includes("run") ? [i] : []));
+    const root = { key: "[]", label: "", fields: [], values: [], runs: [], children: [], parent: null };
+    this.nodes = new Map([[root.key, root]]);
+    const childOf = new Map(); // node -> Map(its level's values joined -> child)
+    runs.forEach((r, j) => {
+      let node = root;
+      root.runs.push(r);
+      r.nodes = [];
+      for (const i of shown) {
+        let kids = childOf.get(node);
+        if (!kids) childOf.set(node, (kids = new Map()));
+        const at = vals[j][i].join("\u0001");
+        let next = kids.get(at);
+        if (!next) {
+          const key = JSON.stringify([...JSON.parse(node.key), ...vals[j][i]]);
+          next = { key, label: nodeLabel(levels[i], vals[j][i], node), fields: levels[i], values: vals[j][i], runs: [], children: [], parent: node };
+          node.children.push(next);
+          kids.set(at, next);
+          this.nodes.set(key, next);
+        }
+        const key = next.key;
+        next.runs.push(r);
+        r.nodes.push(key);
+        node = next;
+      }
+      r.part = node.key;
     });
+    const leaves = [];
+    const order = (node) => {
+      node.children = node.children.map((c) => [c, this.groupSortValue(c.runs, c.label)])
+        .sort((a, b) => this.compare(a[1], b[1]) || cmpNames(a[0].label, b[0].label)).map(([c]) => c);
+      node.children.forEach(order);
+      if (!node.children.length) leaves.push(node);
+    };
+    order(root);
+    this.groupTree = root;
+    this.isGrouped = !levels.some((l, i) => multi[i] && l.includes("run")) && leaves.length > 1 && leaves.some((n) => n.runs.length > 1);
+    this.groups = new Map(this.isGrouped ? leaves.map((n) => [n.key, n]) : []);
+    [...this.groups.values()].map((n) => [n, this.nodeName(n)]).sort((a, b) => cmpNames(a[1], b[1]))
+      .forEach(([n, name], i) => Object.assign(n, { name, color: PALETTE[i % PALETTE.length] }));
   }
 
-  /** Set the group-by: inside an opened group for this view only, else remembered for the current folder (and, by
-   * inheritance, its subfolders). */
-  setGroup(fields) {
-    if (this.opts.focus.length) {
-      [this.opts.group, this.groupSource] = [fields, null];
-      this.saveHash();
-      return this.onRuns();
-    }
-    const key = `groupby:${this.data.rootKey}`;
-    const saved = store.get(key, {});
-    saved[this.opts.path] = fields;
-    store.set(key, saved);
-    this.opts.group = fields;
-    this.groupSource = { kind: "saved", path: this.opts.path };
-    this.saveHash();
-    this.onRuns();
-  }
-
-  /** Drop this folder's saved group-by so it inherits again. */
-  forgetGroup() {
-    const key = `groupby:${this.data.rootKey}`;
-    const saved = store.get(key, {});
-    delete saved[this.opts.path];
-    store.set(key, saved);
-    [this.opts.group, this.groupSource] = this.resolveGroup(this.opts.path);
-    this.saveHash();
-    this.onRuns();
-  }
-
-  renderGroupChips() {
-    $("#groupChips").replaceChildren(...this.opts.group.map((f) =>
-      h("span", { className: "chip" }, this.fieldLabel(f),
-        h("button", { textContent: "×", title: "remove", onclick: () => this.setGroup(this.opts.group.filter((x) => x !== f)) }))));
-    $("#groupAdd").textContent = this.opts.group.length ? "+" : "+ add field";
-    const src = this.groupSource;
-    const here = src && src.path === this.opts.path;
-    const where = src && (src.path || this.data.info?.name || "root");
-    $("#groupSource").replaceChildren(...(!src ? [] : [
-      h("span", { textContent: src.kind === "declared" ? `default of ${here ? "this folder" : where + "/"}`
-        : here ? "saved for this folder" : `inherited from ${where}/` }),
-      src.kind === "saved" && here ? h("button", { className: "linkish", textContent: "reset", title: "forget this folder's choice",
-        onclick: () => this.forgetGroup() }) : null,
-    ].filter(Boolean)));
-  }
-
-  groupValue(r, fields = this.opts.group) {
-    if (!fields.length || fields[0] === PATH_FIELD) return null;
-    const m = r.meta;
-    return fields.map((f) => {
-      const v = f === "subfolder" ? this.subfolder(r) : f === "parent" ? this.rel(m.parent) : f === "dir" ? m.dir : m.config?.[f.slice(CONFIG_FIELD.length)];
-      return v == null ? "∅" : typeof v === "object" ? JSON.stringify(v) : String(v);
-    }).join(" · ");
+  /** A node's labels from the top of the tree, " / " between levels. */
+  nodeName(node) {
+    const out = [];
+    for (let n = node; n?.parent; n = n.parent) out.unshift(n.label);
+    return out.join(" / ");
   }
 
   // ---- runs ----
@@ -1078,8 +1088,7 @@ class App {
     for (const r of runs) {
       r.visible = !this.hidden.has(r.id);
       r.match = match(r);
-      r.gval = this.groupValue(r);
-      r.focused = o.focus.every(([fields, value]) => this.groupValue(r, fields) === value);
+      r.focused = o.focus.every(([fields, values]) => fields.every((f, i) => this.fieldText(r, f) === values[i]));
     }
     if (o.focus.length && runs.length && !runs.some((r) => r.focused)) o.focus = [];
     const isRun = this.scopeIsRun;
@@ -1088,7 +1097,7 @@ class App {
       r.shown = r.inFocus && (!this.hidden.has(r.id) || isRun);
     }
     runs.sort((a, b) => this.compare(this.sortValue(a), this.sortValue(b)) || (b.meta.created || 0) - (a.meta.created || 0));
-    this.groups = this.hasGroups ? this.buildGroups(runs) : new Map();
+    this.buildGroupTree(runs.filter((r) => r.inFocus));
     this.assignColors(runs);
     this.runList = runs;
   }
@@ -1097,22 +1106,10 @@ class App {
   assignColors(runs) {
     let ci = 0;
     for (const r of runs) {
-      r.color = this.hasGroups ? this.groups.get(r.gval)?.color ?? "#999"
+      r.color = this.isGrouped ? this.groups.get(r.part)?.color ?? "#999"
         : r.shown ? PALETTE[ci++ % PALETTE.length] : PALETTE[hashStr(r.id) % PALETTE.length];
     }
   }
-
-  /** Groups of the matching runs by group value, in sort order; colors follow name order, so they stay put when the sort changes. */
-  buildGroups(runs) {
-    const groups = new Map();
-    const vals = [...new Set(runs.filter((r) => r.match).map((r) => r.gval))].sort(cmpNames);
-    vals.forEach((v, i) => groups.set(v, { name: v, color: PALETTE[i % PALETTE.length], runs: [] }));
-    for (const r of runs) if (r.match) groups.get(r.gval).runs.push(r);
-    const sorted = [...groups.values()].map((g) => [g, this.groupSortValue(g.runs, g.name)])
-      .sort((a, b) => this.compare(a[1], b[1]) || cmpNames(a[0].name, b[0].name));
-    return new Map(sorted.map(([g]) => [g.name, g]));
-  }
-
 
   /** Metric and media keys of the shown runs (null: every key, when all runs are shown); true when that set
    * changed. */
@@ -1131,20 +1128,44 @@ class App {
     return true;
   }
 
-  /** {cols, color, label, run | group} per shown run, or per group, of a metric. */
+  /** A hash of what charts draw lines of: the shown runs in order with their colors, or the groups' members. */
+  linesSig() {
+    const grouped = this.grouped;
+    let a = grouped ? 1 : 2, b = 3;
+    const mix = (x) => ((a = Math.imul(a ^ x, 0x9e3779b1)), (b = Math.imul(b + x, 0x85ebca6b) ^ (b >>> 13)));
+    for (const r of this.runList) {
+      if (!r.shown) continue;
+      mix(runNum(r));
+      mix(hashStr(grouped ? r.part : r.color));
+    }
+    for (const g of this.groups.values()) mix(hashStr(`${g.key}\0${g.name}\0${g.color}`));
+    return `${a >>> 0}.${b >>> 0}`;
+  }
+
+  /** {cols, color, label, run} per shown run, or {cols, runs, color, label, group} per group, of a metric (a finished
+   * run without a column has an undefined one: slabs draw it); the same list while neither the
+   * lines (`linesSig`) nor the data change. */
   linesFor(key) {
+    const sig = `${this.drawnSig}|${this.data.version}`, hit = (this.linesKept ||= new Map()).get(key);
+    if (hit?.sig === sig) return hit.lines;
+    const lines = this.collectLines(key);
+    this.linesKept.set(key, { sig, lines });
+    return lines;
+  }
+
+  collectLines(key) {
     const out = [];
     if (!this.grouped) {
       for (const r of this.runList) {
         const c = r.shown ? r.cols.get(key) : undefined;
-        if (c !== undefined) out.push({ cols: [c], color: r.color, label: r.meta.name, run: r });
+        if (c !== undefined || fromSlabs(r, key)) out.push({ cols: [c], color: r.color, label: r.meta.name, run: r });
       }
       return out;
     }
     for (const g of this.groups.values()) {
-      const cols = [];
-      for (const r of g.runs) if (r.shown && r.cols.has(key)) cols.push(r.cols.get(key));
-      if (cols.length) out.push({ cols, color: g.color, label: `${g.name} (${cols.length})`, group: g.name });
+      const cols = [], runs = [];
+      for (const r of g.runs) if (r.shown && (r.cols.has(key) || fromSlabs(r, key))) cols.push(r.cols.get(key)), runs.push(r);
+      if (cols.length) out.push({ cols, runs, color: g.color, label: `${g.name} (${cols.length})`, group: g.key });
     }
     return out;
   }
@@ -1152,11 +1173,13 @@ class App {
   onRuns() {
     this.computeRuns();
     if (this.updateScopeKeys()) this.renderPanels();
-    this.redrawAll();
-    this.replan(true);
+    const sig = this.linesSig();
+    if (sig !== this.drawnSig) (this.drawnSig = sig), this.redrawAll();
+    else this.nextFrame(); // charts just created
+    this.planSoon = true; // once the charts have drawn
     this.afterPaint([
       () => this.renderCrumbs(),
-      () => this.renderGroupChips(),
+      () => this.renderGroupBox(),
       () => this.renderRunTable(),
       () => {
         for (const k of this.mediaPanels.keys()) this.dirtyMedia.add(k);
@@ -1211,7 +1234,7 @@ class App {
   /** The sort fields (base ones, then each metric's last value) and the sort box showing the current one. */
   renderSortOptions() {
     const base = [["created", "created"], ["name", "name"], ["state", "state"], ["step", "steps"], ["runtime", "runtime"],
-                  ["size", this.hasGroups ? "group size" : "folder size"]];
+                  ["size", "group size"]];
     const metrics = [...this.data.keys.keys()].sort(cmpNames);
     this.sortFields = [...base.map(([value, label]) => ({ value, label, metric: false })),
                        ...metrics.map((k) => ({ value: METRIC_SORT + k, label: k, metric: true }))];
@@ -1261,6 +1284,33 @@ class App {
     box.addEventListener("blur", restore);
   }
 
+  /** The group-by box: an expression "a, b / c" applied as it is typed, with the fields completed at the caret (↑/↓
+   * choose, Tab or Enter take one, Escape closes them); Enter without completions, or leaving, shows the expression in
+   * use in its canonical form. */
+  bindGroupBox() {
+    const box = $("#groupBy"), st = { hl: 0, items: [], ctx: null, context: groupContext, candidates: () => this.groupFieldItems() };
+    const apply = throttle(() => document.activeElement === box && this.setGroup(box.value), 150);
+    const show = () => this.filterList(box, st);
+    box.addEventListener("focus", show);
+    box.addEventListener("click", show);
+    box.addEventListener("input", () => ((st.hl = 0), show(), apply()));
+    box.addEventListener("keydown", (e) => {
+      const listed = menu.anchor === box && st.items.length, step = listed && { ArrowDown: 1, ArrowUp: -1 }[e.key];
+      if (step) (st.hl = (st.hl + step + st.items.length) % st.items.length), this.filterList(box, st, false);
+      else if (listed && (e.key === "Tab" || e.key === "Enter")) this.takeCompletion(box, st, st.items[st.hl]);
+      else if (e.key === "Escape" && listed) menu.close();
+      else if (e.key === "Enter" || e.key === "Escape") box.blur();
+      else return;
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    box.addEventListener("blur", () => {
+      if (menu.anchor === box) menu.close();
+      this.setGroup(box.value);
+      box.value = this.opts.group;
+    });
+  }
+
   /** The filter box's completions: field names, operators, a field's values (with run counts) or and / or, as the
    * text before the caret calls for; ↑/↓ choose, Tab or Enter take one, Escape closes them. */
   bindFilterBox() {
@@ -1282,11 +1332,13 @@ class App {
     box.addEventListener("blur", () => menu.anchor === box && menu.close());
   }
 
-  /** Show the completions for the caret's word (recomputed unless `fresh` is false), or close them when there are none. */
+  /** Show a box's completions for the word at the caret (recomputed unless `fresh` is false), or close them when there
+   * are none: st.context finds the word (the filter language's by default) and st.candidates lists them (the
+   * filter's by default). */
   filterList(box, st, fresh = true) {
     if (fresh) {
-      st.ctx = completionContext(box.value, box.selectionStart ?? box.value.length);
-      const q = st.ctx.prefix.toLowerCase(), all = this.completions(st.ctx);
+      st.ctx = (st.context ?? completionContext)(box.value, box.selectionStart ?? box.value.length);
+      const q = st.ctx.prefix.toLowerCase(), all = st.candidates ? st.candidates(st.ctx) : this.completions(st.ctx);
       const rank = (it) => (it.label.toLowerCase().startsWith(q) ? 0 : 1); // matches from the start come first
       st.items = all.filter((it) => !q || it.label.toLowerCase().includes(q)).sort((a, b) => rank(a) - rank(b)).slice(0, 200);
       st.hl = Math.min(st.hl, Math.max(0, st.items.length - 1));
@@ -1299,9 +1351,11 @@ class App {
     list.querySelector(".hl")?.scrollIntoView({ block: "nearest" });
   }
 
-  /** Replace the caret's word with completion `it` (and a space), and filter by the result. */
+  /** Replace the caret's word with completion `it` and what follows it (`it.tail`, else a space), and apply the
+   * result. */
   takeCompletion(box, st, it) {
-    const { from, to } = st.ctx, after = box.value.slice(to), text = it.insert + (it.insert.endsWith("(") || after.startsWith(" ") ? "" : " ");
+    const { from, to } = st.ctx, after = box.value.slice(to);
+    const text = it.insert + (it.tail ?? (it.insert.endsWith("(") || after.startsWith(" ") ? "" : " "));
     box.value = box.value.slice(0, from) + text + after;
     box.setSelectionRange(from + text.length, from + text.length);
     box.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1363,26 +1417,6 @@ class App {
     list.querySelector(".hl")?.scrollIntoView({ block: "nearest" });
   }
 
-  /** Folder tree of `runs` relative to the scope: {name, path, dirs: Map, runs: [], all: []}. */
-  buildTree(runs) {
-    const scope = this.opts.path;
-    const root = { name: "", path: scope, dirs: new Map(), runs: [], all: [] };
-    for (const r of runs) {
-      const rel = this.rel(r.id);
-      const parts = rel === "." ? [] : rel.split("/").slice(0, -1);
-      let node = root;
-      node.all.push(r);
-      for (const part of parts) {
-        let next = node.dirs.get(part);
-        if (!next) node.dirs.set(part, (next = { name: part, path: node.path ? `${node.path}/${part}` : part, dirs: new Map(), runs: [], all: [] }));
-        node = next;
-        node.all.push(r);
-      }
-      node.runs.push(r);
-    }
-    return root;
-  }
-
   renderRunTable() {
     this.renderSortOptions();
     const rows = []; // row factories in display order
@@ -1416,7 +1450,7 @@ class App {
         h("td", { className: "num", textContent: s._runtime != null ? fmtDur(s._runtime) : "" }),
       );
     };
-    /** A collapsible header row for a folder or group. */
+    /** A collapsible header row for a node of the group tree; a group (one line) shows its color. */
     const headRow = ({ key, label, members, color, depth, open, openTitle, onOpen }) => {
       const vis = members.filter((r) => !this.hidden.has(r.id)).length;
       return h("tr", { className: "grp" + (open ? " open" : "") + (this.sideMark === key ? " mark" : ""), title: open ? "click to collapse" : "click to expand",
@@ -1433,34 +1467,17 @@ class App {
     };
     const inScope = this.runList.filter((r) => r.match && r.inFocus);
     const heads = [];
-    if (this.hasGroups) {
-      const scopeSet = new Set(inScope);
-      for (const g of this.groups.values()) {
-        const members = g.runs.filter((r) => scopeSet.has(r));
-        if (!members.length) continue;
-        const key = `group:${g.name}`;
-        const open = !this.collapsed.has(key);
+    const walk = (node, depth) => {
+      for (const c of node.children) {
+        const key = `node:${c.key}`, open = !this.collapsed.has(key);
         heads.push(key);
-        rows.push(Object.assign(() => headRow({ key, label: g.name, members, color: g.color, depth: 0, open,
-          openTitle: "open this group", onOpen: () => this.openGroup(g.name) }), { id: key }));
-        if (open) for (const r of members) rows.push(Object.assign(() => runRow(r, 0), { id: r.id }));
+        rows.push(Object.assign(() => headRow({ key, label: c.label, members: c.runs, color: this.groups.get(c.key)?.color, depth, open,
+          openTitle: "open this group", onOpen: () => this.openGroup(c.key) }), { id: key }));
+        if (open) walk(c, depth + 1);
       }
-    } else if (this.byPath) {
-      const walk = (node, depth) => {
-        const dirs = [...node.dirs.values()].map((d) => [d, this.groupSortValue(d.all, d.name)])
-          .sort((a, b) => this.compare(a[1], b[1]) || cmpNames(a[0].name, b[0].name));
-        for (const [d] of dirs) {
-          const key = `folder:${d.path}`;
-          const open = !this.collapsed.has(key);
-          heads.push(key);
-          rows.push(Object.assign(() => headRow({ key, label: d.name, members: d.all, depth, open, openTitle: `open ${d.path}`,
-            onOpen: () => this.setPath(d.path) }), { id: key }));
-          if (open) walk(d, depth + 1);
-        }
-        for (const r of node.runs) rows.push(Object.assign(() => runRow(r, depth), { id: r.id }));
-      };
-      walk(this.buildTree(inScope), 0);
-    } else for (const r of inScope) rows.push(Object.assign(() => runRow(r, 0), { id: r.id }));
+      if (!node.children.length) for (const r of node.runs) rows.push(Object.assign(() => runRow(r, depth), { id: r.id }));
+    };
+    walk(this.groupTree, 0);
     this.sideRows = rows;
     this.renderSideWindow();
     const shown = this.runList.filter((r) => r.shown).length;
@@ -1766,18 +1783,28 @@ class App {
     }
   }
 
-  onData(keys, r) {
+  /** Mark the charts of `keys` dirty: drawn at once for work the view asked for, once it is all done; paced when
+   * `streamed`. */
+  onData(keys, r, streamed = false) {
     if (!keys || !this.runList) return this.redrawAll();
     if (r && !r.shown) return;
-    let first = false; // a chart still showing nothing draws on the next frame
+    const first = this.markDirty(keys); // a chart still showing nothing draws on the next frame
+    if (!streamed) this.urgent = true;
+    if (!streamed && !this.data.busy) this.schedule(true);
+    else if (first) this.nextFrame();
+    else this.schedule(false);
+  }
+
+  /** Mark the charts of `keys` dirty; whether a visible one among them shows nothing yet. */
+  markDirty(keys) {
+    let first = false;
     for (const k of keys) {
       for (const c of this.chartsOf(k)) {
         c.dirty = true;
         if ((c.visible || c.full) && !c.view?.lines.length) first = true;
       }
     }
-    const d = this.data, settled = !d.queue.length && !d.inflight.size && !d.posts; // the last of a load draws now
-    this.schedule(first || settled);
+    return first;
   }
 
   redrawAll() {
@@ -1785,19 +1812,23 @@ class App {
     this.schedule(true);
   }
 
-  /** Draw dirty visible charts on the next frame; streamed updates are coalesced to 4 Hz, or less often when
-   * drawing the visible charts takes more than a sixteenth of that. */
+  /** Draw dirty visible charts on the next frame (`now`: for the view, which then also draws the charts dirtied
+   * while drawing); streamed updates are coalesced to 4 Hz, or less often when drawing the visible charts takes more
+   * than a sixteenth of that. */
   schedule(now) {
-    if (now) {
-      if (!this.raf) this.raf = requestAnimationFrame(() => this.drawDirty());
-    } else if (!this.slow) {
+    if (now) (this.urgent = true), this.nextFrame();
+    else if (!this.slow) {
       let cost = 0;
       for (const c of this.charts.values()) if (c.visible || c.full) cost += c.drawMs || 0;
       this.slow = setTimeout(() => {
         this.slow = null;
-        this.schedule(true);
+        this.nextFrame();
       }, Math.min(2000, Math.max(250, 16 * cost)));
     }
+  }
+
+  nextFrame() {
+    if (!this.raf) this.raf = requestAnimationFrame(() => this.drawDirty());
   }
 
   /** Draw the dirty visible charts all in one frame: a round prepares the charts dirty when it began,
@@ -1806,24 +1837,55 @@ class App {
   drawDirty() {
     this.raf = null;
     if (!this.runList) return;
-    this.round ||= [...this.charts.values()].filter((c) => (c.visible || c.full) && c.dirty);
-    const t0 = performance.now();
-    let n = 0;
-    for (const c of this.round) {
-      if (c.prepared) continue;
-      if (n && performance.now() - t0 > FRAME_BUDGET_MS) return this.schedule(true);
-      const t = performance.now();
-      c.prepare();
-      c.drawMs = performance.now() - t;
-      n++;
+    if (!this.round) {
+      this.round = [...this.charts.values()].filter((c) => (c.visible || c.full) && c.dirty);
+      (this.paced = !this.urgent), (this.urgent = false); // paced: drawing streamed rows only
     }
-    if (n && performance.now() - t0 > FRAME_BUDGET_MS / 2) return this.schedule(true); // drawing gets a frame of its own
+    const t0 = performance.now(), n = this.prepareRound();
+    if (n < 0) return this.nextFrame();
+    if (this.round.some((c) => c.waiting)) return; // the round draws together once the workers answer
+    if (n && performance.now() - t0 > FRAME_BUDGET_MS / 2) return this.nextFrame(); // drawing gets a frame of its own
     const drew = this.round.length > 0, t1 = performance.now();
     for (const c of this.round) c.draw();
     this.presentMs = performance.now() - t1;
     this.round = null;
-    if (drew) this.replan();
-    if ([...this.charts.values()].some((c) => (c.visible || c.full) && c.dirty)) this.schedule(false);
+    if (drew || this.planSoon) this.replan(this.planSoon), (this.planSoon = false);
+    if ([...this.charts.values()].some((c) => (c.visible || c.full) && c.dirty)) this.schedule(this.urgent && !this.data.busy);
+  }
+
+  /** Prepare the round's charts not yet prepared or computed by a worker, until FRAME_BUDGET_MS of preparing here
+   * (handing charts to workers aside): how many, or -1 when some are left for the next frame. */
+  prepareRound() {
+    let n = 0, spent = 0;
+    for (const c of this.round) {
+      if (c.prepared || c.waiting) continue;
+      if (n && spent > FRAME_BUDGET_MS) return -1;
+      const t = performance.now();
+      c.prepare();
+      c.drawMs = performance.now() - t;
+      if (!c.waiting) (spent += c.drawMs), n++;
+    }
+    return n;
+  }
+
+  /** State, beside the status, when the server speaks another protocol than this page (another trex): a reload
+   * fetches the page that matches it. */
+  showProtocol(n) {
+    const b = $("#mismatch");
+    b.hidden = n === PROTOCOL;
+    b.textContent = "server updated · reload";
+    b.title = `this page speaks trex protocol ${PROTOCOL}, the server ${n ?? "an older one"}; reload to match it`;
+    b.onclick = () => location.reload();
+  }
+
+  /** What to fetch ahead (`Data.nextAhead`): each chart's metric, visible charts first, over the shown runs, with the
+   * slabs a zoom of a visible chart would draw from. */
+  aheadOf() {
+    if (!this.runList) return [];
+    if (this.shownFor !== this.runList) this.replanShown();
+    const charts = [...this.charts.values()].sort((a, b) => (b.visible || b.full) - (a.visible || a.full));
+    const slabs = new Map(charts.filter((c) => (c.visible || c.full) && c.ahead?.length).map((c) => [c.key, c.ahead]));
+    return [...new Set(charts.map((c) => c.key))].map((key) => ({ key, runs: this.shown, slabs: slabs.get(key) || [] }));
   }
 
   /** What chart c shows, for `Data.plan`. */
@@ -1831,7 +1893,7 @@ class App {
     const o = this.panelOpts(c.key), zoom = this.xrange && this.xrange[2] === o.xmode ? this.xrange : null;
     const x0 = o.xmin ?? zoom?.[0] ?? null, x1 = o.xmax ?? zoom?.[1] ?? null;
     return { key: c.key, runs, xmode: o.xmode, zoomed: x0 !== null || x1 !== null, x0: x0 ?? -Infinity, x1: x1 ?? Infinity,
-             pw: c.w ? c.pw : 600, coarseAbove: this.coarseAbove(o) };
+             pw: c.w ? c.pw : 600, coarseAbove: this.coarseAbove(o), slabs: c.slabGuess(o, this.data.runsWith(runs, c.key)) };
   }
 
   /** Runs above which each run of a chart with options `o` needs only coarse buckets: for group statistics, or
@@ -1842,9 +1904,9 @@ class App {
     return o.render === "density" ? 0 : o.render === "auto" ? DENSITY_AUTO : Infinity;
   }
 
-  /** Tell the data layer what the visible charts show: soon if `now`, else within PLAN_IDLE_MS. */
-  replan(now = false) {
-    const due = performance.now() + (now ? 30 : Math.max(30, PLAN_IDLE_MS - (performance.now() - (this.plannedAt || 0))));
+  /** Tell the data layer what the visible charts show: `wait` ms from now if `now`, else within PLAN_IDLE_MS. */
+  replan(now = false, wait = 30) {
+    const due = performance.now() + (now ? wait : Math.max(30, PLAN_IDLE_MS - (performance.now() - (this.plannedAt || 0))));
     if (this.planTimer && this.planDue <= due) return;
     clearTimeout(this.planTimer);
     this.planDue = due;
@@ -1852,15 +1914,23 @@ class App {
       this.planTimer = null;
       this.plannedAt = performance.now();
       if (!this.runList) return;
-      if (this.shownFor !== this.runList) (this.shownFor = this.runList), (this.shown = this.runList.filter((r) => r.shown));
+      if (this.shownFor !== this.runList) this.replanShown();
       const demands = new Map(); // one per metric, from its widest visible chart
       for (const c of this.charts.values()) {
         if (!(c.visible || c.full)) continue;
-        const d = this.demand(c, this.shown), had = demands.get(d.key);
+        const d = { ...this.demand(c, this.shown), runsSig: this.shownSig }, had = demands.get(d.key);
         if (!had || d.pw > had.pw) demands.set(d.key, d);
       }
       this.data.plan([...demands.values()]);
     }, due - performance.now());
+  }
+
+  /** The shown runs of the run list, and a hash of their set. */
+  replanShown() {
+    (this.shownFor = this.runList), (this.shown = this.runList.filter((r) => r.shown));
+    let a = this.shown.length, b = 0;
+    for (const r of this.shown) (a = (a + Math.imul(runNum(r), 0x9e3779b1)) | 0), (b ^= Math.imul(runNum(r), 0x85ebca6b));
+    this.shownSig = `${a}.${b}`;
   }
 
   /** Shared x zoom [x0, x1, xmode], or null. */
@@ -1966,7 +2036,7 @@ class App {
     if (!this.tipPinned) return;
     chart?.highlight(ln);
     if (ln.run) this.revealRun(ln.run.id);
-    else if (ln.group != null) this.revealSide(`group:${ln.group}`);
+    else if (ln.group != null) this.revealSide(`node:${ln.group}`);
   }
 
   tipRowOpen(ln) {
@@ -1976,25 +2046,17 @@ class App {
     else if (ln.group != null) this.openGroup(ln.group);
   }
 
-  /** Scroll the sidebar to a run, opening the folders or group that hold it, and mark it. */
+  /** Scroll the sidebar to a run, opening the groups that hold it, and mark it. */
   revealRun(id) {
     const r = this.data.runs.get(id);
     if (!r) return;
     let opened = false;
-    if (this.hasGroups) opened = this.collapsed.delete(`group:${r.gval}`);
-    else if (this.byPath) {
-      const rel = this.rel(id), parts = rel === "." ? [] : rel.split("/").slice(0, -1);
-      let p = this.opts.path;
-      for (const part of parts) {
-        p = p ? `${p}/${part}` : part;
-        if (this.collapsed.delete(`folder:${p}`)) opened = true;
-      }
-    }
+    for (const k of r.nodes || []) if (this.collapsed.delete(`node:${k}`)) opened = true;
     if (opened) this.saveCollapsed();
     this.revealSide(id, opened);
   }
 
-  /** Scroll the sidebar so the row for `id` (a run id or a "group:" / "folder:" key) is centered and marked. */
+  /** Scroll the sidebar so the row for `id` (a run id or a "node:" key) is centered and marked. */
   revealSide(id, rebuild = false) {
     if (this.sideMark === id && !rebuild) return;
     this.sideMark = id;

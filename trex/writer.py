@@ -148,7 +148,7 @@ def _jsonify(v: object) -> JSONValue:
 
 
 def folder_info(path: str | os.PathLike[str], info: Mapping[str, object] | None = None, **kv: object) -> dict[str, JSONValue]:
-    """Merge notes into `<path>/trex_info.json`; `trex={"group_by": [...]}` sets the folder's default grouping."""
+    """Merge notes into `<path>/trex_info.json`; `trex={"group_by": "a, b / c"}` sets the folder's default grouping."""
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
     f = p / INFO_FILE

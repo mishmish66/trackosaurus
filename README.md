@@ -23,13 +23,14 @@ run.finish()                                    # also at exit; an uncaught exce
 
 - The directory is the run: reopening it resumes, and a copy of it is a readable run.
 - Rows commit every second; a run silent for 5 minutes shows as crashed.
-- `trex.folder_info(path, trex={"group_by": ["subfolder"]})` sets a folder's notes and default grouping.
+- `trex.folder_info(path, trex={"group_by": "run~2 / run~1"})` sets a folder's notes and default grouping.
 
 ## Explore
 
 - `trex serve runs` opens the UI at http://127.0.0.1:13898; it stays fast with 10,000 runs.
-- Runs are listed flat; group by `path` to nest them by folder, or by subfolder or config key for median, mean or
-  IQM lines with 95% CI, IQR or min/max bands.
+- Group by fields, `,` within a level and ` / ` between levels: `algo, env / lr`. `run~1` is a run's directory
+  (the default), `run~2` the one above it, `run` each run alone. A group of several runs is one median, mean or IQM
+  line with a 95% CI, IQR or min/max band.
 - Drag to zoom, hover for values, Shift to pin them and scroll; ⚙ sets smoothing and axes per metric.
 - Hide a chart or media panel with its eye button: its section's header links to it, and the section's ⋯ menu shows
   or hides its panels and folds or unfolds its subsections.

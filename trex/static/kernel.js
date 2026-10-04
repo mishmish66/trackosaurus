@@ -1,5 +1,6 @@
-// Numeric kernel for the UI: resident metric columns, CRC-32, time-weighted EMA smoothing,
-// per-pixel decimation, group aggregation, and axis quantiles. Pure JS on typed arrays.
+// Numeric kernel for the UI: resident metric columns (in memory shared with workers when the page is cross-origin
+// isolated), CRC-32, time-weighted EMA smoothing, per-pixel decimation, group aggregation, and axis quantiles. Pure JS
+// on typed arrays; it runs in the page and in its workers.
 
 /** `flags` bits accepted by prep, agg and yrange; IQM (agg only) adds the interquartile mean. */
 export const LOGY = 1, RAW = 2, LOGX = 4, IQM = 8;
@@ -12,8 +13,6 @@ export const STATS = ["mean", "std", "n", "min", "max", "median", "q25", "q75", 
 export const NSTAT = STATS.length;
 /** Row of each statistic in agg's output. */
 const S = Object.freeze(Object.fromEntries(STATS.map((k, i) => [k, i])));
-const IQM_ROWS = [S.iqm, S.iqmse, S.iqmh];
-const OTHER_ROWS = STATS.map((_, j) => j).filter((j) => j !== S.n && !IQM_ROWS.includes(j)); // all but n and IQM_ROWS
 
 /** One metric of one run: points (step, value, runtime) in sequence order. */
 export class Col {
@@ -31,6 +30,14 @@ export class Col {
 
   get len() {
     return this.n;
+  }
+
+  /** A column of n points whose steps, values and runtimes are s, v, t (Float64Arrays, not copied), sorted as
+   * `sorted` says ([by step, by runtime]); its extents are not tracked. */
+  static view(s, v, t, n, sorted) {
+    const c = Object.create(Col.prototype);
+    Object.assign(c, { n, s, v, t, sorted, ext: null, sm: null, smKey: null, smState: null });
+    return c;
   }
 
   /** A column holding the first n points of s, v, t (Float64Arrays, taken over without copying). */
@@ -113,6 +120,73 @@ export class Col {
   ys(alpha, raw) {
     return alpha > 0 && !raw ? this.sm : this.v;
   }
+}
+
+// ---- column storage shared with workers ----
+
+/** Whether columns live in memory the page's workers can read: a cross-origin isolated page, unless `?shared=0`. */
+export const SHARED = typeof SharedArrayBuffer === "function" && globalThis.crossOriginIsolated === true
+  && !/[?&]shared=0(&|$)/.test(globalThis.location?.search ?? "");
+const CHUNK = 1 << 22; // floats per shared chunk
+const chunks = []; // {id, gen, view (Float64Array over a SharedArrayBuffer), used, live}
+const spare = []; // chunks whose columns are all gone, to be reused
+let current = null; // the chunk new columns go to
+const chunkListeners = new Set();
+const finalizer = SHARED ? new FinalizationRegistry(([id, size]) => release(id, size)) : null;
+
+/** n floats for one column: in a shared chunk when SHARED ({view, loc: {chunk, gen, off}}), else a plain array. */
+export function columnStore(n) {
+  if (!SHARED) return { view: new Float64Array(n), loc: null };
+  if (!current || current.used + n > current.view.length) current = takeChunk(n);
+  const off = current.used;
+  current.used += n;
+  current.live += n;
+  return { view: current.view.subarray(off, off + n), loc: { chunk: current.id, gen: current.gen, off, size: n } };
+}
+
+/** Note that column c holds the storage at `loc`, freed once c is collected. */
+export function holdStore(c, loc) {
+  c.loc = loc;
+  if (loc) finalizer.register(c, [loc.chunk, loc.size]);
+}
+
+/** Take shared buffer `buf` (a multiple of 8 bytes, filled elsewhere) as storage of its own: {view, loc}, freed by
+ * freeStore(loc). */
+export function adoptStore(buf) {
+  const view = new Float64Array(buf), ch = { id: chunks.length, gen: 0, view, used: view.length, live: view.length };
+  chunks.push(ch);
+  for (const fn of chunkListeners) fn(ch.id, buf);
+  return { view, loc: { chunk: ch.id, gen: 0, off: 0, size: view.length } };
+}
+
+/** Free the storage at `loc` (from columnStore) now. */
+export function freeStore(loc) {
+  if (loc) release(loc.chunk, loc.size);
+}
+
+/** Call fn(id, buffer) for every shared chunk, now and as they are made. */
+export function onChunks(fn) {
+  for (const ch of chunks) fn(ch.id, ch.view.buffer);
+  chunkListeners.add(fn);
+}
+
+function takeChunk(n) {
+  const i = spare.findIndex((ch) => ch.view.length >= n);
+  if (i >= 0) {
+    const ch = spare.splice(i, 1)[0];
+    (ch.gen += 1), (ch.used = 0), (ch.live = 0);
+    return ch;
+  }
+  const ch = { id: chunks.length, gen: 0, view: new Float64Array(new SharedArrayBuffer(8 * Math.max(CHUNK, n))), used: 0, live: 0 };
+  chunks.push(ch);
+  for (const fn of chunkListeners) fn(ch.id, ch.view.buffer);
+  return ch;
+}
+
+function release(id, size) {
+  const ch = chunks[id];
+  ch.live -= size;
+  if (ch.live <= 0 && ch !== current && !spare.includes(ch)) spare.push(ch);
 }
 
 /** Extend c's sortedness and extents by n points (steps s, runtimes t) after a last point (ls, lt). */
@@ -313,30 +387,219 @@ export function binGrid(x0, x1, most) {
 }
 
 /** Group statistics over `bins` x-bins of [x0, x1]: each column is averaged per bin and interpolated
- * across its gaps, then summarized. Returns NSTAT * bins values, stat-major (NaN where n = 0). */
-export function agg(cols, xmode, x0, x1, bins, flags, alpha, scale) {
-  const raw = (flags & RAW) !== 0, logx = (flags & LOGX) !== 0;
-  const R = cols.length, out = new Float64Array(NSTAT * bins);
-  const buf = scratchOf(R * bins + 4 * bins);
-  const vals = buf.subarray(0, R * bins).fill(NaN); // bin-major: bin b's values are vals[b * R, (b + 1) * R)
-  const at = (k) => buf.subarray(R * bins + k * bins, R * bins + (k + 1) * bins);
-  const acc = { sum: at(0), cnt: at(1), pos: at(2), neg: at(3) };
-  for (let r = 0; r < R; r++) {
-    cols[r].ensureSmooth(alpha, scale, xmode);
-    binColumn(cols[r], xmode, cols[r].ys(alpha, raw), x0, x1, bins, logx, acc, vals, r, R);
+ * across its gaps, then summarized. Returns NSTAT * bins values, stat-major (NaN where n = 0). Columns' bin means are
+ * kept in `cache` (a BinCache) for the next call. */
+export function agg(cols, xmode, x0, x1, bins, flags, alpha, scale, cache = new BinCache()) {
+  return aggGroups([cols], xmode, x0, x1, bins, flags, alpha, scale, cache);
+}
+
+/** agg of each list of columns in `groups`, one after another in the result (NSTAT * bins values each). */
+export function aggGroups(groups, xmode, x0, x1, bins, flags, alpha, scale, cache = new BinCache()) {
+  let R = 0, most = 0;
+  for (const g of groups) (R += g.length), (most = Math.max(most, g.length));
+  const out = new Float64Array(groups.length * NSTAT * bins).fill(NaN), iqm = (flags & IQM) !== 0;
+  const m = cache.get({ xmode, x0, x1, bins, flags: flags & (RAW | LOGX), alpha, scale }, R), buf = scratchOf(most * bins);
+  finiteOf(most);
+  for (let gi = 0; gi < groups.length; gi++) {
+    const n = groups[gi].length, at = m.slots(groups[gi]);
+    gatherBins(m.v, at, n, bins, buf);
+    for (let b = 0; b < bins; b++) binStats(buf, b * n, n, out, gi * NSTAT * bins, bins, b, iqm);
   }
-  const iqm = (flags & IQM) !== 0;
-  for (let b = 0; b < bins; b++) binStats(vals.subarray(b * R, (b + 1) * R), out, bins, b, iqm);
   return out;
 }
 
-/** Per-bin means of column c's values in [x0, x1] into vals[b * R + r], interpolated across empty bins between full
- * ones. A bin's mean is of its finite values; with none, it is infinite (NaN with both signs). */
-function binColumn(c, xmode, ys, x0, x1, bins, logx, acc, vals, r, R) {
-  const { sum, cnt, pos, neg } = acc;
+/** Each column's (or SlabRun's) per-bin means for binning p ({xmode, x0, x1, bins, flags, alpha, scale}), NaN where
+ * it has none: cols.length * p.bins values, column-major; binnings are kept in `cache` as agg's. */
+export function binRows(cols, p, cache = new BinCache()) {
+  const m = cache.get(p, cols.length), at = m.slots(cols), out = new Float64Array(cols.length * p.bins);
+  for (let r = 0; r < cols.length; r++) out.set(m.v.subarray(at[r] * p.bins, (at[r] + 1) * p.bins), r * p.bins);
+  return out;
+}
+
+/** The bin means of the n columns in slots `at` of v (bins per slot) into buf, bin-major: bin b's at [b * n, (b + 1)
+ * * n). Block by block, so the rows read stay in cache. */
+function gatherBins(v, at, n, bins, buf) {
+  for (let r0 = 0; r0 < n; r0 += GATHER_BLOCK) {
+    const r1 = Math.min(n, r0 + GATHER_BLOCK);
+    for (let b = 0; b < bins; b++) for (let r = r0, o = b * n; r < r1; r++) buf[o + r] = v[at[r] * bins + b];
+  }
+}
+
+const BINNINGS = 4; // binnings a BinCache keeps: smoothed and raw, at two zooms
+const GATHER_BLOCK = 64; // columns agg gathers at a time
+
+/** Columns' per-bin means for one binning ({xmode, x0, x1, bins, flags, alpha, scale}), one slot per column (bin b of
+ * slot k at v[k * bins + b]); a column's slot is reused while it has the same points. */
+class Binning {
+  constructor(p, cap) {
+    this.p = p;
+    this.cap = cap;
+    this.v = new Float64Array(p.bins * cap);
+    this.at = new Map(); // column -> [slot, points binned]
+    const at = () => new Float64Array(p.bins);
+    this.acc = { sum: at(), cnt: at(), pos: at(), neg: at() };
+  }
+
+  /** Slots of `cols`, binning the columns not yet binned with their current points. */
+  slots(cols) {
+    const out = slotScratch(cols.length);
+    for (let r = 0; r < cols.length; r++) {
+      const c = cols[r], e = this.at.get(c);
+      out[r] = e && e[1] === c.n ? e[0] : this.bin(c, e ? e[0] : this.at.size);
+    }
+    return out;
+  }
+
+  /** Bin column (or SlabRun) c into slot k. */
+  bin(c, k) {
+    const p = this.p;
+    if (k >= this.cap) this.grow(k + 1);
+    const row = this.v.subarray(k * p.bins, (k + 1) * p.bins).fill(NaN);
+    if (c.slabs) binSlabRun(c, p.x0, p.x1, p.bins, row);
+    else {
+      c.ensureSmooth(p.alpha, p.scale, p.xmode);
+      binColumn(c, p.xmode, c.ys(p.alpha, (p.flags & RAW) !== 0), p.x0, p.x1, p.bins, (p.flags & LOGX) !== 0, this.acc, row);
+    }
+    this.at.set(c, [k, c.n]);
+    return k;
+  }
+
+  grow(need) {
+    const cap = Math.max(need, 2 * this.cap), v = new Float64Array(this.p.bins * cap);
+    v.set(this.v);
+    (this.v = v), (this.cap = cap);
+  }
+}
+
+/** One chart's recent binnings, newest first. */
+export class BinCache {
+  constructor() {
+    this.binnings = [];
+    this.most = 0; // most columns one call has binned
+  }
+
+  /** The kept binning p, or a new one; one holding many more columns than the chart has drawn (columns since
+   * replaced) starts over. */
+  get(p, R) {
+    const all = this.binnings;
+    this.most = Math.max(this.most, R);
+    let i = all.findIndex((m) => sameBinning(m.p, p));
+    if (i >= 0 && all[i].at.size > 2 * Math.max(R, this.most) + 1024) all.splice(i, 1), (i = -1);
+    const m = i >= 0 ? all.splice(i, 1)[0] : new Binning(p, R);
+    all.unshift(m);
+    if (all.length > BINNINGS) all.pop();
+    return m;
+  }
+}
+
+const sameBinning = (a, b) => a.xmode === b.xmode && a.x0 === b.x0 && a.x1 === b.x1 && a.bins === b.bins
+  && a.flags === b.flags && a.alpha === b.alpha && a.scale === b.scale;
+
+let slotBuf = new Int32Array(1024);
+const slotScratch = (n) => (slotBuf.length < n ? (slotBuf = new Int32Array(2 * n)) : slotBuf).subarray(0, n);
+
+/** Per-bin means of column c's values in [x0, x1] into row, interpolated across empty bins between full ones. A
+ * bin's mean is of its finite values; with none, it is infinite (NaN with both signs). */
+function binColumn(c, xmode, ys, x0, x1, bins, logx, acc, row) {
+  if (!c.sorted[xmode]) return binUnsorted(c, xmode, ys, x0, x1, bins, logx, acc, row);
   const xs = c.xs(xmode), [lo, hi] = visibleRange(c, xmode, x0, x1, logx), per = bins / (x1 - x0);
-  sum.fill(0), cnt.fill(0), pos.fill(0), neg.fill(0);
+  const run = binRun;
+  (run.b = -1), (run.prev = -1), (run.sum = 0), (run.cnt = 0), (run.pos = 0), (run.neg = 0);
   for (let i = lo; i < hi; i++) {
+    const x = tx(xs[i], logx), y = ys[i];
+    if (!(x >= x0 && x <= x1) || y !== y) continue;
+    const b = Math.min(bins - 1, Math.floor((x - x0) * per));
+    if (b !== run.b) closeBin(run, row), (run.b = b);
+    if (y === Infinity) run.pos = 1;
+    else if (y === -Infinity) run.neg = 1;
+    else (run.sum += y), (run.cnt += 1);
+  }
+  closeBin(run, row);
+}
+
+/** The bin binColumn is filling (b, with its finite sum and count and whether it holds +inf or -inf) and the last
+ * full bin before it (prev, of mean pv). */
+const binRun = { b: -1, sum: 0, cnt: 0, pos: 0, neg: 0, prev: -1, pv: 0 };
+
+/** Write the mean of binRun's bin into row, interpolating across the empty bins since the previous full one. */
+function closeBin(run, row) {
+  const b = run.b, v = run.cnt ? run.sum / run.cnt : run.pos || run.neg ? (run.pos ? Infinity : 0) + (run.neg ? -Infinity : 0) : undefined;
+  (run.sum = 0), (run.cnt = 0), (run.pos = 0), (run.neg = 0);
+  if (v === undefined) return;
+  row[b] = v;
+  for (let k = run.prev + 1, prev = run.prev, pv = run.pv; prev >= 0 && k < b; k++) {
+    const w = (k - prev) / (b - prev);
+    row[k] = pv * (1 - w) + v * w;
+  }
+  (run.prev = b), (run.pv = v);
+}
+
+/** Per-bin means of a SlabRun's buckets in step range [x0, x1] into row, as binColumn's of a column but weighted by
+ * the buckets' counts (so a bucket no wider than a bin gives the mean of its rows there). */
+function binSlabRun(src, x0, x1, bins, row) {
+  const per = bins / (x1 - x0), run = binRun;
+  (run.b = -1), (run.prev = -1), (run.sum = 0), (run.cnt = 0), (run.pos = 0), (run.neg = 0);
+  for (let j = 0; j < src.slabs.length; j++) {
+    const s = src.slabs[j], i = src.rows[j], w = 2 ** s.level, base = s.index * SLAB_TILE;
+    for (let q = s.first[i]; q < s.first[i + 1]; q++) {
+      const x = (base + s.bucket[q] + (s.soff[q] + 0.5) / SOFF_SCALE) * w, y = s.mean[q];
+      if (!(x >= x0 && x <= x1) || y !== y) continue;
+      const b = Math.min(bins - 1, Math.floor((x - x0) * per));
+      if (b !== run.b) closeBin(run, row), (run.b = b);
+      if (y === Infinity) run.pos = 1;
+      else if (y === -Infinity) run.neg = 1;
+      else (run.sum += y * s.n[q]), (run.cnt += s.n[q]);
+    }
+  }
+  closeBin(run, row);
+}
+
+// ---- slabs: one step range of many runs at one level (tiles.py) ----
+
+const SLAB_MAGIC = 0x32534b54; // "TKS2"
+const SLAB_TILE = 256; // buckets of a slab's step range (tiles.TILE)
+const SOFF_SCALE = 65536; // a slab's step offsets, in fractions of a bucket (tiles.SOFF_SCALE)
+
+/** Views of the slab encoded at byte `off` of `buf`: {level, index, runs, count, first, bucket, soff (step offsets
+ * times SOFF_SCALE, rounded down), mean, n, names: [byte offset, length] of its run paths, bytes}. */
+export function slabViews(buf, off) {
+  const h = new Uint32Array(buf, off, 8);
+  if (h[0] !== SLAB_MAGIC) throw new Error("bad slab");
+  const level = h[1] | 0, index = (h[3] | 0) * 4294967296 + h[2], runs = h[4], count = h[5], names = [off + 32, h[6]];
+  const pad = (bytes) => Math.ceil(bytes / 8) * 8;
+  let at = off + 32 + pad(h[6]);
+  const first = new Uint32Array(buf, at, runs + 1);
+  at += pad(4 * (runs + 1));
+  const bucket = new Uint16Array(buf, at, count), soff = new Uint16Array(buf, at + pad(2 * count), count);
+  at += 2 * pad(2 * count);
+  return { level, index, runs, count, first, bucket, soff, mean: new Float32Array(buf, at, count), n: new Uint32Array(buf, at + 4 * count, count),
+           names, bytes: at + 8 * count - off };
+}
+
+/** [first, last] mean step of the buckets of slab `v` (slabViews), or null when it has none. */
+export function slabExtent(v) {
+  let lo = Infinity, hi = -Infinity;
+  const w = 2 ** v.level, base = v.index * SLAB_TILE, step = (q) => (base + v.bucket[q] + (v.soff[q] + 0.5) / SOFF_SCALE) * w;
+  for (let i = 0; i < v.runs; i++) if (v.first[i + 1] > v.first[i]) (lo = Math.min(lo, step(v.first[i]))), (hi = Math.max(hi, step(v.first[i + 1] - 1)));
+  return hi >= lo ? [lo, hi] : null;
+}
+
+/** A run's buckets in slabs (slabViews, in step order), at row rows[j] of slabs[j]: a source agg bins as a column. */
+export class SlabRun {
+  constructor(slabs, rows) {
+    this.slabs = slabs;
+    this.rows = rows;
+    this.n = 0; // buckets
+    slabs.forEach((s, j) => (this.n += s.first[rows[j] + 1] - s.first[rows[j]]));
+  }
+}
+
+/** binColumn of a column whose x is not sorted: sums per bin first. */
+function binUnsorted(c, xmode, ys, x0, x1, bins, logx, acc, row) {
+  const { sum, cnt, pos, neg } = acc;
+  const xs = c.xs(xmode), per = bins / (x1 - x0);
+  sum.fill(0), cnt.fill(0), pos.fill(0), neg.fill(0);
+  for (let i = 0; i < c.n; i++) {
     const x = tx(xs[i], logx), y = ys[i];
     if (!(x >= x0 && x <= x1) || y !== y) continue;
     const b = Math.min(bins - 1, Math.floor((x - x0) * per));
@@ -348,10 +611,10 @@ function binColumn(c, xmode, ys, x0, x1, bins, logx, acc, vals, r, R) {
   for (let b = 0; b < bins; b++) {
     const v = binMean(acc, b);
     if (v === undefined) continue;
-    vals[b * R + r] = v;
+    row[b] = v;
     for (let k = prev + 1; prev >= 0 && k < b; k++) {
       const w = (k - prev) / (b - prev);
-      vals[k * R + r] = pv * (1 - w) + v * w;
+      row[k] = pv * (1 - w) + v * w;
     }
     prev = b;
     pv = v;
@@ -366,18 +629,24 @@ function binMean({ sum, cnt, pos, neg }, b) {
   return undefined;
 }
 
-/** Counts of a bin's values: finite ones (moved to the front of the bin), their sum and range, and infinities. */
+/** Counts of a bin's values: finite ones (copied to `fin`), their sum and range, and infinities. */
 const part = { m: 0, sum: 0, lo: 0, hi: 0, neg: 0, pos: 0 };
+let fin = new Float64Array(64); // the finite values of the bin binStats summarizes
 
-/** Move the finite values of `s` to its front, counting them and its infinities into `part`; NaN is no value. */
-function partition(s) {
+function finiteOf(n) {
+  if (fin.length < n) fin = new Float64Array(n);
+}
+
+/** Copy the finite values of a[off, off + n) to the front of `fin`, counting them and the infinities into `part`;
+ * NaN is no value. */
+function partition(a, off, n) {
   let m = 0, sum = 0, lo = Infinity, hi = -Infinity, neg = 0, pos = 0;
-  for (let i = 0; i < s.length; i++) {
-    const v = s[i];
+  for (let i = off; i < off + n; i++) {
+    const v = a[i];
     if (v === Infinity) pos++;
     else if (v === -Infinity) neg++;
     else if (v === v) {
-      s[m++] = v;
+      fin[m++] = v;
       sum += v;
       if (v < lo) lo = v;
       if (v > hi) hi = v;
@@ -386,33 +655,36 @@ function partition(s) {
   (part.m = m), (part.sum = sum), (part.lo = lo), (part.hi = hi), (part.neg = neg), (part.pos = pos);
 }
 
-/** STATS of the values in `s` (NaN: no value; reordered) into bin b of `out`; the IQM's only when `iqm`. Infinities
- * count as values: the mean is infinite (NaN with both signs), the spread NaN, and order statistics see them at the
- * ends. */
-function binStats(s, out, bins, b, iqm) {
-  partition(s);
-  const { m, sum, lo, hi, neg, pos } = part, n = neg + m + pos;
-  out[S.n * bins + b] = n;
-  if (!n || !iqm) for (const j of IQM_ROWS) out[j * bins + b] = NaN;
-  if (!n) {
-    for (const j of OTHER_ROWS) out[j * bins + b] = NaN;
-    return;
-  }
+/** STATS of the values a[off, off + n) (NaN: no value) into bin b of the group at `o` of `out`, which holds NaN; the
+ * IQM's only when `iqm`. Infinities count as values: the mean is infinite (NaN with both signs), the spread NaN, and
+ * order statistics see them at the ends. */
+function binStats(a, off, n0, out, o, bins, b, iqm) {
+  partition(a, off, n0);
+  const { m, neg, pos } = part, n = neg + m + pos;
+  out[o + S.n * bins + b] = n;
+  if (!n) return;
+  moments(out, o, bins, b, n);
+  const k = medianCiRank(n), h50 = (n - 1) * 0.5, h25 = (n - 1) * 0.25, h75 = (n - 1) * 0.75, g = Math.floor(n / 4);
+  if (m <= SMALL_SORT) insertionSort(fin, m), (sortedVals = fin);
+  else (sortedVals = null), resolveRanks(fin, wantRanks(n, [k - 1, n - k, h50, h50 + 1, h25, h25 + 1, h75, h75 + 1, g, n - g - 1]));
+  out[o + S.median * bins + b] = quantileOf(h50, n);
+  out[o + S.q25 * bins + b] = quantileOf(h25, n);
+  out[o + S.q75 * bins + b] = quantileOf(h75, n);
+  out[o + S.medlo * bins + b] = rankValue(k - 1);
+  out[o + S.medhi * bins + b] = rankValue(n - k);
+  if (iqm) iqmStats(fin, g, rankValue(g), rankValue(n - g - 1), out, o, bins, b);
+}
+
+/** Mean, std, min and max of the bin `part` describes (n values) into `out`. */
+function moments(out, o, bins, b, n) {
+  const { m, sum, lo, hi, neg, pos } = part;
   const mean = (sum + (pos ? Infinity : 0) + (neg ? -Infinity : 0)) / n;
   let v2 = 0;
-  for (let i = 0; i < m; i++) v2 += (s[i] - mean) ** 2;
-  out[S.mean * bins + b] = mean;
-  out[S.std * bins + b] = n === 1 ? 0 : neg || pos ? NaN : Math.sqrt(v2 / (n - 1));
-  out[S.min * bins + b] = neg ? -Infinity : lo;
-  out[S.max * bins + b] = pos ? Infinity : hi;
-  const k = medianCiRank(n), h50 = (n - 1) * 0.5, h25 = (n - 1) * 0.25, h75 = (n - 1) * 0.75, g = Math.floor(n / 4);
-  resolveRanks(s, wantRanks(n, [k - 1, n - k, h50, h50 + 1, h25, h25 + 1, h75, h75 + 1, g, n - g - 1]));
-  out[S.median * bins + b] = quantileOf(h50, n);
-  out[S.q25 * bins + b] = quantileOf(h25, n);
-  out[S.q75 * bins + b] = quantileOf(h75, n);
-  out[S.medlo * bins + b] = rankValue(k - 1);
-  out[S.medhi * bins + b] = rankValue(n - k);
-  if (iqm) iqmStats(s, g, rankValue(g), rankValue(n - g - 1), out, bins, b);
+  for (let i = 0; i < m; i++) v2 += (fin[i] - mean) ** 2;
+  out[o + S.mean * bins + b] = mean;
+  out[o + S.std * bins + b] = n === 1 ? 0 : neg || pos ? NaN : Math.sqrt(v2 / (n - 1));
+  out[o + S.min * bins + b] = neg ? -Infinity : lo;
+  out[o + S.max * bins + b] = pos ? Infinity : hi;
 }
 
 /** The values at ranks want[0, count) of the bin `part` describes: the infinities at either end, the finite values
@@ -429,10 +701,10 @@ function resolveRanks(s, count) {
  * ranks g and n - g - 1 are lo and hi; with Yuen's standard error (from the winsorized variance) and the count h
  * it keeps, whose t quantile on h - 1 degrees of freedom gives its 95% CI. Infinite (NaN with both signs, error NaN)
  * when the kept ranks reach an infinity. */
-function iqmStats(s, g, lo, hi, out, bins, b) {
+function iqmStats(s, g, lo, hi, out, o, bins, b) {
   const { m, neg, pos } = part, n = neg + m + pos, h = n - 2 * g;
-  out[S.iqmh * bins + b] = h;
-  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return infiniteIqm(lo, hi, h, out, bins, b);
+  out[o + S.iqmh * bins + b] = h;
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return infiniteIqm(lo, hi, h, out, o, bins, b);
   let le = neg, mid = 0, nmid = 0, wsum = neg * lo + pos * hi;
   for (let i = 0; i < m; i++) {
     const v = s[i];
@@ -445,15 +717,15 @@ function iqmStats(s, g, lo, hi, out, bins, b) {
   const wmean = wsum / n;
   let w2 = neg * (lo - wmean) ** 2 + pos * (hi - wmean) ** 2;
   for (let i = 0; i < m; i++) w2 += ((s[i] < lo ? lo : s[i] > hi ? hi : s[i]) - wmean) ** 2;
-  out[S.iqm * bins + b] = iqm;
-  out[S.iqmse * bins + b] = h > 1 ? Math.sqrt(w2 / (h * (h - 1))) : 0;
+  out[o + S.iqm * bins + b] = iqm;
+  out[o + S.iqmse * bins + b] = h > 1 ? Math.sqrt(w2 / (h * (h - 1))) : 0;
 }
 
 /** The IQM of a kept window from lo to hi that reaches an infinity: that infinity (NaN when it reaches both), error
  * NaN. */
-function infiniteIqm(lo, hi, h, out, bins, b) {
-  out[S.iqm * bins + b] = lo === -Infinity ? (hi === Infinity ? NaN : -Infinity) : hi;
-  out[S.iqmse * bins + b] = h > 1 ? NaN : 0;
+function infiniteIqm(lo, hi, h, out, o, bins, b) {
+  out[o + S.iqm * bins + b] = lo === -Infinity ? (hi === Infinity ? NaN : -Infinity) : hi;
+  out[o + S.iqmse * bins + b] = h > 1 ? NaN : 0;
 }
 
 const want = new Int32Array(10), got = new Float64Array(10); // the ranks orderStats resolves, and their values
@@ -473,7 +745,10 @@ function wantRanks(m, hs) {
   return n;
 }
 
+let sortedVals = null; // when set, the bin's finite values, sorted, which ranks read directly
+
 function rankValue(r) {
+  if (sortedVals) return r < part.neg ? -Infinity : r >= part.neg + part.m ? Infinity : sortedVals[r - part.neg];
   let i = 0;
   while (want[i] !== r) i++;
   return got[i];
@@ -485,7 +760,7 @@ function quantileOf(h, m) {
   return f && i + 1 < m ? rankValue(i) * (1 - f) + rankValue(i + 1) * f : rankValue(i);
 }
 
-const HIST = 1024; // buckets per histogram pass of orderStats
+const HIST = 1024; // most buckets per histogram pass of orderStats: about a quarter of the values
 const SMALL_SORT = 64; // at most this many values are sorted outright
 const hist = new Int32Array(HIST), slotOf = new Int32Array(HIST).fill(-1);
 const gathered = [];
@@ -496,11 +771,11 @@ let sortBuf = new Float64Array(SMALL_SORT);
  * wanted ranks, and only their values are gathered and resolved, by sorting when few. */
 function orderStats(a, n, lo, hi, base, w0, w1, depth) {
   if (lo === hi) return got.fill(lo, w0, w1);
-  const scale = HIST / (hi - lo);
+  const H = Math.min(HIST, 2 ** Math.ceil(Math.log2(n / 4))), scale = H / (hi - lo);
   if (n <= SMALL_SORT || depth > 6 || !(scale < Infinity)) return sortedRanks(a, n, base, w0, w1);
-  histogram(a, n, lo, scale);
-  const groups = wantedBuckets(base, w0, w1);
-  const { buf, start, end } = gather(a, n, lo, scale, groups, depth);
+  histogram(a, n, lo, scale, H);
+  const groups = wantedBuckets(base, w0, w1, H);
+  const { buf, start, end } = gather(a, n, lo, scale, groups, depth, H);
   for (let g = 0; g < groups.k.length; g++) {
     const sub = buf.subarray(start[g], end[g]);
     let l = Infinity, h = -Infinity;
@@ -512,19 +787,19 @@ function orderStats(a, n, lo, hi, base, w0, w1, depth) {
   }
 }
 
-function histogram(a, n, lo, scale) {
-  hist.fill(0);
+function histogram(a, n, lo, scale, H) {
+  hist.fill(0, 0, H);
   for (let i = 0; i < n; i++) {
     const k = ((a[i] - lo) * scale) | 0;
-    hist[k < HIST ? k : HIST - 1]++;
+    hist[k < H ? k : H - 1]++;
   }
 }
 
 /** The histogram buckets holding want[w0, w1): {k (bucket), first (its first rank), w (want ranges, in pairs)}. */
-function wantedBuckets(base, w0, w1) {
+function wantedBuckets(base, w0, w1, H) {
   const groups = { k: [], first: [], w: [] };
   let cum = base, w = w0;
-  for (let k = 0; k < HIST && w < w1; k++) {
+  for (let k = 0; k < H && w < w1; k++) {
     const from = w;
     while (w < w1 && want[w] < cum + hist[k]) w++;
     if (w > from) groups.k.push(k), groups.first.push(cum), groups.w.push(from, w);
@@ -534,16 +809,26 @@ function wantedBuckets(base, w0, w1) {
 }
 
 /** The values of a in the wanted buckets, each bucket's together: {buf, start, end} per bucket. */
-function gather(a, n, lo, scale, groups, depth) {
+function gather(a, n, lo, scale, groups, depth, H) {
   let total = 0;
   const start = groups.k.map((k, g) => ((slotOf[k] = g), (total += hist[k]), total - hist[k])), end = start.slice();
   const buf = (gathered[depth] = gathered[depth]?.length >= total ? gathered[depth] : new Float64Array(Math.max(total, 64)));
   for (let i = 0; i < n; i++) {
-    const k = ((a[i] - lo) * scale) | 0, g = slotOf[k < HIST ? k : HIST - 1];
+    const k = ((a[i] - lo) * scale) | 0, g = slotOf[k < H ? k : H - 1];
     if (g >= 0) buf[end[g]++] = a[i];
   }
   for (const k of groups.k) slotOf[k] = -1;
   return { buf, start, end };
+}
+
+/** Sort a[0, m) ascending in place. */
+function insertionSort(a, m) {
+  for (let i = 1; i < m; i++) {
+    const v = a[i];
+    let j = i - 1;
+    while (j >= 0 && a[j] > v) (a[j + 1] = a[j]), j--;
+    a[j + 1] = v;
+  }
 }
 
 function sortedRanks(a, n, base, w0, w1) {

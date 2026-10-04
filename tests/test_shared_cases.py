@@ -1,4 +1,4 @@
-"""Cases of the formats the Python and browser code share (tiles, smoothing, group statistics), written from the Python
+"""Cases of the formats the Python and browser code share (tiles, live tails, slabs, smoothing, group statistics), written from the Python
 implementations into shared_cases.json, which tests/shared_cases.test.mjs checks the browser's against.
 TREX_WRITE_CASES=1 rewrites the file."""
 
@@ -66,6 +66,62 @@ def merge_cases() -> list[dict[str, object]]:
     return out
 
 
+def tail_cases() -> list[dict[str, object]]:
+    """A live run's tile built before and after its newest rows, which split a bucket: the column of the first plus
+    those rows is the column of the second, for top tiles merged up and for finer tiles."""
+    out: list[dict[str, object]] = []
+    level, index, n = 2, 1, 700
+    lo, hi = tiles.tile_range(level, index)
+    steps: np.ndarray = lo + np.arange(n) * ((hi - lo) / n)
+    values = spread(n, 104729, 2003) * 20 - 10
+    values[::19] = np.nan
+    values[600:640:7] = np.inf
+    times: np.ndarray = steps * 0.5 + spread(n, 5, 13)
+    k = 532  # inside a bucket at every merge below
+    before = tiles.build(steps[:k], values[:k], times[:k], level, index)
+    after = tiles.build(steps, values, times, level, index)
+    for up, fine in [(0, False), (2, False), (0, True)]:
+        out.append({"before": base64.b64encode(before).decode(), "after": base64.b64encode(after).decode(), "level": level,
+                    "index": index, "up": up, "fine": fine, "steps": steps[k:].tolist(), "values": plains(values[k:]),
+                    "times": times[k:].tolist()})
+    return out
+
+
+def slab_cases() -> list[dict[str, object]]:
+    """A slab of runs' top tiles a level up, and each run's mean per bin over its rows, for bins one and two buckets
+    wide: the mean of the finite values, infinite only without any."""
+    rng = np.random.default_rng(7)
+    runs, rows = [], []
+    for i, n in enumerate([900, 1300, 700]):
+        steps: np.ndarray = np.arange(n) * 1.0 + i
+        values = rng.normal(size=n)
+        values[::11] = np.nan
+        if i == 1:
+            values[200:208] = np.inf
+        level, idx = tiles.top_tiles(steps[0], steps[-1])
+        times: np.ndarray = steps * 0.5
+        runs.append((f"r{i}", [tiles.build(steps, values, times, level, k) for k in idx]))
+        rows.append((steps, values))
+    level = max(tiles.decode(b).level for _, bs in runs for b in bs) + 1
+    width = 2.0 ** level
+    out: list[dict[str, object]] = []
+    for bins in (tiles.TILE, tiles.TILE // 2):  # bins one bucket wide, then two
+        lo, w = 0.0, tiles.TILE * width / bins
+        means: list[list[float | str | None]] = []
+        for steps, values in rows:
+            b = np.floor((steps - lo) / w).astype(np.int64)
+            row: list[float | str | None] = [None] * bins
+            for k in range(bins):
+                v = values[(b == k) & ~np.isnan(values)]
+                if v.size:
+                    f = v[np.isfinite(v)]
+                    row[k] = plain(float(f.mean()) if f.size else float(v.mean()))
+            means.append(row)
+        out.append({"slab": base64.b64encode(tiles.slab(runs, level, 0)).decode(), "level": level, "index": 0,
+                    "x0": lo, "x1": lo + bins * w, "bins": bins, "means": means})
+    return out
+
+
 def smoothing_cases() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     for alpha, n, gaps in [(0.6, 50, False), (0.9, 200, True), (0.99, 300, True)]:
@@ -102,7 +158,8 @@ def stats_cases() -> list[dict[str, object]]:
 
 
 def build_cases() -> dict[str, object]:
-    return {"tiles": tile_cases(), "merges": merge_cases(), "smoothing": smoothing_cases(), "stats": stats_cases()}
+    return {"tiles": tile_cases(), "merges": merge_cases(), "tails": tail_cases(), "slabs": slab_cases(),
+            "smoothing": smoothing_cases(), "stats": stats_cases()}
 
 
 def test_shared_cases_match_the_python_implementations():

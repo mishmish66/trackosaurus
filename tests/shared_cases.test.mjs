@@ -3,8 +3,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { buildColumn, decodeTile } from "../trex/static/data.js";
-import { Col, IQM, STATS, X_STEP, agg } from "../trex/static/kernel.js";
+import { buildColumn, decodeTile, finePoints } from "../trex/static/data.js";
+import { Col, IQM, STATS, SlabRun, X_STEP, agg, binRows, slabViews } from "../trex/static/kernel.js";
 import { smoothScale } from "../trex/static/plot.js";
 import { asNumber } from "../trex/static/where.js";
 
@@ -47,6 +47,40 @@ test("buckets merge locally as tiles.coarsen merges them: the mean of the finite
       assert.ok(Math.abs(col.v[i] - want) <= 1e-6 * Math.max(1, Math.abs(want)), `${at}: ${col.v[i]} != ${want}`);
       assert.ok(Math.abs(col.s[i] - nan(c.mean_step[i])) <= 1e-3 * 2 ** (c.level + c.up), `${at} step`);
     });
+  }
+});
+
+test("a live run's column is the same before and after its tiles take in its newest rows", () => {
+  const none = { s: [], v: [], t: [], n: 0, s0: Infinity }, tile = (b64) => decodeTile(Uint8Array.from(Buffer.from(b64, "base64")).buffer);
+  for (const c of CASES.tails) {
+    const tail = { s: c.steps, v: c.values.map(nan), t: c.times, n: c.steps.length, s0: c.steps[0] }, at = `up ${c.up} fine ${c.fine}`;
+    const range = [c.index * TILE * 2 ** c.level, (c.index + 1) * TILE * 2 ** c.level];
+    const column = (t, rows, s0) => (c.fine
+      ? buildColumn([], 1, 1, finePoints([{ tile: t, seq: 0 }], s0), [range], rows, 2 ** c.level)
+      : buildColumn([t], 2 ** c.up, 2 ** c.level, none, [], rows));
+    const got = column(tile(c.before), tail, tail.s0), want = column(tile(c.after), none, Infinity);
+    assert.equal(got.n, want.n, at);
+    for (let i = 0; i < want.n; i++) {
+      const w = want.v[i];
+      if (!Number.isFinite(w)) assert.ok(Object.is(got.v[i], w), `${at} point ${i}: ${got.v[i]} != ${w}`);
+      else assert.ok(Math.abs(got.v[i] - w) <= 1e-5 * Math.max(1, Math.abs(w)), `${at} point ${i}: ${got.v[i]} != ${w}`);
+      assert.ok(Math.abs(got.s[i] - want.s[i]) <= 1e-3 * 2 ** (c.level + c.up), `${at} point ${i} step`);
+    }
+  }
+});
+
+test("a slab's runs bin to the mean of their rows per bucket, as Python bins the rows", () => {
+  for (const c of CASES.slabs) {
+    const bytes = Uint8Array.from(Buffer.from(c.slab, "base64")), sl = slabViews(bytes.buffer, 0);
+    assert.deepEqual([sl.level, sl.index, sl.runs], [c.level, c.index, c.means.length]);
+    const runs = c.means.map((_, i) => new SlabRun([sl], [i]));
+    const rows = binRows(runs, { xmode: X_STEP, x0: c.x0, x1: c.x1, bins: c.bins, flags: 0, alpha: 0, scale: 1 });
+    c.means.forEach((want, i) => want.forEach((m, b) => {
+      if (m === null) return;
+      const got = rows[i * c.bins + b], w = nan(m), at = `run ${i} bin ${b}`;
+      if (!Number.isFinite(w)) return assert.ok(Object.is(got, w), `${at}: ${got} != ${w}`);
+      assert.ok(Math.abs(got - w) <= 1e-5 * Math.max(1, Math.abs(w)), `${at}: ${got} != ${w}`);
+    }));
   }
 });
 

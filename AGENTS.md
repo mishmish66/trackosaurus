@@ -10,7 +10,7 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/format.py` | the run file: `trex.sqlite` schema (format 3), `connect_rw`, `connect_ro`, `snapshot`. The contract between writer and readers. |
 | `trex/journal.py` | commit journal for runs on network filesystems: `Writer` (append + fsync), `records`, `sync` (replay into a local replica) |
 | `trex/chunks.py` | per-metric chunk codec: each commit is one `rowmeta` row (steps, times) plus one `chunk` per metric present; `prepare_merge` / `apply_merge` rewrite adjacent commits as one |
-| `trex/tiles.py` | envelope pyramid tiles (min, max, mean, mean step, mean runtime and count per bucket), `top_tiles`, `build`, `coarsen`, `decode` |
+| `trex/tiles.py` | envelope pyramid tiles (min, max, mean, mean step, mean runtime and count per bucket), `top_tiles`, `build`, `coarsen`, `decode`; slabs (one step range of many runs at one level: mean, mean step and count per bucket): `stack`, `slab_parts`, `encode_slab`, `decode_slab` |
 | `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread, and a merge thread that merges small commits |
 | `trex/media.py` | PNG/MP4 encoding for logged arrays (numpy and ffmpeg imported lazily) |
 | `trex/index.py` | `Explorer`: crawl, per-run scans (inline or process pool), index cache, top tiles, on-demand finer tiles with a size-bounded cache, event hub |
@@ -23,7 +23,7 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/query.py` | read-side queries for the CLI: records, field access, sorting, statistics, series |
 | `trex/where.py` | run filters: a SQL WHERE clause (or a name search) compiled to a test over a field getter |
 | `trex/cli.py` | `trex` command (Typer): `serve daemon systemd-unit launchd-plist ls groups keys tree show series tail media diff index compact` |
-| `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (tile store, scheduler, IndexedDB, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (columns, smoothing, decimation, group stats, CRC-32), `where.js` (run filters, run fields, filter completion); `index.html` |
+| `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (tile store, scheduler, IndexedDB, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (columns, smoothing, decimation, group stats, CRC-32), `pool.js` and `worker.js` (group stats on workers over shared columns), `where.js` (run filters, run fields, filter completion); `index.html` |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/`; the user guide is the `trex` and `trex.daemon` docstrings (Markdown) |
 | `docs/media/` | the docs' video tour and its poster image (left out of the sdist); the README embeds the same video, uploaded to GitHub |
@@ -81,7 +81,8 @@ them WebGL falls back to software and timings mean nothing.
   `TREX_TILE_CACHE_MB` across all of a process's Explorers (`TileBudget`; least recently used
   evicted). A cached tile stays valid while later rows
   lie beyond its step range. `/api/tiles/bundle` answers one kept tier of one metric for every run
-  of a folder in one indexed read.
+  of a folder in one indexed read. An `Explorer` keeps framed bundles (`BUNDLE_CACHE_BYTES`) and `/api/runs` answers in
+  memory until what they hold changes (`_kept_gen`, `_view_gen`).
 - **Daemon**: one server, one `Explorer` (or `Remote`) per tracked directory. A directory's URLs are its
   standalone URLs under `/r/<name>/`, a workspace's under `/w/<name>/`, and the UI prefixes every request
   with that (`BASE` in `data.js`); `/` is the root view, every tracked directory as a top-level folder
@@ -107,9 +108,34 @@ them WebGL falls back to software and timings mean nothing.
   (`DENSITY_PX_PER_BUCKET`), keeps its bucket merging whatever the zoom, and takes overview tiles until they
   are two levels too coarse. When many runs of a chart
   need a tier, one bundle request fetches it. Buckets are merged locally (`Entry.up`) when that is
-  enough. Each (run, metric) column is rebuilt from its best tiles plus the raw rows streamed since
-  its kept tiles were built. Top tiles of finished runs are cached in IndexedDB, keyed by metric so
-  one range read serves a whole chart.
+  enough. Each (run, metric) column is rebuilt from its best tiles plus the rows streamed since they were
+  built, in the buckets the tiles will hold them in (`buildColumn`), so a live run looks the same when its tiles
+  catch up. Top tiles of finished runs are cached in IndexedDB, keyed by metric so one range read serves a whole
+  chart; overview tiles are fetched without waiting for it.
+- **Slabs**: `/api/tiles/slab` answers slab (level, index) of one metric over the finished runs of a folder
+  (`Explorer.slab_body`). Each metric's finished-run overview and top tiles are decoded once each (`Explorer._stack`),
+  and their buckets merged per level (`Explorer._level`, `tiles.level_parts` on threads; from overview tiles where
+  they are fine enough), ahead of requests from the finest top level to the overview level; both are kept up to
+  `STACK_BYTES`. A slab is then cut from its merged level (`tiles.cut`) in a few milliseconds; runs whose top tiles
+  are coarser than the level use their tile at that level, read from the index in one query or built from the run
+  files on a process pool (`build_tile`) and cached. Slabs are kept like bundles until a finished run's tiles of that metric change
+  (`_slab_gens`); running runs are left out. A chart of more than `DENSITY_AUTO` runs in step x without smoothing
+  (`Chart.canSlab`) draws its finished runs from slabs a bucket per bin wide (`kernel.binSlabRun`: the mean of the
+  rows in the bin), its running ones from their columns: group statistics on a worker, or each run's bin means for a
+  heatmap (`Chart.slabRows`). Its finished runs then need no tiles of their own; until its slabs come it draws from
+  coarser ones here (`Data.bestSlabs`), and its first slabs are guessed from the runs' last steps (`Chart.slabGuess`).
+  Workers fetch slabs straight into shared memory (`pool.fetchSlabOnWorker`), which the page takes over
+  (`kernel.adoptStore`, `Data.slabs`, up to `SLAB_BYTES`); while idle, the store fetches the slabs one and two levels
+  finer than each visible chart draws. `/api/info` states `server.PROTOCOL`; a page of another (`data.js`
+  PROTOCOL) says so beside the status.
+- **Workers**: every response carries COOP/COEP headers (`server.ISOLATION`), so the page is cross-origin isolated and
+  `buildColumn` puts columns in `SharedArrayBuffer` chunks (`kernel.columnStore`). Each chart's group statistics run on
+  one worker of the pool (`pool.js`), which keeps that chart's binnings; a draw round waits for its charts' workers and
+  draws them together. `?shared=0`, or a page that is not isolated, computes them on the page instead.
+- **Fetching ahead**: once the store is idle, `Data.prefetch` fetches one bundle at a time: top tiles of the metrics
+  charts show, then overview tiles of charts not loaded yet, then top tiles of the rest (finished runs only). Top
+  tiles are held (`Entry.held`, up to `PREFETCH_BYTES`) without changing what charts show, and installed when a plan
+  wants them.
 - **Rendering**: WebGL2 by default (`?gl=0` selects Canvas 2D). Above 300 lines a chart draws a
   density heatmap. No upload overwrites GPU data a queued draw may read: each draw's line table
   takes fresh rows of the table texture (`Renderer.bind`), and a changed column moves to a new slot
@@ -137,6 +163,8 @@ them WebGL falls back to software and timings mean nothing.
     step, mean runtime and count are of its finite values, or of its infinities when it has no finite value (the
     mean then infinite, NaN with both signs); its min and max include the infinities;
   - tile response framing: `post_tiles` in `server.py` and `unframe` in `static/data.js`;
+  - slab encoding: `tiles.slab` and `slabViews` in `static/kernel.js`; a slab's run binned (`binSlabRun`) is its rows'
+    mean per bin;
   - local bucket merging: `tiles.coarsen` and `buildColumn` in `static/data.js` (count-weighted means over the
     buckets with a finite mean, or all of them when none has one). Points are drawn at their bucket's mean step,
     never the bucket center;
@@ -152,7 +180,7 @@ them WebGL falls back to software and timings mean nothing.
   - run filters and field names: `where.py` and `static/where.js` (`compileWhere`, `runField`), `query.py` `get`;
     both suites run the cases in `tests/where_cases.json`.
 
-  Tile encoding, smoothing and group statistics are checked across languages by `tests/shared_cases.json`, which
+  Tile encoding, live tails, slabs, smoothing and group statistics are checked across languages by `tests/shared_cases.json`, which
   `tests/test_shared_cases.py` writes from the Python side (`TREX_WRITE_CASES=1`) and `tests/shared_cases.test.mjs`
   reads.
 - **Other sites cannot use the server.** `Handler._refusal` answers only requests whose Host is an
@@ -181,12 +209,20 @@ The 10k-run view is the benchmark; interactions should reach the next painted fr
 - Charts draw first. Sidebar, path bar and info panel update after the frame paints
   (`App.afterPaint`), one task each. Chart drawing stops at `FRAME_BUDGET_MS` per frame and
   continues on the next. Redraws for streamed data come at most 4 times a second, less often when the
-  visible charts are expensive to draw, and at once when loading finishes.
-- Group statistics (`agg`) never sort a bin: order statistics come from histogram selection, exact.
+  visible charts are expensive to draw, and keep the y axis while the lines fill most of it (`steadyY`). Work the
+  view asked for draws at once when the data layer is idle (`Data.busy`), and tiles are planned after the charts
+  draw, only when what the view shows or the data changed.
+- Group statistics bin each column once per binning (`BinCache`, kept per chart while the column has the same
+  points); a chart's groups are summarized in one `aggGroups` call. Order statistics come from histogram selection,
+  exact; only bins of at most 64 values are sorted.
+- A chart's lines (`App.linesFor`) and their x extent are kept until the runs drawn (`linesSig`) or the data
+  (`Data.version`) change.
 - Work over all runs is sliced (`Data.rebuildSoon`) or indexed (`ConfigIndex`); nothing that
   touches every run × every key runs on an interaction.
 - The sidebar builds only the rows near its scroll position. Off-screen panels skip layout
   (`content-visibility`) and hold no canvas backing store.
+- The browser smoke test streams runs while recording every chart draw (`flicker_smoke`); `TREX_TOP_REFRESH` sets
+  how often growing runs get new top tiles (10 s; the smoke test uses 1 s).
 - Measure before and after a change (time from the action to the next frame, plus long tasks),
   rather than assuming.
 

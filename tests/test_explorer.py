@@ -19,10 +19,11 @@ import numpy as np
 import pytest
 
 import trex
-from trex import chunks, tiles
+from trex import chunks, server, tiles
 from trex import index as trex_index
 from trex.format import FORMAT, connect_ro, connect_rw
 from trex.index import Explorer
+from trex.workspace import unframe_bundle
 from trex.server import bind, check_root, serve
 from trex.server import urls as server_urls
 
@@ -167,6 +168,101 @@ def test_tile_bundle_answers_every_run_in_scope_like_per_run_requests(root, tmp_
         got = ex.tile_bundle("odd", kind, "a")
         assert [p for p, _ in got] == ["a/r1", "a/r2"]
         assert [b for _, b in got] == ex.tiles([["a/r1", "odd", kind], ["a/r2", "odd", kind]])
+
+
+def test_a_bundle_body_follows_runs_added_and_removed(root, tmp_path):
+    write_run(root / "a" / "r1", 600)
+    ex = explorer(root, tmp_path)
+    body = lambda: ex.tile_bundle_body("odd", "top", "")
+    assert body() == trex_index.frame_bundle(ex.tile_bundle("odd", "top", "")) and body() is body()
+    write_run(root / "a" / "r2", 600)
+    ex.rewalk()
+    ex.poll()
+    assert [p for p, _ in unframe_bundle(body())] == ["a/r1", "a/r2"]
+    shutil.rmtree(root / "a" / "r1")
+    ex.rewalk()
+    ex.poll()
+    assert unframe_bundle(body()) == ex.tile_bundle("odd", "top", "") and [p for p, _ in unframe_bundle(body())] == ["a/r2"]
+
+
+def test_the_runs_body_follows_runs_added_and_folder_notes(root, tmp_path):
+    write_run(root / "a" / "r1", 5)
+    ex = explorer(root, tmp_path)
+    body = lambda: json.loads(ex.runs_body("a"))
+    assert body() == json.loads(trex_index.dumps(ex.runs("a"))) and [m["id"] for m in body()["runs"]] == ["a/r1"]
+    write_run(root / "a" / "r2", 5)
+    trex.folder_info(root / "a", note="x")
+    ex.rewalk()
+    ex.poll()
+    assert [m["id"] for m in body()["runs"]] == ["a/r1", "a/r2"] and body()["folders"]["a"] == {"note": "x"}
+
+
+def test_every_response_isolates_the_page_so_it_may_share_memory_with_its_workers(http):
+    _, url = http
+    for path in ("/", "/static/worker.js", "/api/runs?path="):
+        with urllib.request.urlopen(f"{url}{path}") as r:
+            assert (r.headers["Cross-Origin-Opener-Policy"], r.headers["Cross-Origin-Embedder-Policy"]) == ("same-origin", "require-corp"), path
+
+
+def test_a_slab_holds_the_finished_runs_from_their_top_tiles_or_their_run_files(root, tmp_path):
+    write_run(root / "a" / "short", 600)
+    write_run(root / "a" / "long", 5000)
+    live = write_run(root / "a" / "live", 600, finish=False)
+    ex = explorer(root, tmp_path)
+    top = lambda p: tiles.decode(ex.tiles([[p, "loss", "top"]])[0][0]).level
+    level = top("a/short") + 1
+    assert top("a/long") > level
+    s = tiles.decode_slab(ex.slab_body("loss", level, 0, "a"))
+    assert s.paths == ["a/long", "a/short"]
+    want = [tiles.decode(ex.tiles([["a/long", "loss", level, 0]])[0][0]),
+            next(t for t in map(tiles.decode, tiles.coarsen(ex.tiles([["a/short", "loss", "top"]])[0], 1)) if t.index == 0)]
+    for i, t in enumerate(want):
+        got = slice(s.first[i], s.first[i + 1])
+        assert np.array_equal(s.bucket[got], t.bucket) and np.array_equal(s.n[got], t.n)
+        np.testing.assert_allclose(s.mean[got], t.mean, rtol=1e-6)
+    assert ex.slab_body("loss", level, 0, "a") is ex.slab_body("loss", level, 0, "a")
+    live.finish()
+
+
+def test_a_slab_builds_the_tiles_it_lacks_on_the_process_pool_as_the_run_files_hold_them(root, tmp_path, monkeypatch):
+    monkeypatch.setattr(trex_index, "INLINE_TILES", 0)
+    for name in ("a/r1", "a/r2"):
+        write_run(root / name, 3000)
+    ex = explorer(root, tmp_path, workers=2)
+    level = tiles.decode(ex.tiles([["a/r1", "loss", "top"]])[0][0]).level - 1
+    s = tiles.decode_slab(ex.slab_body("loss", level, 0, "a"))
+    for i, path in enumerate(s.paths):
+        t = tiles.decode(trex_index.build_tile(str(root / path), "loss", level, 0)[0])
+        got = slice(s.first[i], s.first[i + 1])
+        assert np.array_equal(s.bucket[got], t.bucket) and np.array_equal(s.n[got], t.n)
+
+
+def test_a_slab_stays_while_running_runs_grow_and_changes_once_one_finishes(root, tmp_path, monkeypatch):
+    monkeypatch.setattr(trex_index, "TOP_REFRESH", 0.0)
+    write_run(root / "a" / "done", 300)
+    live = write_run(root / "a" / "live", 300, finish=False)
+    ex = explorer(root, tmp_path)
+    level = tiles.decode(ex.tiles([["a/done", "loss", "top"]])[0][0]).level + 1
+    first = ex.slab_body("loss", level, 0, "a")
+    for i in range(300, 400):
+        live.log({"loss": 1.0 / (i + 1)}, step=i)
+    assert wait_for(lambda: (ex.poll(), ex.records["a/live"]["tiles_seq"] >= 400)[1])
+    assert ex.slab_body("loss", level, 0, "a") is first and tiles.decode_slab(first).paths == ["a/done"]
+    live.finish()
+    assert wait_for(lambda: (ex.poll(), ex.records["a/live"]["state"] != "running")[1])
+    assert tiles.decode_slab(ex.slab_body("loss", level, 0, "a")).paths == ["a/done", "a/live"]
+
+
+def test_http_slab_answers_the_slab_and_info_states_the_protocol(http, root):
+    ex, url = http
+    write_run(root / "x" / "r1", 300)
+    ex.rewalk()
+    ex.poll()
+    body = json.dumps({"key": "loss", "level": 0, "index": 0, "scope": "x"}).encode()
+    with urllib.request.urlopen(urllib.request.Request(f"{url}/api/tiles/slab", data=body)) as r:
+        assert r.read() == ex.slab_body("loss", 0, 0, "x")
+    with urllib.request.urlopen(f"{url}/api/info") as r:
+        assert json.loads(r.read())["protocol"] == server.PROTOCOL
 
 
 def test_http_tile_bundle_frames_paths_and_tiles(http, root):

@@ -22,6 +22,10 @@ Explore in a browser or a terminal (`trex --help`); `trex.daemon` serves many di
 The UI's filter box and `trex ls -w` take a name search or a SQL WHERE clause (`trex.where`):
 
     trex ls runs -w "lr = 0.001 and seed in (0, 1)"
+
+Its group-by box takes fields, `,` within a level and ` / ` between levels (`algo, env / lr`). `run~n` is the
+directory n levels above a run, `run~1` (the default) its own; `run` puts each run alone. A group of several runs is
+one line with a band; a folder's `trex_info.json` sets its default (`trex.folder_info(path, trex={"group_by": ...})`).
 """
 
 from .writer import FinalState, ImageInput, MetricValue, Metrics, Run, VideoInput, folder_info, init

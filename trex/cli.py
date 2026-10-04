@@ -235,7 +235,7 @@ EPILOG = """
 A run is any directory holding trex.sqlite. Query commands take `--json` (or `--format jsonl|csv|tsv`);
 non-finite numbers appear as the strings "nan", "inf" and "-inf".
 
-**Fields** (for `--where`, `--sort`, `--columns`, `--group-by`)
+**Fields** (for `--where`, `--sort`, `--columns`, `--group-by`; `--group-by` also takes `run` and `run~N`)
 
     path name parent state step runtime rows media created updated tags dir visible
     state         running, finished, failed or crashed
@@ -654,10 +654,43 @@ def metric_key(metric: str) -> str:
     return metric.partition(".")[2] if metric.split(".")[0] in Q.SUMMARY_PREFIXES else metric
 
 
+RUN_UP: Final = re.compile(r"run~(\d+)")
+
+
+def group_fields(exprs: Iterable[str]) -> list[str]:
+    """Fields of group-by expressions, `,` within a level and ` / ` between levels, in order."""
+    return [f.strip() for e in exprs for level in re.split(r"\s+/\s+", e) for f in level.split(",") if f.strip()]
+
+
+def group_by_fields(given: Sequence[str] | None, path: str, root: str | None) -> list[str]:
+    """Fields of the given group-by, else of the one declared for `path`."""
+    return group_fields(given) if given else declared_group_by(path, root)
+
+
+def declared_group_by(path: str, root: str | None) -> list[str]:
+    """The group-by the nearest trex_info.json at or above `path` declares, else run~1."""
+    for _, info in reversed(Q.folder_infos(path, root)):
+        g = as_dict(as_dict(info).get("trex")).get("group_by")
+        if isinstance(g, str) or isinstance(g, list):
+            return group_fields([g] if isinstance(g, str) else [x for x in g if isinstance(x, str)])
+    return ["run~1"]
+
+
+def relative(path: str, prefix: str) -> str:
+    """`path` relative to the selected folder `prefix`; "." for the folder itself."""
+    if path == prefix:
+        return "."
+    return path[len(prefix) + 1:] if prefix and path.startswith(prefix + "/") else path
+
+
 def group_key(rec: Q.Record, field: str, prefix: str) -> object:
-    if field == "subfolder":
-        rel = rec["path"][len(prefix) + 1:] if prefix else rec["path"]
-        return rel.split("/")[0]
+    """A run's value of group-by field `field`: `run` its path, `run~N` the directory N levels above it (both
+    relative to the selection), anything else the field."""
+    if field == "run":
+        return relative(rec["path"], prefix)
+    if up := RUN_UP.fullmatch(field):
+        parts = rec["path"].split("/")
+        return relative("/".join(parts[:max(0, len(parts) - int(up[1]))]), prefix)
     v = Q.get(rec, field)
     return v if v is None or isinstance(v, (str, int, float, bool)) else json.dumps(v)
 
@@ -667,9 +700,11 @@ def _bracketed(v: object) -> object:
 
 
 @command("groups", "compare")
-def groups_cmd(group_by: Annotated[list[str], typer.Option("--group-by", "-g", show_default=False,
-                                   help="Fields, comma-separated: subfolder, parent, config.KEY, info.KEY, ...")],
-               path: PathArg = ".", where: Where = None, root: Root = None,
+def groups_cmd(path: PathArg = ".",
+               group_by: Annotated[list[str] | None, typer.Option("--group-by", "-g", show_default=False,
+                                   help="Group-by, as in the UI: fields, `,` within a level and ` / ` between levels; run "
+                                        "(each run alone), run~N (the directory N levels above a run). Default: the folder's "
+                                        "declared group_by, else run~1.")] = None, where: Where = None, root: Root = None,
                cache: Cache = None, force: Force = False,
                metric: Annotated[list[str] | None, typer.Option("--metric", "-m", help="Metric keys to aggregate (repeatable).")] = None,
                reduce: Annotated[Literal["last", "first", "max", "min", "mean"], typer.Option("--reduce", "-r", help="How each run's series becomes one value.")] = "last",
@@ -679,7 +714,7 @@ def groups_cmd(group_by: Annotated[list[str], typer.Option("--group-by", "-g", s
                limit: Limit = None, fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Aggregate runs into groups with a median or mean and its 95% CI."""
     recs, _, prefix = Selection(path, where or [], root, cache, force).records()
-    fmt, fields = out_format(fmt, as_json), _csv(group_by)
+    fmt, fields = out_format(fmt, as_json), group_by_fields(group_by, str(path), root)
     spec = GroupSpec(_csv(metric or []), reduce, at, x, center, stats=fmt in ("json", "jsonl"))
     keys = [metric_key(m) for m in spec.metrics]
     rows = Q.sort_records(spec.rows(recs, fields, prefix), sort or (f"-{keys[0]}" if keys else ",".join(fields)),

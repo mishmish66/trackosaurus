@@ -1,9 +1,11 @@
 // Line charts. Canvas 2D: each draw asks the kernel for a smoothed, pixel-decimated polyline (or
 // group aggregate) of just the visible x-range. WebGL (gl.js): every run's line stays on the GPU
 // and zoom is a transform; axes, labels and the hover overlay stay Canvas 2D.
-import { IQM, LOGX, LOGY, RAW, STATS, X_RUNTIME, agg as kagg, binGrid, medianCiCoverage, nearest, prep as kprep, visibleRange,
+import { BinCache, Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, aggGroups, binGrid, medianCiCoverage, nearest, prep as kprep, visibleRange,
          yrange } from "./kernel.js";
 import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
+import { PARALLEL, describe, onWorker } from "./pool.js";
+import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET } from "./data.js";
 import { nonFiniteText } from "./where.js";
 
 /** Renderer choice: WebGL where available; `?gl=0` selects Canvas 2D. */
@@ -93,23 +95,68 @@ export function smoothScale(span) {
  * the IQM), iqr, minmax, ±std, ±stderr; none for one run. */
 function bandOf(st, center, band, bins) {
   const lo = new Float64Array(bins), hi = new Float64Array(bins);
-  const c = st[center];
+  const at = (k) => st.a.subarray(st.o + ROW[k] * bins, st.o + (ROW[k] + 1) * bins);
+  const c = at(center), n = at("n"), std = at("std"), iqmse = at("iqmse"), iqmh = at("iqmh");
+  const [bandLo, bandHi] = { ci: ["medlo", "medhi"], iqr: ["q25", "q75"], minmax: ["min", "max"] }[band] || ["n", "n"];
+  const blo = at(bandLo), bhi = at(bandHi);
   for (let i = 0; i < bins; i++) {
-    const n = st.n[i], m = c[i], se = center === "iqm" ? st.iqmse[i] : st.std[i] / Math.sqrt(n);
+    const m = c[i], se = center === "iqm" ? iqmse[i] : std[i] / Math.sqrt(n[i]);
     let a = m, b = m;
-    if (n > 1) {
+    if (n[i] > 1) {
       if (band === "ci" && center !== "median") {
-        const df = center === "iqm" ? st.iqmh[i] - 1 : n - 1, t = df <= 30 ? T95[df - 1] ?? 0 : 1.96;
+        const df = center === "iqm" ? iqmh[i] - 1 : n[i] - 1, t = df <= 30 ? T95[df - 1] ?? 0 : 1.96;
         (a = m - t * se), (b = m + t * se);
-      } else if (band === "ci") (a = st.medlo[i]), (b = st.medhi[i]);
-      else if (band === "iqr") (a = st.q25[i]), (b = st.q75[i]);
-      else if (band === "minmax") (a = st.min[i]), (b = st.max[i]);
-      else if (band === "std") (a = m - st.std[i]), (b = m + st.std[i]);
+      } else if (band === "ci" || band === "iqr" || band === "minmax") (a = blo[i]), (b = bhi[i]);
+      else if (band === "std") (a = m - std[i]), (b = m + std[i]);
       else if (band === "stderr") (a = m - se), (b = m + se);
     }
     (lo[i] = a), (hi[i] = b);
   }
   return [lo, hi];
+}
+
+const ROW = Object.fromEntries(STATS.map((k, i) => [k, i])); // row of each statistic in aggGroups' result
+const WAITING = Symbol("waiting for a worker"); // what compute returns while a worker computes the chart's statistics
+let chartSlots = 0; // charts given a worker so far
+const SLAB_TILE = 256; // buckets of a slab's step range (tiles.TILE)
+const SLAB_LEVELS = [-20, 62]; // levels a slab may have (tiles.MIN_LEVEL, MAX_LEVEL)
+const SLABS_MOST = 4; // slabs one view may draw from
+
+/** The slabs ({level, indices}) covering steps [x0, x1] at `level`, or null when there are too many or none fit. */
+function slabsCovering(level, x0, x1) {
+  const w = SLAB_TILE * 2 ** level, k0 = Math.floor(x0 / w), k1 = Math.floor(x1 / w);
+  if (!(level >= SLAB_LEVELS[0] && level <= SLAB_LEVELS[1]) || !(k1 - k0 < SLABS_MOST)) return null;
+  return { level, indices: Array.from({ length: k1 - k0 + 1 }, (_, i) => k0 + i) };
+}
+
+/** [first, last, smallest positive] x of columns' extent `e` and steps `slab` ([first, last], or null). */
+function withSlabs(e, slab) {
+  if (!slab) return e;
+  return [Math.min(e[0], slab[0]), Math.max(e[1], slab[1]), Math.min(e[2], slab[0] > 0 ? slab[0] : Infinity)];
+}
+
+/** Lines drawing each run of `groups` as its bin means `rows` (bins per run): one column over the bin centers. */
+function rowLines(groups, rows, g0, dx, bins) {
+  const s = Float64Array.from({ length: bins }, (_, i) => g0 + (i + 0.5) * dx);
+  return groups.map((ln, i) => ({ ...ln, cols: [Col.adopt(s, rows.subarray(i * bins, (i + 1) * bins), s, bins)] }));
+}
+
+/** Run r's buckets in `slabs` ({slabs, rows, n}), or null when it is running (its rows stream) or a slab lacks it. */
+function slabSource(r, slabs) {
+  if (r.meta.state === "running") return null;
+  const rows = slabs.map((sl) => sl.rowOf.get(r.id));
+  if (rows.some((i) => i === undefined)) return null;
+  let n = 0;
+  slabs.forEach((sl, j) => (n += sl.views.first[rows[j] + 1] - sl.views.first[rows[j]]));
+  return { slabs, rows, n };
+}
+
+/** A hash of a typed array's 32-bit words. */
+function hashWords(a) {
+  const w = new Int32Array(a.buffer, a.byteOffset, a.byteLength >> 2);
+  let h = 2166136261, g = 0;
+  for (let i = 0; i < w.length; i++) (h = Math.imul(h ^ w[i], 16777619)), (g = (g + Math.imul(w[i], 0x9e3779b1)) | 0);
+  return `${h >>> 0}.${g >>> 0}`;
 }
 
 /** Band name for the tooltip; the median CI states its exact coverage when 95% is unreachable. */
@@ -204,6 +251,14 @@ class YRange {
 }
 
 const BAND_REACH = 0.25; // share of the group lines' y span a band may add to the axis on either side
+const Y_FILL = 0.75; // share of a streaming chart's y axis its lines must fill for the axis to keep its range
+
+/** A streaming chart's y range: the shown one grown to hold y, while y fills at least Y_FILL of that; else y. */
+function steadyY(y, shown, logy) {
+  if (!shown || shown.logy !== logy) return y;
+  const y0 = Math.min(y.y0, shown.y0), y1 = Math.max(y.y1, shown.y1);
+  return y.y1 - y.y0 >= Y_FILL * (y1 - y0) ? { y0, y1 } : y;
+}
 
 /** [x0, x1] in data units: the settings, else the zoom, else the extent (from its smallest positive x on log axes). */
 function xRange(o, zoom, e0, e1, epos) {
@@ -215,7 +270,16 @@ function xRange(o, zoom, e0, e1, epos) {
 }
 
 /** [min, max, smallest positive] x of the columns. */
+const xExtents = new WeakMap(); // column list -> [xmode] -> its xExtent
+
+/** [min, max, smallest positive] x of `cols`, kept for the list while it is drawn. */
 function xExtent(cols, xmode) {
+  let e = xExtents.get(cols);
+  if (!e) xExtents.set(cols, (e = []));
+  return (e[xmode] ||= colsExtent(cols, xmode));
+}
+
+function colsExtent(cols, xmode) {
   let e0 = Infinity, e1 = -Infinity, epos = Infinity;
   for (const c of cols) {
     const r = c.extent(xmode);
@@ -225,6 +289,15 @@ function xExtent(cols, xmode) {
 }
 
 /** Grow `yr` by column c's values (raw or smoothed) inside the view's x range. */
+const colsOfLines = new WeakMap(); // lines -> their columns
+
+/** Every column of `lines` (a run drawn from slabs may have none), kept for the list while it is drawn. */
+function colsOf(lines) {
+  let c = colsOfLines.get(lines);
+  if (!c) colsOfLines.set(lines, (c = lines.flatMap((g) => g.cols).filter(Boolean)));
+  return c;
+}
+
 function growVisible(c, v, raw, yr) {
   const ys = c.ys(v.alpha, raw);
   const e = colExtent(c, v.xmode, ys, v.logx, v.logy, `${v.xmode}|${v.logx}|${v.logy}|${raw ? 0 : v.alpha}|${raw ? 0 : v.scale}`);
@@ -484,12 +557,15 @@ export class Chart {
   /** Query the kernel for everything this chart draws. */
   compute() {
     const app = this.app, o = app.panelOpts(this.key);
-    const groups = app.linesFor(this.key), allCols = groups.flatMap((g) => g.cols);
+    const groups = app.linesFor(this.key), allCols = colsOf(groups);
     const v = this.xView(o, allCols);
     if (!v) return null;
-    const yr = new YRange(o.logy), r = this.glRenderer();
-    const gl = !app.grouped && r ? this.linesGL(r, groups, v, o, yr) : null;
-    const lines = gl ? gl.lines : app.grouped ? this.linesGrouped(groups, allCols, v, o, yr) : this.linesCanvas(groups, v, yr);
+    const yr = new YRange(o.logy), r = this.glRenderer(), rows = !app.grouped && r ? this.slabRows(groups, v, o, r) : null;
+    if (rows === WAITING) return WAITING;
+    const runLines = rows || groups.filter((ln) => ln.cols[0]);
+    const gl = !app.grouped && r ? this.linesGL(r, runLines, v, o, yr) : null;
+    const lines = gl ? gl.lines : app.grouped ? this.linesGrouped(groups, allCols, v, o, yr) : this.linesCanvas(runLines, v, yr);
+    if (lines === WAITING) return WAITING;
     const y = this.yView(o, yr, allCols, v);
     if (!y) return null;
     return { ...v, ...y, lines, o, gl: !!r && (!!gl || app.grouped), gpu: !!gl, density: !!gl?.density };
@@ -498,7 +574,7 @@ export class Chart {
   /** x range (transformed) and smoothing of the view: the data's extent, or the zoom; null if empty. */
   xView(o, allCols) {
     const { xmode, logx, logy } = o;
-    const [e0, e1, epos] = xExtent(allCols, xmode);
+    const [e0, e1, epos] = withSlabs(xExtent(allCols, xmode), xmode === X_RUNTIME ? null : this.app.data.slabExtent(this.key));
     if (!(e1 >= e0)) return null;
     const zoom = this.app.xrange && this.app.xrange[2] === xmode ? this.app.xrange : null;
     const [x0, x1] = xRange(o, zoom, e0, e1, epos);
@@ -538,11 +614,17 @@ export class Chart {
   linesGrouped(groups, allCols, v, o, yr) {
     let longest = 0;
     for (const c of allCols) longest = Math.max(longest, c.len);
-    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / 2), longest)));
-    const stats = (cols, raw) => {
-      const a = kagg(cols, v.xmode, g0, g0 + bins * dx, bins, (v.logx ? LOGX : 0) | (raw ? RAW : 0) | (o.center === "iqm" ? IQM : 0), v.alpha, v.scale);
-      return Object.fromEntries(STATS.map((k, i) => [k, a.subarray(i * bins, (i + 1) * bins)]));
-    };
+    let n = 0;
+    for (const g of groups) n += g.cols.length; // runs, with or without a column
+    const px = n > DENSITY_AUTO ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET; // as finely as the data is planned
+    const can = this.canSlab(v, n); // then drawn from slabs, as finely as they hold
+    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / px), can ? Infinity : longest)));
+    const p = { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: (v.logx ? LOGX : 0) | (o.center === "iqm" ? IQM : 0),
+                alpha: v.alpha, scale: v.scale };
+    const st = this.groupStats(this.slabSources(groups, v, { g0, dx, bins, can }) || groups.map((g) => g.cols.filter(Boolean)), p, v.alpha > 0);
+    if (!st) return WAITING;
+    const { main, raws } = st;
+    const row = (a, gi, k) => a.subarray((gi * NSTAT + ROW[k]) * bins, (gi * NSTAT + ROW[k] + 1) * bins);
     const centerXY = (center) => {
       const xy = new Float64Array(2 * bins);
       for (let i = 0; i < bins; i++) {
@@ -553,24 +635,97 @@ export class Chart {
       return xy;
     };
     const bands = new YRange(v.logy);
-    const lines = groups.map((g) => {
-      const st = stats(g.cols, false), center = st[o.center];
-      const [lo, hi] = bandOf(st, o.center, o.band, bins);
+    const lines = groups.map((g, gi) => {
+      const center = row(main, gi, o.center);
+      const [lo, hi] = bandOf({ a: main, o: gi * NSTAT * bins }, o.center, o.band, bins);
       for (let i = 0; i < bins; i++) {
         if (v.logy && !(lo[i] > 0)) lo[i] = center[i];
         yr.add(center[i]);
         if (o.band !== "none") bands.add(lo[i]), bands.add(hi[i]);
       }
       let raw = null;
-      if (v.alpha > 0) {
-        const rs = stats(g.cols, true), rc = rs[o.center];
+      if (raws) {
+        const rc = row(raws, gi, o.center);
         rc.forEach((y) => yr.add(y));
         raw = centerXY(rc);
       }
-      return { ...g, xy: centerXY(center), raw, lo, hi, center, cnt: st.n, g0, dx };
+      return { ...g, xy: centerXY(center), raw, lo, hi, center, cnt: row(main, gi, "n"), g0, dx };
     });
     yr.widen(bands, BAND_REACH); // the axis follows the lines; a wide band does not stretch it
     return lines;
+  }
+
+  /** Whether group statistics of this view (of n runs) may come from slabs: many runs, x in steps, no smoothing, and
+   * workers to bin them. */
+  canSlab(v, n) {
+    return PARALLEL && !this.app.data.noSlabs && n > DENSITY_AUTO && v.xmode !== X_RUNTIME && !v.logx && !(v.alpha > 0);
+  }
+
+  /** The slabs this chart's first view will likely draw from, before it has one: steps from 0 to the largest last
+   * step of its runs `runs`, when it may draw from slabs (`canSlab`, with options o). */
+  slabGuess(o, runs) {
+    if (this.slabWant !== undefined) return this.slabWant;
+    let x1 = 0;
+    for (const r of runs) x1 = Math.max(x1, r.meta.summary?._step ?? 0);
+    if (!(x1 > 0) || !this.canSlab({ xmode: o.xmode, logx: o.logx, alpha: o.smooth }, runs.length)) return null;
+    const { g0, dx, bins } = binGrid(0, x1, Math.max(8, Math.floor((this.w ? this.pw : 600) / DENSITY_PX_PER_BUCKET)));
+    return slabsCovering(Math.log2(dx), g0, g0 + (bins - 0.5) * dx);
+  }
+
+  /** The groups' sources from slabs (`slabSource` per finished run, its column per running one) when this view (bin
+   * grid g0, dx, bins) may draw from slabs (`can`) and they are here; else null. Notes the slabs the view wants
+   * (slabWant), and those a zoom of it would (ahead: one and two levels finer). */
+  slabSources(groups, v, { g0, dx, bins, can }) {
+    const want = can ? slabsCovering(Math.log2(dx), g0, g0 + (bins - 0.5) * dx) : null;
+    if (JSON.stringify(want) !== JSON.stringify(this.slabWant)) this.app.replan(true, 0); // fetch them now
+    this.slabWant = want;
+    this.ahead = can ? [1, 2].map((up) => slabsCovering(Math.log2(dx) - up, v.x0, v.x1)).filter(Boolean) : [];
+    const w = this.slabWant, x1 = g0 + (bins - 0.5) * dx, got = w && this.app.data.bestSlabs(this.key, w.level, g0, x1); // coarser ones meanwhile
+    this.fromSlabs = !!got;
+    if (!got) return null;
+    const m = this.sources?.slabs.length === got.slabs.length && this.sources.slabs.every((sl, i) => sl === got.slabs[i])
+      ? this.sources : (this.sources = { slabs: got.slabs, of: new Map() }); // run -> its slabSource, while the slabs stay
+    const source = (r) => (m.of.has(r) ? m.of.get(r) : m.of.set(r, slabSource(r, got.slabs)).get(r));
+    return groups.map((g) => g.runs.map((r, i) => source(r) || g.cols[i]).filter(Boolean));
+  }
+
+  /** aggGroups of `cols` with binning p, and raw when `raw`: {main, raws}; computed here when no worker can, else by
+   * the chart's worker, null until it answers (the chart then prepares again). */
+  groupStats(cols, p, raw) {
+    const d = PARALLEL ? describe(cols) : null;
+    if (!d) {
+      const cache = (this.binCache ||= new BinCache()), all = (f) => aggGroups(cols, p.xmode, p.x0, p.x1, p.bins, f, p.alpha, p.scale, cache);
+      return { main: all(p.flags), raws: raw ? all(p.flags | RAW) : null };
+    }
+    return this.fromWorker("agg", d, p, raw);
+  }
+
+  /** A density heatmap's lines from slabs when it may draw from them: each run as its bin means
+   * (`rowLines`), or WAITING while a worker bins them; null when it draws from its columns. Notes the slabs as
+   * slabSources does. */
+  slabRows(groups, v, o, r) {
+    const density = r.density && (o.render === "density" || (o.render === "auto" && groups.length > DENSITY_AUTO));
+    const can = density && this.canSlab(v, groups.length);
+    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.floor(this.pw / DENSITY_PX_PER_BUCKET)));
+    const src = this.slabSources(groups.map((ln) => ({ cols: ln.cols, runs: [ln.run] })), v, { g0, dx, bins, can });
+    if (!src) return null;
+    const lines = groups.filter((_, i) => src[i].length);
+    const res = this.fromWorker("rows", describe(src.filter((s) => s.length)), { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: 0, alpha: 0, scale: v.scale }, false);
+    return res ? rowLines(lines, res.rows, g0, dx, bins) : WAITING;
+  }
+
+  /** The chart's worker's answer (pool.onWorker `kind`) for described sources d, once it has come; null until then
+   * (the chart then prepares again). */
+  fromWorker(kind, d, p, raw) {
+    const sig = `${kind}|${hashWords(d.desc)}|${hashWords(d.refs)}|${hashWords(d.ends)}|${p.xmode}|${p.x0}|${p.x1}|${p.bins}|${p.flags}|${p.alpha}|${p.scale}|${raw}`;
+    if (this.stats?.sig === sig) return this.stats.result;
+    const job = (this.stats = { sig, result: null });
+    onWorker(kind, (this.slot ||= ++chartSlots), d, p, raw).then((res) => {
+      if (this.stats !== job) return;
+      job.result = res;
+      if (this.waiting) (this.waiting = false), this.app.nextFrame();
+    });
+    return null;
   }
 
   /** [y0, y1] in data units: the lines' range or outlier quantiles, overridden by settings, then the box zoom. */
@@ -590,6 +745,12 @@ export class Chart {
     }
     if (o.logy) (y0 = Math.log10(y0)), (y1 = Math.log10(y1));
     if (y1 === y0) (y0 -= 0.5), (y1 += 0.5);
+    const y = this.padY(o, y0, y1);
+    return this.app.paced && !(this.yzoom || o.ymin != null || o.ymax != null) ? steadyY(y, this.view, o.logy) : y;
+  }
+
+  /** {y0, y1} padded by 4% on the sides neither the box zoom nor a setting fixes. */
+  padY(o, y0, y1) {
     const pad = (y1 - y0) * 0.04;
     return { y0: this.yzoom || o.ymin != null ? y0 : y0 - pad, y1: this.yzoom || o.ymax != null ? y1 : y1 + pad };
   }
@@ -691,13 +852,17 @@ export class Chart {
   prepare() {
     this.dirty = false;
     this.uploadMs = 0;
-    this.next = this.w ? this.compute() : null;
+    const next = this.w ? this.compute() : null;
+    this.waiting = next === WAITING; // a worker computes what it shows; it is prepared again once that is done
+    if (this.waiting) return;
+    this.next = next;
     this.prepared = true;
   }
 
-  /** Present the prepared view, preparing it first if it is not. */
+  /** Present the prepared view, preparing it first if it is not; the shown one stays while a worker computes it. */
   draw() {
     if (!this.prepared) this.prepare();
+    if (!this.prepared) return;
     this.prepared = false;
     this.gear.classList.toggle("on", this.app.hasPanelOverrides(this.key));
     if (!this.w) return;

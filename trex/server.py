@@ -22,7 +22,7 @@ from . import remote, update
 from .daemon import resolve_root, root_url, workspace_url
 from .remote import Remote
 from .workspace import HEARTBEAT, Far, Workspace
-from .index import Explorer, TileKind, dumps, sse
+from .index import Explorer, TileKind, dumps, frame_bundle, framed, sse
 
 if TYPE_CHECKING:
     from .daemon import Roots
@@ -35,8 +35,12 @@ DEFAULT_PORT: Final = 13898
 PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
 HOP_HEADERS: Final = frozenset({"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
                                 "proxy-authorization", "proxy-authenticate"})
+# Every response: the page is cross-origin isolated, so the UI may share memory with its workers.
+ISOLATION: Final = {"Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp",
+                    "Cross-Origin-Resource-Policy": "same-origin"}
 ROOT_PREFIX: Final = re.compile(r"/([rw])/([^/]+)(/.*)?")  # a tracked directory's (r) or workspace's (w) URLs
 MAX_TILE_REQUESTS: Final = 4096
+PROTOCOL: Final = 3  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
 RESTART_DELAY: Final = 0.5  # seconds between answering an update and restarting, so the answer is sent
 CTYPES: Final = {
     ".html": "text/html; charset=utf-8",
@@ -71,6 +75,11 @@ class Handler(BaseHTTPRequestHandler):
 
     _ex: "Explorer | Workspace | None" = None
     _body: bytes = b""
+
+    def end_headers(self) -> None:
+        for k, v in ISOLATION.items():
+            self.send_header(k, v)
+        super().end_headers()
 
     @property
     def srv(self) -> "Server":
@@ -169,7 +178,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._unavailable(remote, target)
             self.send_response(resp.status)
             for k, v in resp.getheaders():
-                if k.lower() not in HOP_HEADERS | {"server", "date"}:
+                if k.lower() not in HOP_HEADERS | {"server", "date"} | {h.lower() for h in ISOLATION}:
                     self.send_header(k, v)
             if resp.getheader("Content-Length") is None:
                 self.send_header("Connection", "close")
@@ -293,7 +302,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", r"/api/info")
     def info(self, q: Query) -> None:
-        self._json(self.ex.info())
+        self._json({**self.ex.info(), "protocol": PROTOCOL})
 
     @route("GET", r"/api/daemon")
     def daemon(self, q: Query) -> None:
@@ -396,7 +405,9 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", r"/api/runs")
     def runs(self, q: Query) -> None:
-        self._json(self.ex.runs(q.get("path", "")))
+        ex, prefix = self.ex, q.get("path", "")
+        body = ex.runs_body(prefix) if isinstance(ex, Explorer) else dumps(ex.runs(prefix)).encode()
+        self.send(body, "application/json", 200, {"Cache-Control": "no-store"}, compress=not self._loopback())
 
     @route("GET", r"/api/run")
     def run(self, q: Query) -> None:
@@ -412,9 +423,21 @@ class Handler(BaseHTTPRequestHandler):
         want = json.loads(self.body())
         if not isinstance(want, list) or len(want) > MAX_TILE_REQUESTS:
             raise ValueError(f"expected a list of at most {MAX_TILE_REQUESTS} tile requests")
-        out = [part for blobs in self.ex.tiles(want) for part in _framed(blobs)]
+        out = [part for blobs in self.ex.tiles(want) for part in framed(blobs)]
         self.send(b"".join(out), "application/octet-stream", headers={"Cache-Control": "no-store"},
                   compress=not self._loopback())
+
+    @route("POST", r"/api/tiles/slab")
+    def post_tile_slab(self, q: Query) -> None:
+        """Body: {key, level, index, scope}. Response: the slab (`tiles.slab`) of the finished runs under scope."""
+        req = json.loads(self.body())
+        if not isinstance(req, dict):
+            raise ValueError("expected {key, level, index, scope}")
+        ex = self.ex
+        if not isinstance(ex, Explorer):
+            raise KeyError("slabs of a workspace")
+        body = ex.slab_body(str(req["key"]), int(req["level"]), int(req["index"]), str(req.get("scope", "")))
+        self.send(body, "application/octet-stream", headers={"Cache-Control": "no-store"}, compress=not self._loopback())
 
     @route("POST", r"/api/tiles/bundle")
     def post_tile_bundle(self, q: Query) -> None:
@@ -424,13 +447,9 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(req, dict) or req.get("kind") not in ("top", "overview"):
             raise ValueError("expected {key, kind: top|overview, scope}")
         kind: TileKind = "top" if req["kind"] == "top" else "overview"
-        entries = self.ex.tile_bundle(str(req["key"]), kind, str(req.get("scope", "")))
-        out = [len(entries).to_bytes(4, "little")]
-        for path, blobs in entries:
-            p = path.encode()
-            out += [len(p).to_bytes(4, "little"), p, b"\0" * (-len(p) % 4), *_framed(blobs)]
-        self.send(b"".join(out), "application/octet-stream", headers={"Cache-Control": "no-store"},
-                  compress=not self._loopback())
+        key, scope, ex = str(req["key"]), str(req.get("scope", "")), self.ex
+        body = ex.tile_bundle_body(key, kind, scope) if isinstance(ex, Explorer) else frame_bundle(ex.tile_bundle(key, kind, scope))
+        self.send(body, "application/octet-stream", headers={"Cache-Control": "no-store"}, compress=not self._loopback())
 
     def _loopback(self) -> bool:
         if not isinstance(self.client_address, tuple):
@@ -485,14 +504,6 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             stop.set()
-
-
-def _framed(blobs: Sequence[bytes]) -> list[bytes]:
-    """`blobs` as sent: u32 count, (u32 length, blob)*."""
-    out = [len(blobs).to_bytes(4, "little")]
-    for b in blobs:
-        out += [len(b).to_bytes(4, "little"), b]
-    return out
 
 
 class Server(ThreadingHTTPServer):
