@@ -570,19 +570,6 @@ export function bucketPaths(buf, v) {
 /** Mean step of bucket q of bucket array `v`. */
 export const bucketStep = (v, q) => (v.base * BLOCK + v.offset[q] + (v.soff[q] + 0.5) / SOFF_SCALE) * 2 ** v.level;
 
-/** [first, last] mean step, then [first, last] mean runtime, of the runs' buckets in bucket array `v` (its runs' first
- * and last buckets), or null when it has none. */
-export function bucketExtent(v) {
-  const e = [Infinity, -Infinity, Infinity, -Infinity];
-  for (let i = 0; i < v.runs; i++) {
-    const a = v.first[i], b = v.first[i + 1] - 1;
-    if (b < a) continue;
-    (e[0] = Math.min(e[0], bucketStep(v, a))), (e[1] = Math.max(e[1], bucketStep(v, b)));
-    (e[2] = Math.min(e[2], v.tmean[a])), (e[3] = Math.max(e[3], v.tmean[b]));
-  }
-  return e[1] >= e[0] ? e : null;
-}
-
 /** Steps [lo, hi) of the block a part ({v, row}) holds. */
 const blockSteps = ({ v }) => [v.base * BLOCK * 2 ** v.level, (v.base + 1) * BLOCK * 2 ** v.level];
 

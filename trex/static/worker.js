@@ -1,6 +1,6 @@
 // A pool.js worker: group statistics, or each run's bin means, of the page's charts, over columns and bucket arrays in
 // the memory it shares; and bucket arrays fetched into that memory.
-import { BinCache, Col, RAW, aggGroups, binRows, bucketExtent, bucketPaths, bucketViews, buildColumn, runColumn } from "./kernel.js";
+import { BinCache, Col, RAW, aggGroups, binRows, bucketPaths, bucketViews, buildColumn, runColumn } from "./kernel.js";
 
 const chunks = new Map(); // shared chunk id -> its Float64Array
 const arrays = new Map(); // "chunk:generation:offset" -> bucketViews of the bucket array there
@@ -30,7 +30,7 @@ async function fetchArray(m) {
     const res = await fetch(m.url, { method: "POST", body: m.body });
     if (!res.ok) return postMessage({ job: m.job, status: res.status, buf: null, bytes: 0 });
     const [buf, bytes] = await readShared(res), v = bucketViews(buf, 0);
-    postMessage({ job: m.job, status: res.status, buf, bytes, paths: bucketPaths(buf, v), ext: bucketExtent(v) });
+    postMessage({ job: m.job, status: res.status, buf, bytes, paths: bucketPaths(buf, v) });
   } catch (e) {
     postMessage({ job: m.job, status: 0, buf: null, bytes: 0, error: String(e) });
   }

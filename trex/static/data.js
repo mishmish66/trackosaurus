@@ -2,7 +2,7 @@
 // stream. A run's column of a metric is built from its buckets in its chart's blocks (`buildColumn`) plus the rows
 // streamed since those buckets were made; a gap or a missed heartbeat resyncs the run.
 
-import { BLOCK, SHARED, adoptStore, bucketExtent, bucketPaths, bucketViews, buildColumn, crc32, freeStore } from "./kernel.js";
+import { BLOCK, SHARED, adoptStore, bucketPaths, bucketStep, bucketViews, buildColumn, crc32, freeStore } from "./kernel.js";
 import { PARALLEL as WORKERS, fetchArrayOnWorker } from "./pool.js";
 import { asNumber } from "./where.js";
 
@@ -138,13 +138,13 @@ export async function getJSON(url) {
   return r.json();
 }
 
-/** A bucket array answer fetched on the page (when no worker fetches it): {status, buf, bytes, paths, ext}. */
+/** A bucket array answer fetched on the page (when no worker fetches it): {status, buf, bytes, paths}. */
 async function fetchArrayHere(url, body) {
   try {
     const res = await fetch(url, { method: "POST", body });
     if (!res.ok) return { status: res.status, buf: null, bytes: 0 };
     const buf = await res.arrayBuffer(), v = bucketViews(buf);
-    return { status: res.status, buf, bytes: buf.byteLength, paths: bucketPaths(buf, v), ext: bucketExtent(v) };
+    return { status: res.status, buf, bytes: buf.byteLength, paths: bucketPaths(buf, v) };
   } catch (e) {
     return { status: 0, buf: null, bytes: 0, error: String(e) };
   }
@@ -171,7 +171,7 @@ export class Data {
     this.scope = null;
     this.rootKey = "";
     this.stream = null; // EventSource of /api/stream
-    this.arrays = new Map(); // id -> {key, level, index, v, seq, buf, loc, bytes, ext, refs (block entries naming it)}
+    this.arrays = new Map(); // id -> {key, level, index, v, seq, buf, loc, bytes, refs (block entries naming it)}
     this.arrayBytes = 0;
     this.nextArray = 0;
     this.blocks = new Map(); // blockId -> {runs: Map(run id -> {a (array), row}), used}
@@ -320,7 +320,7 @@ export class Data {
     const px = d.many ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET, buckets = Math.min(d.pw / px, POINT_BUDGET / Math.max(runs.length, 1));
     let lo = 0, hi = 0;
     for (const r of runs) hi = Math.max(hi, num(r.meta.summary?._step ?? 0));
-    const ext = this.extent(d.key);
+    const ext = this.extentOf(runs, d.key);
     if (ext) (lo = Math.min(ext[0], hi)), (hi = Math.max(hi, ext[1]));
     const coarse = covering(levelFor(hi - lo, buckets), lo, hi);
     const view = d.zoomed ? this.stepWindow(d, runs) : null;
@@ -405,20 +405,28 @@ export class Data {
     return this.charts.get(key)?.ready?.coarse.level ?? null;
   }
 
-  /** [first, last] x of `key` (steps for xmode 0, else runtimes) in the arrays here, or null. */
-  extent(key, xmode = 0) {
-    const k = xmode ? 2 : 0;
+  /** [first, last] x (steps for xmode 0, else runtimes) of the buckets of `runs` in the coarse blocks chart `key`
+   * shows, or null. */
+  extentOf(runs, key, xmode = 0) {
+    const ready = this.charts.get(key)?.ready;
     let lo = Infinity, hi = -Infinity;
-    for (const a of this.arrays.values()) if (a.key === key && a.ext) (lo = Math.min(lo, a.ext[k])), (hi = Math.max(hi, a.ext[k + 1]));
+    for (const index of ready ? ready.coarse.indices : []) {
+      const b = this.blocks.get(blockId(key, ready.coarse.level, index));
+      for (const r of b ? runs : []) {
+        const e = b.runs.get(r.id), v = e?.a.v;
+        if (!v || v.first[e.row + 1] <= v.first[e.row]) continue;
+        const q0 = v.first[e.row], q1 = v.first[e.row + 1] - 1;
+        (lo = Math.min(lo, xmode ? v.tmean[q0] : bucketStep(v, q0))), (hi = Math.max(hi, xmode ? v.tmean[q1] : bucketStep(v, q1)));
+      }
+    }
     return hi >= lo ? [lo, hi] : null;
   }
 
-  /** Keep answer `got` ({buf, bytes, paths, ext}) of request x: each run it names as its entry of the block. */
+  /** Keep answer `got` ({buf, bytes, paths}) of request x: each run it names as its entry of the block. */
   addArray(x, got) {
     const { loc } = SHARED && got.buf instanceof SharedArrayBuffer ? adoptStore(got.buf) : { loc: null };
     const v = bucketViews(got.buf);
-    const a = { id: this.nextArray++, key: x.key, level: x.level, index: x.index, v, seq: v.seq, buf: got.buf, loc, bytes: got.bytes,
-                ext: got.ext, refs: 0 };
+    const a = { id: this.nextArray++, key: x.key, level: x.level, index: x.index, v, seq: v.seq, buf: got.buf, loc, bytes: got.bytes, refs: 0 };
     this.arrays.set(a.id, a);
     this.arrayBytes += a.bytes;
     const id = blockId(x.key, x.level, x.index);

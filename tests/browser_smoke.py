@@ -1,7 +1,7 @@
 """Headless-browser smoke test against a throwaway trex server on a temporary runs directory.
 
 Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, panels of
-hidden runs, the filter box, console errors, UI line coverage (at least UI_COVERAGE of the modules' code lines run),
+hidden runs, the x range of hidden runs, the filter box, console errors, UI line coverage (at least UI_COVERAGE of the modules' code lines run),
 and that a client dropping every 5th stream event still converges to the run files: every row and media item, and columns whose
 points' counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
 a directory with `trex serve -y`, the root view of both, making a workspace of them in the panel the trex
@@ -61,6 +61,15 @@ for step in range(260, 500):  # no power of two between: the top tiles keep thei
     log(step)
     time.sleep(0.04)
 for r in runs:
+    r.finish()
+"""
+
+EXTENT_WRITER = """
+import sys, trex
+for name, n in (("short", 100), ("long", 1000)):
+    r = trex.init(f"{sys.argv[1]}/extent/{name}")
+    for i in range(n):
+        r.log({"loss": 1.0 / (i + 1)}, step=i)
     r.finish()
 """
 
@@ -150,6 +159,27 @@ def group_medians(group, g0, dx, bins):
         steps = [s for s in range(200) if g0 + k * dx <= s < g0 + (k + 1) * dx]
         out.append(statistics.median(statistics.fmean(many_value(group, i, s) for s in steps) for i in range(160)) if steps else None)
     return out
+
+
+def hidden_extent_smoke(page, url, runs):
+    """Whether hiding a run takes its steps out of a chart's x range, and showing it again puts them back."""
+    subprocess.run([sys.executable, "-c", EXTENT_WRITER, str(runs)], check=True)
+    page.goto(f"{url}/?extent#path=extent&group=run")
+    page.wait_for_function("window.app && app.data.runs.size === 2", timeout=60000)
+    page.wait_for_function(SETTLED + " && app.charts.get('loss')?.view", timeout=60000)
+    end = "(() => { const v = app.charts.get('loss').view; return [v.lines.length, Math.round(v.ex1)]; })()"
+
+    def toggle_long():
+        page.click("tr:has-text('long') input[type=checkbox]")
+        page.wait_for_timeout(300)
+        page.wait_for_function(SETTLED, timeout=60000)
+        return page.evaluate(end)
+
+    both = page.evaluate(end)
+    hidden = toggle_long()
+    back = toggle_long()
+    print(f"hidden extent: lines and x range end with both runs {both}, the long one hidden {hidden}, shown again {back}")
+    return both[0] == 2 and both[1] > 900 and hidden[0] == 1 and hidden[1] < 110 and back == both
 
 
 def binned_smoke(page, url, runs):
@@ -829,6 +859,7 @@ def main():
             ok &= check("interactions_smoke", interactions_smoke(page, url))
             ok &= check("flicker_smoke", flicker_smoke(page, url, runs))
             ok &= check("binned_smoke", binned_smoke(page, url, runs))
+            ok &= check("hidden_extent_smoke", hidden_extent_smoke(page, url, runs))
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])
             deadline = time.time() + 20
             while not (runs / "live").exists() and time.time() < deadline:

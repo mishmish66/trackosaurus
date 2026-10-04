@@ -549,7 +549,7 @@ export class Chart {
   compute() {
     const app = this.app, o = app.panelOpts(this.key);
     const groups = app.linesFor(this.key), allCols = colsOf(groups);
-    const v = this.xView(o, allCols);
+    const v = this.xView(o, allCols, groups);
     if (!v) return null;
     const yr = new YRange(o.logy), r = this.glRenderer(), binned = (this.binned = this.binnedOf(o, groups));
     const rows = !app.grouped && binned ? this.binnedRows(groups, v) : null;
@@ -564,9 +564,9 @@ export class Chart {
   }
 
   /** x range (transformed) and smoothing of the view: the data's extent, or the zoom; null if empty. */
-  xView(o, allCols) {
+  xView(o, allCols, groups) {
     const { xmode, logx, logy } = o;
-    const [e0, e1, epos] = withExtent(xExtent(allCols, xmode), this.app.data.extent(this.key, xmode));
+    const [e0, e1, epos] = withExtent(xExtent(allCols, xmode), this.bucketsExtent(groups, xmode));
     if (!(e1 >= e0)) return null;
     const zoom = this.app.xrange && this.app.xrange[2] === xmode ? this.app.xrange : null;
     const [x0, x1] = xRange(o, zoom, e0, e1, epos);
@@ -588,6 +588,16 @@ export class Chart {
     if (!ok) return null;
     for (const c of cols) for (const raw of faint ? [false, true] : [false]) growVisible(c, v, raw, yr);
     return { lines: groups.map((ln) => ({ ...ln })), density };
+  }
+
+  /** [first, last] x of the runs of `groups` drawn from their buckets (those without a column), kept while neither
+   * the groups nor the data change. */
+  bucketsExtent(groups, xmode) {
+    const data = this.app.data, sig = `${data.version}|${xmode}`;
+    if (this.bucketExt?.groups === groups && this.bucketExt.sig === sig) return this.bucketExt.out;
+    const runs = groups.flatMap((g) => (g.runs || [g.run]).filter((_, i) => !g.cols[i]));
+    this.bucketExt = { groups, sig, out: data.extentOf(runs, this.key, xmode) };
+    return this.bucketExt.out;
   }
 
   /** Lines decimated per pixel for Canvas 2D. */
