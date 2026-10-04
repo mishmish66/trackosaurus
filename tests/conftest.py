@@ -25,17 +25,22 @@ with open(os.path.join(home, "sessions"), "a") as f:
     f.write(f"{{os.getpid()}} {{sock}}\\n")
 if rest[0] == "nowhere":
     sys.exit("ssh: Could not resolve hostname nowhere: Name or service not known")
-if os.path.lexists(local):
-    os.unlink(local)
-os.symlink(sock, local)
+if local is not None:
+    if os.path.lexists(local):
+        os.unlink(local)
+    os.symlink(sock, local)
 try:
     sys.exit(subprocess.call(["sh", "-c", " ".join(rest[1:])], env={{**os.environ, "HOME": home, "PATH": "/usr/bin:/bin"}}))
 finally:
-    os.unlink(local)
+    if local is not None:
+        os.unlink(local)
 """
 FAKE_UVX = """#!/bin/sh
 printf '%s\\n' "$@" > "$HOME/uvx.args"
-while [ "$1" != trex ]; do shift; done
+while [ "$1" != trex ]; do
+    if [ "$1" = --from ] && [ ! -f "$2" ]; then echo "uvx: $2 not found" >&2; exit 2; fi
+    shift
+done
 shift
 exec {python} -m trex "$@"
 """

@@ -1,8 +1,10 @@
 import http.client as http_client
 import json
 import os
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.parse
@@ -60,24 +62,45 @@ def test_an_existing_local_path_with_a_colon_is_local(tmp_path, monkeypatch):
     assert remote.parse("run:1") is None
 
 
-@pytest.mark.parametrize("base,commit,want", [
-    ("git+https://example.org/u/trex", "abc123", "git+https://example.org/u/trex@abc123"),
-    ("git+ssh://git@example.org/u/trex@v1", "abc123", "git+ssh://git@example.org/u/trex@abc123"),
-    ("git+https://example.org/u/trex", None, "git+https://example.org/u/trex"),
-    ("/src/trex", "abc123", "/src/trex"),
-])
-def test_remote_machines_run_this_trex_commit_from_the_source(monkeypatch, base, commit, want):
-    monkeypatch.setenv("TREX_SOURCE", base)
-    monkeypatch.setattr(update, "RUNNING", {"version": "0.1.0", "commit": commit})
-    assert remote.source() == want
+def test_remote_machines_get_this_trex_over_ssh_once(roots, runs, home):
+    entry = roots.get(roots.add_remote(f"box:{runs}"))
+    assert isinstance(entry, Remote) and entry.state == "connected"
+    name, data = remote.wheel()
+    args = (home / "uvx.args").read_text().split("\n")
+    assert args[args.index("--from") + 1] == str(home / remote.WHEELS / name)
+    assert (home / remote.WHEELS / name).read_bytes() == data and sorted(p.name for p in (home / remote.WHEELS).iterdir()) == [name]
+    sent = len(sessions(home))  # the session that found no wheel, the copy, the session serving it
+    (pid, _) = sessions(home)[-1]
+    os.kill(pid, signal.SIGKILL)
+    assert wait_for(lambda: len(sessions(home)) == sent + 1 and entry.state == "connected")
+    assert sent == 3
 
 
-def test_remote_directories_are_served_through_the_daemon(roots, runs, http, home, monkeypatch):
-    monkeypatch.setattr(update, "RUNNING", {"version": "0.1.0", "commit": "abc123"})
+def test_this_trex_as_a_wheel_installs_with_its_command_and_ui(tmp_path):
+    name, data = remote.wheel()
+    whl = tmp_path / name
+    whl.write_bytes(data)
+    env = tmp_path / "env"
+    subprocess.run([update.uv(), "venv", "-q", "--python", sys.executable, str(env)], check=True)
+    subprocess.run([update.uv(), "pip", "install", "-q", "--offline", "--no-deps", "--python", str(env / "bin" / "python"), str(whl)], check=True)
+    site = next(env.glob("lib/python*/site-packages"))
+    assert (env / "bin" / "trex").exists() and (site / "trex" / "static" / "app.js").read_bytes() == (Path(remote.__file__).parent / "static" / "app.js").read_bytes()
+
+
+def test_a_wheel_is_the_same_for_the_same_package_and_named_for_its_contents(tmp_path):
+    pkg = tmp_path / "trex"
+    shutil.copytree(Path(remote.__file__).parent, pkg, ignore=shutil.ignore_patterns("__pycache__"))
+    first = remote.build_wheel(pkg)
+    assert remote.build_wheel(pkg) == first
+    (pkg / "static" / "app.js").write_text("changed")
+    assert remote.build_wheel(pkg)[0] != first[0]
+
+
+def test_remote_directories_are_served_through_the_daemon(roots, runs, http, home):
     name = roots.add_remote(f"box:{runs}")
     assert name == "my runs" and roots.served()[0]["state"] == "connected"
     base = f"{http}/r/{urllib.parse.quote(name)}"
-    assert "--from" in (args := (home / "uvx.args").read_text().split("\n")) and args[args.index("--from") + 1].endswith("@abc123")
+    args = (home / "uvx.args").read_text().split("\n")
     assert args[args.index("--no-build-package") + 1] == "numpy" and args[args.index("--python") + 1] == "3.12"
     status, _, body = request(f"{base}/")
     assert status == 200 and b"/static/app.js" in body
@@ -101,7 +124,7 @@ def test_removing_a_remote_directory_ends_its_remote_server(roots, runs, home):
     name = roots.add_remote(f"box:{runs}")
     entry = roots.get(name)
     assert isinstance(entry, Remote)
-    (_, sock), = sessions(home)
+    _, sock = sessions(home)[-1]
     assert wait_for(lambda: Path(sock).exists())
     roots.remove(name)
     assert wait_for(lambda: not Path(sock).exists() and not entry.local.exists())
@@ -111,9 +134,9 @@ def test_removing_a_remote_directory_ends_its_remote_server(roots, runs, home):
 def test_a_dropped_connection_reconnects(roots, runs, home):
     entry = roots.get(roots.add_remote(f"box:{runs}"))
     assert isinstance(entry, Remote)
-    (pid, _), = sessions(home)
-    os.kill(pid, signal.SIGKILL)
-    assert wait_for(lambda: len(sessions(home)) == 2 and entry.state == "connected")
+    started = len(sessions(home))
+    os.kill(sessions(home)[-1][0], signal.SIGKILL)
+    assert wait_for(lambda: len(sessions(home)) == started + 1 and entry.state == "connected")
 
 
 @pytest.mark.parametrize("spec,message", [("nowhere:/runs", "Could not resolve hostname"), ("box:/no/such/dir", "not a directory")])
@@ -189,7 +212,7 @@ def test_passed_through_answers_keep_the_connection_usable(roots, runs, http):
 def test_closing_the_daemons_directories_ends_remote_sessions_and_keeps_them_saved(roots, runs, home, tmp_path):
     entry = roots.get(roots.add_remote(f"box:{runs}"))
     assert isinstance(entry, Remote)
-    (_, sock), = sessions(home)
+    _, sock = sessions(home)[-1]
     roots.close()
     assert not entry.local.exists() and wait_for(lambda: not Path(sock).exists()) and roots.served() == []
     assert json.loads((tmp_path / "state" / "roots.json").read_text())["tracked"] == [f"box:{runs}"]

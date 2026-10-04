@@ -174,15 +174,19 @@ def slab_smoke(page, url, runs):
     page.wait_for_timeout(300)
     page.wait_for_function(SETTLED, timeout=60000)
     heat = page.evaluate("(() => { const c = app.charts.get('loss'); return [c.fromSlabs, c.view.density, c.view.lines.length]; })()")
+    page.goto(f"{url}/?slabs&gl=0#path=many&group=run")
+    page.wait_for_function("window.app && app.data.runs.size === 320", timeout=60000)
+    page.wait_for_function(SETTLED, timeout=60000)
+    canvas = page.evaluate("(() => { const c = app.charts.get('loss'); return [!!c.fromSlabs, c.view?.lines.length ?? 0]; })()")
     page.evaluate("app.showProtocol(1)")
     stated = page.evaluate("[!document.querySelector('#mismatch').hidden, document.querySelector('#mismatch').title]")
     slabbed, lines = drawn[""]
     off = [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
     print(f"slabs: a zoom of 320 runs drew from slabs {slabbed} (with shared=0: {drawn['shared=0'][0]}), groups {[l[0] for l in lines]} of "
-          f"{len(lines[0][3]) if lines else 0} bins, at most {max(off, default=1):.2g} off their exact medians; heatmap from slabs {heat}; "
-          f"protocol 1 stated {stated}")
+          f"{len(lines[0][3]) if lines else 0} bins, at most {max(off, default=1):.2g} off their exact medians; heatmap from slabs {heat}, "
+          f"in Canvas 2D from columns {canvas}; protocol 1 stated {stated}")
     return (slabbed is True and drawn["shared=0"][0] is False and sorted(l[0] for l in lines) == ["a", "b"] and off and max(off) < 1e-5
-            and heat == [True, True, 320] and stated[0] and "the server 1" in stated[1])
+            and heat == [True, True, 320] and canvas == [False, 320] and stated[0] and "the server 1" in stated[1])
 
 
 class JsCoverage:

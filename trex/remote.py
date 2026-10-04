@@ -1,8 +1,13 @@
-"""Remote runs directories (`host:path`): the daemon runs `trex serve` there over ssh with uvx, on a Unix socket
-that ssh forwards back, and passes the directory's requests through to it."""
+"""Remote runs directories (`host:path`): the daemon copies this trex there as a wheel over ssh (once per content),
+runs it with uvx on a Unix socket that ssh forwards back, and passes the directory's requests through to it."""
 
+import base64
 import collections
+import functools
+import hashlib
 import http.client
+import importlib.metadata
+import io
 import os
 import re
 import shlex
@@ -11,10 +16,9 @@ import subprocess
 import tempfile
 import threading
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Final, NamedTuple, Self
-
-from . import update
 
 SPEC: Final = re.compile(r"(?P<host>(?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s\[\]]+)):(?P<path>.+)")
 ADD_TIMEOUT: Final = 120.0  # seconds an add waits for the first start (uvx may install trex first)
@@ -25,6 +29,8 @@ PROXY_TIMEOUT: Final = 120.0  # seconds a passed-through request may wait for th
 SSH_OPTIONS: Final = ["-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
                       "-o", "StreamLocalBindMask=0177", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
 NO_UV: Final = "uv is not installed on $(hostname); install it with: curl -LsSf https://astral.sh/uv/install.sh | sh"
+WHEELS: Final = ".cache/trex/wheels"  # where a remote home keeps the copies of trex it was sent, relative to it
+NEEDS_WHEEL: Final = "trex needs its wheel"  # a session's first line when the remote lacks this trex's wheel
 
 
 class Address(NamedTuple):
@@ -40,25 +46,61 @@ def parse(spec: str) -> Address | None:
     return Address(m["host"], m["path"])
 
 
-def source() -> str:
-    """What remote machines run: $TREX_SOURCE (default the GitHub repository), pinned to this trex's commit."""
-    base = os.environ.get("TREX_SOURCE") or update.DEFAULT_SOURCE
-    commit = update.RUNNING["commit"]
-    if not commit or not base.startswith("git+"):
-        return base
-    head, _, last = base.rpartition("/")
-    return f"{head}/{last.split('@')[0]}@{commit}"
+def build_wheel(package: Path) -> tuple[str, bytes]:
+    """The trex package directory `package` as a pure-Python wheel: its file name, whose version carries a digest of
+    the wheel's contents, and its bytes (the same for the same contents)."""
+    files = sorted((f.relative_to(package.parent).as_posix(), f.read_bytes()) for f in package.rglob("*")
+                   if f.is_file() and "__pycache__" not in f.parts and f.suffix != ".pyc")
+    try:
+        meta = importlib.metadata.metadata("trex")
+        base, python, needs = meta["Version"], meta["Requires-Python"], importlib.metadata.requires("trex") or []
+    except importlib.metadata.PackageNotFoundError:
+        base, python, needs = "0", ">=3.12", ["numpy>=1.24", "typer>=0.27.2"]
+    digest = hashlib.sha256()
+    for name, data in [*files, ("requires", "\n".join([python, *needs]).encode())]:
+        digest.update(name.encode() + b"\0" + hashlib.sha256(data).digest())
+    version = f"{base}+{digest.hexdigest()[:16]}"
+    info = f"trex-{version}.dist-info"
+    files += [(f"{info}/METADATA", "".join([f"Metadata-Version: 2.1\nName: trex\nVersion: {version}\nRequires-Python: {python}\n",
+                                             *(f"Requires-Dist: {r}\n" for r in needs)]).encode()),
+              (f"{info}/WHEEL", b"Wheel-Version: 1.0\nGenerator: trex\nRoot-Is-Purelib: true\nTag: py3-none-any\n"),
+              (f"{info}/entry_points.txt", b"[console_scripts]\ntrex = trex.cli:main\n")]
+    record = [f"{n},sha256={base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b'=').decode()},{len(d)}" for n, d in files]
+    files.append((f"{info}/RECORD", "\n".join([*record, f"{info}/RECORD,,", ""]).encode()))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in files:
+            entry = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            entry.external_attr = 0o644 << 16
+            z.writestr(entry, data, zipfile.ZIP_DEFLATED)
+    return f"trex-{version}-py3-none-any.whl", out.getvalue()
 
 
-def remote_command(addr: Address, sock: str, src: str) -> str:
-    """The shell command that serves `addr.path` on the Unix socket `sock`, until its stdin closes, on Python
-    REMOTE_PYTHON with numpy from a wheel (the newest one for the host's glibc, as old cluster systems need), its index
-    on the host's local disk (never shared by two hosts, as a network home would be) and at most 4 index workers
-    unless $TREX_WORKERS says otherwise there (remote hosts are often shared)."""
-    serve = shlex.join(["uvx", "--python", REMOTE_PYTHON, "--no-build-package", "numpy", "--from", src, "trex", "serve", addr.path, "--standalone", "--unix", sock,
-                        "--exit-on-eof"])
+@functools.cache
+def wheel() -> tuple[str, bytes]:
+    """This trex as remote machines run it (`build_wheel` of this package)."""
+    return build_wheel(Path(__file__).parent)
+
+
+def remote_command(addr: Address, sock: str, wheel_name: str) -> str:
+    """The shell command that serves `addr.path` on the Unix socket `sock`, until its stdin closes, from the wheel
+    `wheel_name` in WHEELS (or prints NEEDS_WHEEL and ends when that is missing), on Python REMOTE_PYTHON with numpy
+    from a wheel (the newest one for the host's glibc, as old cluster systems need), its index on the host's local disk
+    (never shared by two hosts, as a network home would be) and at most 4 index workers unless $TREX_WORKERS says
+    otherwise there (remote hosts are often shared)."""
+    whl = f'"$HOME/{WHEELS}/{wheel_name}"'
+    serve = (f"uvx --python {REMOTE_PYTHON} --no-build-package numpy --from {whl} trex serve "
+             + shlex.join([addr.path, "--standalone", "--unix", sock, "--exit-on-eof"]))
     script = (f'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"; command -v uvx >/dev/null || '
-              f'{{ echo "{NO_UV}" >&2; exit 127; }}; NO_COLOR=1 PYTHONUNBUFFERED=1 TREX_WORKERS="${{TREX_WORKERS:-4}}" exec {serve} --cache "${{TMPDIR:-/tmp}}/trex-cache-$(id -u)"')
+              f'{{ echo "{NO_UV}" >&2; exit 127; }}; test -f {whl} || {{ echo "{NEEDS_WHEEL}"; exit 0; }}; '
+              f'NO_COLOR=1 PYTHONUNBUFFERED=1 TREX_WORKERS="${{TREX_WORKERS:-4}}" exec {serve} --cache "${{TMPDIR:-/tmp}}/trex-cache-$(id -u)"')
+    return shlex.join(["sh", "-c", script])
+
+
+def upload_command(wheel_name: str) -> str:
+    """The shell command that writes its stdin to WHEELS/`wheel_name` (a temporary name, then renamed)."""
+    script = (f'd="$HOME/{WHEELS}"; mkdir -p "$d" && t="$d/.{wheel_name}.$$" && cat > "$t" && mv -f "$t" "$d/{wheel_name}" '
+              f'|| {{ rm -f "$t"; exit 1; }}')
     return shlex.join(["sh", "-c", script])
 
 
@@ -115,11 +157,12 @@ class Remote:
             delay = min(2 * delay, BACKOFF_MAX)
         self.local.unlink(missing_ok=True)
 
-    def _attempt(self) -> bool:
-        """One ssh session; whether it connected."""
+    def _attempt(self, send: bool = True) -> bool:
+        """One ssh session, after sending this trex's wheel when the remote lacks it (if `send`); whether it
+        connected."""
         sock = f"/tmp/trex-{uuid.uuid4().hex[:16]}.sock"
-        ssh = os.environ.get("TREX_SSH", "ssh")
-        cmd = [ssh, *SSH_OPTIONS, "-L", f"{self.local}:{sock}", self.addr.host, remote_command(self.addr, sock, source())]
+        ssh, name = os.environ.get("TREX_SSH", "ssh"), wheel()[0]
+        cmd = [ssh, *SSH_OPTIONS, "-L", f"{self.local}:{sock}", self.addr.host, remote_command(self.addr, sock, name)]
         self.state, self.error = "starting", ""
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -133,7 +176,8 @@ class Remote:
         errors: collections.deque[str] = collections.deque(maxlen=20)
         drain = threading.Thread(target=lambda: errors.extend(line.rstrip() for line in proc.stderr or []), daemon=True)
         drain.start()
-        connected = "trex serving" in proc.stdout.readline()
+        first = proc.stdout.readline()
+        connected = "trex serving" in first
         if connected and not self._closed.is_set():
             self.state = "connected"
             self.settled.set()
@@ -143,10 +187,26 @@ class Remote:
         proc.stdout.close()
         proc.stderr.close()
         self._proc = None
+        if first.strip() == NEEDS_WHEEL and send and not self._closed.is_set():
+            sent = self._send()
+            if sent is None:
+                return self._attempt(send=False)
+            errors.append(sent)
         if not self._closed.is_set():
             self.state = "unreachable"
             self.error = "\n".join(errors) or f"ssh exited with status {proc.returncode}"
         return connected
+
+
+    def _send(self) -> str | None:
+        """Copy this trex's wheel to the remote's WHEELS over ssh; None when it arrived, else why not."""
+        name, data = wheel()
+        cmd = [os.environ.get("TREX_SSH", "ssh"), *SSH_OPTIONS, self.addr.host, upload_command(name)]
+        try:
+            done = subprocess.run(cmd, input=data, capture_output=True, timeout=ADD_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return f"sending trex: {e}"
+        return None if done.returncode == 0 else f"sending trex: {done.stderr.decode(errors='replace').strip() or done.returncode}"
 
 
 def _end(proc: subprocess.Popen[str]) -> None:

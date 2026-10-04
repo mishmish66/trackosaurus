@@ -11,23 +11,34 @@ const MAX_BINS = 16; // texels of the density maximum
 
 const ext = (gl, name) => gl.getExtension(name);
 
+/** A program compiling and linking in the background (KHR_parallel_shader_compile); `linked` checks it. */
 function compile(gl, vs, fs) {
-  const p = gl.createProgram();
+  const p = gl.createProgram(), shaders = [];
   for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
     gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
     gl.attachShader(p, s);
+    shaders.push(s);
   }
   gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return { p, shaders, u: null };
+}
+
+/** `prog` with its uniforms' locations, once it has linked; throws its compile errors when it failed. */
+function linked(gl, prog) {
+  if (prog.u) return prog;
+  const p = prog.p;
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error(prog.shaders.map((s) => gl.getShaderInfoLog(s)).filter(Boolean).join("\n") || gl.getProgramInfoLog(p));
+  }
   const u = {};
   for (let i = 0, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); i < n; i++) {
     const name = gl.getActiveUniform(p, i).name;
     u[name] = gl.getUniformLocation(p, name);
   }
-  return { p, u };
+  prog.u = u;
+  return prog;
 }
 
 const header = (multi) => `#version 300 es
@@ -301,20 +312,13 @@ class Renderer {
     this.lru.clear();
     this.bytes = 0;
     this.multi = ext(gl, "WEBGL_multi_draw");
+    const floats = ext(gl, "EXT_color_buffer_float"), blend = floats && ext(gl, "EXT_float_blend");
+    ext(gl, "KHR_parallel_shader_compile");
     this.maxRows = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), 32768);
-    const make = (multi) => ({
-      line: compile(gl, LINE_VS(multi), LINE_FS),
-      band: compile(gl, BAND_VS(multi), BAND_FS),
-    });
-    try {
-      this.progs = make(!!this.multi);
-    } catch {
-      this.multi = null;
-      this.progs = make(false);
-    }
+    this.progs = this.lineProgs(!!this.multi);
     this.densFormat = null;
-    if (ext(gl, "EXT_color_buffer_float")) {
-      this.densFormat = ext(gl, "EXT_float_blend") ? gl.R32F : gl.R16F;
+    if (floats) {
+      this.densFormat = blend ? gl.R32F : gl.R16F;
       this.progs.max = compile(gl, MAX_VS, MAX_FS);
       this.progs.cmap = compile(gl, QUAD_VS, CMAP_FS);
       this.maxTex = this.texture(this.densFormat, MAX_BINS, 1, gl.RED, gl.FLOAT, null);
@@ -329,6 +333,23 @@ class Renderer {
     this.metaRows = this.metaAt = 0;
     this.vao = gl.createVertexArray();
     this.firsts = this.counts = this.inst = null;
+  }
+
+  lineProgs(multi) {
+    const gl = this.gl;
+    return { ...this.progs, line: compile(gl, LINE_VS(multi), LINE_FS), band: compile(gl, BAND_VS(multi), BAND_FS) };
+  }
+
+  /** Program `name`, linked; line and band programs drop multi-draw when theirs fail to link. */
+  program(name) {
+    try {
+      return linked(this.gl, this.progs[name]);
+    } catch (e) {
+      if (!this.multi || (name !== "line" && name !== "band")) throw e;
+      this.multi = null;
+      this.progs = this.lineProgs(false);
+      return linked(this.gl, this.progs[name]);
+    }
   }
 
   /** Whether density rendering is available. */
@@ -461,7 +482,7 @@ class Renderer {
 
   /** Every line of `table` as a `width` px (device) stroke at opacity `alpha`, in table order. */
   lines(pts, table, view, width, alpha, density = false) {
-    const gl = this.gl, prog = this.progs.line, a = table.a;
+    const gl = this.gl, prog = this.program("line"), a = table.a;
     this.bind(prog, pts, table, view);
     gl.uniform1f(prog.u.u_half, width / 2);
     gl.uniform1f(prog.u.u_alpha, alpha);
@@ -476,7 +497,7 @@ class Renderer {
 
   /** Filled bands: table entries in (hi, lo) pairs with equal counts. */
   bands(pts, table, view, alpha) {
-    const gl = this.gl, prog = this.progs.band, a = table.a;
+    const gl = this.gl, prog = this.program("band"), a = table.a;
     this.bind(prog, pts, table, view);
     gl.uniform1f(prog.u.u_alpha, alpha);
     this.draws(prog, table.n >> 1, (i) => a[8 * i + 1] - 1);
@@ -504,7 +525,7 @@ class Renderer {
     gl.blendFunc(gl.ONE, gl.ONE);
     this.lines(pts, table, view, width, 1, true);
     // maximum over the plot rectangle
-    const [cx, cy, cw, ch] = this.clip, mp = this.progs.max;
+    const [cx, cy, cw, ch] = this.clip, mp = this.program("max");
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.maxFbo);
     gl.disable(gl.SCISSOR_TEST);
     gl.viewport(0, 0, MAX_BINS, 1);
@@ -518,7 +539,7 @@ class Renderer {
     if (cw && ch) gl.drawArrays(gl.POINTS, 0, cw * ch);
     gl.blendEquation(gl.FUNC_ADD);
     // colormap onto the chart image
-    const cp = this.progs.cmap;
+    const cp = this.program("cmap");
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.enable(gl.SCISSOR_TEST);
     gl.viewport(0, this.shift, W, H);
@@ -546,6 +567,9 @@ class Renderer {
 }
 
 let shared;
+/** Whether WebGL2 was found unavailable (false before `renderer` first tries it). */
+export const glFailed = () => shared === null;
+
 /** The shared renderer, or null when WebGL2 is unavailable or the context is lost. */
 export function renderer() {
   if (shared === undefined) {

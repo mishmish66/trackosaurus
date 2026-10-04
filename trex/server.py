@@ -76,6 +76,11 @@ class Handler(BaseHTTPRequestHandler):
     _ex: "Explorer | Workspace | None" = None
     _body: bytes = b""
 
+    def setup(self) -> None:
+        super().setup()
+        if self.connection.family != socket.AF_UNIX:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # each write leaves without waiting for an ACK
+
     def end_headers(self) -> None:
         for k, v in ISOLATION.items():
             self.send_header(k, v)

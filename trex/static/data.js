@@ -202,8 +202,17 @@ const idb = {
 
 export const clearCache = () => idb.clear();
 
-async function getJSON(url) {
-  const r = await fetch(url, { cache: "no-store" });
+const early = new Map(); // url -> its response, requested by `preload` and not yet taken
+
+/** Request `urls` now, all at once; the next getJSON of each takes its answer. */
+export function preload(urls) {
+  for (const u of urls) if (!early.has(u)) early.set(u, fetch(u, { cache: "no-store" }));
+}
+
+export async function getJSON(url) {
+  const pending = early.get(url);
+  early.delete(url);
+  const r = await (pending ?? fetch(url, { cache: "no-store" }));
   if (!r.ok) throw new Error(`${url}: ${r.status}`);
   return r.json();
 }

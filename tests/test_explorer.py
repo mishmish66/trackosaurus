@@ -197,6 +197,20 @@ def test_the_runs_body_follows_runs_added_and_folder_notes(root, tmp_path):
     assert [m["id"] for m in body()["runs"]] == ["a/r1", "a/r2"] and body()["folders"]["a"] == {"note": "x"}
 
 
+def test_requests_on_a_kept_alive_connection_answer_without_waiting_for_delayed_acks(http):
+    _, url = http
+    u = urllib.parse.urlsplit(url)
+    c = http_client.HTTPConnection(u.hostname, u.port, timeout=5)
+    times = []
+    for _ in range(6):
+        t = time.perf_counter()
+        c.request("GET", "/api/info")
+        c.getresponse().read()
+        times.append(time.perf_counter() - t)
+    c.close()
+    assert sorted(times[1:])[2] < 0.02, times
+
+
 def test_every_response_isolates_the_page_so_it_may_share_memory_with_its_workers(http):
     _, url = http
     for path in ("/", "/static/worker.js", "/api/runs?path="):

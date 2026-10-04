@@ -17,7 +17,7 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/server.py` | read-only HTTP + SSE for the UI: `/api/runs`, `/api/tiles`, `/api/rows`, `/api/stream`, media |
 | `trex/daemon.py` | `trex daemon`: `Roots` (tracked directories by spec, `unique_names`, workspaces; `roots.json`, remembered ones in `history.json`), the Unix control socket, its client |
 | `trex/workspace.py` | workspaces: `Workspace` merges member directories (`Local`, `Far`) behind the Explorer interface, renaming run ids |
-| `trex/remote.py` | `host:path` directories: `parse`, the ssh + `uvx` command, `Remote` (one ssh session, reconnected with backoff) |
+| `trex/remote.py` | `host:path` directories: `parse`, this trex as a wheel (`build_wheel`), the ssh + `uvx` command, `Remote` (one ssh session, reconnected with backoff) |
 | `trex/compact.py` | `trex compact`: rewrites a run no process has open with its commits merged (exclusive lock, new file, verify, rename) |
 | `trex/update.py` | the daemon's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd or launchd to restart it |
 | `trex/query.py` | read-side queries for the CLI: records, field access, sorting, statistics, series |
@@ -96,8 +96,9 @@ them WebGL falls back to software and timings mean nothing.
   `$TREX_SOURCE` and exits with `update.RESTART_STATUS`; the systemd unit's `RestartForceExitStatus`
   or the launchd agent's `KeepAlive` restarts it, and the UI reloads once `/api/daemon` reports the new install (`update.RUNNING`, read at start).
   A removed directory's `Explorer` is closed (`Explorer.close`). A `host:path` directory is a `Remote`:
-  one `ssh -L <local socket>:<remote socket> host uvx --from <source>@<this commit> trex serve PATH --unix
-  <remote socket> --exit-on-eof`, and `Handler._proxy` passes its `/r/<name>/` requests (the stream too)
+  one `ssh -L <local socket>:<remote socket> host uvx --from ~/.cache/trex/wheels/<wheel> trex serve PATH --unix
+  <remote socket> --exit-on-eof`, where `<wheel>` is this trex packaged as a wheel named by a digest of its contents
+  (`remote.wheel`); a session that finds it missing says so, and the daemon writes it there over ssh and reconnects. And `Handler._proxy` passes its `/r/<name>/` requests (the stream too)
   to the local socket; the remote server ends when the session's stdin closes. Tests use a fake `ssh`
   and `uvx` (`tests/test_remote.py`).
 - **Browser** (`data.js`): visible charts state what they show (`plan`). Each run needs buckets

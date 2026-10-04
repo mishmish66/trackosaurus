@@ -3,7 +3,7 @@
 // and zoom is a transform; axes, labels and the hover overlay stay Canvas 2D.
 import { BinCache, Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, aggGroups, binGrid, medianCiCoverage, nearest, prep as kprep, visibleRange,
          yrange } from "./kernel.js";
-import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
+import { BREAK, Points, Table, glFailed, pointBuffer, renderer, rgba } from "./gl.js";
 import { PARALLEL, describe, onWorker } from "./pool.js";
 import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET } from "./data.js";
 import { nonFiniteText } from "./where.js";
@@ -658,7 +658,8 @@ export class Chart {
   /** Whether group statistics of this view (of n runs) may come from slabs: many runs, x in steps, no smoothing, and
    * workers to bin them. */
   canSlab(v, n) {
-    return PARALLEL && !this.app.data.noSlabs && n > DENSITY_AUTO && v.xmode !== X_RUNTIME && !v.logx && !(v.alpha > 0);
+    const drawable = this.app.grouped || (USE_GL && !glFailed()); // a heatmap from slabs draws through WebGL
+    return drawable && PARALLEL && !this.app.data.noSlabs && n > DENSITY_AUTO && v.xmode !== X_RUNTIME && !v.logx && !(v.alpha > 0);
   }
 
   /** The slabs this chart's first view will likely draw from, before it has one: steps from 0 to the largest last

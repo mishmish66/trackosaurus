@@ -1,4 +1,4 @@
-import { BASE, Data, PROTOCOL, clearCache, hasKey, mediaURL } from "./data.js";
+import { BASE, Data, PROTOCOL, clearCache, getJSON, hasKey, mediaURL, preload } from "./data.js";
 import { startWorkers } from "./pool.js";
 import { asNumber, compileWhere, completionContext, fieldText, literal, runField, textOf } from "./where.js";
 import { BAND_LABEL, Chart, DENSITY_AUTO, USE_GL, fmt, fmtDur, fmtSI } from "./plot.js";
@@ -37,7 +37,7 @@ const REMOTE = /^((?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s[\]]+)):(.+)$/;
 const tailOf = (s, n) => (s.length > n ? `…${s.slice(1 - n)}` : s);
 
 /** `/api/daemon`: {daemon, roots, workspaces, history, install, updates}. */
-const daemonInfo = async () => (await fetch("/api/daemon", { cache: "no-store" })).json();
+const daemonInfo = () => getJSON("/api/daemon");
 
 const METRIC_SORT = "metric:"; // prefix of a sort key naming a metric
 const DEFAULT_GROUP = "run~1"; // a run's directory: runs logged side by side share a line
@@ -458,6 +458,7 @@ class App {
 
   async start() {
     startWorkers();
+    preload(["/api/daemon", `${BASE}/api/info`, `${BASE}/api/tree`, `${BASE}/api/runs?path=${encodeURIComponent(this.opts.path)}`]);
     if (!(await this.enterDaemon())) return;
     await this.data.init();
     const root = this.data.rootKey;
@@ -470,7 +471,7 @@ class App {
     await this.refreshTree();
     await this.loadScope();
     setInterval(() => this.refreshTree().then(() => this.renderCrumbs()), 15000);
-    if (USE_GL) (window.requestIdleCallback ?? setTimeout)(() => renderer()); // its setup, ~0.2 s, while tiles load
+    if (USE_GL) (window.requestIdleCallback ?? setTimeout)(() => renderer()); // its setup blocks, so it runs while tiles load
   }
 
   /** Under the daemon, its state (else null), and the trex brand opening its panel. False when it tracks nothing,
@@ -623,7 +624,7 @@ class App {
   }
 
   async refreshTree() {
-    this.tree = await (await fetch(`${BASE}/api/tree`, { cache: "no-store" })).json();
+    this.tree = await getJSON(`${BASE}/api/tree`);
   }
 
   /** Navigate to folder (or run) `path` relative to the served root. */

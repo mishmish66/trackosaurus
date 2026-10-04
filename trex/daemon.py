@@ -22,7 +22,7 @@ switches and manages them, and workspaces: named sets of directories whose folde
 from several machines can be compared side by side (group by `dir`).
 
 A directory added as `host:path` (in the UI or with `trex serve host:path`) is served from that machine
-over ssh: the daemon runs this trex there with uvx (`trex.remote`), so the machine needs only uv and an
+over ssh: the daemon copies this trex there and runs it with uvx (`trex.remote`), so the machine needs only uv and an
 ssh key that works without a prompt. On a cluster, use a host that allows long-running processes, such
 as a data-transfer node; runs written by jobs on other nodes are followed through their journals.
 """
