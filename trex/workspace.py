@@ -3,7 +3,7 @@
 Merged (a named workspace), a run keeps its path within its tracked directory; a path that two members hold
 is shown bare for the first member that has it and as `path<member>` for the others. Nested (the daemon's
 root view), each member is a top-level folder named for it. Every run gets a `dir` field: its member's name.
-A workspace answers the same requests as an Explorer (`runs`, `tiles`, ...), by asking each member.
+A workspace answers the same requests as an Explorer (`runs`, `buckets_body`, ...), by asking each member.
 """
 
 import contextlib
@@ -15,9 +15,12 @@ import time
 from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Final
+
+import numpy as np
 from urllib.parse import quote
 
-from .index import Explorer, TileKind, dumps, sse_text
+from . import buckets as bk
+from .index import Explorer, Which, dumps, sse_text
 from .remote import Remote
 
 HEARTBEAT: Final = 10.0  # seconds of stream silence after which a heartbeat is sent
@@ -49,11 +52,8 @@ class Local:
     def rows(self, path: str, start: int) -> str:
         return self.ex.rows_json(path, start)
 
-    def tiles(self, requests: Sequence[Sequence[object]]) -> list[list[bytes]]:
-        return self.ex.tiles(requests)
-
-    def tile_bundle(self, key: str, kind: TileKind, scope: str) -> list[tuple[str, list[bytes]]]:
-        return self.ex.tile_bundle(key, kind, scope)
+    def buckets(self, key: str, level: int, index: int, scope: str, runs: Sequence[str] | None, which: Which) -> bytes:
+        return self.ex.buckets_body(key, level, index, scope, runs, which)
 
     def events(self, prefix: str, stop: threading.Event) -> Generator[SseEvent, None, None]:
         """Backfill, then live events and a heartbeat after each quiet HEARTBEAT, until `stop`."""
@@ -112,11 +112,9 @@ class Far:
     def rows(self, path: str, start: int) -> str:
         return self._call("GET", f"/api/rows?path={quote(path)}&from={start}").decode()
 
-    def tiles(self, requests: Sequence[Sequence[object]]) -> list[list[bytes]]:
-        return unframe_tiles(self._call("POST", "/api/tiles", json.dumps(list(map(list, requests))).encode()), len(requests))
-
-    def tile_bundle(self, key: str, kind: TileKind, scope: str) -> list[tuple[str, list[bytes]]]:
-        return unframe_bundle(self._call("POST", "/api/tiles/bundle", json.dumps({"key": key, "kind": kind, "scope": scope}).encode()))
+    def buckets(self, key: str, level: int, index: int, scope: str, runs: Sequence[str] | None, which: Which) -> bytes:
+        body = {"key": key, "level": level, "index": index, "scope": scope, "which": which}
+        return self._call("POST", "/api/buckets", json.dumps({**body, "runs": list(runs)} if runs is not None else body).encode())
 
     def events(self, prefix: str, stop: threading.Event) -> Generator[SseEvent, None, None]:
         """The remote server's stream, reopened when it drops, until `stop`."""
@@ -162,36 +160,6 @@ def parse_sse(text: str) -> Iterator[SseEvent]:
                 data.append(line[6:])
         if kind:
             yield kind, "\n".join(data)
-
-
-def unframe_tiles(buf: bytes, n: int) -> list[list[bytes]]:
-    """Inverse of the /api/tiles framing: per request, u32 count, (u32 length, tile)*."""
-    out: list[list[bytes]] = []
-    off = 0
-    for _ in range(n):
-        count = int.from_bytes(buf[off:off + 4], "little")
-        off += 4
-        tiles: list[bytes] = []
-        for _ in range(count):
-            ln = int.from_bytes(buf[off:off + 4], "little")
-            tiles.append(buf[off + 4:off + 4 + ln])
-            off += 4 + ln
-        out.append(tiles)
-    return out
-
-
-def unframe_bundle(buf: bytes) -> list[tuple[str, list[bytes]]]:
-    """Inverse of the /api/tiles/bundle framing."""
-    runs = int.from_bytes(buf[:4], "little")
-    off, out = 4, []
-    for _ in range(runs):
-        ln = int.from_bytes(buf[off:off + 4], "little")
-        path = buf[off + 4:off + 4 + ln].decode()
-        off += 4 + ln + (-ln % 4)
-        (tiles,) = unframe_tiles(buf[off:], 1)
-        off += 4 + sum(4 + len(t) for t in tiles)
-        out.append((path, tiles))
-    return out
 
 
 class Workspace:
@@ -309,37 +277,38 @@ class Workspace:
         m, mp = self.resolve(path)
         return _with_run(m.rows(mp, start), mp, path)
 
-    def tiles(self, requests: Sequence[Sequence[object]]) -> list[list[bytes]]:
-        groups: dict[str, list[int]] = {}
-        resolved: list[tuple[Member, list[object]] | None] = []
-        for i, req in enumerate(requests):
-            try:
-                m, mp = self.resolve(str(req[0]))
-            except KeyError:
-                resolved.append(None)
+    def buckets_body(self, key: str, level: int, index: int, scope: str = "", runs: Sequence[str] | None = None,
+                     which: Which = "all") -> bytes:
+        """The block as `Explorer.buckets_body` answers it, of every member's runs it names, run ids renamed, in id
+        order."""
+        if runs is None:
+            calls = [(m, mp, None) for m, mp in self._scope(scope)]
+        else:
+            by_member: dict[str, list[str]] = {}
+            for r in runs:
+                with contextlib.suppress(KeyError):
+                    m, mp = self.resolve(r)
+                    by_member.setdefault(m.name, []).append(mp)
+            calls = [(m, "", by_member[m.name]) for m in self.members if m.name in by_member]
+        bodies = list(self._pool.map(lambda c: _try(lambda: c[0].buckets(key, level, index, c[1], c[2], which)), calls))
+        paths: list[str] = []
+        seqs: list[np.ndarray] = []
+        parts: list[bk.Buckets] = []
+        for (m, _, _), body in zip(calls, bodies, strict=True):
+            if body is None:
                 continue
-            resolved.append((m, [mp, *req[1:]]))
-            groups.setdefault(m.name, []).append(i)
-        out: list[list[bytes]] = [[] for _ in requests]
-        by_name = {m.name: m for m in self.members}
-
-        def fetch(name: str) -> tuple[list[int], list[list[bytes]] | None]:
-            idx = groups[name]
-            reqs = [r[1] for i in idx if (r := resolved[i]) is not None]
-            return idx, _try(lambda: by_name[name].tiles(reqs))
-
-        for idx, got in self._pool.map(fetch, list(groups)):
-            for i, tiles in zip(idx, got or [[] for _ in idx], strict=True):
-                out[i] = tiles
-        return out
-
-    def tile_bundle(self, key: str, kind: TileKind, scope: str) -> list[tuple[str, list[bytes]]]:
-        parts = self._scope(scope)
-        bodies = list(self._pool.map(lambda mp: _try(lambda: mp[0].tile_bundle(key, kind, mp[1])), parts))
-        out: list[tuple[str, list[bytes]]] = []
-        for (m, _), body in zip(parts, bodies, strict=True):
-            out += [(self.ws_id(m, p), tiles) for p, tiles in body or []]
-        return out
+            a = bk.decode(body)
+            parts.append(a.buckets._replace(run=a.buckets.run + len(paths)))
+            paths += [self.ws_id(m, p) for p in a.paths]
+            seqs.append(a.seq)
+        seq = np.concatenate(seqs) if seqs else np.empty(0, np.uint32)
+        order = np.argsort(np.array(paths, dtype=object), kind="stable").astype(np.int64)
+        rank = np.empty(len(paths), np.int32)
+        rank[order] = np.arange(len(paths), dtype=np.int32)
+        b = bk.union(parts)
+        b = b._replace(run=rank[b.run])
+        b = bk.take(b, np.argsort(b.run, kind="stable"))
+        return bk.encode(level, index, [paths[i] for i in order], seq[order], b)
 
     def events(self, prefix: str, stop: threading.Event) -> Generator[bytes, None, None]:
         """Every member's stream under `prefix`, run ids renamed, as SSE messages; until `stop`."""

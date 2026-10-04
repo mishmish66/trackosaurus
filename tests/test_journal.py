@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import trex
-from trex import chunks, journal, query
+from trex import buckets as bk, chunks, journal, query
 from trex.format import DB, SCHEMA, connect_ro
 from trex.index import Explorer
 
@@ -189,5 +189,5 @@ def test_the_explorer_follows_a_live_journaled_run(tmp_path):
     assert (meta["seq"], meta["mseq"]) == (80, 1)
     run.finish()
     ex.poll()
-    assert ex.run_meta("r")["state"] == "finished" and ex.tiles([["r", "loss", "top"]])[0]
+    assert ex.run_meta("r")["state"] == "finished" and bk.decode(ex.buckets_body("loss", 20, 0, runs=["r"])).buckets.run.size
     assert sorted(os.listdir(root / "r")) == sorted(["media", DB, journal.JOURNAL])

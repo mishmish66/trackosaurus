@@ -1,6 +1,6 @@
-// Workers computing group statistics, or runs' bin means, over columns and slabs in shared memory (kernel.js
-// `columnStore`), each chart on one worker, so the charts of a round are computed in parallel and each worker keeps
-// its charts' binnings.
+// Workers computing group statistics, or runs' bin means, over columns and bucket arrays in shared memory (kernel.js
+// `columnStore`, `adoptStore`), each chart on one worker, so the charts of a round are computed in parallel and each
+// worker keeps its charts' binnings; and fetching bucket arrays into that memory.
 import { SHARED, onChunks } from "./kernel.js";
 
 /** Workers in the pool; none when the page is not cross-origin isolated. */
@@ -34,20 +34,22 @@ export function startWorkers() {
   if (PARALLEL) pool();
 }
 
-/** `groups` (lists of columns, or {slabs, rows} sources: a run's rows of slabs in shared memory, `Data.slabFor`) as a
- * worker reads them: {desc (FIELDS numbers per source: a column's chunk, generation, offset, capacity, points and
- * sortedness, or -1, its first reference, their count and its buckets), refs (per slab reference: chunk, generation,
- * offset in floats, row), ends (where each group ends)}; null when a column is not in shared memory. */
+/** `groups` (lists of sources: columns, or a run's buckets {parts ([{v, row, a}] of bucket arrays in shared memory,
+ * `Data.partsOf`), level}) as a worker reads them: {desc (FIELDS numbers per source: a column's chunk, generation,
+ * offset, capacity, points and sortedness, or -1, its first reference, their count and its level), refs (per part:
+ * chunk, generation, offset in floats, row), ends (where each group ends)}; null when a source is not in shared memory. */
 export function describe(groups) {
   let R = 0, S = 0;
-  for (const g of groups) for (const c of g) (R += 1), (S += c.slabs ? c.slabs.length : 0);
+  for (const g of groups) for (const c of g) (R += 1), (S += c.parts ? c.parts.length : 0);
   const desc = new Float64Array(FIELDS * R), refs = new Float64Array(4 * S), ends = new Int32Array(groups.length);
   let r = 0, q = 0;
   for (let gi = 0; gi < groups.length; gi++) {
     for (const c of groups[gi]) {
       const o = FIELDS * r++;
-      if (c.slabs) (desc[o] = -1), (desc[o + 1] = q / 4), (desc[o + 2] = c.slabs.length), (desc[o + 3] = c.n), (q = refer(c, refs, q));
-      else if (!c.loc) return null;
+      if (c.parts) {
+        if (c.parts.some((p) => !p.a.loc)) return null;
+        (desc[o] = -1), (desc[o + 1] = q / 4), (desc[o + 2] = c.parts.length), (desc[o + 3] = c.level), (q = refer(c, refs, q));
+      } else if (!c.loc) return null;
       else describeColumn(c, desc, o);
     }
     ends[gi] = r;
@@ -62,15 +64,16 @@ function describeColumn(c, desc, o) {
 }
 
 function refer(c, refs, q) {
-  c.slabs.forEach((s, j) => refs.set([s.loc.chunk, s.loc.gen, s.loc.off, c.rows[j]], q + 4 * j));
-  return q + 4 * c.slabs.length;
+  c.parts.forEach((p, j) => refs.set([p.a.loc.chunk, p.a.loc.gen, p.a.loc.off, p.row], q + 4 * j));
+  return q + 4 * c.parts.length;
 }
 
 let fetches = 0;
 
-/** POST `body` to `url` on a worker, which copies a slab answer into shared memory: a promise of {status, buf
- * (SharedArrayBuffer, null unless the answer was a slab), bytes, paths (its runs), ext ([first, last] step)}. */
-export function fetchSlabOnWorker(url, body) {
+/** POST `body` to `url` on a worker, which reads the bucket array it answers into shared memory: a promise of
+ * {status, buf (SharedArrayBuffer, null unless the answer was a bucket array), bytes, paths (its runs), ext ([first,
+ * last] step)}. */
+export function fetchArrayOnWorker(url, body) {
   const ws = pool(), job = ++jobs;
   return new Promise((ok) => {
     answers.set(job, ok);

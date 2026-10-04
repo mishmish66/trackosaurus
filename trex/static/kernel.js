@@ -14,13 +14,15 @@ export const NSTAT = STATS.length;
 /** Row of each statistic in agg's output. */
 const S = Object.freeze(Object.fromEntries(STATS.map((k, i) => [k, i])));
 
-/** One metric of one run: points (step, value, runtime) in sequence order. */
+/** One metric of one run: points (step, value, runtime, and the count of rows each stands for when `w` is set) in
+ * sequence order. */
 export class Col {
   constructor() {
     this.n = 0;
     this.s = new Float64Array(64);
     this.v = new Float64Array(64);
     this.t = new Float64Array(64);
+    this.w = null;
     this.sorted = [true, true];
     this.ext = [Infinity, -Infinity, Infinity, Infinity, -Infinity, Infinity]; // min, max, min positive: steps then runtimes
     this.sm = null;
@@ -32,18 +34,19 @@ export class Col {
     return this.n;
   }
 
-  /** A column of n points whose steps, values and runtimes are s, v, t (Float64Arrays, not copied), sorted as
-   * `sorted` says ([by step, by runtime]); its extents are not tracked. */
-  static view(s, v, t, n, sorted) {
+  /** A column of n points whose steps, values, runtimes and counts are s, v, t, w (Float64Arrays, not copied; w null
+   * for one row each), sorted as `sorted` says ([by step, by runtime]); its extents are not tracked. */
+  static view(s, v, t, n, sorted, w = null) {
     const c = Object.create(Col.prototype);
-    Object.assign(c, { n, s, v, t, sorted, ext: null, sm: null, smKey: null, smState: null });
+    Object.assign(c, { n, s, v, t, w, sorted, ext: null, sm: null, smKey: null, smState: null });
     return c;
   }
 
-  /** A column holding the first n points of s, v, t (Float64Arrays, taken over without copying). */
-  static adopt(s, v, t, n) {
+  /** A column holding the first n points of s, v, t and w (Float64Arrays, taken over without copying; w null for one
+   * row each). */
+  static adopt(s, v, t, n, w = null) {
     const c = Object.create(Col.prototype);
-    Object.assign(c, { n, s, v, t, sorted: [true, true], ext: [Infinity, -Infinity, Infinity, Infinity, -Infinity, Infinity],
+    Object.assign(c, { n, s, v, t, w, sorted: [true, true], ext: [Infinity, -Infinity, Infinity, Infinity, -Infinity, Infinity],
                        sm: null, smKey: null, smState: null });
     track(c, s, t, n, -Infinity, -Infinity);
     return c;
@@ -408,7 +411,7 @@ export function aggGroups(groups, xmode, x0, x1, bins, flags, alpha, scale, cach
   return out;
 }
 
-/** Each column's (or SlabRun's) per-bin means for binning p ({xmode, x0, x1, bins, flags, alpha, scale}), NaN where
+/** Each column's per-bin means for binning p ({xmode, x0, x1, bins, flags, alpha, scale}), NaN where
  * it has none: cols.length * p.bins values, column-major; binnings are kept in `cache` as agg's. */
 export function binRows(cols, p, cache = new BinCache()) {
   const m = cache.get(p, cols.length), at = m.slots(cols), out = new Float64Array(cols.length * p.bins);
@@ -450,16 +453,13 @@ class Binning {
     return out;
   }
 
-  /** Bin column (or SlabRun) c into slot k. */
+  /** Bin column c into slot k. */
   bin(c, k) {
     const p = this.p;
     if (k >= this.cap) this.grow(k + 1);
     const row = this.v.subarray(k * p.bins, (k + 1) * p.bins).fill(NaN);
-    if (c.slabs) binSlabRun(c, p.x0, p.x1, p.bins, row);
-    else {
-      c.ensureSmooth(p.alpha, p.scale, p.xmode);
-      binColumn(c, p.xmode, c.ys(p.alpha, (p.flags & RAW) !== 0), p.x0, p.x1, p.bins, (p.flags & LOGX) !== 0, this.acc, row);
-    }
+    c.ensureSmooth(p.alpha, p.scale, p.xmode);
+    binColumn(c, p.xmode, c.ys(p.alpha, (p.flags & RAW) !== 0), p.x0, p.x1, p.bins, (p.flags & LOGX) !== 0, this.acc, row);
     this.at.set(c, [k, c.n]);
     return k;
   }
@@ -498,21 +498,22 @@ const sameBinning = (a, b) => a.xmode === b.xmode && a.x0 === b.x0 && a.x1 === b
 let slotBuf = new Int32Array(1024);
 const slotScratch = (n) => (slotBuf.length < n ? (slotBuf = new Int32Array(2 * n)) : slotBuf).subarray(0, n);
 
-/** Per-bin means of column c's values in [x0, x1] into row, interpolated across empty bins between full ones. A
- * bin's mean is of its finite values; with none, it is infinite (NaN with both signs). */
+/** Per-bin means of column c's values in [x0, x1] into row, each point weighted by the rows it stands for,
+ * interpolated across empty bins between full ones. A bin's mean is of its finite values; with none, it is infinite
+ * (NaN with both signs). */
 function binColumn(c, xmode, ys, x0, x1, bins, logx, acc, row) {
   if (!c.sorted[xmode]) return binUnsorted(c, xmode, ys, x0, x1, bins, logx, acc, row);
-  const xs = c.xs(xmode), [lo, hi] = visibleRange(c, xmode, x0, x1, logx), per = bins / (x1 - x0);
+  const xs = c.xs(xmode), ws = c.w, [lo, hi] = visibleRange(c, xmode, x0, x1, logx), per = bins / (x1 - x0);
   const run = binRun;
   (run.b = -1), (run.prev = -1), (run.sum = 0), (run.cnt = 0), (run.pos = 0), (run.neg = 0);
   for (let i = lo; i < hi; i++) {
     const x = tx(xs[i], logx), y = ys[i];
     if (!(x >= x0 && x <= x1) || y !== y) continue;
-    const b = Math.min(bins - 1, Math.floor((x - x0) * per));
+    const b = Math.min(bins - 1, Math.floor((x - x0) * per)), k = ws ? ws[i] : 1;
     if (b !== run.b) closeBin(run, row), (run.b = b);
     if (y === Infinity) run.pos = 1;
     else if (y === -Infinity) run.neg = 1;
-    else (run.sum += y), (run.cnt += 1);
+    else (run.sum += y * k), (run.cnt += k);
   }
   closeBin(run, row);
 }
@@ -534,78 +535,188 @@ function closeBin(run, row) {
   (run.prev = b), (run.pv = v);
 }
 
-/** Per-bin means of a SlabRun's buckets in step range [x0, x1] into row, as binColumn's of a column but weighted by
- * the buckets' counts (so a bucket no wider than a bin gives the mean of its rows there). */
-function binSlabRun(src, x0, x1, bins, row) {
-  const per = bins / (x1 - x0), run = binRun;
-  (run.b = -1), (run.prev = -1), (run.sum = 0), (run.cnt = 0), (run.pos = 0), (run.neg = 0);
-  for (let j = 0; j < src.slabs.length; j++) {
-    const s = src.slabs[j], i = src.rows[j], w = 2 ** s.level, base = s.index * SLAB_TILE;
-    for (let q = s.first[i]; q < s.first[i + 1]; q++) {
-      const x = (base + s.bucket[q] + (s.soff[q] + 0.5) / SOFF_SCALE) * w, y = s.mean[q];
-      if (!(x >= x0 && x <= x1) || y !== y) continue;
-      const b = Math.min(bins - 1, Math.floor((x - x0) * per));
-      if (b !== run.b) closeBin(run, row), (run.b = b);
-      if (y === Infinity) run.pos = 1;
-      else if (y === -Infinity) run.neg = 1;
-      else (run.sum += y * s.n[q]), (run.cnt += s.n[q]);
+// ---- bucket arrays: some runs' buckets of one metric at one level (buckets.py) ----
+
+export const BLOCK = 256; // buckets of a block (buckets.BLOCK)
+const BUCKETS_MAGIC = 0x31424b54; // "TKB1"
+const SOFF_SCALE = 65536; // step offsets, in fractions of a bucket (buckets.SOFF_SCALE)
+const pad8 = (n) => Math.ceil(n / 8) * 8;
+
+/** Views of the bucket array encoded at byte `off` of `buf`: {level, base (its first block), runs, count, first (run
+ * i's buckets are [first[i], first[i + 1])), seq (the rows each run's buckets hold), offset (bucket - base * BLOCK),
+ * soff (mean step offset times SOFF_SCALE, rounded down), mean, tmean, n, names: [byte offset, length] of its run
+ * paths, bytes}. */
+export function bucketViews(buf, off = 0) {
+  const h = new Uint32Array(buf, off, 8);
+  if (h[0] !== BUCKETS_MAGIC) throw new Error("bad bucket array");
+  const level = h[1] | 0, base = (h[3] | 0) * 4294967296 + h[2], runs = h[4], count = h[5];
+  let at = off + 32 + pad8(h[6]);
+  const first = new Uint32Array(buf, at, runs + 1);
+  at += pad8(4 * (runs + 1));
+  const seq = new Uint32Array(buf, at, runs);
+  at += pad8(4 * runs);
+  const offset = new Uint16Array(buf, at, count), soff = new Uint16Array(buf, at + pad8(2 * count), count);
+  at += 2 * pad8(2 * count);
+  return { level, base, runs, count, first, seq, offset, soff, mean: new Float32Array(buf, at, count),
+           tmean: new Float32Array(buf, at + 4 * count, count), n: new Uint32Array(buf, at + 8 * count, count),
+           names: [off + 32, h[6]], bytes: at + 12 * count - off };
+}
+
+/** The run paths of bucket array `v` (bucketViews of `buf`). */
+export function bucketPaths(buf, v) {
+  return v.runs ? new TextDecoder().decode(new Uint8Array(buf, v.names[0], v.names[1]).slice()).split("\0") : [];
+}
+
+/** Mean step of bucket q of bucket array `v`. */
+export const bucketStep = (v, q) => (v.base * BLOCK + v.offset[q] + (v.soff[q] + 0.5) / SOFF_SCALE) * 2 ** v.level;
+
+/** [first, last] mean step, then [first, last] mean runtime, of the runs' buckets in bucket array `v` (its runs' first
+ * and last buckets), or null when it has none. */
+export function bucketExtent(v) {
+  const e = [Infinity, -Infinity, Infinity, -Infinity];
+  for (let i = 0; i < v.runs; i++) {
+    const a = v.first[i], b = v.first[i + 1] - 1;
+    if (b < a) continue;
+    (e[0] = Math.min(e[0], bucketStep(v, a))), (e[1] = Math.max(e[1], bucketStep(v, b)));
+    (e[2] = Math.min(e[2], v.tmean[a])), (e[3] = Math.max(e[3], v.tmean[b]));
+  }
+  return e[1] >= e[0] ? e : null;
+}
+
+/** Steps [lo, hi) of the block a part ({v, row}) holds. */
+const blockSteps = ({ v }) => [v.base * BLOCK * 2 ** v.level, (v.base + 1) * BLOCK * 2 ** v.level];
+
+/** A run's column from its buckets in `parts` ({v (bucketViews), row}, of any levels): each level's buckets where its
+ * blocks lie and no finer level's do, as points at their mean steps standing for their counts, in step order; then the
+ * rows of `tail` ({s, v, t, q (sequence numbers), n}) the parts do not hold, in buckets as wide as the finest level
+ * holding their place (`level` where none does), the first merged into the column's last point when in its bucket.
+ * A bucket's mean is of its finite values, of its infinities when it has none. In memory shared with workers when
+ * `shared`. */
+export function buildColumn(parts, tail, level, shared = true) {
+  const layers = layersOf(parts);
+  let cap = tail.n;
+  for (const p of parts) cap += p.v.first[p.row + 1] - p.v.first[p.row];
+  const { view: all, loc } = shared ? columnStore(4 * cap) : { view: new Float64Array(4 * cap), loc: null };
+  const col = { s: all.subarray(0, cap), v: all.subarray(cap, 2 * cap), t: all.subarray(2 * cap, 3 * cap), w: all.subarray(3 * cap), n: 0, lv: 0, b: 0 };
+  emitBuckets(layers, col);
+  emitTail(layers, tail, level ?? (layers.length ? layers[layers.length - 1].level : 0), col);
+  const c = Col.adopt(col.s, col.v, col.t, col.n, col.w);
+  if (shared) holdStore(c, loc && { ...loc, cap });
+  return c;
+}
+
+/** `parts` by level, finest first: [{level, parts (by step), ranges ([lo, hi) steps of their blocks)}]. */
+function layersOf(parts) {
+  const by = new Map();
+  for (const p of parts) {
+    if (!by.has(p.v.level)) by.set(p.v.level, []);
+    by.get(p.v.level).push(p);
+  }
+  return [...by].sort((a, b) => a[0] - b[0]).map(([level, ps]) => {
+    ps.sort((a, b) => a.v.base - b.v.base);
+    return { level, parts: ps, ranges: ps.map(blockSteps) };
+  });
+}
+
+/** Whether step x lies in one of `ranges` ([lo, hi), by lo). */
+function inRanges(ranges, x) {
+  let lo = 0, hi = ranges.length;
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    if (ranges[m][1] <= x) lo = m + 1;
+    else hi = m;
+  }
+  return lo < ranges.length && ranges[lo][0] <= x;
+}
+
+/** The layers' buckets each finer layer leaves them, into col in step order (sorted when there are several layers). */
+function emitBuckets(layers, col) {
+  for (let k = 0; k < layers.length; k++) {
+    const finer = layers.slice(0, k);
+    for (const { v, row } of layers[k].parts) {
+      for (let q = v.first[row]; q < v.first[row + 1]; q++) {
+        const x = bucketStep(v, q);
+        if (finer.some((f) => inRanges(f.ranges, x))) continue;
+        (col.s[col.n] = x), (col.v[col.n] = v.mean[q]), (col.t[col.n] = v.tmean[q]), (col.w[col.n] = v.n[q]), col.n++;
+      }
     }
   }
-  closeBin(run, row);
+  if (layers.length > 1) sortPoints(col);
+  if (col.n) (col.lv = levelAt(layers, col.s[col.n - 1])), (col.b = Math.floor(col.s[col.n - 1] / 2 ** col.lv));
 }
 
-// ---- slabs: one step range of many runs at one level (tiles.py) ----
-
-const SLAB_MAGIC = 0x32534b54; // "TKS2"
-const SLAB_TILE = 256; // buckets of a slab's step range (tiles.TILE)
-const SOFF_SCALE = 65536; // a slab's step offsets, in fractions of a bucket (tiles.SOFF_SCALE)
-
-/** Views of the slab encoded at byte `off` of `buf`: {level, index, runs, count, first, bucket, soff (step offsets
- * times SOFF_SCALE, rounded down), mean, n, names: [byte offset, length] of its run paths, bytes}. */
-export function slabViews(buf, off) {
-  const h = new Uint32Array(buf, off, 8);
-  if (h[0] !== SLAB_MAGIC) throw new Error("bad slab");
-  const level = h[1] | 0, index = (h[3] | 0) * 4294967296 + h[2], runs = h[4], count = h[5], names = [off + 32, h[6]];
-  const pad = (bytes) => Math.ceil(bytes / 8) * 8;
-  let at = off + 32 + pad(h[6]);
-  const first = new Uint32Array(buf, at, runs + 1);
-  at += pad(4 * (runs + 1));
-  const bucket = new Uint16Array(buf, at, count), soff = new Uint16Array(buf, at + pad(2 * count), count);
-  at += 2 * pad(2 * count);
-  return { level, index, runs, count, first, bucket, soff, mean: new Float32Array(buf, at, count), n: new Uint32Array(buf, at + 4 * count, count),
-           names, bytes: at + 8 * count - off };
-}
-
-/** [first, last] mean step of the buckets of slab `v` (slabViews), or null when it has none. */
-export function slabExtent(v) {
-  let lo = Infinity, hi = -Infinity;
-  const w = 2 ** v.level, base = v.index * SLAB_TILE, step = (q) => (base + v.bucket[q] + (v.soff[q] + 0.5) / SOFF_SCALE) * w;
-  for (let i = 0; i < v.runs; i++) if (v.first[i + 1] > v.first[i]) (lo = Math.min(lo, step(v.first[i]))), (hi = Math.max(hi, step(v.first[i + 1] - 1)));
-  return hi >= lo ? [lo, hi] : null;
-}
-
-/** A run's buckets in slabs (slabViews, in step order), at row rows[j] of slabs[j]: a source agg bins as a column. */
-export class SlabRun {
-  constructor(slabs, rows) {
-    this.slabs = slabs;
-    this.rows = rows;
-    this.n = 0; // buckets
-    slabs.forEach((s, j) => (this.n += s.first[rows[j] + 1] - s.first[rows[j]]));
+function sortPoints(col) {
+  const order = Array.from({ length: col.n }, (_, i) => i).sort((a, b) => col.s[a] - col.s[b]);
+  for (const k of ["s", "v", "t", "w"]) {
+    const a = col[k].slice(0, col.n);
+    order.forEach((j, i) => (col[k][i] = a[j]));
   }
+}
+
+/** The level of the finest layer whose blocks hold step x, or null. */
+function levelAt(layers, x) {
+  for (const L of layers) if (inRanges(L.ranges, x)) return L.level;
+  return null;
+}
+
+/** The sequence number from which the part holding step x lacks rows (0 when none holds it). */
+function heldUpTo(layers, x) {
+  for (const L of layers) {
+    let lo = 0, hi = L.ranges.length;
+    while (lo < hi) {
+      const m = (lo + hi) >> 1;
+      if (L.ranges[m][1] <= x) lo = m + 1;
+      else hi = m;
+    }
+    if (lo < L.ranges.length && L.ranges[lo][0] <= x) return L.parts[lo].v.seq[L.parts[lo].row];
+  }
+  return 0;
+}
+
+const merged = new Float64Array(8); // one bucket's sums of value, step and runtime and its count: of its finite values, then of the rest
+
+/** The tail rows the parts lack, bucketed and appended to col. */
+function emitTail(layers, tail, level, col) {
+  let cur = null;
+  merged.fill(0);
+  const close = () => {
+    const o = merged[3] > 0 ? 0 : 4, k = merged[o + 3];
+    if (k > 0) (col.s[col.n] = merged[o + 1] / k), (col.v[col.n] = merged[o] / k), (col.t[col.n] = merged[o + 2] / k), (col.w[col.n] = k), col.n++;
+    merged.fill(0);
+  };
+  for (let i = 0; i < tail.n; i++) {
+    const y = tail.v[i], x = tail.s[i];
+    if (y !== y || tail.q[i] < heldUpTo(layers, x)) continue;
+    const lv = levelAt(layers, x) ?? level, b = Math.floor(x / 2 ** lv), key = `${lv}|${b}`;
+    if (key !== cur) {
+      if (cur !== null) close();
+      else if (col.n && col.lv === lv && col.b === b) reopen(col);
+      cur = key;
+    }
+    const o = Number.isFinite(y) ? 0 : 4;
+    (merged[o] += y), (merged[o + 1] += x), (merged[o + 2] += tail.t[i]), (merged[o + 3] += 1);
+  }
+  if (cur !== null) close();
+}
+
+/** Take the column's last point back into `merged`, to merge rows into its bucket. */
+function reopen(col) {
+  const i = --col.n, k = col.w[i], o = Number.isFinite(col.v[i]) ? 0 : 4;
+  (merged[o] = col.v[i] * k), (merged[o + 1] = col.s[i] * k), (merged[o + 2] = col.t[i] * k), (merged[o + 3] = k);
 }
 
 /** binColumn of a column whose x is not sorted: sums per bin first. */
 function binUnsorted(c, xmode, ys, x0, x1, bins, logx, acc, row) {
   const { sum, cnt, pos, neg } = acc;
-  const xs = c.xs(xmode), per = bins / (x1 - x0);
+  const xs = c.xs(xmode), ws = c.w, per = bins / (x1 - x0);
   sum.fill(0), cnt.fill(0), pos.fill(0), neg.fill(0);
   for (let i = 0; i < c.n; i++) {
     const x = tx(xs[i], logx), y = ys[i];
     if (!(x >= x0 && x <= x1) || y !== y) continue;
-    const b = Math.min(bins - 1, Math.floor((x - x0) * per));
+    const b = Math.min(bins - 1, Math.floor((x - x0) * per)), k = ws ? ws[i] : 1;
     if (y === Infinity) pos[b] = 1;
     else if (y === -Infinity) neg[b] = 1;
-    else (sum[b] += y), (cnt[b] += 1);
+    else (sum[b] += y * k), (cnt[b] += k);
   }
   let prev = -1, pv = 0;
   for (let b = 0; b < bins; b++) {

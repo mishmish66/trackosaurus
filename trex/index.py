@@ -1,6 +1,6 @@
 """Explorer index of a runs directory, in <cache_root>/<hash of root>/index.sqlite: run metadata, last
-values, kept tiles, a bounded cache of finer tiles, and media; beside it, in levels/, the merged levels slabs are cut
-from. A run is its path relative to the root.
+values, each run's kept buckets of every metric (`trex.buckets`), a bounded cache of finer blocks built from run files,
+and media; beside it, in levels/, the finished runs' buckets merged per level. A run is its path relative to the root.
 Runs are scanned inline or in worker processes; the main process commits, then publishes events in
 order per run.
 """
@@ -31,8 +31,8 @@ from typing import Final, Literal, NamedTuple, Self, TypedDict, cast
 import numpy as np
 import numpy.typing as npt
 
-from . import chunks, tiles
-from .tiles import Buckets, Stack
+from . import buckets as bk, chunks
+from .buckets import Buckets, Stack
 from .journal import JOURNAL
 from .format import (DB, INFO_FILE, JSONValue, MediaKind, RunState, as_dict, as_float, as_run_state, as_str, as_str_list,
                      snapshot)
@@ -43,7 +43,8 @@ type Sig = list[int]
 type Summary = dict[str, float | str]
 """Last value of every metric (non-finite as strings), plus _step and _runtime."""
 
-type TileKind = Literal["top", "overview"]
+type Which = Literal["all", "finished", "running"]
+"""The runs of a scope a block request takes: all, or the finished or the running ones."""
 type Event = tuple[str, object]
 """(SSE event name, data); data that is a str is already JSON."""
 
@@ -61,14 +62,12 @@ class MediaRecord(NamedTuple):
     size: int
 
 
-class TileRecord(NamedTuple):
-    """A tile of a metric of a run, as the index stores it."""
+class KeptRecord(NamedTuple):
+    """A metric of a run as the index keeps it: a one-run bucket array at its kept level."""
 
     key: str
     level: int
-    idx: int
     data: bytes
-    kind: int
 
 
 class Public(TypedDict):
@@ -89,21 +88,21 @@ class Prev(TypedDict):
     uid: str
     seq: int
     mseq: int
-    tiles_seq: int
-    tiles_t: float
-    tiles_state: RunState | None
+    kept_seq: int
+    kept_t: float
+    kept_state: RunState | None
 
 
 class Job(TypedDict):
-    """A run to scan and how: `want_rows` when a browser watches it, `top_refresh` seconds between kept-tile rebuilds of
-    a growing run."""
+    """A run to scan and how: `want_rows` when a browser watches it, `kept_refresh` seconds between rebuilds of a
+    growing run's kept buckets."""
 
     path: str
     dir: str
     sig: Sig
     prev: Prev | None
     crash_after: float
-    top_refresh: float
+    kept_refresh: float
     want_rows: bool
 
 
@@ -123,7 +122,7 @@ class ScanResult(TypedDict):
     public: Public
     keys: list[str]
     summary: Summary | None
-    kept: list[TileRecord] | None
+    kept: list[KeptRecord] | None
     rows: str | None
 
 
@@ -139,9 +138,9 @@ class RunRecord(TypedDict):
     heartbeat: float | None
     public: Public
     state: RunState
-    tiles_seq: int
-    tiles_t: float
-    tiles_state: RunState | None
+    kept_seq: int
+    kept_t: float
+    kept_state: RunState | None
 
 
 class RunMeta(TypedDict):
@@ -161,7 +160,7 @@ class RunMeta(TypedDict):
     seq: int
     mseq: int
     keys: list[str]
-    tiles_seq: int
+    kept_seq: int
 
 
 class RunsView(TypedDict):
@@ -176,44 +175,45 @@ class RunView(TypedDict):
     run: RunMeta
     media: list[MediaRecord]
 
-CACHE_VERSION: Final = 11  # bump whenever what the index stores changes; older caches are rebuilt
+CACHE_VERSION: Final = 12  # bump whenever what the index stores changes; older caches are rebuilt
 CRASH_AFTER = 300.0  # seconds without a heartbeat after which a running run shows as crashed
 POLL: Final = 1.0  # seconds between polls of known runs
 REWALK: Final = 3.0  # seconds between walks of the root for new and removed runs
-CACHED, TOP, OVERVIEW = 0, 1, 2  # values of tiles.kind
-KINDS: Final[dict[str, int]] = {"top": TOP, "overview": OVERVIEW}  # request names of the kept tile kinds
-OVERVIEW_UP: Final = 2  # overview tiles are top tiles merged this many levels coarser
-TOP_REFRESH = float(os.environ.get("TREX_TOP_REFRESH", "10"))  # seconds between top-tile rebuilds of a growing run
+KEPT_REFRESH = float(os.environ.get("TREX_KEPT_REFRESH", "10"))  # seconds between rebuilds of a growing run's kept buckets
 SKIP_DIRS: Final = frozenset({"node_modules", "__pycache__"})
 INLINE_BYTES = 5 << 20  # polls whose run files grew by at most this many bytes are read in the main process
 BATCH_RUNS: Final = 256  # scan results per index transaction
 BATCH_SECONDS: Final = 0.5  # longest wait before committing a partial batch
 CLOSE_WAIT: Final = 5.0  # longest `close` waits for a scan in progress
-TILE_CACHE_BYTES = int(os.environ.get("TREX_TILE_CACHE_MB", "4096")) << 20
-BUNDLE_CACHE_BYTES = 512 << 20  # framed tile bundles an Explorer keeps in memory, least recently used evicted
+BLOCK_CACHE_BYTES = int(os.environ.get("TREX_BLOCK_CACHE_MB", "4096")) << 20  # built blocks the Explorers sharing a budget cache
+ANSWER_CACHE_BYTES = 512 << 20  # block answers an Explorer keeps in memory, least recently used evicted
 RUNS_BODIES: Final = 8  # `runs` answers an Explorer keeps, by folder
-STACK_BYTES = 512 << 20  # decoded and merged top tiles of finished runs an Explorer keeps for slabs
+STACK_BYTES = 512 << 20  # finished runs' kept buckets and merged levels an Explorer keeps in memory
 LEVELS_BYTES = int(os.environ.get("TREX_LEVELS_MB", "4096")) << 20  # saved merged levels an index keeps, least recently used deleted
-LEVELS_MAGIC: Final = b"TKL1"
+LEVELS_MAGIC: Final = b"TKL2"
 LEVELS_SAVE_EVERY = 60.0  # seconds between saves of one metric's merged levels
-INLINE_TILES: Final = 64  # finer tiles a slab builds without the process pool
-SLAB_THREADS: Final = min(8, os.cpu_count() or 1)  # threads building one slab from decoded top tiles
+LEVELS_AHEAD: Final = 3  # levels above a metric's coarsest kept level merged and saved ahead of requests
+INLINE_BUILDS: Final = 64  # blocks a request builds from run files without the process pool
+MERGE_THREADS: Final = min(8, os.cpu_count() or 1)  # threads merging one level
 PAGE_SIZE: Final = 16384
 READ_ERRORS: Final = (sqlite3.Error, OSError, ValueError, KeyError, struct.error)
-ROWS_EVENT_MAX: Final = 20_000  # larger catch-ups reach browsers as refreshed tiles instead of rows
+ROWS_EVENT_MAX: Final = 20_000  # larger catch-ups reach browsers through new kept buckets instead of rows
+NO_BUCKETS: Final = bk.encode(bk.MIN_LEVEL, 0, [""], [0], bk.empty())  # a run's bucket array where it has none
 
 TABLES: Final = {
     "cache": "CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, value TEXT)",
     "runs": "CREATE TABLE IF NOT EXISTS runs(path TEXT PRIMARY KEY, record TEXT NOT NULL)",
     "media": "CREATE TABLE IF NOT EXISTS media(path TEXT, seq INTEGER, step REAL, key TEXT, kind TEXT, file TEXT, "
              "crc INTEGER, size INTEGER, PRIMARY KEY(path, seq)) WITHOUT ROWID",
-    # kind: TOP for the coarsest tiles of a metric and OVERVIEW for those merged OVERVIEW_UP levels up
-    # (both kept); CACHED for a finer tile built on request (evicted by `used`).
-    # seq: run rows when built; a tile stays valid while later rows lie beyond its step range.
-    "tiles": "CREATE TABLE IF NOT EXISTS tiles(path TEXT, key TEXT, level INTEGER, idx INTEGER, kind INTEGER, "
-             "seq INTEGER, used REAL, data BLOB, PRIMARY KEY(path, key, level, idx))",
-    "tiles_kind": "CREATE INDEX IF NOT EXISTS tiles_kind ON tiles(key, kind)",
-    "tiles_used": "CREATE INDEX IF NOT EXISTS tiles_used ON tiles(kind, used)",
+    # a run's buckets of a metric at the level it keeps them at (a one-run bucket array); seq: the rows they hold
+    "kept": "CREATE TABLE IF NOT EXISTS kept(path TEXT, key TEXT, level INTEGER, seq INTEGER, data BLOB, PRIMARY KEY(key, path))",
+    "kept_path": "CREATE INDEX IF NOT EXISTS kept_path ON kept(path)",
+    # a block finer than its run keeps, built from the run file on request (evicted by `used`); seq: the rows read;
+    # it stays valid while later rows lie beyond its step range
+    "fine": "CREATE TABLE IF NOT EXISTS fine(path TEXT, key TEXT, level INTEGER, idx INTEGER, seq INTEGER, used REAL, "
+            "data BLOB, PRIMARY KEY(key, level, idx, path))",
+    "fine_path": "CREATE INDEX IF NOT EXISTS fine_path ON fine(path)",
+    "fine_used": "CREATE INDEX IF NOT EXISTS fine_used ON fine(used)",
 }
 
 
@@ -324,19 +324,13 @@ def _last_values(c: sqlite3.Connection, names: Mapping[int, str]) -> dict[str, f
     return out
 
 
-def _top_tiles(c: sqlite3.Connection, names: Mapping[int, str], stop: int) -> list[TileRecord]:
-    """Top and overview tiles over rows [0, stop) of every metric."""
-    out: list[TileRecord] = []
+def _kept_arrays(c: sqlite3.Connection, names: Mapping[int, str], stop: int) -> list[KeptRecord]:
+    """Every metric's kept buckets over rows [0, stop)."""
+    out: list[KeptRecord] = []
     for kid, name in sorted(names.items(), key=lambda kv: kv[1]):
         s, v, t = chunks.metric(c, kid, stop=stop)
-        if not s.size:
-            continue
-        level, idxs = tiles.top_tiles(float(s.min()), float(s.max()))
-        top = [tiles.build(s, v, t, level, i) for i in idxs]
-        out += [TileRecord(name, level, i, b, TOP) for i, b in zip(idxs, top, strict=True)]
-        parents = sorted({i >> OVERVIEW_UP for i in idxs})
-        out += [TileRecord(name, level + OVERVIEW_UP, i, b, OVERVIEW)
-                for i, b in zip(parents, tiles.coarsen(top, OVERVIEW_UP), strict=True)]
+        if s.size:
+            out.append(KeptRecord(name, bk.kept_level(float(s.min()), float(s.max())), bk.kept(s, v, t, stop)))
     return out
 
 
@@ -354,7 +348,7 @@ def scan(job: Job) -> ScanResult | None:
         prev = None if reset else prev
         names = chunks.key_names(c)
         summary = _summary(c, names, seq) if prev is None or seq != prev["seq"] else None
-        kept = _top_tiles(c, names, seq) if _top_due(prev, seq, state, job["top_refresh"]) else None
+        kept = _kept_arrays(c, names, seq) if _kept_due(prev, seq, state, job["kept_refresh"]) else None
         text = (_rows_event(path, prev["seq"], chunks.rows(c, prev["seq"], seq))
                 if prev and _rows_wanted(job, prev, seq) else None)
         mseq = prev["mseq"] if prev else 0
@@ -383,12 +377,12 @@ def _summary(c: sqlite3.Connection, names: Mapping[int, str], seq: int) -> Summa
     return out
 
 
-def _top_due(prev: Prev | None, seq: int, state: RunState, refresh: float) -> bool:
-    """Kept tiles are rebuilt for a new run, and for a changed one when it stopped running or `refresh` passed."""
+def _kept_due(prev: Prev | None, seq: int, state: RunState, refresh: float) -> bool:
+    """Kept buckets are rebuilt for a new run, and for a changed one when it stopped running or `refresh` passed."""
     if prev is None:
         return True
-    stale = prev["tiles_seq"] != seq or prev["tiles_state"] != state
-    return stale and (state != "running" or time.time() - prev["tiles_t"] >= refresh)
+    stale = prev["kept_seq"] != seq or prev["kept_state"] != state
+    return stale and (state != "running" or time.time() - prev["kept_t"] >= refresh)
 
 
 def _rewritten(prev: Prev, uid: JSONValue, rows: int, media: int) -> bool:
@@ -397,7 +391,7 @@ def _rewritten(prev: Prev, uid: JSONValue, rows: int, media: int) -> bool:
 
 
 def _rows_wanted(job: Job, prev: Prev, seq: int) -> bool:
-    """A rows event goes to watching browsers, unless the catch-up is large (tiles serve it)."""
+    """A rows event goes to watching browsers, unless the catch-up is large (kept buckets serve it)."""
     return job["want_rows"] and 0 < seq - prev["seq"] <= ROWS_EVENT_MAX
 
 
@@ -463,46 +457,54 @@ def _mp_context() -> BaseContext:
     return multiprocessing.get_context("spawn")
 
 
-def build_tile(run_dir: str, key: str, level: int, idx: int) -> tuple[bytes, int]:
-    """(tile (level, idx) of `key`, rows read) from the run file in `run_dir`."""
-    lo, hi = tiles.tile_range(level, idx)
+def build_block(run_dir: str, key: str, level: int, index: int) -> tuple[bytes, int]:
+    """(block `index` of `level` of `key`, as a one-run bucket array, and the rows it holds) from the run file in
+    `run_dir`."""
+    lo, hi = bk.block_range(level, index)
     with snapshot(Path(run_dir)) as c:
         kid = c.execute("SELECT id FROM keys WHERE name=?", (key,)).fetchone()
         stop = chunks.row_count(c)
         if kid is None:
-            e = np.empty(0)
-            return tiles.build(e, e, e, level, idx), stop
+            return bk.encode(level, index, [""], [stop], bk.empty()), stop
         s, v, t = chunks.metric(c, kid[0], stop=stop, step_lo=lo, step_hi=hi)
-    return tiles.build(s, v, t, level, idx), stop
+    return bk.built(s, v, t, stop, level, index), stop
 
 
-def _build_tile_job(job: tuple[str, str, int, int]) -> tuple[bytes, int]:
-    return build_tile(*job)
+def _build_block_job(job: tuple[str, str, int, int]) -> tuple[bytes, int]:
+    return build_block(*job)
 
 
 def _padded(a: npt.NDArray[np.generic]) -> list[bytes]:
     return [a.tobytes(), b"\0" * (-a.nbytes % 8)]
 
 
+def _pad(n: int) -> int:
+    return -(-n // 8) * 8
+
+
 class SavedLevels(NamedTuple):
-    """A metric's merged levels saved beside the index, memory-mapped: its finished runs, each one's overview level, and
-    where each level's buckets lie (offset, count)."""
+    """A metric's merged levels saved beside the index, memory-mapped: its finished runs, the rows of each and the
+    level each keeps its buckets at, and where each merged level's buckets lie (offset, count)."""
 
     paths: list[str]
-    ov_level: npt.NDArray[np.int8]
+    seq: npt.NDArray[np.uint32]
+    level: npt.NDArray[np.int8]
     buf: mmap.mmap
     at: dict[int, tuple[int, int]]
 
     @staticmethod
-    def pack(sig: bytes, runs: int, ov_level: npt.NDArray[np.int8], parts: Mapping[int, Buckets]) -> bytes:
-        """`LEVELS_MAGIC`, u32 levels, u32 runs, u32 0, the 20-byte digest of the runs, u32 0, i8 overview level per run;
-        then per level: i64 level, u64 buckets, u32 first bucket per run and one past the last, i64 bucket, f32 mean,
-        u32 count, u16 mean step offset; each array padded to 8 bytes."""
-        out = [LEVELS_MAGIC, struct.pack("<III20sI", len(parts), runs, 0, sig, 0), *_padded(ov_level.astype(np.int8))]
+    def pack(sig: bytes, st: Stack, parts: Mapping[int, Buckets]) -> bytes:
+        """`LEVELS_MAGIC`, u32 levels, u32 runs, u32 0, the 20-byte digest of the runs, u32 0, then per run its rows (u32)
+        and its level (i8); then per merged level: i64 level, u64 buckets, u32 first bucket per run and one past the
+        last, i64 bucket, f32 mean, f32 mean runtime, u32 count, u16 mean step offset; each array padded to 8 bytes."""
+        runs = len(st.paths)
+        out = [LEVELS_MAGIC, struct.pack("<III20sI", len(parts), runs, 0, sig, 0), *_padded(st.seq.astype("<u4")),
+               *_padded(st.level.astype(np.int8))]
         for level, b in parts.items():
             first = np.searchsorted(b.run, np.arange(runs + 1)).astype("<u4")
             out += [struct.pack("<qQ", level, b.run.size), *_padded(first), *_padded(b.bucket.astype("<i8")),
-                    *_padded(b.mean.astype("<f4")), *_padded(b.n.astype("<u4")), *_padded(b.soff.astype("<u2"))]
+                    *_padded(b.mean.astype("<f4")), *_padded(b.tmean.astype("<f4")), *_padded(b.n.astype("<u4")),
+                    *_padded(b.soff.astype("<u2"))]
         return b"".join(out)
 
     @classmethod
@@ -515,28 +517,29 @@ class SavedLevels(NamedTuple):
         levels, runs, _, saved_sig, _ = struct.unpack_from("<III20sI", buf, 4)
         if saved_sig != sig or runs != len(paths):
             return None
-        off, at = 40 + -(-runs // 8) * 8, dict[int, tuple[int, int]]()
+        off, at = 40 + _pad(4 * runs) + _pad(runs), dict[int, tuple[int, int]]()
         for _ in range(levels):
             level, count = struct.unpack_from("<qQ", buf, off)
             at[level] = (off + 16, count)
-            off += 16 + -(-4 * (runs + 1) // 8) * 8 + 8 * count + 2 * -(-4 * count // 8) * 8 + -(-2 * count // 8) * 8
+            off += 16 + _pad(4 * (runs + 1)) + 8 * count + 3 * _pad(4 * count) + _pad(2 * count)
         if off != len(buf):
             raise ValueError("levels length mismatch")
-        return cls(paths, np.frombuffer(buf, np.int8, runs, 40), buf, at)
+        return cls(paths, np.frombuffer(buf, np.uint32, runs, 40), np.frombuffer(buf, np.int8, runs, 40 + _pad(4 * runs)), buf, at)
 
     def part(self, level: int) -> Buckets:
         """The buckets of `level`, viewing the file."""
         off, count = self.at[level]
         runs = len(self.paths)
         first = np.frombuffer(self.buf, "<u4", runs + 1, off)
-        off += -(-4 * (runs + 1) // 8) * 8
+        off += _pad(4 * (runs + 1))
         bucket = np.frombuffer(self.buf, "<i8", count, off)
-        mean = np.frombuffer(self.buf, "<f4", count, off + 8 * count)
-        off += 8 * count + -(-4 * count // 8) * 8
-        n = np.frombuffer(self.buf, "<u4", count, off)
-        soff = np.frombuffer(self.buf, "<u2", count, off + -(-4 * count // 8) * 8)
+        off += 8 * count
+        mean = np.frombuffer(self.buf, "<f4", count, off)
+        tmean = np.frombuffer(self.buf, "<f4", count, off + _pad(4 * count))
+        n = np.frombuffer(self.buf, "<u4", count, off + 2 * _pad(4 * count))
+        soff = np.frombuffer(self.buf, "<u2", count, off + 3 * _pad(4 * count))
         run = np.repeat(np.arange(runs, dtype=np.int32), np.diff(first.astype(np.int64)))
-        return Buckets(run, bucket, mean, soff, n)
+        return Buckets(run, bucket, mean, soff, tmean, n)
 
 
 def _bound_dir(d: Path, limit: int) -> None:
@@ -573,46 +576,28 @@ def _events(r: ScanResult, cur: RunRecord | None, st: RunRecord) -> list[Event]:
 
 
 def _needs_scan(st: RunRecord, sig: Sig, now: float) -> bool:
-    """Its files changed, it went silent while running, or its kept tiles are due a refresh."""
+    """Its files changed, it went silent while running, or its kept buckets are due a refresh."""
     silent = st["state"] == "running" and now - (st["heartbeat"] or now) > CRASH_AFTER
-    due = st["tiles_seq"] != st["seq"] and now - st["tiles_t"] >= TOP_REFRESH
+    due = st["kept_seq"] != st["seq"] and now - st["kept_t"] >= KEPT_REFRESH
     return sig != st["sig"] or silent or due
 
 
 def _record(r: ScanResult, cur: RunRecord | None) -> RunRecord:
-    """The run's record after scan result `r`; kept-tile fields carry over from `cur`."""
+    """The run's record after scan result `r`; kept-bucket fields carry over from `cur`."""
     return {"uid": r["uid"], "seq": r["seq"], "mseq": r["mseq"], "keys": r["keys"],
             "summary": r["summary"] if r["summary"] is not None else cur["summary"] if cur else {},
             "sig": r["sig"], "heartbeat": r["heartbeat"], "public": r["public"], "state": r["state"],
-            "tiles_seq": cur["tiles_seq"] if cur else -1, "tiles_t": cur["tiles_t"] if cur else 0.0,
-            "tiles_state": cur["tiles_state"] if cur else None}
+            "kept_seq": cur["kept_seq"] if cur else -1, "kept_t": cur["kept_t"] if cur else 0.0,
+            "kept_state": cur["kept_state"] if cur else None}
 
 
 def _bytes_of(sig: Sig) -> int:
     return sig[1] + sig[3]
 
 
-def framed(blobs: Sequence[bytes]) -> list[bytes]:
-    """`blobs` as sent: u32 count, (u32 length, blob)*."""
-    out = [len(blobs).to_bytes(4, "little")]
-    for b in blobs:
-        out += [len(b).to_bytes(4, "little"), b]
-    return out
-
-
-def frame_bundle(entries: Sequence[tuple[str, Sequence[bytes]]]) -> bytes:
-    """A tile bundle as sent: u32 runs, then per run: u32 length, UTF-8 path padded to 4, u32 count,
-    (u32 length, tile)*."""
-    out = [len(entries).to_bytes(4, "little")]
-    for path, blobs in entries:
-        p = path.encode()
-        out += [len(p).to_bytes(4, "little"), p, b"\0" * (-len(p) % 4), *framed(blobs)]
-    return b"".join(out)
-
-
-class TileBudget:
-    """Bytes of cached finer tiles shared by Explorers; beyond `limit` (default TILE_CACHE_BYTES) the least recently
-    used across all of them are evicted to 90% of it."""
+class BlockBudget:
+    """Bytes of built blocks cached by Explorers that share it; beyond `limit` (default BLOCK_CACHE_BYTES) the least
+    recently used across all of them are evicted to 90% of it."""
 
     def __init__(self, limit: int | None = None) -> None:
         self.limit = limit
@@ -632,7 +617,7 @@ class TileBudget:
         return sum(m.cached_bytes for m in list(self.members))
 
     def enforce(self) -> None:
-        limit = self.limit if self.limit is not None else TILE_CACHE_BYTES
+        limit = self.limit if self.limit is not None else BLOCK_CACHE_BYTES
         if self.used() <= limit:
             return
         with self.lock:
@@ -648,7 +633,7 @@ class Explorer:
     """Index of a runs directory, kept current by `start` (or `poll_forever`); `close` releases it."""
 
     def __init__(self, root: str | os.PathLike[str], cache_root: str | os.PathLike[str], workers: int | None = None,
-                 budget: TileBudget | None = None) -> None:
+                 budget: BlockBudget | None = None) -> None:
         self.root = Path(root).resolve()
         self.workers = max(1, int(workers)) if workers is not None else default_workers()
         self.cache_dir = Path(cache_root) / hashlib.sha1(str(self.root).encode()).hexdigest()[:12]
@@ -676,24 +661,22 @@ class Explorer:
         self.dirs: dict[str, Path] = {}
         self.folders: dict[str, tuple[int, dict[str, JSONValue]]] = {}  # folder path -> (mtime_ns, notes) of trex_info.json files
         self._readers: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue()
-        self.cached_bytes: int = self._writer.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE kind = ?",
-                                                      (CACHED,)).fetchone()[0]
+        self.cached_bytes: int = self._writer.execute("SELECT coalesce(sum(length(data)), 0) FROM fine").fetchone()[0]
         self._stop = threading.Event()
         self._poller: threading.Thread | None = None
         self._closed = False
         self.ready = threading.Event()
-        self.budget = budget or TileBudget()
+        self.budget = budget or BlockBudget()
         self.budget.join(self)
-        self._kept_gen = 0  # bumped whenever kept tiles change
-        self._slab_gens: dict[str, int] = {}  # metric -> bumped whenever a finished run's kept tiles of it change
+        self._gens: dict[str, int] = {}  # metric -> bumped whenever its finished runs, or their kept buckets, change
         self._memo: OrderedDict[tuple[object, ...], tuple[int, object, int]] = OrderedDict()  # stacks and merged levels: (gen, value, bytes)
         self._building: dict[tuple[object, ...], threading.Lock] = {}  # a lock per memo entry, held while it is built
         self._saved_at: dict[str, float] = {}  # metric -> when its merged levels were last saved (monotonic)
         self._view_gen = 0  # bumped whenever what `runs` answers may change
         self._runs_bodies: OrderedDict[str, tuple[int, bytes]] = OrderedDict()
-        self._bundles: OrderedDict[tuple[object, ...], tuple[int, bytes]] = OrderedDict()  # bundles and slabs
-        self._bundle_bytes = 0
-        self._bundle_lock = threading.Lock()
+        self._answers: OrderedDict[tuple[object, ...], tuple[int, bytes]] = OrderedDict()  # block answers: (gen, body)
+        self._answer_bytes = 0
+        self._answer_lock = threading.Lock()
 
     def __enter__(self) -> Self:
         return self
@@ -708,7 +691,7 @@ class Explorer:
         return self
 
     def close(self) -> None:
-        """Stop polling, end subscriptions, leave the tile budget and close the index's connections."""
+        """Stop polling, end subscriptions, leave the block budget and close the index's connections."""
         self.stop()
         if self._poller is not None and self._poller is not threading.current_thread():
             self._poller.join(CLOSE_WAIT)
@@ -813,7 +796,7 @@ class Explorer:
             self.hub.publish(p, "folder", {"path": p, "info": self.folders[p][1]})
 
     def poll(self) -> list[str]:
-        """Rescan runs that changed, went silent, or are due new kept tiles; returns their paths."""
+        """Rescan runs that changed, went silent, or are due new kept buckets; returns their paths."""
         now = time.time()
         todo: list[tuple[str, Path, Sig]] = []
         growth = 0
@@ -834,10 +817,10 @@ class Explorer:
         st = self.records.get(path)
         prev: Prev | None = None
         if st:
-            prev = {"uid": st["uid"], "seq": st["seq"], "mseq": st["mseq"], "tiles_seq": st["tiles_seq"],
-                    "tiles_t": st["tiles_t"], "tiles_state": st["tiles_state"]}
+            prev = {"uid": st["uid"], "seq": st["seq"], "mseq": st["mseq"], "kept_seq": st["kept_seq"],
+                    "kept_t": st["kept_t"], "kept_state": st["kept_state"]}
         return {"path": path, "dir": str(d), "sig": sig, "prev": prev, "crash_after": CRASH_AFTER,
-                "top_refresh": TOP_REFRESH, "want_rows": self.hub.watched(path)}
+                "kept_refresh": KEPT_REFRESH, "want_rows": self.hub.watched(path)}
 
     def _sync_inline(self, todo: Sequence[tuple[str, Path, Sig]]) -> None:
         batch = _Batch(self)
@@ -937,29 +920,28 @@ class Explorer:
         if r["media"]:
             self._writer.executemany("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?,?,?)", r["media"])
         st = _record(r, cur)
-        was, done = cur is not None and cur["state"] != "running", st["state"] != "running"  # in slabs before, and now
+        was, done = cur is not None and cur["state"] != "running", st["state"] != "running"  # finished before, and now
         if (r["kept"] is not None and done) or was != done:
-            self._bump_slabs(st["keys"])
+            self._bump(st["keys"])
         if r["kept"] is not None:
-            self._kept_gen += 1
-            self._writer.execute("DELETE FROM tiles WHERE path=? AND kind != ?", (path, CACHED))
-            self._writer.executemany("INSERT OR REPLACE INTO tiles VALUES (?,?,?,?,?,?,?,?)",
-                                     [(path, t.key, t.level, t.idx, t.kind, r["seq"], now, t.data) for t in r["kept"]])
-            st.update(tiles_seq=r["seq"], tiles_t=now, tiles_state=r["state"])
+            self._writer.execute("DELETE FROM kept WHERE path=?", (path,))
+            self._writer.executemany("INSERT INTO kept VALUES (?,?,?,?,?)",
+                                     [(path, k.key, k.level, r["seq"], k.data) for k in r["kept"]])
+            st.update(kept_seq=r["seq"], kept_t=now, kept_state=r["state"])
         self._writer.execute("INSERT OR REPLACE INTO runs VALUES (?, ?)", (path, dumps(st)))
         return st, ev + _events(r, cur, st)
 
-    def _bump_slabs(self, keys: Sequence[str]) -> None:
-        """Note that the slabs of `keys` changed."""
+    def _bump(self, keys: Sequence[str]) -> None:
+        """Note that the finished runs of `keys`, or their kept buckets, changed."""
         for k in keys:
-            self._slab_gens[k] = self._slab_gens.get(k, 0) + 1
+            self._gens[k] = self._gens.get(k, 0) + 1
 
     def _forget(self, path: str) -> None:
         """Delete a run's index rows inside the caller's write transaction."""
-        self._kept_gen += 1
         rec = self.records.get(path)
-        self._bump_slabs(rec["keys"] if rec else list(self._slab_gens))
-        for t in ("runs", "media", "tiles"):
+        self._bump(rec["keys"] if rec else list(self._gens))
+        self.cached_bytes -= self._writer.execute("SELECT coalesce(sum(length(data)), 0) FROM fine WHERE path=?", (path,)).fetchone()[0]
+        for t in ("runs", "media", "kept", "fine"):
             self._writer.execute(f"DELETE FROM {t} WHERE path=?", (path,))
 
     # ---- queries ----
@@ -973,7 +955,7 @@ class Explorer:
             "tags": p["tags"], "config": p["config"], "info": p["info"],
             "summary": {**p["user_summary"], **st["summary"]},
             "state": st["state"], "created": p.get("created"), "updated": st["heartbeat"],
-            "seq": st["seq"], "mseq": st["mseq"], "keys": st["keys"], "tiles_seq": st["tiles_seq"],
+            "seq": st["seq"], "mseq": st["mseq"], "keys": st["keys"], "kept_seq": st["kept_seq"],
         }
 
     def info(self) -> dict[str, object]:
@@ -1000,12 +982,12 @@ class Explorer:
     def runs_body(self, prefix: str) -> bytes:
         """`runs` as JSON, kept while no run, medium or folder note changes."""
         gen = self._view_gen
-        with self._bundle_lock:
+        with self._answer_lock:
             hit = self._runs_bodies.get(prefix)
             if hit is not None and hit[0] == gen:
                 return hit[1]
         body = dumps(self.runs(prefix)).encode()
-        with self._bundle_lock:
+        with self._answer_lock:
             self._runs_bodies[prefix] = (gen, body)
             self._runs_bodies.move_to_end(prefix)
             while len(self._runs_bodies) > RUNS_BODIES:
@@ -1033,10 +1015,10 @@ class Explorer:
         return _rows_event(path, start, self._read_rows(path, start, stop))
 
     def backfill(self, prefix: str) -> list[bytes]:
-        """`rows` events for running runs' rows beyond their kept tiles."""
+        """`rows` events for running runs' rows beyond their kept buckets."""
         with self.lock:
-            tails = [(p, st["tiles_seq"], st["seq"]) for p, st in self.records.items()
-                     if in_scope(p, prefix) and st["state"] == "running" and 0 < st["seq"] - st["tiles_seq"] <= ROWS_EVENT_MAX]
+            tails = [(p, st["kept_seq"], st["seq"]) for p, st in self.records.items()
+                     if in_scope(p, prefix) and st["state"] == "running" and 0 < st["seq"] - st["kept_seq"] <= ROWS_EVENT_MAX]
         out: list[bytes] = []
         for p, start, stop in tails:
             try:
@@ -1053,167 +1035,158 @@ class Explorer:
             return {p: (st["seq"], st["mseq"]) for p, st in self.records.items()
                     if in_scope(p, prefix) and st["state"] == "running"}
 
-    # ---- tiles ----
+    # ---- buckets ----
 
-    def tiles(self, requests: Sequence[Sequence[object]]) -> list[list[bytes]]:
-        """Tiles answering each request [path, key, "top" | "overview"] or [path, key, level, index];
-        finer tiles are built on first request and cached."""
-        out: list[list[bytes]] = []
-        hits: list[tuple[str, str, int, int]] = []
-        c = self.reader()
-        try:
-            for req in requests:
-                path, key = str(req[0]), str(req[1])
-                with self.lock:
-                    st = self.records.get(path)
-                if st is None or key not in st["keys"]:
-                    out.append([])
-                    continue
-                if isinstance(req[2], str) and req[2] in KINDS:
-                    out.append([r[0] for r in c.execute(
-                        "SELECT data FROM tiles WHERE path=? AND key=? AND kind=? ORDER BY idx", (path, key, KINDS[req[2]]))])
-                    continue
-                level, idx = _int(req[2]), _int(req[3])
-                if not tiles.MIN_LEVEL <= level <= tiles.MAX_LEVEL:
-                    raise ValueError(f"tile level {level} out of range")
-                row = c.execute("SELECT seq, data FROM tiles WHERE path=? AND key=? AND level=? AND idx=?",
-                                (path, key, level, idx)).fetchone()
-                if row and (row[0] == st["seq"] or self._still_valid(path, level, idx, row[0])):
-                    out.append([row[1]])
-                    hits.append((path, key, level, idx))
-                    continue
-                blob, seq = self._build(path, key, level, idx)
-                out.append([blob])
-                self._store(path, key, level, idx, seq, blob)
-        finally:
-            self.release(c)
-        if hits:
-            with self._write_lock:
-                self._writer.executemany("UPDATE tiles SET used=? WHERE path=? AND key=? AND level=? AND idx=?",
-                                         [(time.time(), *h) for h in hits])
-        return out
+    def buckets_body(self, key: str, level: int, index: int, scope: str = "", runs: Sequence[str] | None = None,
+                     which: Which = "all") -> bytes:
+        """Block `index` of `level` of `key` as a bucket array (`trex.buckets`): of the runs `runs`, or else of the runs
+        under `scope` in state `which`. A scope's finished runs' blocks are kept in memory while those runs' buckets
+        stay the same."""
+        if not bk.MIN_LEVEL <= level <= bk.MAX_LEVEL:
+            raise ValueError(f"level {level} out of range")
+        if runs is None and which == "finished":
+            return self._answer(("finished", key, level, index, scope), self._gens.get(key, 0),
+                                lambda: self._block(key, level, index, self._chosen(key, scope, None, which)))
+        return self._block(key, level, index, self._chosen(key, scope, runs, which))
 
-    def tile_bundle(self, key: str, kind: TileKind, scope: str) -> list[tuple[str, list[bytes]]]:
-        """[(path, tiles)] of one kept kind of one metric for every run under `scope`."""
-        c = self.reader()
-        try:
-            rows = c.execute("SELECT path, data FROM tiles WHERE key=? AND kind=? ORDER BY path, idx", (key, KINDS[kind])).fetchall()
-        finally:
-            self.release(c)
-        out: list[tuple[str, list[bytes]]] = []
-        for path, data in rows:
-            if not in_scope(path, scope):
-                continue
-            if out and out[-1][0] == path:
-                out[-1][1].append(data)
-            else:
-                out.append((path, [data]))
-        return out
+    def _chosen(self, key: str, scope: str, runs: Sequence[str] | None, which: Which) -> list[str]:
+        """The runs a block request names that log `key`, in path order."""
+        with self.lock:
+            if runs is not None:
+                return sorted({p for p in runs if (r := self.records.get(p)) is not None and key in r["keys"]})
+            return sorted(p for p, r in self.records.items() if in_scope(p, scope) and key in r["keys"]
+                          and (which == "all" or (r["state"] == "running") == (which == "running")))
 
-    def tile_bundle_body(self, key: str, kind: TileKind, scope: str) -> bytes:
-        """`tile_bundle` framed (`frame_bundle`), kept in memory while the kept tiles stay the same."""
-        return self._kept((key, KINDS[kind], scope), lambda: frame_bundle(self.tile_bundle(key, kind, scope)))
+    def _block(self, key: str, level: int, index: int, paths: list[str]) -> bytes:
+        """Block `index` of `level` of `key` of runs `paths` (in path order): cut from the finished runs' merged level
+        (`_level`), or merged from the other runs' kept buckets, where a run keeps its buckets at `level` or finer; else
+        built from its run file (`_built`)."""
+        lo, hi = index * bk.BLOCK, (index + 1) * bk.BLOCK
+        done, levels, seqs = self._runs(key)
+        positions = self._positions(key)
+        at = np.array([positions.get(p, -1) for p in paths], np.int64)  # each run's index in `done`, or -1
+        known = at >= 0
+        coarse = known.copy()
+        coarse[known] = levels[at[known]] <= level
+        seq = np.zeros(len(paths), np.uint32)
+        seq[coarse] = seqs[at[coarse]]
+        parts = []
+        if coarse.any():
+            out = np.full(len(done), -1, np.int32)
+            out[at[coarse]] = np.flatnonzero(coarse)
+            part = bk.cut(self._level(key, level), lo, hi, out >= 0)
+            parts.append(part._replace(run=out[part.run]))
+        others = np.flatnonzero(~known)
+        fine = [int(i) for i in np.flatnonzero(known & ~coarse)]
+        if others.size:
+            st = self._kept_of(key, [paths[i] for i in others])
+            near = st.level <= level
+            seq[others[near]] = st.seq[near]
+            part = bk.cut(st.at(level, np.flatnonzero(near).astype(np.int32)), lo, hi)
+            parts.append(part._replace(run=others[part.run].astype(np.int32)))
+            fine += [int(i) for i in others[~near]]
+        if fine:
+            fine.sort()
+            st = bk.stack([paths[i] for i in fine], self._built([paths[i] for i in fine], key, level, index))
+            pos = np.array(fine, np.int32)
+            seq[pos] = st.seq
+            parts.append(st.buckets._replace(run=pos[st.buckets.run]))
+        return bk.encode(level, index, paths, seq, bk.union(parts))
 
-    def slab_body(self, key: str, level: int, index: int, scope: str) -> bytes:
-        """`tiles.slab` (level, index) of `key` over the finished runs under `scope` that log it (running runs change,
-        and reach the UI as rows), kept in memory like bundles until a finished run's tiles of `key` change."""
-        if not tiles.MIN_LEVEL <= level <= tiles.MAX_LEVEL:
-            raise ValueError(f"tile level {level} out of range")
-        gen = self._slab_gens.get(key, 0)
-        return self._kept(("slab", key, level, index, scope), lambda: self._slab(key, level, index, scope), gen)
-
-    def _slab(self, key: str, level: int, index: int, scope: str) -> bytes:
-        """Slab (level, index) of `key` under `scope`: cut from the merged level (`_level`) for runs whose top tiles
-        are no finer than it, from their tiles at `level` (`_fine_tiles`) for the others."""
-        paths, ov_level = self._runs(key)
-        top = ov_level.astype(np.int16) - OVERVIEW_UP
-        inside = np.fromiter((in_scope(p, scope) for p in paths), bool, len(paths))
-        idx = np.flatnonzero(inside).astype(np.int32)
-        fine = idx[top[idx] > level]
-        at = np.full(len(paths), -1, np.int32)
-        at[idx] = np.arange(idx.size, dtype=np.int32)  # run index in the stacks -> in the slab
-        parts = [tiles.cut(self._level(key, level), index, inside & (top <= level))]
-        if fine.size:
-            fs = tiles.stack(self._fine_tiles([paths[i] for i in fine], key, level, index))
-            f = tiles.slab_parts(fs, level, index)
-            parts.append(f._replace(run=fine[f.run]))  # its runs as indices into the stacks
-        return tiles.encode_slab(level, index, [paths[i] for i in idx], [p._replace(run=at[p.run]) for p in parts])
-
-    def _runs(self, key: str) -> tuple[list[str], npt.NDArray[np.int8]]:
-        """The finished runs of `key` in path order, and each one's overview level: from its saved levels when they
-        are current, else from the overview stack."""
+    def _runs(self, key: str) -> tuple[list[str], npt.NDArray[np.int8], npt.NDArray[np.uint32]]:
+        """The finished runs of `key` in path order, the level each keeps its buckets at and the rows they hold: from
+        their saved levels when those are current, else from their stack."""
         saved = self._saved(key)
         if saved is not None:
-            return saved.paths, saved.ov_level
-        ov, ov_level = self._stack(key, OVERVIEW)
-        return ov.paths, ov_level
+            return saved.paths, saved.level, saved.seq
+        st = self._stack(key)
+        return st.paths, st.level, st.seq
+
+    def _positions(self, key: str) -> dict[str, int]:
+        """Each finished run of `key` by its index in path order."""
+        return self._once(("positions", key), self._gens.get(key, 0),
+                          lambda: ({p: i for i, p in enumerate(self._finished(key)[0])}, 0))
+
+    def _kept_of(self, key: str, paths: list[str]) -> Stack:
+        """The kept buckets of `key` of runs `paths`, read from the index."""
+        rows: dict[str, bytes] = {}
+        c = self.reader()
+        try:
+            for i in range(0, len(paths), 500):
+                part = paths[i:i + 500]
+                rows.update(c.execute(f"SELECT path, data FROM kept WHERE key=? AND path IN ({','.join('?' * len(part))})",
+                                      (key, *part)).fetchall())
+        finally:
+            self.release(c)
+        return bk.stack(paths, [rows.get(p, NO_BUCKETS) for p in paths])
 
     def _level(self, key: str, level: int) -> Buckets:
-        """The buckets of every finished run of `key` whose top tiles are no finer than `level`, merged at `level` from
-        its overview tiles when they are no coarser, else from its top tiles (`tiles.level_parts`, on threads); kept as
-        stacks are."""
-        return self._once(("level", key, level), self._slab_gens.get(key, 0), lambda: self._merge_level(key, level))
+        """The buckets of every finished run of `key` that keeps its buckets at `level` or finer, merged to `level`
+        (on threads); kept as stacks are."""
+        return self._once(("level", key, level), self._gens.get(key, 0), lambda: self._merge_level(key, level))
 
     def _merge_level(self, key: str, level: int) -> tuple[Buckets, int]:
         saved = self._saved(key)
         if saved is not None and level in saved.at:
             part = saved.part(level)
             return part, part.run.nbytes
-        ov, ov_level = self._stack(key, OVERVIEW)
-        from_ov = np.flatnonzero(ov_level <= level).astype(np.int32)
-        from_top = np.flatnonzero((ov_level > level) & (ov_level.astype(np.int16) - OVERVIEW_UP <= level)).astype(np.int32)
-        parts = self._merged(ov, level, from_ov)
-        if from_top.size:
-            parts = [*parts, *self._merged(self._stack(key, TOP)[0], level, from_top)]
-        part = tiles.join_buckets(parts, ordered=not from_top.size)
-        return part, sum(x.nbytes for x in part)
+        st = self._stack(key)
+        part = self._merged(st, level, st.level <= level)
+        return part, part.nbytes
 
-    def _merged(self, st: Stack, level: int, runs: npt.NDArray[np.int32]) -> list[Buckets]:
-        """`tiles.level_parts` of the runs `runs` of `st`, on threads over runs in order (numpy lets go of the GIL)."""
-        with ThreadPoolExecutor(max_workers=SLAB_THREADS) as pool:
-            return list(pool.map(lambda sub: tiles.level_parts(sub, level, runs), tiles.stack_parts(st, SLAB_THREADS)))
+    def _merged(self, st: Stack, level: int, take: npt.NDArray[np.bool_]) -> Buckets:
+        """The buckets of the runs `take` marks merged to `level`, on threads over runs in order (numpy lets go of the
+        GIL)."""
+        b = st.buckets
+        cuts = np.searchsorted(b.run, np.linspace(0, len(st.paths), MERGE_THREADS + 1)[1:-1].astype(np.int32))
+        bounds = [0, *cuts.tolist(), b.run.size]
 
-    def _stack(self, key: str, kind: int) -> tuple[Stack, npt.NDArray[np.int8]]:
-        """The finished runs' kept tiles of `kind` (TOP or OVERVIEW) of `key`, decoded (`tiles.stack`; runs in path
-        order, the same for both kinds), and each run's level of them; kept while they stay the same. A new overview
-        stack gets the levels from its own to the finest top level merged and saved, on a thread of its own."""
-        return self._once(("stack", key, kind), self._slab_gens.get(key, 0), lambda: self._read_stack(key, kind))
+        def one(lo: int, hi: int) -> Buckets:
+            part = bk.Buckets(b.run[lo:hi], b.bucket[lo:hi], b.mean[lo:hi], b.soff[lo:hi], b.tmean[lo:hi], b.n[lo:hi])
+            part = bk.select(part, take[part.run])
+            return bk.merge(part, level - st.level[part.run].astype(np.int64))
 
-    def _read_stack(self, key: str, kind: int) -> tuple[tuple[Stack, npt.NDArray[np.int8]], int]:
+        with ThreadPoolExecutor(max_workers=MERGE_THREADS) as pool:
+            parts = list(pool.map(lambda ab: one(*ab), zip(bounds, bounds[1:])))
+        return bk.Buckets(*(np.concatenate(field) for field in zip(*parts)))
+
+    def _stack(self, key: str) -> Stack:
+        """The finished runs' kept buckets of `key` (`buckets.stack`, runs in path order); kept while they stay the
+        same. A new stack gets its levels from the coarsest a first view takes to the finest it keeps merged and
+        saved, on a thread of its own."""
+        return self._once(("stack", key), self._gens.get(key, 0), lambda: self._read_stack(key))
+
+    def _read_stack(self, key: str) -> tuple[Stack, int]:
         done, sig = self._finished(key)
         c = self.reader()
         try:
-            rows = c.execute("SELECT path, data FROM tiles WHERE key=? AND kind=? ORDER BY path, idx", (key, kind)).fetchall()
+            rows = dict(c.execute("SELECT path, data FROM kept WHERE key=?", (key,)).fetchall())
         finally:
             self.release(c)
-        runs: dict[str, list[bytes]] = {}
-        for path, data in rows:
-            runs.setdefault(path, []).append(data)
-        st = tiles.stack([(p, runs.get(p, [])) for p in done])
-        lv = np.full(len(st.paths), tiles.MIN_LEVEL, np.int8)
-        np.maximum.at(lv, st.run, st.level)
-        if kind == OVERVIEW and lv.size:
-            levels = range(int(lv.max()), int(lv.max()) - OVERVIEW_UP - 1, -1)  # coarsest first, as zooms ask
-            threading.Thread(target=self._merge_ahead, args=(key, sig, st.paths, lv, levels), name="trex-levels", daemon=True).start()
-        return (st, lv), st.nbytes
+        st = bk.stack(done, [rows.get(p, NO_BUCKETS) for p in done])
+        if done:
+            top = int(st.level.max())
+            levels = range(top + LEVELS_AHEAD, top - 1, -1)  # coarsest first, as views ask
+            threading.Thread(target=self._merge_ahead, args=(key, sig, st, levels), name="trex-levels", daemon=True).start()
+        return st, st.buckets.nbytes
 
-    def _merge_ahead(self, key: str, sig: bytes, paths: list[str], ov_level: npt.NDArray[np.int8], levels: range) -> None:
+    def _merge_ahead(self, key: str, sig: bytes, st: Stack, levels: range) -> None:
         """Merge `levels` of `key` and save them (`_save_levels`) while its finished runs stay those of `sig`, at most
         once every LEVELS_SAVE_EVERY seconds."""
         parts = {x: self._level(key, x) for x in levels}
         due = time.monotonic() - self._saved_at.get(key, -math.inf) >= LEVELS_SAVE_EVERY
         if due and self._finished(key)[1] == sig and self._saved(key) is None:
             self._saved_at[key] = time.monotonic()
-            self._save_levels(key, sig, paths, ov_level, parts)
+            self._save_levels(key, sig, st, parts)
 
     def _finished(self, key: str) -> tuple[list[str], bytes]:
-        """The finished runs logging `key`, in path order, and a digest of them and their kept tiles."""
-        gen = self._slab_gens.get(key, 0)
+        """The finished runs logging `key`, in path order, and a digest of them and their kept buckets."""
+        gen = self._gens.get(key, 0)
         hit = self._memo_get(("finished", key), gen)
         if hit is not None:
             return cast(tuple[list[str], bytes], hit)
         with self.lock:
-            done = [(p, rec["tiles_seq"], rec["tiles_t"]) for p, rec in self.records.items()
+            done = [(p, rec["kept_seq"], rec["kept_t"]) for p, rec in self.records.items()
                     if rec["state"] != "running" and key in rec["keys"]]
         done.sort()
         paths = [p for p, _, _ in done]
@@ -1228,8 +1201,9 @@ class Explorer:
         return self.cache_dir / "levels" / hashlib.sha1(key.encode()).hexdigest()[:20]
 
     def _saved(self, key: str) -> "SavedLevels | None":
-        """The merged levels of `key` an earlier build saved, when its finished runs and their kept tiles are the same."""
-        gen = self._slab_gens.get(key, 0)
+        """The merged levels of `key` an earlier build saved, when its finished runs and their kept buckets are the
+        same."""
+        gen = self._gens.get(key, 0)
         hit = self._memo_get(("saved", key), gen)
         if hit is not None:
             return hit if isinstance(hit, SavedLevels) else None
@@ -1244,14 +1218,14 @@ class Explorer:
         self._memo_put(("saved", key), gen, saved or False, 0)
         return saved
 
-    def _save_levels(self, key: str, sig: bytes, paths: list[str], ov_level: npt.NDArray[np.int8], parts: Mapping[int, Buckets]) -> None:
+    def _save_levels(self, key: str, sig: bytes, st: Stack, parts: Mapping[int, Buckets]) -> None:
         """Write merged levels of `key` (`SavedLevels.pack`) beside the index, then delete the least recently used saved
         levels beyond LEVELS_BYTES."""
         f = self._levels_file(key)
         f.parent.mkdir(exist_ok=True)
         tmp = f.with_name(f"{f.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
-            tmp.write_bytes(SavedLevels.pack(sig, len(paths), ov_level, parts))
+            tmp.write_bytes(SavedLevels.pack(sig, st, parts))
             tmp.replace(f)
         except OSError:
             tmp.unlink(missing_ok=True)
@@ -1259,11 +1233,11 @@ class Explorer:
         _bound_dir(f.parent, LEVELS_BYTES)
 
     def _once[T](self, k: tuple[object, ...], gen: int, build: Callable[[], tuple[T, int]]) -> T:
-        """build()'s value (and its bytes) kept under `k` at slab generation `gen`; built by one thread while others
-        asking for it wait."""
+        """build()'s value (and its bytes) kept under `k` at generation `gen`; built by one thread while others asking
+        for it wait."""
         hit = self._memo_get(k, gen)
         if hit is None:
-            with self._bundle_lock:
+            with self._answer_lock:
                 lock = self._building.setdefault(k, threading.Lock())
             with lock:
                 hit = self._memo_get(k, gen)
@@ -1273,7 +1247,7 @@ class Explorer:
         return cast(T, hit)
 
     def _memo_get(self, k: tuple[object, ...], gen: int) -> object | None:
-        with self._bundle_lock:
+        with self._answer_lock:
             hit = self._memo.get(k)
             if hit is None or hit[0] != gen:
                 return None
@@ -1281,119 +1255,107 @@ class Explorer:
             return hit[1]
 
     def _memo_put(self, k: tuple[object, ...], gen: int, value: object, nbytes: int) -> None:
-        """Keep `value` (nbytes) under `k` at slab generation `gen`; the least recently used beyond STACK_BYTES go."""
-        with self._bundle_lock:
+        """Keep `value` (nbytes) under `k` at generation `gen`; the least recently used beyond STACK_BYTES go."""
+        with self._answer_lock:
             self._memo[k] = (gen, value, nbytes)
             self._memo.move_to_end(k)
             total = sum(x[2] for x in self._memo.values())
             while total > STACK_BYTES and len(self._memo) > 1:
                 total -= self._memo.popitem(last=False)[1][2]
 
-    def _fine_tiles(self, paths: list[str], key: str, level: int, index: int) -> list[tuple[str, list[bytes]]]:
-        """Each finished run's tile (level, index) of `key`: the cached ones in one read, the others built from the run
-        files on all cores and cached in one transaction, after they are returned."""
+    def _built(self, paths: list[str], key: str, level: int, index: int) -> list[bytes]:
+        """Each run's block (level, index) of `key` as a one-run bucket array: the cached ones that still hold every row
+        in the block in one read, the others built from the run files on all cores and cached, after they are
+        returned."""
         c = self.reader()
         try:
-            rows = c.execute("SELECT path, seq, data FROM tiles WHERE key=? AND level=? AND idx=?", (key, level, index)).fetchall()
+            rows = c.execute("SELECT path, seq, data FROM fine WHERE key=? AND level=? AND idx=?", (key, level, index)).fetchall()
         finally:
             self.release(c)
         with self.lock:
             seqs = {p: self.records[p]["seq"] for p in paths if p in self.records}
-        have = {p: data for p, seq, data in rows if seqs.get(p) == seq}
+        have = {p: data for p, seq, data in rows
+                if p in seqs and (seq == seqs[p] or self._still_valid(p, level, index, seq))}
         todo = [p for p in paths if p not in have and p in seqs]
         built = self._build_many(todo, key, level, index)
-        rows = [(p, key, level, index, seq, blob) for p, (blob, seq) in zip(todo, built)]
-        threading.Thread(target=self._store_many, args=(rows,), name="trex-store-tiles", daemon=True).start()  # not waited for
+        store = [(p, seq, blob) for p, (blob, seq) in zip(todo, built)]
+        threading.Thread(target=self._store_many, args=(key, level, index, store, list(have)), name="trex-store-blocks",
+                         daemon=True).start()
         have.update((p, blob) for p, (blob, _) in zip(todo, built))
-        return [(p, [have[p]]) for p in paths if p in have]
+        return [have.get(p, NO_BUCKETS) for p in paths]
 
     def _build_many(self, paths: list[str], key: str, level: int, index: int) -> list[tuple[bytes, int]]:
-        """(tile, rows read) of tile (level, index) of `key` for each run, from the run files: on a process pool when
-        there are more than INLINE_TILES."""
+        """(block, rows read) of block (level, index) of `key` for each run, from the run files: on a process pool when
+        there are more than INLINE_BUILDS."""
         jobs = [(str(self.run_dir(p)), key, level, index) for p in paths]
-        if len(jobs) <= INLINE_TILES or self.workers == 1:
-            return [build_tile(*j) for j in jobs]
+        if len(jobs) <= INLINE_BUILDS or self.workers == 1:
+            return [build_block(*j) for j in jobs]
         with ProcessPoolExecutor(max_workers=self.workers, mp_context=_mp_context(), initializer=_worker_init) as pool:
-            return list(pool.map(_build_tile_job, jobs, chunksize=max(1, len(jobs) // (4 * self.workers))))
+            return list(pool.map(_build_block_job, jobs, chunksize=max(1, len(jobs) // (4 * self.workers))))
 
-    def _store_many(self, rows: Sequence[tuple[str, str, int, int, int, bytes]]) -> None:
-        """Cache built tiles ((path, key, level, index, seq, tile)) in one transaction, within the tile budget; tiles
-        that are kept ones are left as they are."""
-        if not rows:
+    def _store_many(self, key: str, level: int, index: int, rows: Sequence[tuple[str, int, bytes]], used: Sequence[str]) -> None:
+        """Cache the built blocks (level, index) of `key` (rows: path, rows held, block) and note that the cached ones of
+        runs `used` were used, in one transaction, within the block budget."""
+        if not rows and not used:
             return
         with self._write_lock:
             if self._closed:
                 return
+            now = time.time()
             self._writer.execute("BEGIN IMMEDIATE")
             try:
-                kept = {tuple(r) for r in self._writer.execute(
-                    "SELECT path, level, idx FROM tiles WHERE key=? AND kind != ?", (rows[0][1], CACHED))}
-                new = [r for r in rows if (r[0], r[2], r[3]) not in kept]
-                self._writer.executemany("INSERT OR REPLACE INTO tiles VALUES (?,?,?,?,?,?,?,?)",
-                                         [(p, k, lv, ix, CACHED, seq, time.time(), blob) for p, k, lv, ix, seq, blob in new])
+                sizes = dict(self._writer.execute("SELECT path, length(data) FROM fine WHERE key=? AND level=? AND idx=?",
+                                                  (key, level, index)).fetchall())
+                self._writer.executemany("INSERT OR REPLACE INTO fine VALUES (?,?,?,?,?,?,?)",
+                                         [(p, key, level, index, seq, now, blob) for p, seq, blob in rows])
+                self._writer.executemany("UPDATE fine SET used=? WHERE path=? AND key=? AND level=? AND idx=?",
+                                         [(now, p, key, level, index) for p in used])
             except BaseException:
                 self._writer.execute("ROLLBACK")
                 raise
             self._writer.execute("COMMIT")
-            self.cached_bytes += sum(len(r[5]) for r in new)
+            self.cached_bytes += sum(len(b) - sizes.get(p, 0) for p, _, b in rows)
         self.budget.enforce()
 
-    def _kept(self, k: tuple[object, ...], build: Callable[[], bytes], gen: int | None = None) -> bytes:
-        """build(), kept in memory under `k` while `gen` (default: the kept tiles' generation) stays the same; the least
-        recently used are dropped beyond BUNDLE_CACHE_BYTES."""
-        gen = self._kept_gen if gen is None else gen
-        with self._bundle_lock:
-            hit = self._bundles.get(k)
+    def _answer(self, k: tuple[object, ...], gen: int, build: Callable[[], bytes]) -> bytes:
+        """build(), kept in memory under `k` while `gen` stays the same; the least recently used are dropped beyond
+        ANSWER_CACHE_BYTES."""
+        with self._answer_lock:
+            hit = self._answers.get(k)
             if hit is not None and hit[0] == gen:
-                self._bundles.move_to_end(k)
+                self._answers.move_to_end(k)
                 return hit[1]
         body = build()
-        with self._bundle_lock:
-            old = self._bundles.pop(k, None)
-            self._bundle_bytes += len(body) - (len(old[1]) if old else 0)
-            self._bundles[k] = (gen, body)
-            while self._bundle_bytes > BUNDLE_CACHE_BYTES and len(self._bundles) > 1:
-                self._bundle_bytes -= len(self._bundles.popitem(last=False)[1][1])
+        with self._answer_lock:
+            old = self._answers.pop(k, None)
+            self._answer_bytes += len(body) - (len(old[1]) if old else 0)
+            self._answers[k] = (gen, body)
+            while self._answer_bytes > ANSWER_CACHE_BYTES and len(self._answers) > 1:
+                self._answer_bytes -= len(self._answers.popitem(last=False)[1][1])
         return body
 
-    def _still_valid(self, path: str, level: int, idx: int, seq: int) -> bool:
-        """Whether every row after `seq` lies beyond the tile."""
-        _, hi = tiles.tile_range(level, idx)
+    def _still_valid(self, path: str, level: int, index: int, seq: int) -> bool:
+        """Whether every row of the run after `seq` lies beyond block (level, index)."""
+        _, hi = bk.block_range(level, index)
         with snapshot(self.run_dir(path)) as c:
             first = c.execute("SELECT min(step_lo) FROM rowmeta WHERE seq0 + n > ?", (seq,)).fetchone()[0]
         return first is None or first >= hi
 
-    def _build(self, path: str, key: str, level: int, idx: int) -> tuple[bytes, int]:
-        """(tile, run rows read) from the run file."""
-        return build_tile(str(self.run_dir(path)), key, level, idx)
-
-    def _store(self, path: str, key: str, level: int, idx: int, seq: int, blob: bytes) -> None:
-        """Cache a built tile within the tile budget."""
-        with self._write_lock:
-            old = self._writer.execute("SELECT length(data), kind FROM tiles WHERE path=? AND key=? AND level=? AND idx=?",
-                                       (path, key, level, idx)).fetchone()
-            if old and old[1] != CACHED:
-                return
-            self._writer.execute("INSERT OR REPLACE INTO tiles VALUES (?,?,?,?,?,?,?,?)",
-                                 (path, key, level, idx, CACHED, seq, time.time(), blob))
-            self.cached_bytes += len(blob) - (old[0] if old else 0)
-        self.budget.enforce()
-
     def oldest_cached(self) -> float | None:
-        """When the least recently used cached tile was last used."""
+        """When the least recently used cached block was last used."""
         with self._write_lock:
-            return None if self._closed else self._writer.execute("SELECT min(used) FROM tiles WHERE kind=?", (CACHED,)).fetchone()[0]
+            return None if self._closed else self._writer.execute("SELECT min(used) FROM fine").fetchone()[0]
 
     def evict(self, before: float, nbytes: int) -> int:
-        """Evict cached tiles last used at or before `before`, oldest first, until `nbytes` are freed; how many."""
+        """Evict cached blocks last used at or before `before`, oldest first, until `nbytes` are freed; how many."""
         with self._write_lock:
-            rows = self._writer.execute("SELECT path, key, level, idx, length(data) FROM tiles WHERE kind=? AND used<=? "
-                                        "ORDER BY used LIMIT 512", (CACHED, before)).fetchall()
+            rows = self._writer.execute("SELECT path, key, level, idx, length(data) FROM fine WHERE used<=? "
+                                        "ORDER BY used LIMIT 512", (before,)).fetchall()
             n = 0
             for p, k, lv, i, size in rows:
                 if nbytes <= 0:
                     break
-                self._writer.execute("DELETE FROM tiles WHERE path=? AND key=? AND level=? AND idx=?", (p, k, lv, i))
+                self._writer.execute("DELETE FROM fine WHERE path=? AND key=? AND level=? AND idx=?", (p, k, lv, i))
                 self.cached_bytes -= size
                 nbytes -= size
                 n += 1
@@ -1406,10 +1368,3 @@ class Explorer:
         if f.parent != (d / "media").resolve():
             raise KeyError(file)
         return f
-
-
-def _int(v: object) -> int:
-    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
-        raise ValueError(f"expected an integer, got {v!r}")
-    return int(v)
-

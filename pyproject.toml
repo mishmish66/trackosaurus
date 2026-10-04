@@ -74,4 +74,4 @@ include = ["trex", "tests", "examples", "docs"]
 exclude = ["tests/browser_smoke.py"]  # needs playwright: `uv run --with playwright`
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
-strict = ["trex/writer.py", "trex/media.py", "trex/format.py", "trex/chunks.py", "trex/tiles.py", "trex/journal.py"]
+strict = ["trex/writer.py", "trex/media.py", "trex/format.py", "trex/chunks.py", "trex/buckets.py", "trex/journal.py"]

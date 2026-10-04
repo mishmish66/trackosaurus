@@ -1,5 +1,6 @@
-"""Cases of the formats the Python and browser code share (tiles, live tails, slabs, smoothing, group statistics), written from the Python
-implementations into shared_cases.json, which tests/shared_cases.test.mjs checks the browser's against.
+"""Cases of the formats the Python and browser code share (bucket arrays, live tails, layered levels, binning, smoothing, group
+statistics), written from the Python implementations into shared_cases.json, which tests/shared_cases.test.mjs checks the browser's
+against.
 TREX_WRITE_CASES=1 rewrites the file."""
 
 import base64
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from trex import query, tiles
+from trex import buckets as bk, query
 
 CASES = Path(__file__).with_name("shared_cases.json")
 
@@ -29,84 +30,106 @@ def spread(n: int, k: int, m: int) -> np.ndarray:
     return (np.arange(n) * k % m) / m
 
 
-def tile_cases() -> list[dict[str, object]]:
-    out: list[dict[str, object]] = []
-    for level, index, n, infinite in [(0, 0, 300, False), (-3, 2, 200, False), (5, 1, 1500, True), (2, 7, 0, False)]:
-        lo, hi = tiles.tile_range(level, index)
-        steps = lo - 10 + spread(n, 7919, 100003) * (hi - lo + 20)
-        values = spread(n, 104729, 2003) * 20 - 10
-        values[::17] = np.nan
-        if infinite:
-            values[5::29], values[11::31] = np.inf, -np.inf
-        times = steps * 0.25 + spread(n, 5, 13)
-        blob = tiles.build(steps, values, times, level, index)
-        t = tiles.decode(blob)
-        out.append({"blob": base64.b64encode(blob).decode(), "level": t.level, "index": t.index, "count": int(t.bucket.size),
-                    "bucket": t.bucket.tolist(), "min": plains(t.min), "max": plains(t.max), "mean": plains(t.mean),
-                    "tmean": plains(t.tmean), "soff": plains(t.soff), "n": t.n.tolist(), "mean_step": plains(t.mean_step)})
-    return out
+def b64(blob: bytes) -> str:
+    return base64.b64encode(blob).decode()
 
 
-def merge_cases() -> list[dict[str, object]]:
-    """Tiles with runs of infinities, merged up: buckets merge into the mean of the finite ones."""
-    out: list[dict[str, object]] = []
-    level, index, n = 2, 3, 900
-    lo, hi = tiles.tile_range(level, index)
-    steps = lo + spread(n, 7919, 100003) * (hi - lo)
-    values = spread(n, 104729, 2003) * 20 - 10
+def run_rows(n: int, seed: int, level: int, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """n rows spread over block `index` of `level` and a little beyond, with NaN gaps and runs of infinities."""
+    lo, hi = bk.block_range(level, index)
+    steps = np.sort(lo - 10 + spread(n, 7919 + seed, 100003) * (hi - lo + 20))
+    values = spread(n, 104729 + seed, 2003) * 20 - 10
+    values[::17] = np.nan
+    values[5::29], values[11::31] = np.inf, -np.inf
     values[(steps > lo + 100) & (steps < lo + 180)] = np.inf
-    values[(steps > lo + 400) & (steps < lo + 405)] = -np.inf
-    values[::23] = np.inf
-    blob = tiles.build(steps, values, steps * 0.5, level, index)
-    for up in (1, 3):
-        merged = [tiles.decode(b) for b in tiles.coarsen([blob], up)]
-        out.append({"blob": base64.b64encode(blob).decode(), "level": level, "up": up,
-                    "mean": [plain(v) for t in merged for v in t.mean.tolist()],
-                    "mean_step": [plain(v) for t in merged for v in t.mean_step.tolist()]})
+    return steps, values, steps * 0.25 + spread(n, 5, 13)
+
+
+def array_cases() -> list[dict[str, object]]:
+    """Bucket arrays of a few runs: each field as Python wrote it, and each bucket's mean step."""
+    out: list[dict[str, object]] = []
+    for level, index, sizes in [(0, 0, [300, 0, 120]), (-3, 2, [200]), (5, 1, [1500, 700]), (2, 7, [])]:
+        parts = []
+        for i, n in enumerate(sizes):
+            if n:
+                b = bk.cut(bk.bucketize(*run_rows(n, i, level, index), level), index * bk.BLOCK, (index + 1) * bk.BLOCK)
+                parts.append(b._replace(run=np.full(b.run.size, i, np.int32)))
+        paths, seq = [f"runs/r{i}" for i in range(len(sizes))], [3 * n + 1 for n in sizes]
+        blob = bk.encode(level, index, paths, seq, bk.union(parts))
+        a = bk.decode(blob)
+        out.append({"blob": b64(blob), "level": level, "index": index, "paths": paths, "seq": seq,
+                    "first": np.searchsorted(a.buckets.run, np.arange(len(paths) + 1)).tolist(),
+                    "offset": (a.buckets.bucket - index * bk.BLOCK).tolist(), "soff": a.buckets.soff.tolist(),
+                    "mean": plains(a.buckets.mean), "tmean": plains(a.buckets.tmean), "n": a.buckets.n.tolist(),
+                    "mean_step": plains(a.buckets.step(level))})
     return out
+
+
+def one_run(level: int, index: int, b: bk.Buckets, seq: int) -> str:
+    return b64(bk.encode(level, index, ["r"], [seq], bk.cut(b, index * bk.BLOCK, (index + 1) * bk.BLOCK)))
 
 
 def tail_cases() -> list[dict[str, object]]:
-    """A live run's tile built before and after its newest rows, which split a bucket: the column of the first plus
-    those rows is the column of the second, for top tiles merged up and for finer tiles."""
+    """A live run's blocks before and after its newest rows (which split a bucket) reach them: its column from the
+    first and those rows is its column from the second; at its own level, and two levels coarser."""
     out: list[dict[str, object]] = []
-    level, index, n = 2, 1, 700
-    lo, hi = tiles.tile_range(level, index)
+    level, index, n, k = 2, 1, 700, 532  # row k falls inside a bucket at every level below
+    lo, hi = bk.block_range(level, index)
     steps: np.ndarray = lo + np.arange(n) * ((hi - lo) / n)
     values = spread(n, 104729, 2003) * 20 - 10
     values[::19] = np.nan
     values[600:640:7] = np.inf
     times: np.ndarray = steps * 0.5 + spread(n, 5, 13)
-    k = 532  # inside a bucket at every merge below
-    before = tiles.build(steps[:k], values[:k], times[:k], level, index)
-    after = tiles.build(steps, values, times, level, index)
-    for up, fine in [(0, False), (2, False), (0, True)]:
-        out.append({"before": base64.b64encode(before).decode(), "after": base64.b64encode(after).decode(), "level": level,
-                    "index": index, "up": up, "fine": fine, "steps": steps[k:].tolist(), "values": plains(values[k:]),
-                    "times": times[k:].tolist()})
+    for up in (0, 2):
+        lv, ix = level + up, index >> up
+        before = bk.bucketize(steps[:k], values[:k], times[:k], lv)
+        after = bk.bucketize(steps, values, times, lv)
+        out.append({"before": one_run(lv, ix, before, k), "after": one_run(lv, ix, after, n), "level": lv,
+                    "steps": steps[k:].tolist(), "values": plains(values[k:]), "times": times[k:].tolist(), "seq0": k})
     return out
 
 
-def slab_cases() -> list[dict[str, object]]:
-    """A slab of runs' top tiles a level up, and each run's mean per bin over its rows, for bins one and two buckets
-    wide: the mean of the finite values, infinite only without any."""
+def layer_cases() -> list[dict[str, object]]:
+    """A run's buckets at a coarse level over everything and a finer level over two blocks: its column takes the finer
+    buckets inside those blocks and the coarse ones whose mean step lies outside them, in step order."""
+    level, n = 1, 4000
+    steps: np.ndarray = np.arange(n) * 0.75
+    values = spread(n, 104729, 2003) * 20 - 10
+    values[::13] = np.nan
+    times: np.ndarray = steps * 2.0
+    coarse_level, fine_blocks = level + 3, (2, 3)
+    coarse = bk.bucketize(steps, values, times, coarse_level)
+    fine = bk.bucketize(steps, values, times, level)
+    lo, hi = bk.block_range(level, fine_blocks[0])[0], bk.block_range(level, fine_blocks[-1])[1]
+    outside = (coarse.step(coarse_level) < lo) | (coarse.step(coarse_level) >= hi)
+    inside = bk.cut(fine, fine_blocks[0] * bk.BLOCK, (fine_blocks[-1] + 1) * bk.BLOCK)
+    want = sorted([(x, m) for x, m in zip(coarse.step(coarse_level)[outside].tolist(), coarse.mean[outside].tolist())]
+                  + list(zip(inside.step(level).tolist(), inside.mean.tolist())))
+    return [{"coarse": [one_run(coarse_level, i, coarse, n) for i in bk.blocks(coarse_level, 0, steps[-1])],
+             "fine": [one_run(level, i, fine, n) for i in fine_blocks], "steps": [x for x, _ in want],
+             "means": [plain(m) for _, m in want]}]
+
+
+def bin_cases() -> list[dict[str, object]]:
+    """A block of runs a level above their rows, and each run's mean per bin over its rows, for bins one and two
+    buckets wide: the mean of the finite values, infinite only without any."""
     rng = np.random.default_rng(7)
-    runs, rows = [], []
+    parts, rows = [], []
+    level = 3
     for i, n in enumerate([900, 1300, 700]):
         steps: np.ndarray = np.arange(n) * 1.0 + i
         values = rng.normal(size=n)
         values[::11] = np.nan
         if i == 1:
             values[200:208] = np.inf
-        level, idx = tiles.top_tiles(steps[0], steps[-1])
-        times: np.ndarray = steps * 0.5
-        runs.append((f"r{i}", [tiles.build(steps, values, times, level, k) for k in idx]))
+        b = bk.cut(bk.bucketize(steps, values, steps * 0.5, level), 0, bk.BLOCK)
+        parts.append(b._replace(run=np.full(b.run.size, i, np.int32)))
         rows.append((steps, values))
-    level = max(tiles.decode(b).level for _, bs in runs for b in bs) + 1
     width = 2.0 ** level
+    blob = bk.encode(level, 0, ["r0", "r1", "r2"], [900, 1300, 700], bk.union(parts))
     out: list[dict[str, object]] = []
-    for bins in (tiles.TILE, tiles.TILE // 2):  # bins one bucket wide, then two
-        lo, w = 0.0, tiles.TILE * width / bins
+    for bins in (bk.BLOCK, bk.BLOCK // 2):  # bins one bucket wide, then two
+        lo, w = 0.0, bk.BLOCK * width / bins
         means: list[list[float | str | None]] = []
         for steps, values in rows:
             b = np.floor((steps - lo) / w).astype(np.int64)
@@ -117,8 +140,7 @@ def slab_cases() -> list[dict[str, object]]:
                     f = v[np.isfinite(v)]
                     row[k] = plain(float(f.mean()) if f.size else float(v.mean()))
             means.append(row)
-        out.append({"slab": base64.b64encode(tiles.slab(runs, level, 0)).decode(), "level": level, "index": 0,
-                    "x0": lo, "x1": lo + bins * w, "bins": bins, "means": means})
+        out.append({"blob": b64(blob), "x0": lo, "x1": lo + bins * w, "bins": bins, "means": means})
     return out
 
 
@@ -158,7 +180,7 @@ def stats_cases() -> list[dict[str, object]]:
 
 
 def build_cases() -> dict[str, object]:
-    return {"tiles": tile_cases(), "merges": merge_cases(), "tails": tail_cases(), "slabs": slab_cases(),
+    return {"arrays": array_cases(), "tails": tail_cases(), "layers": layer_cases(), "bins": bin_cases(),
             "smoothing": smoothing_cases(), "stats": stats_cases()}
 
 

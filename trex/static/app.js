@@ -15,7 +15,7 @@ const HIDE_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="
 const MENU_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="3" cy="8" r="1.5" fill="currentColor"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/><circle cx="13" cy="8" r="1.5" fill="currentColor"/></svg>';
 const SPREAD_SHOWN = 8; // values listed per config key that varies
 const FRAME_BUDGET_MS = 12; // chart drawing per frame
-const PLAN_IDLE_MS = 250; // tile planning interval while the view is unchanged
+const PLAN_IDLE_MS = 250; // block planning interval while the view is unchanged
 const OUTLIERS = [[0, "off"], [0.01, "1–99%"], [0.05, "5–95%"]];
 const $ = (s) => document.querySelector(s);
 const h = (tag, attrs = {}, ...kids) => {
@@ -269,8 +269,8 @@ function focusOpt(q) {
 
 const cmpNames = (a, b) => a.localeCompare(b, undefined, { numeric: true });
 const fieldTexts = new WeakMap(); // run metadata -> Map(group-by field -> its text)
-/** Whether shown run r may be drawn for `key` without a column: a finished run logging it, from slabs. */
-const fromSlabs = (r, key) => r.shown && r.meta.state !== "running" && hasKey(r, key);
+/** Whether shown run r may be drawn for `key` without a column: a finished run logging it, from its buckets. */
+const fromBlocks = (r, key) => r.shown && r.meta.state !== "running" && hasKey(r, key);
 
 let runNums = 0;
 /** A number of its own for run r. */
@@ -471,7 +471,7 @@ class App {
     await this.refreshTree();
     await this.loadScope();
     setInterval(() => this.refreshTree().then(() => this.renderCrumbs()), 15000);
-    if (USE_GL) (window.requestIdleCallback ?? setTimeout)(() => renderer()); // its setup blocks, so it runs while tiles load
+    if (USE_GL) (window.requestIdleCallback ?? setTimeout)(() => renderer()); // its setup blocks, so it runs while blocks load
   }
 
   /** Under the daemon, its state (else null), and the trex brand opening its panel. False when it tracks nothing,
@@ -1144,7 +1144,7 @@ class App {
   }
 
   /** {cols, color, label, run} per shown run, or {cols, runs, color, label, group} per group, of a metric (a finished
-   * run without a column has an undefined one: slabs draw it); the same list while neither the
+   * run without a column has an undefined one: its buckets draw it); the same list while neither the
    * lines (`linesSig`) nor the data change. */
   linesFor(key) {
     const sig = `${this.drawnSig}|${this.data.version}`, hit = (this.linesKept ||= new Map()).get(key);
@@ -1159,13 +1159,13 @@ class App {
     if (!this.grouped) {
       for (const r of this.runList) {
         const c = r.shown ? r.cols.get(key) : undefined;
-        if (c !== undefined || fromSlabs(r, key)) out.push({ cols: [c], color: r.color, label: r.meta.name, run: r });
+        if (c !== undefined || fromBlocks(r, key)) out.push({ cols: [c], color: r.color, label: r.meta.name, run: r });
       }
       return out;
     }
     for (const g of this.groups.values()) {
       const cols = [], runs = [];
-      for (const r of g.runs) if (r.shown && (r.cols.has(key) || fromSlabs(r, key))) cols.push(r.cols.get(key)), runs.push(r);
+      for (const r of g.runs) if (r.shown && (r.cols.has(key) || fromBlocks(r, key))) cols.push(r.cols.get(key)), runs.push(r);
       if (cols.length) out.push({ cols, runs, color: g.color, label: `${g.name} (${cols.length})`, group: g.key });
     }
     return out;
@@ -1879,14 +1879,12 @@ class App {
     b.onclick = () => location.reload();
   }
 
-  /** What to fetch ahead (`Data.nextAhead`): each chart's metric, visible charts first, over the shown runs, with the
-   * slabs a zoom of a visible chart would draw from. */
+  /** What to fetch ahead (`Data.nextAhead`): each chart's demand over the shown runs, visible charts first. */
   aheadOf() {
     if (!this.runList) return [];
     if (this.shownFor !== this.runList) this.replanShown();
-    const charts = [...this.charts.values()].sort((a, b) => (b.visible || b.full) - (a.visible || a.full));
-    const slabs = new Map(charts.filter((c) => (c.visible || c.full) && c.ahead?.length).map((c) => [c.key, c.ahead]));
-    return [...new Set(charts.map((c) => c.key))].map((key) => ({ key, runs: this.shown, slabs: slabs.get(key) || [] }));
+    const charts = [...this.charts.values()].sort((a, b) => (b.visible || b.full) - (a.visible || a.full)), seen = new Set();
+    return charts.filter((c) => !seen.has(c.key) && seen.add(c.key)).map((c) => this.demand(c, this.shown));
   }
 
   /** What chart c shows, for `Data.plan`. */
@@ -1894,11 +1892,11 @@ class App {
     const o = this.panelOpts(c.key), zoom = this.xrange && this.xrange[2] === o.xmode ? this.xrange : null;
     const x0 = o.xmin ?? zoom?.[0] ?? null, x1 = o.xmax ?? zoom?.[1] ?? null;
     return { key: c.key, runs, xmode: o.xmode, zoomed: x0 !== null || x1 !== null, x0: x0 ?? -Infinity, x1: x1 ?? Infinity,
-             pw: c.w ? c.pw : 600, coarseAbove: this.coarseAbove(o), slabs: c.slabGuess(o, this.data.runsWith(runs, c.key)) };
+             pw: c.w ? c.pw : 600, many: this.data.runsWith(runs, c.key).length > this.coarseAbove(o) };
   }
 
-  /** Runs above which each run of a chart with options `o` needs only coarse buckets: for group statistics, or
-   * a density heatmap. */
+  /** Runs above which a chart with options `o` draws its runs from bins of their buckets: group statistics, or a
+   * density heatmap. */
   coarseAbove(o) {
     if (this.grouped) return DENSITY_AUTO;
     if (!USE_GL) return Infinity;

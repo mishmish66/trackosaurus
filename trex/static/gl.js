@@ -567,9 +567,6 @@ class Renderer {
 }
 
 let shared;
-/** Whether WebGL2 was found unavailable (false before `renderer` first tries it). */
-export const glFailed = () => shared === null;
-
 /** The shared renderer, or null when WebGL2 is unavailable or the context is lost. */
 export function renderer() {
   if (shared === undefined) {

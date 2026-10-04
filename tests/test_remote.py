@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from trex import daemon, remote, server, update
+from trex import buckets as bk, daemon, remote, server, update
 from trex.cli import main
 from trex.daemon import ControlServer, Roots
 from trex.remote import Address, Remote
@@ -110,8 +110,9 @@ def test_remote_directories_are_served_through_the_daemon(roots, runs, http, hom
     media = listing["media"][0]
     status, headers, data = request(f"{base}/m/{urllib.parse.quote('a/r1', safe='')}/{media[5]}", headers={"Range": "bytes=8-11"})
     assert status == 206 and data == bytes(range(4)) and headers["Content-Range"].startswith("bytes 8-11/")
-    tiles = urllib.request.urlopen(urllib.request.Request(f"{base}/api/tiles", data=b'[["a/r1", "loss", "top"]]', method="POST"))
-    assert int.from_bytes(tiles.read()[:4], "little") >= 1
+    body = b'{"key": "loss", "level": 20, "index": 0, "runs": ["a/r1"]}'
+    answer = bk.decode(urllib.request.urlopen(urllib.request.Request(f"{base}/api/buckets", data=body, method="POST")).read())
+    assert answer.paths == ["a/r1"] and answer.buckets.run.size >= 1
 
 
 def test_the_live_stream_passes_through(roots, runs, http):

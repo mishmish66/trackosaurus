@@ -19,11 +19,10 @@ import numpy as np
 import pytest
 
 import trex
-from trex import chunks, server, tiles
+from trex import buckets as bk, chunks, server
 from trex import index as trex_index
 from trex.format import FORMAT, connect_ro, connect_rw
 from trex.index import Explorer
-from trex.workspace import unframe_bundle
 from trex.server import bind, check_root, serve
 from trex.server import urls as server_urls
 
@@ -100,10 +99,12 @@ def chunked(rows, sizes):
     return out
 
 
-def expected_tile(rows, key, level, idx):
+def expected(rows, key, level, index=None):
+    """The buckets of `key` in `rows` at `level` (in block `index` when given)."""
     pts = [(s, d[key], t) for s, t, d in rows if key in d]
     s, v, t = (np.array(x, dtype=float) for x in zip(*pts))
-    return tiles.build(s, v, t, level, idx)
+    b = bk.bucketize(s, v, t, level)
+    return b if index is None else bk.cut(b, index * bk.BLOCK, (index + 1) * bk.BLOCK)
 
 
 def run_points(root, path, key):
@@ -118,71 +119,109 @@ def run_points(root, path, key):
 def index_dump(ex):
     """Everything the index stores, without access and build times."""
     c = sqlite3.connect(ex.db_path)
-    out = {t: c.execute(f"SELECT * FROM {t} ORDER BY 1, 2").fetchall() for t in ("runs", "media")}
-    out["tiles"] = c.execute("SELECT path, key, level, idx, kind, seq, data FROM tiles ORDER BY 1, 2, 3, 4").fetchall()
+    out = {t: c.execute(f"SELECT * FROM {t} ORDER BY 1, 2").fetchall() for t in ("runs", "media", "kept")}
     c.close()
-    out["runs"] = [(p, {k: v for k, v in json.loads(s).items() if k != "tiles_t"}) for p, s in out["runs"]]
+    out["runs"] = [(p, {k: v for k, v in json.loads(s).items() if k != "kept_t"}) for p, s in out["runs"]]
     return out
 
 
-def top_n(ex, path, key):
-    return sum(int(tiles.decode(b).n.sum()) for b in ex.tiles([[path, key, "top"]])[0])
+def kept_of(ex, path, key):
+    """Run `path`'s kept bucket array of `key`, decoded."""
+    return bk.decode(kept_blob(ex, path, key))
 
 
-def test_finished_run_has_top_tiles_covering_every_finite_point_of_every_metric(root, tmp_path):
+def kept_blob(ex, path, key):
+    c = sqlite3.connect(ex.db_path)
+    try:
+        return c.execute("SELECT data FROM kept WHERE path=? AND key=?", (path, key)).fetchone()[0]
+    finally:
+        c.close()
+
+
+def kept_n(ex, path, key):
+    return int(kept_of(ex, path, key).buckets.n.sum())
+
+
+def block(ex, key, level, index, scope="", runs=None, which="all"):
+    return bk.decode(ex.buckets_body(key, level, index, scope, runs, which))
+
+
+def of_run(a, path):
+    """The buckets of run `path` of decoded array `a`, as one run's."""
+    b = bk.select(a.buckets, a.buckets.run == a.paths.index(path))
+    return b._replace(run=np.zeros(b.run.size, np.int32))
+
+
+def same(a, b):
+    """Whether two runs' buckets are equal (NaN equal to NaN)."""
+    return all(np.array_equal(x, y, equal_nan=x.dtype.kind == "f") for x, y in zip(a[1:], b[1:], strict=True))
+
+
+def stored(ex):
+    """(level, index) of every built block the index caches, in order."""
+    c = sqlite3.connect(ex.db_path)
+    try:
+        return c.execute("SELECT level, idx FROM fine ORDER BY level, idx").fetchall()
+    finally:
+        c.close()
+
+
+def test_a_finished_run_keeps_each_metrics_buckets_holding_every_finite_point(root, tmp_path):
     rows = mixed_rows(7053)
     write_chunked(root / "r", chunked(rows, [700, 1, 2000, 323, 1024, 5, 3000]))
     ex = explorer(root, tmp_path)
     meta = ex.run_meta("r")
-    assert (meta["state"], meta["seq"], meta["tiles_seq"]) == ("finished", 7053, 7053)
+    assert (meta["state"], meta["seq"], meta["kept_seq"]) == ("finished", 7053, 7053)
     assert meta["keys"] == ["eval/r", "loss", "lr", "x"]
     for key in meta["keys"]:
-        blobs = ex.tiles([["r", key, "top"]])[0]
-        assert 1 <= len(blobs) <= 2
-        level = {tiles.decode(b).level for b in blobs}
-        assert len(level) == 1
-        for b in blobs:
-            t = tiles.decode(b)
-            assert b == expected_tile(rows, key, t.level, t.index)
-        finite = sum(1 for _, _, d in rows if key in d and np.isfinite(d[key]))
-        assert top_n(ex, "r", key) == finite
+        a = kept_of(ex, "r", key)
+        steps = [s for s, _, d in rows if key in d]
+        assert a.level == bk.kept_level(min(steps), max(steps)) and list(a.seq) == [7053] and a.paths == [""]
+        assert same(a.buckets, expected(rows, key, a.level))
+        assert kept_n(ex, "r", key) == sum(1 for _, _, d in rows if key in d and np.isfinite(d[key]))
 
 
-def test_overview_tiles_are_the_top_tiles_merged_overview_up_levels(root, tmp_path):
+def test_a_block_of_a_coarser_level_merges_the_kept_buckets(root, tmp_path):
     rows = mixed_rows(7053)
     write_chunked(root / "r", chunked(rows, [700, 1, 2000, 323, 1024, 5, 3000]))
     ex = explorer(root, tmp_path)
     for key in ex.run_meta("r")["keys"]:
-        top, overview = ex.tiles([["r", key, "top"], ["r", key, "overview"]])
-        assert overview == tiles.coarsen(top, trex_index.OVERVIEW_UP)
-        assert {tiles.decode(b).level for b in overview} == {tiles.decode(top[0]).level + trex_index.OVERVIEW_UP}
-        assert sum(int(tiles.decode(b).n.sum()) for b in overview) == top_n(ex, "r", key)
+        k = kept_of(ex, "r", key)
+        for up in (0, 2):
+            for index in bk.blocks(k.level + up, 0, 7053):
+                a = block(ex, key, k.level + up, index, runs=["r"])
+                assert a.paths == ["r"] and list(a.seq) == [7053] and a.level == k.level + up
+                want = bk.cut(bk.merge(k.buckets, up), index * bk.BLOCK, (index + 1) * bk.BLOCK)
+                assert same(of_run(a, "r"), want)
 
 
-def test_tile_bundle_answers_every_run_in_scope_like_per_run_requests(root, tmp_path):
+def test_a_scope_block_holds_every_run_under_it_that_logs_the_metric(root, tmp_path):
     for name in ("a/r1", "a/r2", "b/r3"):
         write_run(root / name, 600)
     write_run(root / "a" / "short", 1)
     ex = explorer(root, tmp_path)
-    for kind in ("top", "overview"):
-        got = ex.tile_bundle("odd", kind, "a")
-        assert [p for p, _ in got] == ["a/r1", "a/r2"]
-        assert [b for _, b in got] == ex.tiles([["a/r1", "odd", kind], ["a/r2", "odd", kind]])
+    level = kept_of(ex, "a/r1", "odd").level
+    a = block(ex, "odd", level, 0, "a")
+    assert a.paths == ["a/r1", "a/r2"] and list(a.seq) == [600, 600]
+    for p in a.paths:
+        assert same(of_run(a, p), of_run(block(ex, "odd", level, 0, runs=[p]), p))
+    assert block(ex, "odd", level, 0, runs=["a/r2", "nope", "a/short", "a/r2"]).paths == ["a/r2"]
 
 
-def test_a_bundle_body_follows_runs_added_and_removed(root, tmp_path):
+def test_a_scopes_finished_blocks_are_kept_until_its_finished_runs_change(root, tmp_path):
     write_run(root / "a" / "r1", 600)
     ex = explorer(root, tmp_path)
-    body = lambda: ex.tile_bundle_body("odd", "top", "")
-    assert body() == trex_index.frame_bundle(ex.tile_bundle("odd", "top", "")) and body() is body()
+    level = kept_of(ex, "a/r1", "odd").level
+    body = lambda: ex.buckets_body("odd", level, 0, "", None, "finished")
+    assert body() is body() and bk.decode(body()).paths == ["a/r1"]
     write_run(root / "a" / "r2", 600)
     ex.rewalk()
     ex.poll()
-    assert [p for p, _ in unframe_bundle(body())] == ["a/r1", "a/r2"]
+    assert bk.decode(body()).paths == ["a/r1", "a/r2"]
     shutil.rmtree(root / "a" / "r1")
     ex.rewalk()
     ex.poll()
-    assert unframe_bundle(body()) == ex.tile_bundle("odd", "top", "") and [p for p, _ in unframe_bundle(body())] == ["a/r2"]
+    assert bk.decode(body()).paths == ["a/r2"]
 
 
 def test_the_runs_body_follows_runs_added_and_folder_notes(root, tmp_path):
@@ -218,53 +257,54 @@ def test_every_response_isolates_the_page_so_it_may_share_memory_with_its_worker
             assert (r.headers["Cross-Origin-Opener-Policy"], r.headers["Cross-Origin-Embedder-Policy"]) == ("same-origin", "require-corp"), path
 
 
-def test_a_slab_holds_the_finished_runs_from_their_top_tiles_or_their_run_files(root, tmp_path):
+def test_a_block_holds_runs_from_their_kept_buckets_or_their_run_files(root, tmp_path):
     write_run(root / "a" / "short", 600)
     write_run(root / "a" / "long", 5000)
     live = write_run(root / "a" / "live", 600, finish=False)
+    assert wait_for(lambda: committed_rows(root / "a" / "live") == 600)
     ex = explorer(root, tmp_path)
-    top = lambda p: tiles.decode(ex.tiles([[p, "loss", "top"]])[0][0]).level
-    level = top("a/short") + 1
-    assert top("a/long") > level
-    s = tiles.decode_slab(ex.slab_body("loss", level, 0, "a"))
-    assert s.paths == ["a/long", "a/short"]
-    want = [tiles.decode(ex.tiles([["a/long", "loss", level, 0]])[0][0]),
-            next(t for t in map(tiles.decode, tiles.coarsen(ex.tiles([["a/short", "loss", "top"]])[0], 1)) if t.index == 0)]
-    for i, t in enumerate(want):
-        got = slice(s.first[i], s.first[i + 1])
-        assert np.array_equal(s.bucket[got], t.bucket) and np.array_equal(s.n[got], t.n)
-        np.testing.assert_allclose(s.mean[got], t.mean, rtol=1e-6)
-    assert ex.slab_body("loss", level, 0, "a") is ex.slab_body("loss", level, 0, "a")
+    level = kept_of(ex, "a/short", "loss").level + 1
+    assert kept_of(ex, "a/long", "loss").level > level and kept_of(ex, "a/live", "loss").level < level
+    a = block(ex, "loss", level, 0, "a", which="finished")
+    assert a.paths == ["a/long", "a/short"] and list(a.seq) == [5000, 600]
+    s, v, t = run_points(root, "a/long", "loss")
+    assert same(of_run(a, "a/long"), bk.cut(bk.bucketize(s, v, t, level), 0, bk.BLOCK))
+    assert same(of_run(a, "a/short"), bk.cut(bk.merge(kept_of(ex, "a/short", "loss").buckets, 1), 0, bk.BLOCK))
+    every = block(ex, "loss", level, 0, "a")
+    assert every.paths == ["a/live", "a/long", "a/short"] and list(every.seq) == [600, 5000, 600]
+    assert same(of_run(every, "a/live"), bk.cut(bk.merge(kept_of(ex, "a/live", "loss").buckets, 1), 0, bk.BLOCK))
+    assert block(ex, "loss", level, 0, "a", which="running").paths == ["a/live"]
+    assert ex.buckets_body("loss", level, 0, "a", None, "finished") is ex.buckets_body("loss", level, 0, "a", None, "finished")
     live.finish()
 
 
-def test_a_slab_builds_the_tiles_it_lacks_on_the_process_pool_as_the_run_files_hold_them(root, tmp_path, monkeypatch):
-    monkeypatch.setattr(trex_index, "INLINE_TILES", 0)
+def test_a_block_builds_what_runs_keep_coarser_on_the_process_pool_as_the_run_files_hold_it(root, tmp_path, monkeypatch):
+    monkeypatch.setattr(trex_index, "INLINE_BUILDS", 0)
     for name in ("a/r1", "a/r2"):
         write_run(root / name, 3000)
     ex = explorer(root, tmp_path, workers=2)
-    level = tiles.decode(ex.tiles([["a/r1", "loss", "top"]])[0][0]).level - 1
-    s = tiles.decode_slab(ex.slab_body("loss", level, 0, "a"))
-    for i, path in enumerate(s.paths):
-        t = tiles.decode(trex_index.build_tile(str(root / path), "loss", level, 0)[0])
-        got = slice(s.first[i], s.first[i + 1])
-        assert np.array_equal(s.bucket[got], t.bucket) and np.array_equal(s.n[got], t.n)
+    level = kept_of(ex, "a/r1", "loss").level - 1
+    a = block(ex, "loss", level, 0, "a")
+    assert a.paths == ["a/r1", "a/r2"]
+    for p in a.paths:
+        assert same(of_run(a, p), bk.decode(trex_index.build_block(str(root / p), "loss", level, 0)[0]).buckets)
 
 
-def test_a_slab_stays_while_running_runs_grow_and_changes_once_one_finishes(root, tmp_path, monkeypatch):
-    monkeypatch.setattr(trex_index, "TOP_REFRESH", 0.0)
+def test_a_finished_block_stays_while_running_runs_grow_and_changes_once_one_finishes(root, tmp_path, monkeypatch):
+    monkeypatch.setattr(trex_index, "KEPT_REFRESH", 0.0)
     write_run(root / "a" / "done", 300)
     live = write_run(root / "a" / "live", 300, finish=False)
     ex = explorer(root, tmp_path)
-    level = tiles.decode(ex.tiles([["a/done", "loss", "top"]])[0][0]).level + 1
-    first = ex.slab_body("loss", level, 0, "a")
+    level = kept_of(ex, "a/done", "loss").level + 1
+    finished = lambda: ex.buckets_body("loss", level, 0, "a", None, "finished")
+    first = finished()
     for i in range(300, 400):
         live.log({"loss": 1.0 / (i + 1)}, step=i)
-    assert wait_for(lambda: (ex.poll(), ex.records["a/live"]["tiles_seq"] >= 400)[1])
-    assert ex.slab_body("loss", level, 0, "a") is first and tiles.decode_slab(first).paths == ["a/done"]
+    assert wait_for(lambda: (ex.poll(), ex.records["a/live"]["kept_seq"] >= 400)[1])
+    assert finished() is first and bk.decode(first).paths == ["a/done"]
     live.finish()
     assert wait_for(lambda: (ex.poll(), ex.records["a/live"]["state"] != "running")[1])
-    assert tiles.decode_slab(ex.slab_body("loss", level, 0, "a")).paths == ["a/done", "a/live"]
+    assert bk.decode(finished()).paths == ["a/done", "a/live"]
 
 
 def saved_levels(ex):
@@ -272,49 +312,49 @@ def saved_levels(ex):
     return sorted(f.name for f in d.iterdir() if not f.name.endswith(".tmp")) if d.exists() else []
 
 
-def test_a_new_explorer_cuts_slabs_from_the_levels_an_earlier_one_saved(root, tmp_path, monkeypatch):
+def test_a_new_explorer_cuts_blocks_from_the_levels_an_earlier_one_saved(root, tmp_path, monkeypatch):
     for name in ("a/r1", "a/r2", "b/r3"):
         write_run(root / name, 3000)
     ex = explorer(root, tmp_path)
-    level = tiles.decode(ex.tiles([["a/r1", "loss", "overview"]])[0][0]).level
-    want = {(lv, scope): ex.slab_body("loss", lv, 0, scope) for lv in (level, level - 1) for scope in ("", "a")}
+    level = kept_of(ex, "a/r1", "loss").level
+    want = {(lv, scope): ex.buckets_body("loss", lv, 0, scope, None, "finished") for lv in (level, level + 2) for scope in ("", "a")}
     assert wait_for(lambda: saved_levels(ex))
     ex.close()
 
     def unread(*_):
-        raise AssertionError("tiles decoded")
-    monkeypatch.setattr(tiles, "stack", unread)
+        raise AssertionError("kept buckets read")
+    monkeypatch.setattr(bk, "stack", unread)
     again = explorer(root, tmp_path)
-    assert {k: again.slab_body("loss", *k[:1], 0, k[1]) for k in want} == want
+    assert {k: again.buckets_body("loss", k[0], 0, k[1], None, "finished") for k in want} == want
 
 
 def test_saved_levels_are_left_unused_once_the_finished_runs_change(root, tmp_path):
     for name in ("a/r1", "a/r2"):
         write_run(root / name, 3000)
     ex = explorer(root, tmp_path)
-    level = tiles.decode(ex.tiles([["a/r1", "loss", "overview"]])[0][0]).level
-    ex.slab_body("loss", level, 0, "a")
+    level = kept_of(ex, "a/r1", "loss").level + 1
+    ex.buckets_body("loss", level, 0, "a", None, "finished")
     assert wait_for(lambda: saved_levels(ex))
     ex.close()
     write_run(root / "a" / "r3", 3000, metrics=lambda i: {"loss": 5.0})
     again = explorer(root, tmp_path)
-    s = tiles.decode_slab(again.slab_body("loss", level, 0, "a"))
-    assert s.paths == ["a/r1", "a/r2", "a/r3"] and np.all(s.mean[s.first[2]:s.first[3]] == 5.0)
+    a = block(again, "loss", level, 0, "a", which="finished")
+    assert a.paths == ["a/r1", "a/r2", "a/r3"] and np.all(of_run(a, "a/r3").mean == 5.0)
 
 
 def test_a_metric_saves_its_levels_at_most_once_every_levels_save_every(root, tmp_path, monkeypatch):
     monkeypatch.setattr(trex_index, "LEVELS_SAVE_EVERY", 3600.0)
     write_run(root / "a" / "r1", 3000)
     ex = explorer(root, tmp_path)
-    level = tiles.decode(ex.tiles([["a/r1", "loss", "overview"]])[0][0]).level
-    ex.slab_body("loss", level, 0, "a")
+    level = kept_of(ex, "a/r1", "loss").level + 1
+    ex.buckets_body("loss", level, 0, "a", None, "finished")
     assert wait_for(lambda: saved_levels(ex))
     f = ex.cache_dir / "levels" / saved_levels(ex)[0]
     before = f.read_bytes()
     write_run(root / "a" / "r2", 3000)
     ex.rewalk()
     ex.poll()
-    assert tiles.decode_slab(ex.slab_body("loss", level, 0, "a")).paths == ["a/r1", "a/r2"]
+    assert block(ex, "loss", level, 0, "a", which="finished").paths == ["a/r1", "a/r2"]
     time.sleep(0.5)
     assert f.read_bytes() == before
 
@@ -331,110 +371,100 @@ def test_saved_levels_beyond_their_budget_go_least_recently_used_first(tmp_path)
 def test_a_changed_cache_version_deletes_the_saved_levels(root, tmp_path, monkeypatch):
     write_run(root / "a" / "r1", 3000)
     ex = explorer(root, tmp_path)
-    ex.slab_body("loss", tiles.decode(ex.tiles([["a/r1", "loss", "overview"]])[0][0]).level, 0, "a")
+    ex.buckets_body("loss", kept_of(ex, "a/r1", "loss").level, 0, "a", None, "finished")
     assert wait_for(lambda: saved_levels(ex))
     ex.close()
     monkeypatch.setattr(trex_index, "CACHE_VERSION", trex_index.CACHE_VERSION + 1)
     assert saved_levels(explorer(root, tmp_path)) == []
 
 
-def test_http_slab_answers_the_slab_and_info_states_the_protocol(http, root):
-    ex, url = http
-    write_run(root / "x" / "r1", 300)
-    ex.rewalk()
-    ex.poll()
-    body = json.dumps({"key": "loss", "level": 0, "index": 0, "scope": "x"}).encode()
-    with urllib.request.urlopen(urllib.request.Request(f"{url}/api/tiles/slab", data=body)) as r:
-        assert r.read() == ex.slab_body("loss", 0, 0, "x")
-    with urllib.request.urlopen(f"{url}/api/info") as r:
-        assert json.loads(r.read())["protocol"] == server.PROTOCOL
-
-
-def test_http_tile_bundle_frames_paths_and_tiles(http, root):
+def test_http_buckets_answers_the_block_and_info_states_the_protocol(http, root):
     ex, url = http
     for name in ("x/r1", "x/r2"):
         write_run(root / name, 300)
     ex.rewalk()
     ex.poll()
-    req = urllib.request.Request(f"{url}/api/tiles/bundle", data=json.dumps({"key": "loss", "kind": "top", "scope": "x"}).encode())
-    with urllib.request.urlopen(req) as r:
-        body = r.read()
-    n, off, got = int.from_bytes(body[:4], "little"), 4, []
-    for _ in range(n):
-        plen = int.from_bytes(body[off: off + 4], "little")
-        path = body[off + 4: off + 4 + plen].decode()
-        off += 4 + plen + (-plen % 4)
-        k = int.from_bytes(body[off: off + 4], "little")
-        off += 4
-        blobs = []
-        for _ in range(k):
-            m = int.from_bytes(body[off: off + 4], "little")
-            blobs.append(body[off + 4: off + 4 + m])
-            off += 4 + m
-        got.append((path, blobs))
-    assert off == len(body) and got == ex.tile_bundle("loss", "top", "x")
+
+    def post(body):
+        return urllib.request.urlopen(urllib.request.Request(f"{url}/api/buckets", data=json.dumps(body).encode())).read()
+
+    assert post({"key": "loss", "level": 0, "index": 0, "scope": "x"}) == ex.buckets_body("loss", 0, 0, "x")
+    assert post({"key": "loss", "level": 0, "index": 1, "runs": ["x/r2"]}) == ex.buckets_body("loss", 0, 1, runs=["x/r2"])
+    assert post({"key": "loss", "level": 2, "index": 0, "scope": "x", "which": "finished"}) == ex.buckets_body("loss", 2, 0, "x", None, "finished")
+    for bad in ({"key": "loss", "level": 0.5, "index": 0}, {"key": "loss", "level": 0, "index": 0, "which": "some"},
+                {"key": "loss", "level": bk.MAX_LEVEL + 1, "index": 0}, {"key": "loss", "level": 0, "index": 0, "runs": "x/r1"},
+                {"level": 0, "index": 0}):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            post(bad)
+        assert e.value.code == 400, bad
+    with urllib.request.urlopen(f"{url}/api/info") as r:
+        assert json.loads(r.read())["protocol"] == server.PROTOCOL
 
 
-def test_finer_tiles_are_built_from_the_run_and_served_from_cache(root, tmp_path, monkeypatch):
+def test_blocks_finer_than_a_run_keeps_are_built_from_its_file_and_served_from_cache(root, tmp_path, monkeypatch):
     rows = mixed_rows(5000)
     write_chunked(root / "r", chunked(rows, [1000] * 5))
     ex = explorer(root, tmp_path)
-    want = [["r", "loss", 2, 3], ["r", "lr", 0, 7], ["r", "x", -1, 0], ["r", "loss", 5, 99]]
-    first = ex.tiles(want)
-    assert [b for (b,) in first] == [expected_tile(rows, k, L, i) for _, k, L, i in want]
-    monkeypatch.setattr(Explorer, "_build", lambda *a: pytest.fail("cached tile rebuilt"))
-    assert ex.tiles(want) == first
-    assert ex.tiles([["r", "nope", 0, 0], ["nope", "loss", 0, 0], ["nope", "loss", "top"]]) == [[], [], []]
+    want = [("loss", 2, 3), ("lr", 0, 7), ("x", -1, 0), ("loss", 5, 99)]
+    first = [ex.buckets_body(k, lv, i, runs=["r"]) for k, lv, i in want]
+    for (k, lv, i), body in zip(want, first):
+        a = bk.decode(body)
+        assert (a.paths, list(a.seq), a.level) == (["r"], [5000], lv) and same(of_run(a, "r"), expected(rows, k, lv, i))
+    assert wait_for(lambda: stored(ex) == [(-1, 0), (0, 7), (2, 3)])
+    monkeypatch.setattr(trex_index, "build_block", lambda *a: pytest.fail("a cached block was built again"))
+    assert [ex.buckets_body(k, lv, i, runs=["r"]) for k, lv, i in want] == first
+    assert block(ex, "nope", 0, 0, runs=["r"]).paths == [] and block(ex, "loss", 0, 0, runs=["nope"]).paths == []
     with pytest.raises(ValueError):
-        ex.tiles([["r", "loss", tiles.MAX_LEVEL + 1, 0]])
+        ex.buckets_body("loss", bk.MAX_LEVEL + 1, 0, runs=["r"])
 
 
-def test_cached_tile_is_rebuilt_only_when_new_rows_reach_its_step_range(root, tmp_path, monkeypatch):
+def test_a_cached_block_is_built_again_only_when_new_rows_reach_its_step_range(root, tmp_path, monkeypatch):
     run = trex.init(root / "r", commit_interval=0.01)
     for i in range(3000):
         run.log({"loss": float(i)}, step=i)
     assert wait_for(lambda: committed_rows(root / "r") == 3000)
     ex = explorer(root, tmp_path)
-    early, edge = ["r", "loss", 0, 0], ["r", "loss", 0, 11]
-    ex.tiles([early, edge])
+    for i in (0, 11):
+        ex.buckets_body("loss", 0, i, runs=["r"])
+    assert wait_for(lambda: stored(ex) == [(0, 0), (0, 11)])
     for i in range(3000, 3500):
         run.log({"loss": float(i)}, step=i)
     run.finish()
     ex.poll()
     built = []
-    real = Explorer._build
-    monkeypatch.setattr(Explorer, "_build", lambda self, *a: (built.append(list(a)), real(self, *a))[1])
-    got = ex.tiles([early, edge])
-    assert built == [edge[:2] + edge[2:]]
+    real = trex_index.build_block
+    monkeypatch.setattr(trex_index, "build_block", lambda *a: (built.append(a[2:]), real(*a))[1])
+    got = [block(ex, "loss", 0, i, runs=["r"]) for i in (0, 11)]
+    assert built == [(0, 11)]
     s, v, t = run_points(root, "r", "loss")
-    assert got == [[tiles.build(s, v, t, 0, 0)], [tiles.build(s, v, t, 0, 11)]]
-    assert tiles.decode(got[1][0]).n.sum() == 256
+    for a, i in zip(got, (0, 11)):
+        assert same(of_run(a, "r"), bk.cut(bk.bucketize(s, v, t, 0), i * bk.BLOCK, (i + 1) * bk.BLOCK))
+    assert of_run(got[1], "r").n.sum() == 256 and list(got[1].seq) == [3500]
 
 
-def test_tile_cache_evicts_least_recently_used_finer_tiles_and_keeps_top_tiles(root, tmp_path, monkeypatch):
+def test_the_block_cache_evicts_the_least_recently_used_built_blocks_and_keeps_the_kept_buckets(root, tmp_path, monkeypatch):
     write_run(root / "r", 4000)
     ex = explorer(root, tmp_path)
-    top = ex.tiles([["r", "loss", "top"]])
-    size = len(ex.tiles([["r", "loss", 0, 0]])[0][0])
-    monkeypatch.setattr(trex_index, "TILE_CACHE_BYTES", 4 * size)
+    kept = kept_blob(ex, "r", "loss")
+    ex.buckets_body("loss", 0, 0, runs=["r"])
+    assert wait_for(lambda: stored(ex) == [(0, 0)])
+    size = ex.cached_bytes
+    monkeypatch.setattr(trex_index, "BLOCK_CACHE_BYTES", 4 * size)
     for i in range(1, 15):
-        ex.tiles([["r", "loss", 0, i]])
-    c = sqlite3.connect(ex.db_path)
-    cached = c.execute("SELECT level, idx FROM tiles WHERE kind = 0 ORDER BY idx").fetchall()
-    stored = c.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE kind = 0").fetchone()[0]
-    c.close()
-    assert stored <= 4 * size and (0, 14) in cached and (0, 0) not in cached
-    assert ex.tiles([["r", "loss", "top"]]) == top
+        ex.buckets_body("loss", 0, i, runs=["r"])
+        assert wait_for(lambda: (0, i) in stored(ex))
+    assert ex.cached_bytes <= 4 * size and (0, 14) in stored(ex) and (0, 0) not in stored(ex)
+    assert kept_blob(ex, "r", "loss") == kept
 
 
-def test_live_run_streams_contiguous_rows_and_refreshes_top_tiles_on_finish(root, tmp_path):
+def test_live_run_streams_contiguous_rows_and_refreshes_its_kept_buckets_on_finish(root, tmp_path):
     run = trex.init(root / "live", commit_interval=0.05)
     run.log({"x": 0})
     assert wait_for(lambda: committed_rows(root / "live") == 1)
     ex = explorer(root, tmp_path)
     sub = ex.hub.subscribe("")
     seen = ex.run_meta("live")["seq"]
-    assert ex.run_meta("live")["tiles_seq"] == seen
+    assert ex.run_meta("live")["kept_seq"] == seen
     for i in range(1, 30):
         run.log({"x": i})
         if i % 10 == 0:
@@ -449,11 +479,11 @@ def test_live_run_streams_contiguous_rows_and_refreshes_top_tiles_on_finish(root
             seen += len(data["rows"])
     assert seen == 30
     last = [d for e, d in events if e == "run"][-1]
-    assert (last["state"], last["tiles_seq"]) == ("finished", 30)
-    assert top_n(ex, "live", "x") == 30
+    assert (last["state"], last["kept_seq"]) == ("finished", 30)
+    assert kept_n(ex, "live", "x") == 30
 
 
-def test_growing_run_top_tiles_refresh_after_the_refresh_interval(root, tmp_path, monkeypatch):
+def test_a_growing_runs_kept_buckets_refresh_after_the_refresh_interval(root, tmp_path, monkeypatch):
     run = trex.init(root / "r", commit_interval=0.01)
     run.log({"x": 0.0}, step=0)
     assert wait_for(lambda: committed_rows(root / "r") == 1)
@@ -462,14 +492,14 @@ def test_growing_run_top_tiles_refresh_after_the_refresh_interval(root, tmp_path
         run.log({"x": float(i)}, step=i)
     assert wait_for(lambda: committed_rows(root / "r") == 100)
     ex.poll()
-    assert (ex.run_meta("r")["seq"], ex.run_meta("r")["tiles_seq"]) == (100, 1)
-    monkeypatch.setattr(trex_index, "TOP_REFRESH", 0.0)
+    assert (ex.run_meta("r")["seq"], ex.run_meta("r")["kept_seq"]) == (100, 1)
+    monkeypatch.setattr(trex_index, "KEPT_REFRESH", 0.0)
     ex.poll()
-    assert ex.run_meta("r")["tiles_seq"] == 100 and top_n(ex, "r", "x") == 100
+    assert ex.run_meta("r")["kept_seq"] == 100 and kept_n(ex, "r", "x") == 100
     run.finish()
 
 
-def test_silent_running_run_becomes_crashed_with_complete_top_tiles(root, tmp_path, monkeypatch):
+def test_a_silent_running_run_becomes_crashed_with_complete_kept_buckets(root, tmp_path, monkeypatch):
     run = write_run(root / "r", 10, finish=False)
     assert wait_for(lambda: committed_rows(root / "r") == 10)
     ex = explorer(root, tmp_path)
@@ -477,11 +507,11 @@ def test_silent_running_run_becomes_crashed_with_complete_top_tiles(root, tmp_pa
         run.log({"loss": 0.0}, step=i)
     assert wait_for(lambda: committed_rows(root / "r") == 20)
     ex.poll()
-    assert ex.run_meta("r")["state"] == "running" and ex.run_meta("r")["tiles_seq"] == 10
+    assert ex.run_meta("r")["state"] == "running" and ex.run_meta("r")["kept_seq"] == 10
     monkeypatch.setattr(trex_index, "CRASH_AFTER", 0.0)
     ex.poll()
     meta = ex.run_meta("r")
-    assert meta["state"] == "crashed" and meta["tiles_seq"] == 20 and top_n(ex, "r", "loss") == 20
+    assert meta["state"] == "crashed" and meta["kept_seq"] == 20 and kept_n(ex, "r", "loss") == 20
     run.finish()
 
 
@@ -513,8 +543,8 @@ def test_pool_and_inline_indexing_produce_identical_index(root, tmp_path, monkey
     assert {p: sorted(x.name for x in p.iterdir()) for p in root.glob("sweep/*")} == before
     assert [m[4] for m in a["media"]] == ["html", "image"] and a["media"][0][6] == zlib.crc32(b"<p>1</p>")
     for path, st in a["runs"]:
-        assert st["tiles_seq"] == st["seq"]
-        assert {k for p, k, *_ in a["tiles"] if p == path} == set(st["keys"])
+        assert st["kept_seq"] == st["seq"]
+        assert {k for p, k, *_ in a["kept"] if p == path} == set(st["keys"])
 
 
 def test_live_rows_are_contiguous_while_the_writer_commits(root, tmp_path):
@@ -563,18 +593,18 @@ def test_run_whose_row_count_shrank_under_the_same_id_is_dropped_and_reindexed(r
     ex = explorer(root, tmp_path)
     uid = ex.run_meta("r")["uid"]
     assert ex.run_meta("r")["seq"] == 50
-    ex.tiles([["r", "loss", 0, 0]])
+    ex.buckets_body("loss", 0, 0, runs=["r"])
     sub = ex.hub.subscribe("")
     shutil.copy(old, root / "r" / "trex.sqlite")
     ex.poll()
     events = drain(sub)
     assert events[0] == ("delete", {"run": "r"})
     meta = ex.run_meta("r")
-    assert (meta["uid"], meta["seq"], meta["tiles_seq"]) == (uid, 20, 20)
-    assert top_n(ex, "r", "loss") == 20 and tiles.decode(ex.tiles([["r", "loss", 0, 0]])[0][0]).n.sum() == 20
+    assert (meta["uid"], meta["seq"], meta["kept_seq"]) == (uid, 20, 20)
+    assert kept_n(ex, "r", "loss") == 20 and of_run(block(ex, "loss", 0, 0, runs=["r"]), "r").n.sum() == 20
 
 
-def test_http_stream_sends_rows_beyond_top_tiles_then_live_rows(http, root):
+def test_http_stream_sends_rows_beyond_the_kept_buckets_then_live_rows(http, root):
     ex, url = http
     run = trex.init(root / "s" / "r", commit_interval=0.05)
     run.log({"x": 0})
@@ -607,33 +637,6 @@ def test_http_stream_sends_rows_beyond_top_tiles_then_live_rows(http, root):
     assert ev == "rows" and data["seq0"] == 3 and data["rows"][0][2] == {"x": 3, "bad": "inf"}
     run.finish()
     r.close()
-
-
-def test_http_tiles_frame_each_request_in_order(http, root):
-    ex, url = http
-    write_run(root / "r", 3000)
-    ex.rewalk()
-    ex.poll()
-    want = [["r", "loss", "top"], ["r", "nope", 0, 0], ["r", "odd", 1, 2], ["r", "loss", 0, 0]]
-    expect = ex.tiles(want)
-    req = urllib.request.Request(f"{url}/api/tiles", data=json.dumps(want).encode())
-    with urllib.request.urlopen(req) as r:
-        body = r.read()
-    got, off = [], 0
-    while off < len(body):
-        k = int.from_bytes(body[off: off + 4], "little")
-        off += 4
-        blobs = []
-        for _ in range(k):
-            n = int.from_bytes(body[off: off + 4], "little")
-            blobs.append(body[off + 4: off + 4 + n])
-            off += 4 + n
-        got.append(blobs)
-    assert got == expect and [len(b) for b in got] == [1, 0, 1, 1]
-    bad = urllib.request.Request(f"{url}/api/tiles", data=json.dumps([["r", "loss", 999, 0]]).encode())
-    with pytest.raises(urllib.error.HTTPError) as e:
-        urllib.request.urlopen(bad)
-    assert e.value.code == 400
 
 
 def test_walk_finds_nested_runs_and_skips_hidden_env_and_run_internals(root, tmp_path):
@@ -791,9 +794,9 @@ def test_http_media_ranges_cover_suffixes_open_ends_and_unsatisfiable_starts(htt
     ("GET", "/api/run", None, 404),
     ("GET", "/api/rows?path=r&from=x", None, 400),
     ("GET", "/api/nothing", None, 404),
-    ("POST", "/api/tiles", b'{"not": "a list"}', 400),
-    ("POST", "/api/tiles", b"not json", 400),
-    ("POST", "/api/tiles/bundle", b'{"key": "loss", "kind": "fine"}', 400),
+    ("POST", "/api/buckets", b'["not", "an object"]', 400),
+    ("POST", "/api/buckets", b"not json", 400),
+    ("POST", "/api/buckets", b'{"key": "loss", "level": 0, "index": 0, "which": "fine"}', 400),
 ])
 def test_http_bad_requests_are_client_errors_with_a_json_message(http, root, method, path, body, status):
     ex, url = http
@@ -827,7 +830,7 @@ def test_deleted_run_directory_is_dropped_and_announced(root, tmp_path):
     shutil.rmtree(root / "a")
     ex.rewalk()
     assert drain(sub) == [("delete", {"run": "a"})]
-    assert [r["id"] for r in ex.runs("")["runs"]] == ["b"] and ex.tiles([["a", "loss", "top"]]) == [[]]
+    assert [r["id"] for r in ex.runs("")["runs"]] == ["b"] and block(ex, "loss", 0, 0, runs=["a"]).paths == []
     with pytest.raises(KeyError):
         ex.run_meta("a")
 
@@ -910,7 +913,7 @@ def test_close_stops_polling_ends_subscriptions_and_closes_connections(root, tmp
         ex._writer.execute("SELECT 1")
 
 
-def test_a_shared_tile_budget_evicts_the_least_recently_used_tiles_of_any_explorer(tmp_path, monkeypatch):
+def test_a_shared_block_budget_evicts_the_least_recently_used_blocks_of_any_explorer(tmp_path, monkeypatch):
     roots = [tmp_path / "a", tmp_path / "b"]
     for r in roots:
         write_run(r / "r", 300)
@@ -919,25 +922,19 @@ def test_a_shared_tile_budget_evicts_the_least_recently_used_tiles_of_any_explor
     probe = Explorer(roots[0], tmp_path / "probe")
     probe.rewalk()
     probe.poll()
-    size = len(probe.tiles([["r", "loss", -6, 0]])[0][0])
-    budget = trex_index.TileBudget(limit=int(4.5 * size))
+    probe.buckets_body("loss", -6, 0, runs=["r"])
+    assert wait_for(lambda: probe.cached_bytes > 0)
+    size = probe.cached_bytes
+    budget = trex_index.BlockBudget(limit=int(4.5 * size))
     a, b = (Explorer(r, tmp_path / "cache", budget=budget) for r in roots)
     for ex in (a, b):
         ex.rewalk()
         ex.poll()
-    a.tiles([["r", "loss", -6, i] for i in range(3)])
-    b.tiles([["r", "loss", -6, i] for i in range(3)])
-
-    def cached(ex):
-        c = sqlite3.connect(ex.db_path)
-        try:
-            idx = [i for (i,) in c.execute("SELECT idx FROM tiles WHERE kind = 0 ORDER BY idx")]
-            return idx, c.execute("SELECT coalesce(sum(length(data)), 0) FROM tiles WHERE kind = 0").fetchone()[0]
-        finally:
-            c.close()
-
-    (kept_a, bytes_a), (kept_b, bytes_b) = cached(a), cached(b)
-    assert kept_a == [2] and kept_b == [0, 1, 2] and budget.used() == bytes_a + bytes_b <= 4.5 * size
+        for i in range(3):
+            ex.buckets_body("loss", -6, i, runs=["r"])
+            assert wait_for(lambda: (-6, i) in stored(ex))
+    assert [i for _, i in stored(a)] == [2] and [i for _, i in stored(b)] == [0, 1, 2]
+    assert budget.used() == a.cached_bytes + b.cached_bytes <= 4.5 * size
 
 
 def slow_scans(monkeypatch, seconds):

@@ -2,8 +2,8 @@
 
 Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, panels of
 hidden runs, the filter box, console errors, UI line coverage (at least UI_COVERAGE of the modules' code lines run),
-and that a client dropping every 5th stream event still converges to the run files: every row and media item, and top tiles whose
-bucket counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
+and that a client dropping every 5th stream event still converges to the run files: every row and media item, and columns whose
+points' counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
 a directory with `trex serve -y`, the root view of both, making a workspace of them in the panel the trex
 brand opens, and from that panel removing a directory and re-adding it from the remembered ones.
 
@@ -152,41 +152,40 @@ def group_medians(group, g0, dx, bins):
     return out
 
 
-def slab_smoke(page, url, runs):
-    """Whether a zoom of more runs than a chart draws one by one draws from slabs, as group statistics (each group's
-    median per bin of its runs' means of their rows) and as a heatmap, while `?shared=0` draws from columns; and
-    whether a server of another protocol is stated."""
+def binned_smoke(page, url, runs):
+    """Whether a zoom of more runs than a chart draws one by one draws them from bins of their buckets, as group
+    statistics (each group's median per bin of its runs' means of their rows), with workers and without, and as a
+    heatmap, which Canvas 2D draws as lines; and whether a server of another protocol is stated."""
     subprocess.run([sys.executable, "-c", MANY_WRITER, str(runs)], check=True)
-    drawn = {}
-    for q in ("", "shared=0"):
-        page.goto(f"{url}/?slabs&{q}#path=many&group=run~1")
+
+    def zoomed(query, hash_):
+        page.goto(f"{url}/?binned&{query}#path=many&{hash_}")
         page.wait_for_function("window.app && app.data.runs.size === 320", timeout=60000)
         page.wait_for_function(SETTLED, timeout=60000)
         page.evaluate("app.setXRange([60, 140, 0])")
         page.wait_for_timeout(300)
         page.wait_for_function(SETTLED, timeout=60000)
+
+    drawn = {}
+    for q in ("", "shared=0"):
+        zoomed(q, "group=run~1")
         drawn[q] = page.evaluate("""(() => { const c = app.charts.get('loss');
-            return [c.fromSlabs, c.view.lines.map((l) => [l.label.split(' ')[0], l.g0, l.dx, [...l.center]])]; })()""")
-    page.goto(f"{url}/?slabs#path=many&group=run")
-    page.wait_for_function("window.app && app.data.runs.size === 320", timeout=60000)
-    page.wait_for_function(SETTLED, timeout=60000)
-    page.evaluate("app.setXRange([60, 140, 0])")
-    page.wait_for_timeout(300)
-    page.wait_for_function(SETTLED, timeout=60000)
-    heat = page.evaluate("(() => { const c = app.charts.get('loss'); return [c.fromSlabs, c.view.density, c.view.lines.length]; })()")
-    page.goto(f"{url}/?slabs&gl=0#path=many&group=run")
-    page.wait_for_function("window.app && app.data.runs.size === 320", timeout=60000)
-    page.wait_for_function(SETTLED, timeout=60000)
-    canvas = page.evaluate("(() => { const c = app.charts.get('loss'); return [!!c.fromSlabs, c.view?.lines.length ?? 0]; })()")
+            return [c.binned, c.view.lines.map((l) => [l.label.split(' ')[0], l.g0, l.dx, [...l.center]])]; })()""")
+    zoomed("", "group=run")
+    heat = page.evaluate("(() => { const c = app.charts.get('loss'); return [c.binned, c.view.density, c.view.lines.length]; })()")
+    zoomed("gl=0", "group=run")
+    canvas = page.evaluate("(() => { const c = app.charts.get('loss'); return [!!c.binned, c.view?.lines.length ?? 0]; })()")
     page.evaluate("app.showProtocol(1)")
     stated = page.evaluate("[!document.querySelector('#mismatch').hidden, document.querySelector('#mismatch').title]")
-    slabbed, lines = drawn[""]
-    off = [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
-    print(f"slabs: a zoom of 320 runs drew from slabs {slabbed} (with shared=0: {drawn['shared=0'][0]}), groups {[l[0] for l in lines]} of "
-          f"{len(lines[0][3]) if lines else 0} bins, at most {max(off, default=1):.2g} off their exact medians; heatmap from slabs {heat}, "
-          f"in Canvas 2D from columns {canvas}; protocol 1 stated {stated}")
-    return (slabbed is True and drawn["shared=0"][0] is False and sorted(l[0] for l in lines) == ["a", "b"] and off and max(off) < 1e-5
-            and heat == [True, True, 320] and canvas == [False, 320] and stated[0] and "the server 1" in stated[1])
+    off = {q: [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
+           for q, (_, lines) in drawn.items()}
+    groups = sorted(l[0] for l in drawn[""][1])
+    print(f"binned: a zoom of 320 runs drew bins of their buckets {drawn[''][0]} (without workers {drawn['shared=0'][0]}), groups {groups}"
+          f" of {len(drawn[''][1][0][3]) if drawn[''][1] else 0} bins, at most {max(off[''], default=1):.2g} off their exact medians "
+          f"({max(off['shared=0'], default=1):.2g} without workers); heatmap {heat}, in Canvas 2D as lines {canvas}; protocol 1 stated {stated}")
+    return (drawn[""][0] is True and drawn["shared=0"][0] is True and groups == ["a", "b"] and off[""] and max(off[""]) < 1e-5
+            and off["shared=0"] and max(off["shared=0"]) < 1e-5 and heat == [True, True, 320] and canvas == [False, 320]
+            and stated[0] and "the server 1" in stated[1])
 
 
 class JsCoverage:
@@ -791,7 +790,7 @@ def main():
     subprocess.run([sys.executable, str(REPO / "examples/demo.py"), str(runs / "sweep"), "--seeds", "3", "--steps", "1500"], check=True)
     subprocess.run([sys.executable, "-c", NESTED_WRITER, str(runs)], check=True)
     port = free_port()
-    env = {**os.environ, "TREX_DAEMON_DIR": str(tmp / "daemon"), "TREX_TOP_REFRESH": "1"}
+    env = {**os.environ, "TREX_DAEMON_DIR": str(tmp / "daemon"), "TREX_KEPT_REFRESH": "1"}
     server = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs), "--standalone", "--port", str(port),
                                "--cache", str(tmp / "cache")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     url = f"http://127.0.0.1:{port}"
@@ -829,7 +828,7 @@ def main():
             ok &= check("filter_smoke", filter_smoke(page, url))
             ok &= check("interactions_smoke", interactions_smoke(page, url))
             ok &= check("flicker_smoke", flicker_smoke(page, url, runs))
-            ok &= check("slab_smoke", slab_smoke(page, url, runs))
+            ok &= check("binned_smoke", binned_smoke(page, url, runs))
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])
             deadline = time.time() + 20
             while not (runs / "live").exists() and time.time() < deadline:
@@ -850,19 +849,24 @@ def main():
             client = page.evaluate("""() => {
                 const out = {};
                 for (const r of app.data.runs.values()) {
-                    const tiles = {};
-                    for (const [k, e] of r.tiles) if (e.top) tiles[k] = { seq: e.topSeq, n: e.top.reduce((s, t) => { for (let i = 0; i < t.count; i++) s += t.u32[t.f + 5 * t.count + i]; return s; }, 0) };
-                    out[r.id] = { seq: r.seq, media: r.mseq, tiles, tail: r.tail.length };
+                    const cols = {};
+                    for (const [k, c] of r.cols) {
+                        let n = 0;
+                        for (let i = 0; i < c.n; i++) n += c.w ? c.w[i] : 1;
+                        cols[k] = { n, seqs: (app.data.partsOf(r, k) || []).map((p) => p.v.seq[p.row]) };
+                    }
+                    out[r.id] = { seq: r.seq, media: r.mseq, cols, tail: r.tail.length };
                 }
                 return { runs: out, dropped: app.data.dropped };
             }""")
             for rid, c in sorted(client["runs"].items()):
                 n, finite, mseq = file_columns(runs / rid)
-                tiles = {k: t["n"] for k, t in c["tiles"].items()}
-                match = (c["seq"] == n and c["media"] == mseq and c["tail"] == 0 and tiles
-                         and all(t["seq"] == n for t in c["tiles"].values()) and all(tiles[k] == finite.get(k, 0) for k in tiles))
+                counts = {k: col["n"] for k, col in c["cols"].items()}
+                match = (c["seq"] == n and c["media"] == mseq and c["tail"] == 0 and counts
+                         and all(col["seqs"] and set(col["seqs"]) == {n} for col in c["cols"].values())
+                         and all(counts[k] == finite.get(k, 0) for k in counts))
                 ok &= check(f"live {rid}", match)
-                print(f"{rid}: client {c['seq']} rows / {c['media']} media / tile points {tiles}, "
+                print(f"{rid}: client {c['seq']} rows / {c['media']} media / column counts {counts}, "
                       f"file {n} / {mseq} / finite {finite}: {'match' if match else 'MISMATCH'}")
             print(f"dropped {client['dropped']} rows events; client {'converged' if ok else 'DIVERGED'}")
             server.terminate()

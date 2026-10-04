@@ -39,7 +39,7 @@ from typing import Final, TypedDict, cast
 from urllib.parse import quote
 
 from . import remote
-from .index import Explorer, TileBudget
+from .index import BlockBudget, Explorer
 from .remote import Remote
 from .workspace import Far, Local, Workspace
 
@@ -131,7 +131,7 @@ class Roots:
         self.entries: dict[str, Explorer | Remote] = {}  # by spec: path, or host:path
         self.workspaces: dict[str, list[str]] = {}  # name -> member specs
         self._views: dict[str, Workspace] = {}
-        self.budget = TileBudget()
+        self.budget = BlockBudget()
         try:
             saved = json.loads(self.history_path.read_text())
         except (FileNotFoundError, ValueError):

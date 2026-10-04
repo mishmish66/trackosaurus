@@ -1,9 +1,9 @@
 // Line charts. Canvas 2D: each draw asks the kernel for a smoothed, pixel-decimated polyline (or
 // group aggregate) of just the visible x-range. WebGL (gl.js): every run's line stays on the GPU
 // and zoom is a transform; axes, labels and the hover overlay stay Canvas 2D.
-import { BinCache, Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, aggGroups, binGrid, medianCiCoverage, nearest, prep as kprep, visibleRange,
-         yrange } from "./kernel.js";
-import { BREAK, Points, Table, glFailed, pointBuffer, renderer, rgba } from "./gl.js";
+import { BinCache, Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, aggGroups, binGrid, binRows, buildColumn, medianCiCoverage, nearest,
+         prep as kprep, visibleRange, yrange } from "./kernel.js";
+import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
 import { PARALLEL, describe, onWorker } from "./pool.js";
 import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET } from "./data.js";
 import { nonFiniteText } from "./where.js";
@@ -118,37 +118,28 @@ function bandOf(st, center, band, bins) {
 const ROW = Object.fromEntries(STATS.map((k, i) => [k, i])); // row of each statistic in aggGroups' result
 const WAITING = Symbol("waiting for a worker"); // what compute returns while a worker computes the chart's statistics
 let chartSlots = 0; // charts given a worker so far
-const SLAB_TILE = 256; // buckets of a slab's step range (tiles.TILE)
-const SLAB_LEVELS = [-20, 62]; // levels a slab may have (tiles.MIN_LEVEL, MAX_LEVEL)
-const SLABS_MOST = 4; // slabs one view may draw from
+const NO_TAIL = Object.freeze({ s: [], v: [], t: [], q: [], n: 0 });
+const partsCols = new WeakMap(); // a run's buckets ({parts, level}) -> their column, built on the page
 
-/** The slabs ({level, indices}) covering steps [x0, x1] at `level`, or null when there are too many or none fit. */
-function slabsCovering(level, x0, x1) {
-  const w = SLAB_TILE * 2 ** level, k0 = Math.floor(x0 / w), k1 = Math.floor(x1 / w);
-  if (!(level >= SLAB_LEVELS[0] && level <= SLAB_LEVELS[1]) || !(k1 - k0 < SLABS_MOST)) return null;
-  return { level, indices: Array.from({ length: k1 - k0 + 1 }, (_, i) => k0 + i) };
+/** Source c of binning as a column: itself, or the column of its buckets, built here. */
+function here(c) {
+  if (!c.parts) return c;
+  let col = partsCols.get(c);
+  if (!col) partsCols.set(c, (col = buildColumn(c.parts, NO_TAIL, c.level, false)));
+  return col;
 }
 
-/** [first, last, smallest positive] x of columns' extent `e` and steps `slab` ([first, last], or null). */
-function withSlabs(e, slab) {
-  if (!slab) return e;
-  return [Math.min(e[0], slab[0]), Math.max(e[1], slab[1]), Math.min(e[2], slab[0] > 0 ? slab[0] : Infinity)];
+/** [first, last, smallest positive] x of columns' extent `e`, widened by `more` ([first, last], or null). */
+function withExtent(e, more) {
+  if (!more) return e;
+  return [Math.min(e[0], more[0]), Math.max(e[1], more[1]), Math.min(e[2], more[0] > 0 ? more[0] : Infinity)];
 }
 
-/** Lines drawing each run of `groups` as its bin means `rows` (bins per run): one column over the bin centers. */
-function rowLines(groups, rows, g0, dx, bins) {
-  const s = Float64Array.from({ length: bins }, (_, i) => g0 + (i + 0.5) * dx);
+/** Lines drawing each run of `groups` as its bin means `rows` (bins per run, from transformed x g0 in steps of dx):
+ * one column over the bin centers. */
+function rowLines(groups, rows, g0, dx, bins, logx) {
+  const s = Float64Array.from({ length: bins }, (_, i) => (logx ? 10 ** (g0 + (i + 0.5) * dx) : g0 + (i + 0.5) * dx));
   return groups.map((ln, i) => ({ ...ln, cols: [Col.adopt(s, rows.subarray(i * bins, (i + 1) * bins), s, bins)] }));
-}
-
-/** Run r's buckets in `slabs` ({slabs, rows, n}), or null when it is running (its rows stream) or a slab lacks it. */
-function slabSource(r, slabs) {
-  if (r.meta.state === "running") return null;
-  const rows = slabs.map((sl) => sl.rowOf.get(r.id));
-  if (rows.some((i) => i === undefined)) return null;
-  let n = 0;
-  slabs.forEach((sl, j) => (n += sl.views.first[rows[j] + 1] - sl.views.first[rows[j]]));
-  return { slabs, rows, n };
 }
 
 /** A hash of a typed array's 32-bit words. */
@@ -291,7 +282,7 @@ function colsExtent(cols, xmode) {
 /** Grow `yr` by column c's values (raw or smoothed) inside the view's x range. */
 const colsOfLines = new WeakMap(); // lines -> their columns
 
-/** Every column of `lines` (a run drawn from slabs may have none), kept for the list while it is drawn. */
+/** Every column of `lines` (a run drawn from its buckets may have none), kept for the list while it is drawn. */
 function colsOf(lines) {
   let c = colsOfLines.get(lines);
   if (!c) colsOfLines.set(lines, (c = lines.flatMap((g) => g.cols).filter(Boolean)));
@@ -560,11 +551,12 @@ export class Chart {
     const groups = app.linesFor(this.key), allCols = colsOf(groups);
     const v = this.xView(o, allCols);
     if (!v) return null;
-    const yr = new YRange(o.logy), r = this.glRenderer(), rows = !app.grouped && r ? this.slabRows(groups, v, o, r) : null;
+    const yr = new YRange(o.logy), r = this.glRenderer(), binned = (this.binned = this.binnedOf(o, groups));
+    const rows = !app.grouped && binned ? this.binnedRows(groups, v) : null;
     if (rows === WAITING) return WAITING;
     const runLines = rows || groups.filter((ln) => ln.cols[0]);
     const gl = !app.grouped && r ? this.linesGL(r, runLines, v, o, yr) : null;
-    const lines = gl ? gl.lines : app.grouped ? this.linesGrouped(groups, allCols, v, o, yr) : this.linesCanvas(runLines, v, yr);
+    const lines = gl ? gl.lines : app.grouped ? this.linesGrouped(groups, allCols, v, o, yr, binned) : this.linesCanvas(runLines, v, yr);
     if (lines === WAITING) return WAITING;
     const y = this.yView(o, yr, allCols, v);
     if (!y) return null;
@@ -574,7 +566,7 @@ export class Chart {
   /** x range (transformed) and smoothing of the view: the data's extent, or the zoom; null if empty. */
   xView(o, allCols) {
     const { xmode, logx, logy } = o;
-    const [e0, e1, epos] = withSlabs(xExtent(allCols, xmode), xmode === X_RUNTIME ? null : this.app.data.slabExtent(this.key));
+    const [e0, e1, epos] = withExtent(xExtent(allCols, xmode), this.app.data.extent(this.key, xmode));
     if (!(e1 >= e0)) return null;
     const zoom = this.app.xrange && this.app.xrange[2] === xmode ? this.app.xrange : null;
     const [x0, x1] = xRange(o, zoom, e0, e1, epos);
@@ -611,17 +603,16 @@ export class Chart {
 
   /** One center line with its band per group, from per-bin group statistics; they set the y range, which a band
    * widens by at most BAND_REACH of it. */
-  linesGrouped(groups, allCols, v, o, yr) {
+  linesGrouped(groups, allCols, v, o, yr, binned) {
     let longest = 0;
     for (const c of allCols) longest = Math.max(longest, c.len);
     let n = 0;
     for (const g of groups) n += g.cols.length; // runs, with or without a column
     const px = n > DENSITY_AUTO ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET; // as finely as the data is planned
-    const can = this.canSlab(v, n); // then drawn from slabs, as finely as they hold
-    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / px), can ? Infinity : longest)));
+    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / px), binned ? Infinity : longest)));
     const p = { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: (v.logx ? LOGX : 0) | (o.center === "iqm" ? IQM : 0),
                 alpha: v.alpha, scale: v.scale };
-    const st = this.groupStats(this.slabSources(groups, v, { g0, dx, bins, can }) || groups.map((g) => g.cols.filter(Boolean)), p, v.alpha > 0);
+    const st = this.groupStats(this.sources(groups, binned), p, v.alpha > 0);
     if (!st) return WAITING;
     const { main, raws } = st;
     const row = (a, gi, k) => a.subarray((gi * NSTAT + ROW[k]) * bins, (gi * NSTAT + ROW[k] + 1) * bins);
@@ -655,39 +646,29 @@ export class Chart {
     return lines;
   }
 
-  /** Whether group statistics of this view (of n runs) may come from slabs: many runs, x in steps, no smoothing, and
-   * workers to bin them. */
-  canSlab(v, n) {
-    const drawable = this.app.grouped || (USE_GL && !glFailed()); // a heatmap from slabs draws through WebGL
-    return drawable && PARALLEL && !this.app.data.noSlabs && n > DENSITY_AUTO && v.xmode !== X_RUNTIME && !v.logx && !(v.alpha > 0);
+  /** Whether this chart (options o, lines `groups`) draws its runs from bins of their buckets: group statistics, or a
+   * heatmap, of more runs than it draws one by one (`App.coarseAbove`). */
+  binnedOf(o, groups) {
+    let n = 0;
+    for (const g of groups) n += g.cols.length;
+    return n > this.app.coarseAbove(o);
   }
 
-  /** The slabs this chart's first view will likely draw from, before it has one: steps from 0 to the largest last
-   * step of its runs `runs`, when it may draw from slabs (`canSlab`, with options o). */
-  slabGuess(o, runs) {
-    if (this.slabWant !== undefined) return this.slabWant;
-    let x1 = 0;
-    for (const r of runs) x1 = Math.max(x1, r.meta.summary?._step ?? 0);
-    if (!(x1 > 0) || !this.canSlab({ xmode: o.xmode, logx: o.logx, alpha: o.smooth }, runs.length)) return null;
-    const { g0, dx, bins } = binGrid(0, x1, Math.max(8, Math.floor((this.w ? this.pw : 600) / DENSITY_PX_PER_BUCKET)));
-    return slabsCovering(Math.log2(dx), g0, g0 + (bins - 0.5) * dx);
-  }
-
-  /** The groups' sources from slabs (`slabSource` per finished run, its column per running one) when this view (bin
-   * grid g0, dx, bins) may draw from slabs (`can`) and they are here; else null. Notes the slabs the view wants
-   * (slabWant), and those a zoom of it would (ahead: one and two levels finer). */
-  slabSources(groups, v, { g0, dx, bins, can }) {
-    const want = can ? slabsCovering(Math.log2(dx), g0, g0 + (bins - 0.5) * dx) : null;
-    if (JSON.stringify(want) !== JSON.stringify(this.slabWant)) this.app.replan(true, 0); // fetch them now
-    this.slabWant = want;
-    this.ahead = can ? [1, 2].map((up) => slabsCovering(Math.log2(dx) - up, v.x0, v.x1)).filter(Boolean) : [];
-    const w = this.slabWant, x1 = g0 + (bins - 0.5) * dx, got = w && this.app.data.bestSlabs(this.key, w.level, g0, x1); // coarser ones meanwhile
-    this.fromSlabs = !!got;
-    if (!got) return null;
-    const m = this.sources?.slabs.length === got.slabs.length && this.sources.slabs.every((sl, i) => sl === got.slabs[i])
-      ? this.sources : (this.sources = { slabs: got.slabs, of: new Map() }); // run -> its slabSource, while the slabs stay
-    const source = (r) => (m.of.has(r) ? m.of.get(r) : m.of.set(r, slabSource(r, got.slabs)).get(r));
-    return groups.map((g) => g.runs.map((r, i) => source(r) || g.cols[i]).filter(Boolean));
+  /** The groups' sources of binning: a finished run's buckets in the blocks its chart shows ({parts, level},
+   * `Data.partsOf`) when `binned`, else (and for a running run) its column; runs with neither are left out. Kept while
+   * neither the groups nor the data change. */
+  sources(groups, binned) {
+    const data = this.app.data, sig = `${data.version}|${binned}`;
+    if (this.src?.groups === groups && this.src.sig === sig) return this.src.out;
+    const level = data.levelOf(this.key);
+    const one = (r, c) => {
+      if (!binned || r.meta.state === "running") return c;
+      const parts = data.partsOf(r, this.key);
+      return parts?.length ? { parts, level } : null;
+    };
+    const out = groups.map((g) => (g.runs || [g.run]).map((r, i) => one(r, g.cols[i])).filter(Boolean));
+    this.src = { groups, sig, out };
+    return out;
   }
 
   /** aggGroups of `cols` with binning p, and raw when `raw`: {main, raws}; computed here when no worker can, else by
@@ -695,24 +676,22 @@ export class Chart {
   groupStats(cols, p, raw) {
     const d = PARALLEL ? describe(cols) : null;
     if (!d) {
-      const cache = (this.binCache ||= new BinCache()), all = (f) => aggGroups(cols, p.xmode, p.x0, p.x1, p.bins, f, p.alpha, p.scale, cache);
+      const local = cols.map((g) => g.map(here));
+      const cache = (this.binCache ||= new BinCache()), all = (f) => aggGroups(local, p.xmode, p.x0, p.x1, p.bins, f, p.alpha, p.scale, cache);
       return { main: all(p.flags), raws: raw ? all(p.flags | RAW) : null };
     }
     return this.fromWorker("agg", d, p, raw);
   }
 
-  /** A density heatmap's lines from slabs when it may draw from them: each run as its bin means
-   * (`rowLines`), or WAITING while a worker bins them; null when it draws from its columns. Notes the slabs as
-   * slabSources does. */
-  slabRows(groups, v, o, r) {
-    const density = r.density && (o.render === "density" || (o.render === "auto" && groups.length > DENSITY_AUTO));
-    const can = density && this.canSlab(v, groups.length);
+  /** A heatmap's lines: each run as its bin means (`rowLines`), from the chart's worker (WAITING until it answers),
+   * else binned here. */
+  binnedRows(groups, v) {
     const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.floor(this.pw / DENSITY_PX_PER_BUCKET)));
-    const src = this.slabSources(groups.map((ln) => ({ cols: ln.cols, runs: [ln.run] })), v, { g0, dx, bins, can });
-    if (!src) return null;
-    const lines = groups.filter((_, i) => src[i].length);
-    const res = this.fromWorker("rows", describe(src.filter((s) => s.length)), { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: 0, alpha: 0, scale: v.scale }, false);
-    return res ? rowLines(lines, res.rows, g0, dx, bins) : WAITING;
+    const src = this.sources(groups, true), lines = groups.filter((_, i) => src[i].length), all = src.filter((s) => s.length);
+    const p = { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: v.logx ? LOGX : 0, alpha: v.alpha, scale: v.scale };
+    const d = PARALLEL ? describe(all) : null;
+    const res = d ? this.fromWorker("rows", d, p, false) : { rows: binRows(all.flat().map(here), p, (this.binCache ||= new BinCache())) };
+    return res ? rowLines(lines, res.rows, g0, dx, bins, v.logx) : WAITING;
   }
 
   /** The chart's worker's answer (pool.onWorker `kind`) for described sources d, once it has come; null until then
