@@ -593,16 +593,54 @@ const blockSteps = ({ v }) => [v.base * BLOCK * 2 ** v.level, (v.base + 1) * BLO
  * A bucket's mean is of its finite values, of its infinities when it has none. In memory shared with workers when
  * `shared`. */
 export function buildColumn(parts, tail, level, shared = true) {
-  const layers = layersOf(parts);
   let cap = tail.n;
   for (const p of parts) cap += p.v.first[p.row + 1] - p.v.first[p.row];
   const { view: all, loc } = shared ? columnStore(4 * cap) : { view: new Float64Array(4 * cap), loc: null };
   const col = { s: all.subarray(0, cap), v: all.subarray(cap, 2 * cap), t: all.subarray(2 * cap, 3 * cap), w: all.subarray(3 * cap), n: 0, lv: 0, b: 0 };
-  emitBuckets(layers, col);
-  emitTail(layers, tail, level ?? (layers.length ? layers[layers.length - 1].level : 0), col);
+  if (!tail.n && parts.every((p) => p.v.level === parts[0].v.level)) oneLevel(parts, col);
+  else {
+    const layers = layersOf(parts);
+    emitBuckets(layers, col);
+    emitTail(layers, tail, level ?? (layers.length ? layers[layers.length - 1].level : 0), col);
+  }
   const c = Col.adopt(col.s, col.v, col.t, col.n, col.w);
   if (shared) holdStore(c, loc && { ...loc, cap });
   return c;
+}
+
+const arraySteps = new WeakMap(); // bucket array views -> {s (each bucket's mean step), rising (whether each run's runtimes rise)}
+
+/** Run `row` of bucket array `v` as a column viewing the array, its steps computed once per array. */
+export function runColumn(v, row) {
+  let st = arraySteps.get(v);
+  if (!st) arraySteps.set(v, (st = stepsOf(v)));
+  const a = v.first[row], e = v.first[row + 1];
+  return Col.view(st.s.subarray(a, e), v.mean.subarray(a, e), v.tmean.subarray(a, e), e - a, [true, st.rising[row] === 1], v.n.subarray(a, e));
+}
+
+function stepsOf(v) {
+  const s = new Float64Array(v.count), rising = new Uint8Array(v.runs), w = 2 ** v.level, base = v.base * BLOCK;
+  for (let q = 0; q < v.count; q++) s[q] = (base + v.offset[q] + (v.soff[q] + 0.5) / SOFF_SCALE) * w;
+  for (let i = 0; i < v.runs; i++) {
+    let q = v.first[i] + 1;
+    while (q < v.first[i + 1] && !(v.tmean[q] < v.tmean[q - 1])) q++;
+    rising[i] = q >= v.first[i + 1] ? 1 : 0;
+  }
+  return { s, rising };
+}
+
+/** emitBuckets of parts of one level: each part's buckets, parts by block. */
+function oneLevel(parts, col) {
+  if (parts.length > 1) parts = [...parts].sort((a, b) => a.v.base - b.v.base);
+  let n = 0;
+  for (const { v, row } of parts) {
+    const w = 2 ** v.level, base = v.base * BLOCK, { offset, soff, mean, tmean } = v, cnt = v.n;
+    for (let q = v.first[row], end = v.first[row + 1]; q < end; q++) {
+      col.s[n] = (base + offset[q] + (soff[q] + 0.5) / SOFF_SCALE) * w;
+      (col.v[n] = mean[q]), (col.t[n] = tmean[q]), (col.w[n] = cnt[q]), n++;
+    }
+  }
+  col.n = n;
 }
 
 /** `parts` by level, finest first: [{level, parts (by step), ranges ([lo, hi) steps of their blocks)}]. */

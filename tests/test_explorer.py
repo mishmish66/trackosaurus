@@ -453,7 +453,7 @@ def test_the_block_cache_evicts_the_least_recently_used_built_blocks_and_keeps_t
     for i in range(1, 15):
         ex.buckets_body("loss", 0, i, runs=["r"])
         assert wait_for(lambda: (0, i) in stored(ex))
-    assert ex.cached_bytes <= 4 * size and (0, 14) in stored(ex) and (0, 0) not in stored(ex)
+    assert wait_for(lambda: ex.cached_bytes <= 4 * size and (0, 14) in stored(ex) and (0, 0) not in stored(ex))
     assert kept_blob(ex, "r", "loss") == kept
 
 
@@ -933,7 +933,7 @@ def test_a_shared_block_budget_evicts_the_least_recently_used_blocks_of_any_expl
         for i in range(3):
             ex.buckets_body("loss", -6, i, runs=["r"])
             assert wait_for(lambda: (-6, i) in stored(ex))
-    assert [i for _, i in stored(a)] == [2] and [i for _, i in stored(b)] == [0, 1, 2]
+    assert wait_for(lambda: [i for _, i in stored(a)] == [2] and [i for _, i in stored(b)] == [0, 1, 2])
     assert budget.used() == a.cached_bytes + b.cached_bytes <= 4.5 * size
 
 

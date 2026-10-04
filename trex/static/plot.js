@@ -654,16 +654,16 @@ export class Chart {
     return n > this.app.coarseAbove(o);
   }
 
-  /** The groups' sources of binning: a finished run's buckets in the blocks its chart shows ({parts, level},
-   * `Data.partsOf`) when `binned`, else (and for a running run) its column; runs with neither are left out. Kept while
-   * neither the groups nor the data change. */
+  /** The groups' sources of binning: a finished run's buckets in the finest blocks its chart shows ({parts, level},
+   * `Data.partsOf`; they cover the bins) when `binned`, else (and for a running run) its column; runs with neither are
+   * left out. Kept while neither the groups nor the data change. */
   sources(groups, binned) {
     const data = this.app.data, sig = `${data.version}|${binned}`;
     if (this.src?.groups === groups && this.src.sig === sig) return this.src.out;
     const level = data.levelOf(this.key);
     const one = (r, c) => {
       if (!binned || r.meta.state === "running") return c;
-      const parts = data.partsOf(r, this.key);
+      const parts = data.partsOf(r, this.key, true);
       return parts?.length ? { parts, level } : null;
     };
     const out = groups.map((g) => (g.runs || [g.run]).map((r, i) => one(r, g.cols[i])).filter(Boolean));

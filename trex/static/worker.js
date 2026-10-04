@@ -1,6 +1,6 @@
 // A pool.js worker: group statistics, or each run's bin means, of the page's charts, over columns and bucket arrays in
 // the memory it shares; and bucket arrays fetched into that memory.
-import { BinCache, Col, RAW, aggGroups, binRows, bucketExtent, bucketPaths, bucketViews, buildColumn } from "./kernel.js";
+import { BinCache, Col, RAW, aggGroups, binRows, bucketExtent, bucketPaths, bucketViews, buildColumn, runColumn } from "./kernel.js";
 
 const chunks = new Map(); // shared chunk id -> its Float64Array
 const arrays = new Map(); // "chunk:generation:offset" -> bucketViews of the bucket array there
@@ -83,7 +83,8 @@ function partsKey(refs, q, count) {
   return key;
 }
 
-/** The column of a run's buckets in the bucket arrays refs[q, q + count) refer to, at `level`. */
+/** The column of a run's buckets in the bucket arrays refs[q, q + count) refer to, at `level`: viewing the array when
+ * there is one. */
 function partsColumn(refs, q, count, level) {
   const parts = [];
   for (let j = 4 * q; j < 4 * (q + count); j += 4) {
@@ -95,7 +96,7 @@ function partsColumn(refs, q, count, level) {
     }
     parts.push({ v, row: refs[j + 3] });
   }
-  return buildColumn(parts, NO_TAIL, level, false);
+  return parts.length === 1 ? runColumn(parts[0].v, parts[0].row) : buildColumn(parts, NO_TAIL, level, false);
 }
 
 function view(d, o) {

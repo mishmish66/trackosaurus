@@ -385,12 +385,13 @@ export class Data {
 
   // ---- blocks ----
 
-  /** Run r's buckets of `key` in the blocks its chart shows ([{v, row}] in its layers), or null before they are here. */
-  partsOf(r, key) {
+  /** Run r's buckets of `key` in the blocks its chart shows ([{v, row, a}] in its layers; only its finest, which
+   * covers the steps the chart shows, when `finest`), or null before they are here. */
+  partsOf(r, key, finest = false) {
     const ready = this.charts.get(key)?.ready;
     if (!ready) return null;
     const parts = [];
-    for (const L of [ready.coarse, ready.fine]) {
+    for (const L of finest ? [ready.fine || ready.coarse] : [ready.coarse, ready.fine]) {
       for (const index of L ? L.indices : []) {
         const e = this.blocks.get(blockId(key, L.level, index))?.runs.get(r.id);
         if (e) parts.push({ v: e.a.v, row: e.row, a: e.a });

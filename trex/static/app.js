@@ -1935,7 +1935,7 @@ class App {
   /** Shared x zoom [x0, x1, xmode], or null. */
   setXRange(r) {
     this.xrange = r;
-    this.replan(true);
+    this.replan(true, 0); // its blocks are asked for before the charts redraw
     this.updateZoomButton();
     this.redrawAll();
   }

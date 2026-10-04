@@ -653,6 +653,7 @@ class Explorer:
                     self._writer.execute(sql)
             self._writer.execute("INSERT OR REPLACE INTO cache VALUES ('version', ?)", (str(CACHE_VERSION),))
             self._writer.execute("COMMIT")
+            self._writer.execute("VACUUM")  # the dropped tables' pages go back to the disk
             shutil.rmtree(self.cache_dir / "levels", ignore_errors=True)
         self._write_lock = threading.Lock()  # serializes every use of `_writer`
         self.lock = threading.Lock()
