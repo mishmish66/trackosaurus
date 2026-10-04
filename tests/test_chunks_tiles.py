@@ -161,14 +161,27 @@ def test_parent_envelope_contains_children():
             assert parent.bucket[k] == pb and parent.min[k] <= mn and parent.max[k] >= mx
 
 
-def test_tiles_leave_out_nan_keep_infinities_and_empty_tiles_are_valid():
-    steps = np.arange(6.0)
-    vals = np.array([1.0, np.nan, np.inf, -np.inf, np.inf, 2.0])
+def test_buckets_average_their_finite_values_and_are_infinite_only_without_any():
+    inf, nan = np.inf, np.nan
+    steps = np.arange(10.0)
+    vals = np.array([1.0, nan, inf, inf, -inf, inf, inf, 3.0, 5.0, 7.0])
     t = tiles.decode(tiles.build(steps, vals, steps, 1, 0))
-    assert list(t.bucket) == [0, 1, 2] and list(t.n) == [1, 2, 2]
-    assert t.mean[0] == 1.0 and math.isnan(t.mean[1]) and t.mean[2] == np.inf
-    assert (t.min[1], t.max[1]) == (-np.inf, np.inf) and (t.min[2], t.max[2]) == (2.0, np.inf)
+    assert list(t.bucket) == [0, 1, 2, 3, 4] and list(t.n) == [1, 2, 2, 1, 2]
+    assert t.mean[0] == 1.0 and t.mean[1] == inf and math.isnan(t.mean[2]) and t.mean[3] == 3.0 and t.mean[4] == 6.0
+    assert list(t.mean_step) == [0.0, 2.5, 4.5, 7.0, 8.5] and (t.min[3], t.max[3]) == (3.0, inf)
     assert tiles.decode(tiles.build(steps, vals, steps, 0, 5)).bucket.size == 0
+
+
+def test_merged_buckets_average_the_finite_ones_and_are_infinite_only_without_any():
+    inf = np.inf
+    steps = np.arange(16.0)
+    vals = np.array([1.0, 1.0, inf, inf, 3.0, 3.0, inf, inf, inf, inf, inf, inf, 2.0, 4.0, -inf, -inf])
+    blob = tiles.build(steps, vals, steps, 1, 0)
+    up1 = tiles.decode(tiles.coarsen([blob], 1)[0])
+    assert list(up1.mean) == [1.0, 3.0, inf, 3.0] and list(up1.n) == [2, 2, 4, 2] and list(up1.mean_step) == [0.5, 4.5, 9.5, 12.5]
+    assert (up1.min[3], up1.max[3]) == (-inf, 4.0)
+    up2 = tiles.decode(tiles.coarsen([blob], 2)[0])
+    assert list(up2.mean) == [2.0, 3.0] and list(up2.n) == [4, 2]
 
 
 def test_fractional_and_negative_steps_get_valid_tiles():

@@ -317,9 +317,10 @@ export function binGrid(x0, x1, most) {
 export function agg(cols, xmode, x0, x1, bins, flags, alpha, scale) {
   const raw = (flags & RAW) !== 0, logx = (flags & LOGX) !== 0;
   const R = cols.length, out = new Float64Array(NSTAT * bins);
-  const buf = scratchOf(R * bins + 2 * bins);
+  const buf = scratchOf(R * bins + 4 * bins);
   const vals = buf.subarray(0, R * bins).fill(NaN); // bin-major: bin b's values are vals[b * R, (b + 1) * R)
-  const acc = { sum: buf.subarray(R * bins, R * bins + bins), cnt: buf.subarray(R * bins + bins, R * bins + 2 * bins) };
+  const at = (k) => buf.subarray(R * bins + k * bins, R * bins + (k + 1) * bins);
+  const acc = { sum: at(0), cnt: at(1), pos: at(2), neg: at(3) };
   for (let r = 0; r < R; r++) {
     cols[r].ensureSmooth(alpha, scale, xmode);
     binColumn(cols[r], xmode, cols[r].ys(alpha, raw), x0, x1, bins, logx, acc, vals, r, R);
@@ -330,22 +331,23 @@ export function agg(cols, xmode, x0, x1, bins, flags, alpha, scale) {
 }
 
 /** Per-bin means of column c's values in [x0, x1] into vals[b * R + r], interpolated across empty bins between full
- * ones. */
-function binColumn(c, xmode, ys, x0, x1, bins, logx, { sum, cnt }, vals, r, R) {
+ * ones. A bin's mean is of its finite values; with none, it is infinite (NaN with both signs). */
+function binColumn(c, xmode, ys, x0, x1, bins, logx, acc, vals, r, R) {
+  const { sum, cnt, pos, neg } = acc;
   const xs = c.xs(xmode), [lo, hi] = visibleRange(c, xmode, x0, x1, logx), per = bins / (x1 - x0);
-  sum.fill(0);
-  cnt.fill(0);
+  sum.fill(0), cnt.fill(0), pos.fill(0), neg.fill(0);
   for (let i = lo; i < hi; i++) {
     const x = tx(xs[i], logx), y = ys[i];
     if (!(x >= x0 && x <= x1) || y !== y) continue;
     const b = Math.min(bins - 1, Math.floor((x - x0) * per));
-    sum[b] += y;
-    cnt[b] += 1;
+    if (y === Infinity) pos[b] = 1;
+    else if (y === -Infinity) neg[b] = 1;
+    else (sum[b] += y), (cnt[b] += 1);
   }
   let prev = -1, pv = 0;
   for (let b = 0; b < bins; b++) {
-    if (!cnt[b]) continue;
-    const v = sum[b] / cnt[b];
+    const v = binMean(acc, b);
+    if (v === undefined) continue;
     vals[b * R + r] = v;
     for (let k = prev + 1; prev >= 0 && k < b; k++) {
       const w = (k - prev) / (b - prev);
@@ -354,6 +356,14 @@ function binColumn(c, xmode, ys, x0, x1, bins, logx, { sum, cnt }, vals, r, R) {
     prev = b;
     pv = v;
   }
+}
+
+/** Bin b's mean from binColumn's sums: of its finite values, else infinite (NaN with both signs); undefined when
+ * the bin is empty. */
+function binMean({ sum, cnt, pos, neg }, b) {
+  if (cnt[b]) return sum[b] / cnt[b];
+  if (pos[b] || neg[b]) return (pos[b] ? Infinity : 0) + (neg[b] ? -Infinity : 0);
+  return undefined;
 }
 
 /** Counts of a bin's values: finite ones (moved to the front of the bin), their sum and range, and infinities. */

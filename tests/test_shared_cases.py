@@ -47,6 +47,25 @@ def tile_cases() -> list[dict[str, object]]:
     return out
 
 
+def merge_cases() -> list[dict[str, object]]:
+    """Tiles with runs of infinities, merged up: buckets merge into the mean of the finite ones."""
+    out: list[dict[str, object]] = []
+    level, index, n = 2, 3, 900
+    lo, hi = tiles.tile_range(level, index)
+    steps = lo + spread(n, 7919, 100003) * (hi - lo)
+    values = spread(n, 104729, 2003) * 20 - 10
+    values[(steps > lo + 100) & (steps < lo + 180)] = np.inf
+    values[(steps > lo + 400) & (steps < lo + 405)] = -np.inf
+    values[::23] = np.inf
+    blob = tiles.build(steps, values, steps * 0.5, level, index)
+    for up in (1, 3):
+        merged = [tiles.decode(b) for b in tiles.coarsen([blob], up)]
+        out.append({"blob": base64.b64encode(blob).decode(), "level": level, "up": up,
+                    "mean": [plain(v) for t in merged for v in t.mean.tolist()],
+                    "mean_step": [plain(v) for t in merged for v in t.mean_step.tolist()]})
+    return out
+
+
 def smoothing_cases() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     for alpha, n, gaps in [(0.6, 50, False), (0.9, 200, True), (0.99, 300, True)]:
@@ -83,7 +102,7 @@ def stats_cases() -> list[dict[str, object]]:
 
 
 def build_cases() -> dict[str, object]:
-    return {"tiles": tile_cases(), "smoothing": smoothing_cases(), "stats": stats_cases()}
+    return {"tiles": tile_cases(), "merges": merge_cases(), "smoothing": smoothing_cases(), "stats": stats_cases()}
 
 
 def test_shared_cases_match_the_python_implementations():

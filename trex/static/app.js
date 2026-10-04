@@ -1642,12 +1642,12 @@ class App {
   sectionMenu(id) {
     const s = this.sectionEls?.get(id), anchor = s?.el.querySelector(":scope > summary .secmenu");
     if (!anchor) return menu.close();
-    const { sec, subs } = s, again = () => this.sectionMenu(id);
+    const { sec } = s, again = () => this.sectionMenu(id), sub = (x) => this.sectionEls.get(x.id)?.el; // looked up when used: a re-render replaces them
     const panels = [...sec.items, ...sec.hidden].sort((a, b) => cmpNames(a[0], b[0]));
     const items = [...panels.map(([key, kind]) => ({ label: shortName(key, sec), sub: kind === "media" ? "media" : "chart",
                      icon: this.hiddenPanels.has(key) ? " " : "✓", onpick: () => (this.togglePanel(key), again()) })),
-                   ...sec.children.map((x, i) => ({ label: `${x.title}/`, sub: `${x.n} panels`, icon: subs[i].open ? "✓" : " ",
-                     onpick: () => ((subs[i].open = !subs[i].open), again()) }))];
+                   ...sec.children.map((x) => ({ label: `${x.title}/`, sub: `${x.n} panels`, icon: sub(x)?.open ? "✓" : " ",
+                     onpick: () => (sub(x) && (sub(x).open = !sub(x).open), again()) }))];
     menu.list(anchor, { title: `${sec.title}: shown panels, open subsections`, items, search: items.length > 12 });
   }
 

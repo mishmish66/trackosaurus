@@ -171,7 +171,7 @@ class RunView(TypedDict):
     run: RunMeta
     media: list[MediaRecord]
 
-CACHE_VERSION: Final = 10  # bump whenever what the index stores changes; older caches are rebuilt
+CACHE_VERSION: Final = 11  # bump whenever what the index stores changes; older caches are rebuilt
 CRASH_AFTER = 300.0  # seconds without a heartbeat after which a running run shows as crashed
 POLL: Final = 1.0  # seconds between polls of known runs
 REWALK: Final = 3.0  # seconds between walks of the root for new and removed runs

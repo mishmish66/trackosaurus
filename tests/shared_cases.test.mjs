@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { decodeTile } from "../trex/static/data.js";
+import { buildColumn, decodeTile } from "../trex/static/data.js";
 import { Col, IQM, STATS, X_STEP, agg } from "../trex/static/kernel.js";
 import { smoothScale } from "../trex/static/plot.js";
 import { asNumber } from "../trex/static/where.js";
@@ -32,6 +32,21 @@ test("tiles decode to the buckets the Python encoder wrote, f32 fields exactly",
       assert.equal(t.u32[t.f + 5 * k + i], c.n[i], `${at} n`);
       close((t.index * TILE + t.u16[t.b + i] + t.f32[t.f + 4 * k + i]) * 2 ** t.level, c.mean_step[i], `${at} mean step`);
     }
+  }
+});
+
+test("buckets merge locally as tiles.coarsen merges them: the mean of the finite ones, infinite only without any", () => {
+  const none = { s: [], v: [], t: [], n: 0, s0: Infinity };
+  for (const c of CASES.merges) {
+    const tile = decodeTile(Uint8Array.from(Buffer.from(c.blob, "base64")).buffer);
+    const col = buildColumn([tile], 2 ** c.up, 2 ** c.level, none, [], none);
+    assert.equal(col.n, c.mean.length, `up ${c.up}`);
+    c.mean.forEach((m, i) => {
+      const want = nan(m), at = `up ${c.up} bucket ${i}`;
+      if (!Number.isFinite(want)) return assert.ok(Object.is(col.v[i], want), `${at}: ${col.v[i]} != ${want}`);
+      assert.ok(Math.abs(col.v[i] - want) <= 1e-6 * Math.max(1, Math.abs(want)), `${at}: ${col.v[i]} != ${want}`);
+      assert.ok(Math.abs(col.s[i] - nan(c.mean_step[i])) <= 1e-3 * 2 ** (c.level + c.up), `${at} step`);
+    });
   }
 });
 

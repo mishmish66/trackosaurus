@@ -133,17 +133,20 @@ them WebGL falls back to software and timings mean nothing.
   derives it, changes. Bump the IndexedDB version in `data.js` when the stored entries or their
   keys change. Older caches are then rebuilt instead of silently misread.
 - **Shared formats across languages.** Change all of these together:
-  - tile encoding: `tiles.py` and `decodeTile` in `static/data.js`. Buckets leave NaN out and keep ±inf (a bucket's
-    mean is then infinite, NaN with both signs);
+  - tile encoding: `tiles.py` and `decodeTile` in `static/data.js`. Buckets leave NaN out; a bucket's mean, mean
+    step, mean runtime and count are of its finite values, or of its infinities when it has no finite value (the
+    mean then infinite, NaN with both signs); its min and max include the infinities;
   - tile response framing: `post_tiles` in `server.py` and `unframe` in `static/data.js`;
-  - local bucket merging: `tiles.coarsen` and `Data.rebuild` (count-weighted means). Points are drawn
-    at their bucket's mean step, never the bucket center;
+  - local bucket merging: `tiles.coarsen` and `buildColumn` in `static/data.js` (count-weighted means over the
+    buckets with a finite mean, or all of them when none has one). Points are drawn at their bucket's mean step,
+    never the bucket center;
   - smoothing (time-weighted EMA, scale = span/1000 rounded to a power of two): `kernel.js`
     `Col.ensureSmooth`, `plot.js` `smoothScale`, `query.py` `twema`/`smooth_scale`;
   - group statistics (order-statistic median CI, Student-t mean CI, interquartile mean of ranks
     [floor(n/4), n - floor(n/4)) with Yuen's CI): `kernel.js` `agg` / `medianCiRank` / `iqmStats`, `plot.js` `bandOf`,
     `query.py` `stats` / `_iqm`. NaN is no value; ±inf are values (the mean infinite or NaN, the spread NaN, order
-    statistics and the IQM finite while the infinities fall outside their ranks);
+    statistics and the IQM finite while the infinities fall outside their ranks). A run's value in a bin is the mean
+    of its finite points there, infinite only when it has none (`kernel.js` `binColumn`), as with tile buckets;
   - non-finite numbers as text: "nan", "inf", "-inf" (`index.wire`, `cli.jsonable`, `where`'s markers,
     `where.js` `nonFiniteText`);
   - run filters and field names: `where.py` and `static/where.js` (`compileWhere`, `runField`), `query.py` `get`;

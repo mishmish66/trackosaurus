@@ -65,8 +65,9 @@ def tile_range(level: int, index: int) -> tuple[float, float]:
 
 
 def build(steps: Floats, values: Floats, times: Floats, level: int, index: int) -> bytes:
-    """Tile (level, index) of the points; NaN values are left out, and a bucket holding an infinite value has an
-    infinite mean (NaN with both signs), as its min or max say."""
+    """Tile (level, index) of the points; NaN values are left out. A bucket's mean, mean step, mean runtime and count
+    are of its finite values, or of its infinite ones when it has no finite value (the mean then infinite, NaN with
+    both signs); its min and max are of all of them."""
     lo, hi = tile_range(level, index)
     keep = (steps >= lo) & (steps < hi) & ~np.isnan(values)
     s, v, t = steps[keep], values[keep], times[keep]
@@ -78,13 +79,21 @@ def build(steps: Floats, values: Floats, times: Floats, level: int, index: int) 
     order = np.argsort(b, kind="stable")
     b, s, v, t = b[order], s[order], v[order], t[order]
     starts = np.flatnonzero(np.r_[True, b[1:] != b[:-1]])
-    n = np.diff(np.r_[starts, b.size])
     bucket = b[starts]
-    soff = np.add.reduceat(s - lo, starts) / n / 2.0 ** level - bucket
+    use = _finite_first(np.isfinite(v), starts)
+    n = np.add.reduceat(use.astype(np.int64), starts)
+    soff = np.add.reduceat(np.where(use, s - lo, 0.0), starts) / n / 2.0 ** level - bucket
     with np.errstate(invalid="ignore"):  # inf and -inf in one bucket make its mean NaN
-        mean = np.add.reduceat(v, starts) / n
+        mean = np.add.reduceat(np.where(use, v, 0.0), starts) / n
     return _encode(level, index, bucket.astype(np.uint16), np.minimum.reduceat(v, starts), np.maximum.reduceat(v, starts),
-                   mean, np.add.reduceat(t, starts) / n, soff, n)
+                   mean, np.add.reduceat(np.where(use, t, 0.0), starts) / n, soff, n)
+
+
+def _finite_first(finite: npt.NDArray[np.bool_], starts: npt.NDArray[np.intp]) -> npt.NDArray[np.bool_]:
+    """Which items count toward their group's mean: its finite ones, or all of them when none is finite; groups are
+    the runs of items from each of `starts`."""
+    any_finite = np.maximum.reduceat(finite.astype(np.int8), starts) > 0
+    return finite | np.repeat(~any_finite, np.diff(np.r_[starts, finite.size]))
 
 
 def coarsen(blobs: Sequence[bytes], up: int) -> list[bytes]:
@@ -105,14 +114,15 @@ def coarsen(blobs: Sequence[bytes], up: int) -> list[bytes]:
     def joined(field: str) -> Floats:
         return np.concatenate([getattr(t, field) for t in ts]).astype(np.float64)[order]
 
-    n = joined("n")
     step = np.concatenate([t.mean_step for t in ts])[order]
     starts = np.flatnonzero(np.r_[True, a[1:] != a[:-1]])
+    means = joined("mean")
+    n = np.where(_finite_first(np.isfinite(means), starts), joined("n"), 0.0)  # weights: as in `build`
     nn = np.add.reduceat(n, starts)
     bucket = a[starts]
     mn, mx = np.minimum.reduceat(joined("min"), starts), np.maximum.reduceat(joined("max"), starts)
     with np.errstate(invalid="ignore"):  # inf and -inf in one bucket make its mean NaN
-        mean = np.add.reduceat(joined("mean") * n, starts) / nn
+        mean = np.add.reduceat(np.where(n > 0, means * n, 0.0), starts) / nn
     tmean = np.add.reduceat(joined("tmean") * n, starts) / nn
     soff = np.add.reduceat(step * n, starts) / nn / 2.0 ** level - bucket
     out: list[bytes] = []

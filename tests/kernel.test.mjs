@@ -112,6 +112,15 @@ test("agg averages within bins, then summarizes across runs", () => {
   assert.deepEqual([s.medlo, s.medhi], [[2, 0], [9, 30]]);
 });
 
+test("a run's value in a bin is the mean of its finite values, infinite only when it has none", () => {
+  const a = column([0, 1, 2, 3], [1, Infinity, 3, Infinity]);
+  const b = column([0, 1], [Infinity, Infinity]);
+  const c = column([0, 1], [5, -Infinity]);
+  const s = aggOf([a, b, c], 0, 4, 1);
+  assert.deepEqual([s.n[0], s.mean[0], s.median[0], s.max[0]], [3, Infinity, 5, Infinity]);
+  assert.ok(Number.isNaN(s.std[0]));
+});
+
 test("median CI uses the widest order statistics reaching 95% coverage", () => {
   for (const [n, k, cov] of [[5, 1, 0.9375], [9, 2, 0.9609375], [20, 6, 0.9586105346679688], [100, 40, 0.9647997997822952]]) {
     const cols = Array.from({ length: n }, (_, i) => column([0], [i + 1]));

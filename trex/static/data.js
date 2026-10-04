@@ -94,7 +94,7 @@ const idb = {
   async open() {
     try {
       this.db = await new Promise((ok, bad) => {
-        const r = indexedDB.open("trex", 6);
+        const r = indexedDB.open("trex", 7);
         r.onupgradeneeded = () => {
           for (const s of [...r.result.objectStoreNames]) r.result.deleteObjectStore(s);
           r.result.createObjectStore("tiles").createIndex("at", "at");
@@ -227,30 +227,33 @@ function finePoints(fine, s0) {
   return { s, v, t, n };
 }
 
-/** A column: `src` tiles' buckets merged f-fold (count-weighted means of value, step and runtime; w0
- * is their bucket width) outside `ranges`, the finer points `fp` inside them, then the tail rows. */
-function buildColumn(src, f, w0, fp, ranges, tail) {
+const merged = new Float64Array(8); // buckets merged into one: value, step and runtime sums and count, of the finite buckets then of the rest
+
+/** A column: `src` tiles' buckets merged f-fold (count-weighted means of value, step and runtime, over the buckets
+ * with a finite mean, or all of them when none has one, as `tiles.coarsen`; w0 is their bucket width) outside
+ * `ranges`, the finer points `fp` inside them, then the tail rows. */
+export function buildColumn(src, f, w0, fp, ranges, tail) {
   let cap = tail.n + fp.n;
   for (const t of src) cap += t.count;
   const all = new Float64Array(3 * cap), s = all.subarray(0, cap), v = all.subarray(cap, 2 * cap), tt = all.subarray(2 * cap);
-  let n = 0, fi = 0, ri = 0, cur = null, sm = 0, ss = 0, st = 0, cnt = 0;
+  let n = 0, fi = 0, ri = 0, cur = null;
   const emit = () => {
-    const x = ss / cnt;
+    const o = merged[3] > 0 ? 0 : 4, cnt = merged[o + 3], x = merged[o + 1] / cnt;
     if (cur === null || !(cnt > 0) || !(x < tail.s0)) return;
     while (ri < ranges.length && ranges[ri][1] <= x) ri++;
     if (ri < ranges.length && x >= ranges[ri][0]) return;
     while (fi < fp.n && fp.s[fi] < x) (s[n] = fp.s[fi]), (v[n] = fp.v[fi]), (tt[n] = fp.t[fi]), n++, fi++;
-    (s[n] = x), (v[n] = sm / cnt), (tt[n] = st / cnt), n++;
+    (s[n] = x), (v[n] = merged[o] / cnt), (tt[n] = merged[o + 2] / cnt), n++;
   };
   for (const t of src) {
     const base = t.index * TILE, c = t.count, { u16, f32, u32 } = t, mo = t.f + 2 * c, to = t.f + 3 * c, so = t.f + 4 * c, no = t.f + 5 * c;
     for (let i = 0; i < c; i++) {
-      const bi = base + u16[t.b + i], bk = Math.floor(bi / f), k = u32[no + i];
-      if (bk !== cur) emit(), (cur = bk), (sm = ss = st = cnt = 0);
-      sm += f32[mo + i] * k;
-      ss += (bi + f32[so + i]) * w0 * k;
-      st += f32[to + i] * k;
-      cnt += k;
+      const bi = base + u16[t.b + i], bk = Math.floor(bi / f), k = u32[no + i], m = f32[mo + i], o = Number.isFinite(m) ? 0 : 4;
+      if (bk !== cur) emit(), (cur = bk), merged.fill(0);
+      merged[o] += m * k;
+      merged[o + 1] += (bi + f32[so + i]) * w0 * k;
+      merged[o + 2] += f32[to + i] * k;
+      merged[o + 3] += k;
     }
   }
   emit();
