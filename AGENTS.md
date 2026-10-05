@@ -136,7 +136,8 @@ them WebGL falls back to software and timings mean nothing.
 - **Fetching ahead**: once the store is idle, `Data.prefetch` fetches one block at a time (`Data.nextAhead`, while the
   blocks no chart uses hold less than `AHEAD_BYTES`): for each chart, visible ones first, its wanted layers when it
   shows none yet, else the two levels below its finest over the steps it shows. Fetched blocks wait in the store.
-- **Rendering**: WebGL2 by default (`?gl=0` selects Canvas 2D). Above 300 lines a chart draws a
+- **Rendering**: WebGL2; a browser without it gets no charts, and a lost context keeps the charts as drawn until it is
+  restored. Above 300 lines a chart draws a
   density heatmap. No upload overwrites GPU data a queued draw may read: each draw's line table
   takes fresh rows of the table texture (`Renderer.bind`), and columns, which never change once built, each take a
   slot of their own after the others (`LineSet.update`). Charts then never depend on how a driver orders uploads

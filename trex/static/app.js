@@ -1,7 +1,7 @@
 import { BASE, Data, PROTOCOL, getJSON, hasKey, mediaURL, preload } from "./data.js";
 import { startWorkers } from "./pool.js";
 import { asNumber, compileWhere, completionContext, fieldText, literal, runField, textOf } from "./where.js";
-import { BAND_LABEL, Chart, DENSITY_AUTO, USE_GL, fmt, fmtDur, fmtSI } from "./plot.js";
+import { BAND_LABEL, Chart, DENSITY_AUTO, fmt, fmtDur, fmtSI } from "./plot.js";
 import { X_RUNTIME, X_STEP } from "./kernel.js";
 import { renderer } from "./gl.js";
 
@@ -476,7 +476,11 @@ class App {
     this.hiddenPanels = new Set(store.get(`hiddenPanels:${root}`, []));
     this.bindControls();
     await this.loadScope();
-    if (USE_GL) (window.requestIdleCallback ?? setTimeout)(() => renderer()); // its setup blocks, so it runs while blocks load
+    (window.requestIdleCallback ?? setTimeout)(() => { // its setup blocks, so it runs while blocks load
+      const r = renderer();
+      if (r) r.onRestore = () => this.redrawAll();
+      else $("#status").textContent = "charts need WebGL2, which this browser lacks";
+    });
   }
 
   /** Under the daemon, its state (else null), and the trex brand opening its panel. False when it tracks nothing,
@@ -1859,7 +1863,6 @@ class App {
    * density heatmap. */
   coarseAbove(o) {
     if (this.grouped) return DENSITY_AUTO;
-    if (!USE_GL) return Infinity;
     return o.render === "density" ? 0 : o.render === "auto" ? DENSITY_AUTO : Infinity;
   }
 

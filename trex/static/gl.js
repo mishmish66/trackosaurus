@@ -255,8 +255,7 @@ export function pointBuffer(buf, n) {
   return buf && buf.length >= need ? buf : new Float32Array(need);
 }
 
-/** Line table: per line (point offset, point count, color). */
-/** Lines' (offset, count, color), in whole rows of the table texture. */
+/** Line table: per line (point offset, point count, color), in whole rows of the table texture. */
 export class Table {
   constructor(n) {
     this.n = 0;
@@ -301,6 +300,7 @@ class Renderer {
     this.canvas.addEventListener("webglcontextrestored", () => {
       this.init();
       this.lost = false;
+      this.onRestore?.();
     });
     this.init();
   }
@@ -350,6 +350,11 @@ class Renderer {
       this.progs = this.lineProgs(false);
       return linked(this.gl, this.progs[name]);
     }
+  }
+
+  /** Points one point texture holds. */
+  get capacity() {
+    return this.maxRows * TW;
   }
 
   /** Whether this GPU draws density heatmaps (float render targets). */
@@ -562,17 +567,17 @@ class Renderer {
 }
 
 let shared;
-/** The shared renderer, or null when WebGL2 is unavailable or the context is lost. */
+/** The shared renderer (`lost` while its context is lost; `onRestore` runs once it is back), or null without WebGL2. */
 export function renderer() {
   if (shared === undefined) {
     try {
       shared = new Renderer();
     } catch (e) {
-      console.warn("trex: WebGL2 renderer unavailable, using Canvas 2D:", e.message);
+      console.warn("trex: charts need WebGL2:", e.message);
       shared = null;
     }
   }
-  return shared && !shared.lost ? shared : null;
+  return shared;
 }
 
 export { BREAK };

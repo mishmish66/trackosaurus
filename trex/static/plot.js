@@ -1,6 +1,5 @@
-// Line charts. Canvas 2D: each draw asks the kernel for a smoothed, pixel-decimated polyline (or
-// group aggregate) of just the visible x-range. WebGL (gl.js): every run's line stays on the GPU
-// and zoom is a transform; axes, labels and the hover overlay stay Canvas 2D.
+// Line charts, drawn with WebGL (gl.js): every run's line stays on the GPU and zoom is a transform;
+// group statistics are uploaded per draw. Axes, labels and the hover overlay are Canvas 2D.
 import { BinCache, Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, aggGroups, binGrid, binRows, buildColumn, medianCiCoverage, nearest,
          prep as kprep, visibleRange, yrange } from "./kernel.js";
 import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
@@ -8,10 +7,7 @@ import { PARALLEL, describe, onWorker } from "./pool.js";
 import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET } from "./data.js";
 import { nonFiniteText } from "./where.js";
 
-/** Renderer choice: WebGL where available; `?gl=0` selects Canvas 2D. */
-const GL_PARAM = typeof location === "undefined" ? null : new URLSearchParams(location.search).get("gl");
-export const USE_GL = GL_PARAM !== "0";
-const GPU_POINTS = 8e6; // points per line set kept at full resolution; larger sets are decimated
+const GPU_POINTS = 8e6; // points per line set kept at full resolution (at most half a texture); larger sets are decimated
 export const DENSITY_AUTO = 300; // "auto" draws a density heatmap above this many lines
 const DENSITY_TIP = 8; // runs listed by the density tooltip
 
@@ -337,8 +333,9 @@ class LineSet {
     let total = 0;
     for (const c of cols) total += c.n;
     this.win = null;
-    if (total > GPU_POINTS) {
-      this.R = Math.min(16384, Math.max(Math.ceil(2 * p.pw), Math.floor(GPU_POINTS / (4 * cols.length))));
+    const budget = Math.min(GPU_POINTS, this.r.capacity / 2);
+    if (total > budget) {
+      this.R = Math.min(16384, Math.max(Math.ceil(2 * p.pw), Math.floor(budget / (4 * cols.length))));
       const span = p.vx1 - p.vx0, head = (p.ex1 - p.ex0) / 8;
       this.win = [Math.max(p.ex0, p.vx0 - span / 2), Math.min(p.ex1 + head, p.vx1 + span / 2)];
       if (!(this.win[1] > this.win[0])) this.win = [p.vx0, p.vx1];
@@ -520,22 +517,24 @@ export class Chart {
     return Math.max(10, this.h - MARGIN.t - MARGIN.b);
   }
 
-  /** Query the kernel for everything this chart draws. */
+  /** Query the kernel for everything this chart draws; WAITING while the GPU context is lost (drawn again once it is
+   * back). */
   compute() {
-    const app = this.app, o = app.panelOpts(this.key);
+    const app = this.app, o = app.panelOpts(this.key), r = renderer();
+    if (!r) return null;
+    if (r.lost) return WAITING;
     const groups = app.linesFor(this.key), allCols = colsOf(groups);
     const v = this.xView(o, allCols, groups);
     if (!v) return null;
-    const yr = new YRange(o.logy), r = this.glRenderer(), binned = (this.binned = this.binnedOf(o, groups));
+    const yr = new YRange(o.logy), binned = (this.binned = this.binnedOf(o, groups));
     const rows = !app.grouped && binned ? this.binnedRows(groups, v) : null;
     if (rows === WAITING) return WAITING;
-    const runLines = rows || groups.filter((ln) => ln.cols[0]);
-    const gl = !app.grouped && r ? this.linesGL(r, runLines, v, yr) : null;
-    const lines = gl ? gl.lines : app.grouped ? this.linesGrouped(groups, allCols, v, o, yr, binned) : this.linesCanvas(runLines, v, yr);
+    const gl = app.grouped ? null : this.linesGL(r, rows || groups.filter((ln) => ln.cols[0]), v, yr);
+    const lines = gl ? gl.lines : this.linesGrouped(groups, allCols, v, o, yr, binned);
     if (lines === WAITING) return WAITING;
     const y = this.yView(o, yr, allCols, v);
     if (!y) return null;
-    return { ...v, ...y, lines, o, gl: !!r && (!!gl || app.grouped), gpu: !!gl, density: !!gl?.density };
+    return { ...v, ...y, lines, o, lineSets: !!gl, density: !!gl?.density };
   }
 
   /** x range (transformed) and smoothing of the view: the data's extent, or the zoom; null if empty. */
@@ -551,15 +550,15 @@ export class Chart {
              scale: smoothScale(e1 - e0), flags: (logy ? LOGY : 0) | (logx ? LOGX : 0) };
   }
 
-  /** Lines drawn from the GPU line sets ({lines, density}), or null when the GPU cannot hold them. */
+  /** Lines drawn from the GPU line sets: {lines, density}. */
   linesGL(r, groups, v, yr) {
     const faint = v.alpha > 0;
     const density = this.binned && r.heatmaps;
     const p = { ...v, pw: this.pw, vx0: v.x0, vx1: v.x1 };
     const g = this.glLines(r);
     const cols = groups.map((ln) => ln.cols[0]);
-    const ok = g.main.sync(cols, p) && (!faint || density || g.faint.sync(cols, p));
-    if (!ok) return null;
+    g.main.sync(cols, p);
+    if (faint && !density) g.faint.sync(cols, p);
     for (const c of cols) for (const raw of faint ? [false, true] : [false]) growVisible(c, v, raw, yr);
     return { lines: groups.map((ln) => ({ ...ln })), density };
   }
@@ -572,17 +571,6 @@ export class Chart {
     const runs = groups.flatMap((g) => (g.runs || [g.run]).filter((_, i) => !g.cols[i]));
     this.bucketExt = { groups, sig, out: data.extentOf(runs, this.key, xmode) };
     return this.bucketExt.out;
-  }
-
-  /** Lines decimated per pixel for Canvas 2D. */
-  linesCanvas(groups, v, yr) {
-    const out = outBuf(Math.ceil(this.pw) * 4 + 1024);
-    const prep = (c, raw) => {
-      const r = kprep(c, v.xmode, v.x0, v.x1, this.pw, v.flags | (raw ? RAW : 0), v.alpha, v.scale, out);
-      if (r.ymin <= r.ymax) yr.add(r.ymin), yr.add(r.ymax);
-      return out.slice(0, 2 * r.n);
-    };
-    return groups.map((g) => ({ ...g, raw: v.alpha > 0 ? prep(g.cols[0], true) : null, xy: prep(g.cols[0], false) }));
   }
 
   /** One center line with its band per group, from per-bin group statistics; they set the y range, which a band
@@ -720,11 +708,6 @@ export class Chart {
   }
 
 
-  /** The WebGL renderer when selected and available, else null (Canvas 2D). */
-  glRenderer() {
-    return USE_GL ? renderer() : null;
-  }
-
   /** This chart's GPU line sets, created on first use. */
   glLines(r) {
     return (this.glState ||= { main: new LineSet(r, false), faint: new LineSet(r, true), tmp: new Points(r) });
@@ -740,9 +723,10 @@ export class Chart {
   /** Draw bands and lines of `view` through WebGL onto ctx (device px, clipped to the plot). */
   drawGL(ctx, view) {
     const r = renderer(), dpr = devicePixelRatio || 1;
+    if (r.lost) return;
     r.begin(this.canvas.width, this.canvas.height, [MARGIN.l * dpr, MARGIN.t * dpr, this.pw * dpr, this.ph * dpr]);
     const g = this.glLines(r);
-    if (view.gpu) {
+    if (view.lineSets) {
       const { main, faint } = g;
       r.touch(main.pts);
       if (view.density) r.density(main.pts, main.tableFor(view.lines), glView(this, view, main.ox, main.oy), dpr, isDark());
@@ -837,18 +821,9 @@ export class Chart {
     const css = getComputedStyle(document.documentElement);
     ctx.font = "10px system-ui, sans-serif";
     ctx.fillStyle = css.getPropertyValue("--muted");
-    if (!view) return ctx.fillText("no data", MARGIN.l + 4, MARGIN.t + 14);
+    if (!view) return ctx.fillText(renderer() ? "no data" : "charts need WebGL2", MARGIN.l + 4, MARGIN.t + 14);
     this.drawAxes(ctx, view, css.getPropertyValue("--grid"));
-    if (view.gl) return this.drawGL(ctx, view);
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(MARGIN.l, MARGIN.t, this.pw, this.ph);
-    ctx.clip();
-    if (view.o.band !== "none") for (const ln of view.lines) if (ln.lo) this.drawBand(ctx, ln);
-    ctx.lineJoin = "round";
-    for (const ln of view.lines) if (ln.raw) this.stroke(ctx, ln.raw, ln.color, 1, 0.22);
-    for (const ln of view.lines) this.stroke(ctx, ln.xy, ln.color, this.app.grouped ? 2 : 1.25, 1);
-    ctx.restore();
+    this.drawGL(ctx, view);
   }
 
   /** Grid lines and tick labels. */
@@ -874,14 +849,6 @@ export class Chart {
     for (const t of xt) ctx.fillText(view.xmode === X_RUNTIME ? fmtDur(t) : fmtSI(t), this.px(t), MARGIN.t + this.ph + 4);
   }
 
-  stroke(ctx, xy, color, width, alpha) {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width;
-    ctx.globalAlpha = alpha;
-    this.polyline(ctx, xy, xy.length >> 1);
-    ctx.globalAlpha = 1;
-  }
-
   /** Stroke the first n (x, y) pairs of xy (data units); NaN y breaks the line. */
   polyline(ctx, xy, n) {
     ctx.beginPath();
@@ -897,25 +864,6 @@ export class Chart {
       else ctx.moveTo(X, Y), (pen = true);
     }
     ctx.stroke();
-  }
-
-  drawBand(ctx, ln) {
-    ctx.fillStyle = ln.color;
-    ctx.globalAlpha = 0.18;
-    const n = ln.lo.length, xy = ln.xy;
-    let i = 0;
-    while (i < n) {
-      while (i < n && !(Number.isFinite(ln.lo[i]) && Number.isFinite(ln.hi[i]))) i++;
-      const s = i;
-      while (i < n && Number.isFinite(ln.lo[i]) && Number.isFinite(ln.hi[i])) i++;
-      if (i - s < 1) continue;
-      ctx.beginPath();
-      for (let j = s; j < i; j++) ctx.lineTo(this.px(xy[2 * j]), this.py(ln.hi[j]));
-      for (let j = i - 1; j >= s; j--) ctx.lineTo(this.px(xy[2 * j]), this.py(ln.lo[j]));
-      ctx.closePath();
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
   }
 
   hover(e) {

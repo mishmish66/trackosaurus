@@ -191,8 +191,8 @@ LINE_PIXELS = """(key) => {
 
 
 def line_pixels_smoke(page, url):
-    """Whether charts put their lines on their canvases, with WebGL and with Canvas 2D: grouped, one per run in a
-    folder, and grouped again after going back, drawn as at first whatever the folder's lines drew before."""
+    """Whether charts put their lines on their canvases: grouped, one per run in a folder, and grouped again after
+    going back, drawn as at first whatever the folder's lines drew before."""
     chart = "app.charts.get('train/loss')"
 
     def drawn():
@@ -202,25 +202,23 @@ def line_pixels_smoke(page, url):
         page.wait_for_timeout(400)
         return page.evaluate(LINE_PIXELS, "train/loss")
 
-    out = {}
-    for render in ("gl", "gl=0"):
-        page.goto(f"{url}/?pixels&{render}#path=sweep&group=lr")
-        page.wait_for_function("window.app && app.data.runs.size > 0 && app.grouped", timeout=60000)
-        grouped = drawn()
-        page.evaluate("app.setPath('sweep/width512/lr0.01')")
-        page.wait_for_function("!app.grouped", timeout=60000)
-        lines = drawn()
-        page.evaluate("history.back()")
-        page.wait_for_function("app.grouped", timeout=60000)
-        out[render] = [grouped, lines, drawn()]
-    print(f"line pixels (grouped, a folder's runs, grouped again): WebGL {out['gl']}, Canvas 2D {out['gl=0']}")
-    return all(g > 300 and n > 300 and abs(again - g) <= 0.02 * g for g, n, again in out.values())
+    page.goto(f"{url}/?pixels#path=sweep&group=lr")
+    page.wait_for_function("window.app && app.data.runs.size > 0 && app.grouped", timeout=60000)
+    grouped = drawn()
+    page.evaluate("app.setPath('sweep/width512/lr0.01')")
+    page.wait_for_function("!app.grouped", timeout=60000)
+    lines = drawn()
+    page.evaluate("history.back()")
+    page.wait_for_function("app.grouped", timeout=60000)
+    again = drawn()
+    print(f"line pixels: grouped {grouped}, a folder's runs {lines}, grouped again {again}")
+    return grouped > 300 and lines > 300 and abs(again - grouped) <= 0.02 * grouped
 
 
 def binned_smoke(page, url, runs):
     """Whether a zoom of more runs than a chart draws one by one draws them from bins of their buckets, as group
     statistics (each group's median per bin of its runs' means of their rows), with workers and without, and as a
-    heatmap, which Canvas 2D draws as lines; and whether a server of another protocol is stated."""
+    heatmap; and whether a server of another protocol is stated."""
     subprocess.run([sys.executable, "-c", MANY_WRITER, str(runs)], check=True)
 
     def zoomed(query, hash_):
@@ -238,8 +236,6 @@ def binned_smoke(page, url, runs):
             return [c.binned, c.view.lines.map((l) => [l.label.split(' ')[0], l.g0, l.dx, [...l.center]])]; })()""")
     zoomed("", "group=run")
     heat = page.evaluate("(() => { const c = app.charts.get('loss'); return [c.binned, c.view.density, c.view.lines.length]; })()")
-    zoomed("gl=0", "group=run")
-    canvas = page.evaluate("(() => { const c = app.charts.get('loss'); return [!!c.binned, c.view?.lines.length ?? 0]; })()")
     page.evaluate("app.showProtocol(1)")
     stated = page.evaluate("[!document.querySelector('#mismatch').hidden, document.querySelector('#mismatch').title]")
     off = {q: [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
@@ -247,9 +243,9 @@ def binned_smoke(page, url, runs):
     groups = sorted(l[0] for l in drawn[""][1])
     print(f"binned: a zoom of 320 runs drew bins of their buckets {drawn[''][0]} (without workers {drawn['shared=0'][0]}), groups {groups}"
           f" of {len(drawn[''][1][0][3]) if drawn[''][1] else 0} bins, at most {max(off[''], default=1):.2g} off their exact medians "
-          f"({max(off['shared=0'], default=1):.2g} without workers); heatmap {heat}, in Canvas 2D as lines {canvas}; protocol 1 stated {stated}")
+          f"({max(off['shared=0'], default=1):.2g} without workers); heatmap {heat}; protocol 1 stated {stated}")
     return (drawn[""][0] is True and drawn["shared=0"][0] is True and groups == ["a", "b"] and off[""] and max(off[""]) < 1e-5
-            and off["shared=0"] and max(off["shared=0"]) < 1e-5 and heat == [True, True, 320] and canvas == [False, 320]
+            and off["shared=0"] and max(off["shared=0"]) < 1e-5 and heat == [True, True, 320]
             and stated[0] and "the server 1" in stated[1])
 
 
@@ -381,8 +377,7 @@ def interactions_smoke(page, url):
     """Whether charts carry no legend and the chart controls do what they say: hover and Shift-pinned tooltips
     (which the wheel scrolls, and whose rows reveal and open runs), x and box zooms and their reset, the chart
     settings (smoothing, axes, outliers, density, reset), the sort box (type, pick, Enter, Escape), sidebar hiding,
-    group-by search, keyboard scrolling, the media slider, back/forward (back to the grouping the folder had), and
-    Canvas 2D drawing."""
+    group-by search, keyboard scrolling, the media slider, and back/forward (back to the grouping the folder had)."""
     key, checks = "train/loss", {}
     sel = f".panel:has(.pname:text-is('{key}'))"
     chart = f"app.charts.get({key!r})"
@@ -540,12 +535,6 @@ def interactions_smoke(page, url):
     checks["the y axis follows the group lines; a band widens it by at most a quarter"] = (
         span[2] <= span[0] and span[3] >= span[1] and span[2] >= span[0] - reach - 0.05 * (span[1] - span[0] + 2 * reach)
         and span[3] <= span[1] + reach + 0.05 * (span[1] - span[0] + 2 * reach))
-    page.goto(f"{url}/?gl=0#path=sweep&group=lr")
-    page.wait_for_function(READY, timeout=30000)
-    hover(plot())
-    page.goto(f"{url}/?gl=0#path=sweep&group=")
-    page.wait_for_function(READY, timeout=30000)
-    checks["Canvas 2D draws without WebGL"] = page.evaluate(f"!!{chart}.view && !{chart}.view.gl")
     failed = [k for k, v in checks.items() if not v]
     print(f"interactions: {len(checks) - len(failed)}/{len(checks)} as intended" + (f"; not: {failed}" if failed else ""))
     return not failed
