@@ -57,7 +57,7 @@ vec4 toClip(vec2 P) { return vec4(P.x / u_size.x * 2.0 - 1.0, 1.0 - P.y / u_size
 vec4 unpack(ivec4 m) { return vec4(float((m.z >> 16) & 255), float((m.z >> 8) & 255), float(m.z & 255), float(m.w)) / 255.0; }
 `;
 
-// Segment quad: two triangles around segment i -> i+1, padded by half width plus 1 px of fringe.
+// Segment quad: two triangles around segment i -> i+1, padded by half width plus the half pixel coverage reaches.
 const LINE_VS = (multi) => `${header(multi)}
 uniform float u_half, u_count;
 out vec2 v_uv;
@@ -75,7 +75,7 @@ void main() {
   int c = gl_VertexID;
   float end = (c == 1 || c == 4 || c == 5) ? 1.0 : 0.0;
   float side = (c == 2 || c == 3 || c == 5) ? 1.0 : -1.0;
-  float h = u_half + 1.0, s = end * 2.0 - 1.0;
+  float h = u_half + 0.5, s = end * 2.0 - 1.0;
   v_uv = vec2(end * len + s * h, side * h);
   v_len = len;
   v_color = unpack(m);

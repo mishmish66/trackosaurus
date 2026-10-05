@@ -11,10 +11,10 @@ docstrings (Markdown, published by `docs/build.py`); the README's "One trex, man
 | `trex/format.py` | the run file: `trex.sqlite` schema (format 3), `connect_rw`, `connect_ro`, `snapshot`; `JSONValue` and the `as_*` helpers that narrow JSON. The contract between writer and readers. |
 | `trex/journal.py` | commit journal for runs on network filesystems: `Writer` (append + fsync), `records`, `sync` (replay into a local replica) |
 | `trex/chunks.py` | per-metric chunk codec: each commit is one `rowmeta` row (steps, times) plus one `chunk` per metric present; `metric` (one metric's `Series`), `rows`; `prepare_merge` / `apply_merge` rewrite adjacent commits as one |
-| `trex/buckets.py` | bucket arrays, the one form metric data takes between run files and charts: `TKB1` (`encode`, `decode`, `frame`), `bucketize`, `merge`, `cut`, `refine`, `union`, `Stack`; one run's levels: `pyramid` (from every row) and `grow` (the blocks new rows change) |
+| `trex/buckets.py` | bucket arrays, the one form metric data takes between run files and charts: `TKB1` (`encode`, `decode`, `frame`), `bucketize`, `merge`, `cut`, `refine`, `union`, `Stack`; arrays put together as bytes (`join`, `chain`); one run's levels: `pyramid` (from every row) and `grow` (the blocks new rows change) |
 | `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread, and a merge thread that merges small commits |
 | `trex/media.py` | PNG/MP4 encoding for logged arrays (MP4 through ffmpeg) |
-| `trex/index.py` | `Explorer`: a directory's index (`index.sqlite`), kept current by its `Origin`, and everything answered from it: run lists, blocks (`buckets_body`), rows, the event hub and SSE stream (`messages`), dumps for other trex (`dump`). The records (`RunRecord`, `Update`, `Dump`, `Have`, `RunMeta`, `Rows`, ...); finished runs' merged levels (saved as `.npy`, memory-mapped); `Memo` |
+| `trex/index.py` | `Explorer`: a directory's index (`index.sqlite`), kept current by its `Origin`, and everything answered from it: run lists, blocks (`buckets_body`; stored ones read by `stored_block`, on the block workers, `Workers`), rows, the event hub and SSE stream (`messages`), dumps for other trex (`dump`). The records (`RunRecord`, `Update`, `Dump`, `Have`, `RunMeta`, `Rows`, ...); finished runs' merged levels (saved as `.npy`, memory-mapped); `Memo` |
 | `trex/crawl.py` | `Crawl`, the origin of a runs directory on this machine: walks it, scans changed runs (inline or on a process pool), compiles their levels |
 | `trex/mirror.py` | `Pull`, the origin of a directory another trex holds: its run list, dumps, media copies, its stream, running runs' tails. `Upstream`: that trex's API over http or a Unix socket, connections kept alive |
 | `trex/node.py` | `Node`: what one trex process holds and serves: directories by id (crawled here, or pulled through a `Link`), links, workspaces, display names, `holdings`, `reconcile`; saved state (`Saved`, `Identity`). Its docstring is the user guide for running trex. |
@@ -163,10 +163,19 @@ array, all in one body (`buckets.frame`). Per run (`Explorer._block`):
 - a finished run whose top level is `level` or finer: cut from the metric's merged level (`_level`: every finished
   run's top-level blocks decoded at once, `buckets.stack`, merged on `MERGE_THREADS` threads, or the saved `.npy`);
 - a running run whose top level is `level` or finer: merged from its top level read from the index (`_tops`);
-- any other run: its stored block (`_stored`); below its finest level, its finest level's buckets refined
-  (`buckets.refine`: each bucket placed at its mean step).
+- any other run: its stored block (`stored_block`), as it is stored (`buckets.join` puts the runs' one-run arrays
+  together without decoding them); below its finest level, its finest level's buckets refined (`buckets.refine`: each
+  bucket placed at its mean step).
 
 Each run's `seq` in the answer is its `compiled`; the browser adds the rows beyond it from the stream.
+
+Stored blocks of more than `BLOCK_ALONE` runs are read by the **block workers** (`index.Workers`): `BLOCK_WORKERS`
+processes, each reading a slice of the runs (at most `SLICE`; rows and decompression on `READ_THREADS` threads) from
+its own read-only connections to the index, the slices' arrays chained as bytes (`buckets.chain`). The first such
+block starts them on a thread of their own; until every worker has answered, and whenever they fail, the asking thread
+reads the block itself, one such block at a time. While the workers are up, a request's asks for such blocks are
+answered at once (`at_once`), each waiting for its workers, the smaller asks meanwhile by the request's thread.
+Workers end with the process that started them (`worker_init`), also when it is killed.
 
 ### Transfer between nodes
 
@@ -212,9 +221,10 @@ start).
 
 A `Workspace` answers the Explorer interface by asking its members in parallel. Merged, a run id is the member's path,
 or `path<member>` when an earlier member holds the same path (`resolve` maps it back); nested, each member is a
-top-level folder named for it. It asks each member once per request for its part of every block and joins the members'
-bucket arrays per block, run ids renamed (`Workspace.buckets_bodies`). Its stream merges the members' streams,
-renaming run ids in every event. Every run gets a `dir` field: its member's name.
+top-level folder named for it. For each block it asks the members for their parts (at once, as an Explorer answers
+asks) and chains their bucket arrays as bytes, each member's runs in turn, run ids renamed
+(`Workspace.buckets_bodies`, `buckets.chain`). Its stream merges the members' streams, renaming run ids in every
+event. Every run gets a `dir` field: its member's name.
 
 ### Browser
 
@@ -224,12 +234,17 @@ renaming run ids in every event. Every run gets a `dir` field: its member's name
   chart of many runs) within a point budget, rounded so they change only when a span crosses a power of two, as top
   levels do. When many finished runs lack a block, one request asks for the folder's finished runs; other runs are
   asked for by id, and a running run again once its `compiled` passes the rows its block holds (`Data.current`).
-  Requests go out in batches of at most `BATCH_BLOCKS` blocks, spread over the free request slots (`Data.pump`).
+  Requests go out in batches of at most `BATCH_BLOCKS` blocks, spread over the free request slots (`Data.pump`), the
+  chart last pressed first (`App.lead`).
 - **The store**: answers fill one store, `Data.blocks` (block -> run -> its row of a bucket array); a chart shows its
   wanted layers once every block holds every run, and keeps showing the previous ones until then. A run drawn as a line
   has a column (`kernel.buildColumn`): its buckets in the shown blocks, a finer level's where its blocks lie and the
-  coarse level's elsewhere, then the streamed rows those blocks do not hold, bucketed as the server would, so a live run
-  looks the same when its levels catch up. A chart of more runs than it draws one by one (`App.coarseAbove`: group
+  coarse level's elsewhere (in step order without sorting: the finer blocks, when they join into one range, replace
+  the coarse buckets inside it, `emitBuckets`), then the streamed rows those blocks do not hold, bucketed as the server
+  would, so a live run looks the same when its levels catch up. Columns are rebuilt in tasks (`Data.rebuildSome`:
+  `REBUILD_SLICE_MS` at a time, going on up to `REBUILD_WHOLE_MS` to finish a metric), only those whose blocks or
+  layers changed, and the UI is told of a metric once none of its columns awaits rebuilding, so a chart draws its runs'
+  new columns together. A chart of more runs than it draws one by one (`App.coarseAbove`: group
   statistics, or a heatmap) bins its finished runs from their buckets in its finest shown blocks (`Data.partsOf`), its
   running ones from their columns. Binning weights each point by the rows it stands for, so a bin's mean is the mean
   of the rows in it. Workers fetch blocks, each array of a batch into a buffer of its own handed to the page
@@ -245,12 +260,15 @@ renaming run ids in every event. Every run gets a `dir` field: its member's name
   flight (`Data.nextAhead`, each request once a page, while the blocks no chart uses hold less than `AHEAD_BYTES`):
   every chart's wanted layers first, visible charts first and then the nearest the view (`App.aheadOf`), then the two
   levels below the finest each shown chart shows over the steps it shows. Fetched blocks wait in the store, so a
-  scroll finds the charts' blocks already there.
+  scroll finds the charts' blocks already there. While a zoom is dragged, the blocks the charts would want for it are
+  fetched ahead too, for where the drag is every `AIM_MS` (`App.aimZoom`, `Data.fetchFor`), so a zoom mostly finds its
+  blocks there at release.
 - **Rendering**: WebGL2; a browser without it gets no charts, and a lost context keeps the charts as drawn until it is
   restored. Above 300 lines a chart draws a density heatmap. No upload overwrites GPU data a queued draw may read: each
   draw's line table takes fresh rows of the table texture (`Renderer.bind`), and columns, which never change once
-  built, each take a slot of their own after the others (`LineSet.update`). Charts then never depend on how a driver
-  orders uploads against earlier draws.
+  built, each take a slot of their own after the others (`LineSet.update`; a set whose columns are mostly new is
+  uploaded whole). Charts then never depend on how a driver orders uploads against earlier draws. A draw's instances
+  are each line's segments in view (`LineSet.tableFor`), not all of its points.
 
 ## Invariants (things that break silently if ignored)
 
@@ -325,8 +343,10 @@ block input for more than about 50 ms.
 - Charts draw first. Sidebar, path bar and info panel update after the frame paints (`App.afterPaint`), one task each.
   Chart drawing stops at `FRAME_BUDGET_MS` per frame and continues on the next. Redraws for streamed data come at most
   4 times a second, less often when the visible charts are expensive to draw, and keep the y axis while the lines fill
-  most of it (`steadyY`). Work the view asked for draws at once when the data layer is idle (`Data.busy`), and blocks
-  are planned after the charts draw, only when what the view shows or the data changed; a zoom plans before it draws.
+  most of it (`steadyY`). Work the view asked for draws on the next frame; after a zoom, a chart that shows lines
+  waits up to `HOLD_MS` for the columns being rebuilt for it (`App.due`), so it redraws once, with all of them. Blocks
+  are planned after the charts draw, only when what the view shows or the data changed; a zoom plans before it draws
+  (`App.setXRange`).
 - Group statistics bin each column once per binning (`BinCache`, kept per chart while the column has the same points);
   a chart's groups are summarized in one `aggGroups` call. Order statistics come from histogram selection, exact; only
   bins of at most 64 values are sorted.

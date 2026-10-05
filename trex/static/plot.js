@@ -8,6 +8,7 @@ import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET } from "./data.js";
 import { nonFiniteText } from "./where.js";
 
 const GPU_POINTS = 8e6; // points per line set kept at full resolution (at most half a texture); larger sets are decimated
+const EDGE_PX = 4; // px beyond the plot's sides within which a segment's end may still draw inside it
 export const DENSITY_AUTO = 300; // "auto" draws a density heatmap above this many lines
 const DENSITY_TIP = 8; // runs listed by the density tooltip
 
@@ -15,6 +16,7 @@ const MARGIN = { l: 52, r: 10, t: 6, b: 20 };
 export const BAND_LABEL = { ci: "95% CI", iqr: "IQR", minmax: "min/max", std: "±std", stderr: "±stderr", none: "none" };
 const CLICK_MAX = 5; // px of movement below which a press is a click
 const BOX_MIN = 8; // px of vertical drag that turns an x zoom into a box zoom
+const AIM_MIN = 16; // px of horizontal drag from which the zoom's blocks are fetched while it is dragged
 
 // Two-sided 95% Student t critical values for df = 1..30; normal beyond.
 const T95 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.16, 2.145, 2.131,
@@ -311,10 +313,11 @@ class LineSet {
     return p.vx0 >= w0 && p.vx1 <= w1 && (this.R * (p.vx1 - p.vx0)) / (w1 - w0) >= p.pw;
   }
 
-  /** Upload the columns not yet here; false if a rebuild is needed instead. */
+  /** Upload the columns not yet here, when they are few of them (a set mostly new goes up whole, in one upload); false
+   * if a rebuild is needed instead. */
   updateStale(cols, p, alpha) {
     const stale = cols.filter((c) => !this.slots.has(c));
-    return stale.length <= 256 && stale.every((c) => this.update(c, p, alpha));
+    return stale.length <= Math.min(256, cols.length >> 1) && stale.every((c) => this.update(c, p, alpha));
   }
 
   build(cols, p, alpha, key) {
@@ -386,13 +389,18 @@ class LineSet {
     return true;
   }
 
-  /** Line table for `lines` (each with cols[0] and color) in draw order. */
-  tableFor(lines) {
-    const t = this.table;
+  /** Line table for `lines` (each with cols[0] and color) in draw order: of each line, the points whose segments can
+   * show in view v, `pw` px wide (every point of a decimated set). */
+  tableFor(lines, v, pw) {
+    const t = this.table, pad = (EDGE_PX * (v.x1 - v.x0)) / pw;
     t.clear();
     for (const ln of lines) {
       const s = this.slots.get(ln.cols[0]);
-      t.push(s ? s.off : 0, s ? s.n : 0, ln.color);
+      if (!s || this.win) t.push(s ? s.off : 0, s ? s.n : 0, ln.color);
+      else {
+        const [lo, hi] = visibleRange(ln.cols[0], v.xmode, v.x0 - pad, v.x1 + pad, v.logx);
+        t.push(s.off + lo, Math.max(0, hi - lo), ln.color);
+      }
     }
     return t;
   }
@@ -455,6 +463,7 @@ export class Chart {
     this.overlay.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
       this.drag = { x: e.offsetX, y: e.offsetY };
+      this.app.lead = this.key;
       const up = (ev) => {
         window.removeEventListener("mouseup", up);
         this.endDrag(ev);
@@ -711,13 +720,13 @@ export class Chart {
     if (view.lineSets) {
       const { main, faint } = g;
       r.touch(main.pts);
-      if (view.density) r.density(main.pts, main.tableFor(view.lines), glView(this, view, main.ox, main.oy), dpr, isDark());
+      if (view.density) r.density(main.pts, main.tableFor(view.lines, view, this.pw), glView(this, view, main.ox, main.oy), dpr, isDark());
       else {
         if (view.alpha > 0) {
           r.touch(faint.pts);
-          r.lines(faint.pts, faint.tableFor(view.lines), glView(this, view, faint.ox, faint.oy), dpr, 0.22);
+          r.lines(faint.pts, faint.tableFor(view.lines, view, this.pw), glView(this, view, faint.ox, faint.oy), dpr, 0.22);
         }
-        r.lines(main.pts, main.tableFor(view.lines), glView(this, view, main.ox, main.oy), 1.25 * dpr, 1);
+        r.lines(main.pts, main.tableFor(view.lines, view, this.pw), glView(this, view, main.ox, main.oy), 1.25 * dpr, 1);
       }
       r.trim(new Set([main.pts, faint.pts]));
     } else this.drawGroupsGL(r, g.tmp, view, dpr);
@@ -887,6 +896,7 @@ export class Chart {
     ctx.fillStyle = "rgba(127,127,127,0.2)";
     if (h >= BOX_MIN) ctx.fillRect(Math.min(d.x, e.offsetX), Math.min(d.y, e.offsetY), w, h);
     else ctx.fillRect(Math.min(d.x, e.offsetX), MARGIN.t, w, this.ph);
+    if (w >= AIM_MIN) this.app.aimZoom([this.xAt(Math.min(d.x, e.offsetX)), this.xAt(Math.max(d.x, e.offsetX)), this.view.xmode]);
   }
 
   /** Tooltip row of a group line at x: its center, band and count in that bin. */

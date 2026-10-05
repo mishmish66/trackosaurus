@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import get_json, post_json, write_run
+from helpers import get_json, post_json, wait_for, write_run
 
 type Forge = tuple[str, Callable[[], str]]
 
@@ -107,6 +107,36 @@ def test_a_terminated_trex_exits_cleanly_and_removes_its_socket(tmp_path: Path, 
 
 
 GIT = ["git", "-c", "user.name=trex", "-c", "user.email=trex@localhost", "-c", "init.defaultBranch=main"]
+
+
+WORKER = """
+import os, time
+from concurrent.futures import ProcessPoolExecutor
+from trex.index import mp_context, worker_init
+pool = ProcessPoolExecutor(1, mp_context=mp_context(), initializer=worker_init)
+print(pool.submit(os.getpid).result(), flush=True)
+time.sleep(120)
+"""
+
+
+def running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_a_worker_ends_when_the_process_that_started_it_is_killed() -> None:
+    p = subprocess.Popen([sys.executable, "-c", WORKER], stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout
+        worker = int(p.stdout.readline())
+        assert running(worker)
+    finally:
+        p.kill()
+        p.wait()
+    assert wait_for(lambda: not running(worker))
 
 
 @pytest.fixture

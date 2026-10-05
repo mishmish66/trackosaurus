@@ -81,7 +81,7 @@ def test_workspace_buckets_rows_and_media_come_from_the_member_holding_the_run(n
     got = blocks(f"{http}/w/both", runs=["sac/r3", "shared/x", "shared/x<runs<b>>", "missing"])
     direct_b = blocks(f"{http}{dir_base(node.id_of(b))}", runs=["sac/r3", "shared/x"])
     direct_a = blocks(f"{http}{dir_base(node.id_of(a))}", runs=["shared/x"])
-    assert got.paths == ["sac/r3", "shared/x", "shared/x<runs<b>>"] and runs_with_buckets(got) == got.paths
+    assert got.paths == ["shared/x", "sac/r3", "shared/x<runs<b>>"] and runs_with_buckets(got) == got.paths  # each member's in turn
     for path, direct, there in (("sac/r3", direct_b, "sac/r3"), ("shared/x", direct_a, "shared/x"), ("shared/x<runs<b>>", direct_b, "shared/x")):
         mine, theirs = got.buckets.run == got.paths.index(path), direct.buckets.run == direct.paths.index(there)
         assert all((x[mine] == y[theirs]).all() for x, y in zip(got.buckets.columns[1:], direct.buckets.columns[1:]))
@@ -99,6 +99,13 @@ def test_a_workspace_block_holds_every_members_runs_under_its_scope(node: Node, 
     node.set_workspace("both", [a, b])
     got = blocks(f"{http}/w/both", scope="sac")
     assert got.paths == ["sac/r1", "sac/r2", "sac/r3"] and runs_with_buckets(got) == got.paths
+
+
+def test_a_workspace_block_of_a_scope_without_runs_names_none(node: Node, dirs: tuple[Path, Path], http: str) -> None:
+    a, b = tracked(node, *dirs)
+    node.set_workspace("both", [a, b])
+    got = blocks(f"{http}/w/both", scope="nowhere")
+    assert got.paths == [] and got.buckets.run.size == 0
 
 
 def test_a_workspace_answers_a_batch_as_each_block_alone(node: Node, dirs: tuple[Path, Path], http: str) -> None:

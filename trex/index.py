@@ -8,23 +8,28 @@ live stream, and the dumps other trex pull.
 
 import contextlib
 import fcntl
+import functools
 import hashlib
 import itertools
 import json
 import math
+import multiprocessing
 import os
 import queue
 import shutil
+import signal
 import sqlite3
 import struct
+import sys
 import threading
 import time
 import zlib
 from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import batched
+from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol, Self, TextIO, cast
 
@@ -359,6 +364,12 @@ LEVELS_BYTES = int(os.environ.get("TREX_LEVELS_MB", "4096")) << 20  # saved merg
 LEVELS_SAVE_EVERY = 60.0  # seconds between saves of one metric's merged levels
 LEVELS_AHEAD: Final = 3  # levels above a metric's coarsest top level merged and saved ahead of requests
 MERGE_THREADS: Final = min(8, os.cpu_count() or 1)  # threads merging one level
+READ_THREADS: Final = min(8, os.cpu_count() or 1)  # threads reading and decompressing stored blocks
+READ_ALONE: Final = 48  # runs whose stored blocks one thread reads
+BLOCK_WORKERS: Final = min(4, os.cpu_count() or 1)  # processes reading and joining stored blocks
+BLOCK_ALONE: Final = 32  # runs whose stored blocks the asking thread reads and joins itself
+SLICE: Final = 512  # runs of a block one block worker reads, at most
+STARTING: Final = 0.05  # seconds each block worker is kept busy as the workers start, so that every one starts
 PAGE_SIZE: Final = 16384
 READ_ERRORS: Final = (sqlite3.Error, OSError, ValueError, KeyError, struct.error)
 ROWS_EVENT_MAX: Final = 20_000  # larger catch-ups reach browsers through newly compiled levels instead of rows
@@ -376,6 +387,8 @@ TABLES: Final = {
     "metrics": "CREATE TABLE IF NOT EXISTS metrics(path TEXT, key TEXT, fine INTEGER, top INTEGER, lo REAL, hi REAL, "
                "PRIMARY KEY(key, path))",
     "metrics_path": "CREATE INDEX IF NOT EXISTS metrics_path ON metrics(path)",
+    # a run's levels of a metric without reading its row
+    "metrics_levels": "CREATE INDEX IF NOT EXISTS metrics_levels ON metrics(key, path, fine, top)",
     # a run's buckets of a metric at every level from fine to top, by block (compressed one-run bucket arrays, those
     # holding buckets); since: the rows compiled when the block last changed
     "levels": "CREATE TABLE IF NOT EXISTS levels(key TEXT, level INTEGER, block INTEGER, path TEXT, since INTEGER, data BLOB, "
@@ -570,6 +583,208 @@ def _sized(body: bytes) -> tuple[bytes, int]:
     return body, len(body)
 
 
+# ---- stored blocks: read and joined by the asking thread, or by a block worker ----
+
+_reading = ThreadPoolExecutor(READ_THREADS, thread_name_prefix="trex-read")  # reads of stored blocks, in every process
+_readers: dict[str, tuple[int, queue.LifoQueue[sqlite3.Connection]]] = {}  # index file -> (its inode, idle read connections)
+_readers_lock = threading.Lock()
+_answering = ThreadPoolExecutor(2 * BLOCK_WORKERS, thread_name_prefix="trex-ask")  # the asks of a request being answered
+
+
+def at_once[A, T](answer: Callable[[A], T], asks: Sequence[A], shared: Callable[[A], bool],
+                  threads: ThreadPoolExecutor = _answering) -> list[T]:
+    """`answer` of each of `asks`, in order. While the block workers are up, the asks whose blocks they may read
+    (`shared`) are answered several at a time on `threads`, each waiting for its workers, and the others meanwhile by
+    the calling thread; else one after another."""
+    if _workers.pool is None or sum(map(shared, asks)) < 2:
+        return [answer(a) for a in asks]
+    waiting = {i: threads.submit(answer, a) for i, a in enumerate(asks) if shared(a)}
+    return [waiting[i].result() if i in waiting else answer(a) for i, a in enumerate(asks)]
+
+
+def for_workers(a: Ask) -> bool:
+    """Whether the block workers may read ask `a`'s block: one of a scope's runs, or of more runs than BLOCK_ALONE."""
+    return a.runs is None or len(a.runs) > BLOCK_ALONE
+
+
+def worker_init() -> None:
+    """Workers leave Ctrl-C to the main process, which stops them, and end when it does."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    threading.Thread(target=_end_with_parent, name="trex-parent", daemon=True).start()
+
+
+def _end_with_parent() -> None:
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        parent.join()
+        os._exit(0)
+
+
+def mp_context() -> BaseContext:
+    """Fresh worker interpreters that import only trex (the main process runs threads)."""
+    if "forkserver" in multiprocessing.get_all_start_methods():
+        ctx = multiprocessing.get_context("forkserver")
+        ctx.set_forkserver_preload(["trex.crawl"])
+        return ctx
+    return multiprocessing.get_context("spawn")
+
+
+def _read_only(db: str) -> str:
+    """The SQLite URI that opens file `db` read-only."""
+    return "file:" + db.replace("%", "%25").replace("?", "%3f").replace("#", "%23") + "?mode=ro"
+
+
+@contextlib.contextmanager
+def _reader(db: str) -> Generator[sqlite3.Connection]:
+    """A read connection to index file `db`, kept for the next reader while the file is the one it was opened on."""
+    inode = os.stat(db).st_ino
+    with _readers_lock:
+        held, stale = _readers.get(db), None
+        if held is None or held[0] != inode:
+            stale, held = held, (inode, queue.LifoQueue[sqlite3.Connection]())
+            _readers[db] = held
+    if stale is not None:
+        _close_idle(stale[1])
+    try:
+        c = held[1].get_nowait()
+    except queue.Empty:
+        c = sqlite3.connect(_read_only(db), uri=True, check_same_thread=False, isolation_level=None, timeout=60)
+    try:
+        yield c
+    finally:
+        with _readers_lock:
+            kept = _readers.get(db) is held
+            if kept:
+                held[1].put(c)
+        if not kept:
+            c.close()
+
+
+def _forget_readers(db: str) -> None:
+    """Close this process's idle read connections to index file `db`."""
+    with _readers_lock:
+        held = _readers.pop(db, None)
+    if held is not None:
+        _close_idle(held[1])
+
+
+def _close_idle(idle: queue.LifoQueue[sqlite3.Connection]) -> None:
+    with contextlib.suppress(queue.Empty):
+        while True:
+            idle.get_nowait().close()
+
+
+def stored_block(db: str, key: str, level: int, index: int, paths: Sequence[str], seq: bytes) -> bytes:
+    """Block `index` of `level` of `key` of the runs `paths` (in path order; `seq` the rows their levels hold, u32) as
+    a bucket array, from the blocks index file `db` stores: each run's block as it is stored (`buckets.join`), or,
+    below its finest level, that level's buckets refined."""
+    fine: dict[str, int] = {}
+    with _reader(db) as c:
+        for part in batched(paths, PATHS_PER_QUERY):
+            fine.update(c.execute(f"SELECT path, fine FROM metrics WHERE key=? AND path IN ({_marks(part)})", (key, *part)))
+    rows = {src: found for src in sorted({max(f, level) for f in fine.values()})
+            if (found := _read(db, key, src, index >> (src - level), [p for p in paths if p in fine and max(fine[p], level) == src]))}
+    held = np.frombuffer(seq, "<u4")
+    if set(rows) <= {level}:
+        stored = dict(rows.get(level, ()))
+        return bk.join(level, index, paths, held, [stored.get(p) for p in paths])
+    place = {p: i for i, p in enumerate(paths)}
+    parts: list[Buckets] = []
+    for src, found in rows.items():
+        b = bk.stack([], np.empty(0, np.uint32), np.empty(0, np.int8), [blob for _, blob in found], [place[p] for p, _ in found]).buckets
+        parts.append(b if src == level else bk.cut(bk.refine(b, src, level), index * bk.BLOCK, (index + 1) * bk.BLOCK))
+    return bk.encode(level, index, paths, held, bk.union(parts))
+
+
+def _read(db: str, key: str, level: int, block: int, paths: Sequence[str]) -> list[tuple[str, bytes]]:
+    """(path, one-run bucket array) of each of `paths` (in path order) storing block `block` of `level` of `key`, in
+    path order: read and decompressed on READ_THREADS threads when there are more than READ_ALONE."""
+    if len(paths) <= READ_ALONE:
+        return _read_some(db, key, level, block, paths)
+    size = max(READ_ALONE, -(-len(paths) // READ_THREADS))
+    chunks = [paths[i:i + size] for i in range(0, len(paths), size)]
+    return [row for rows in _reading.map(functools.partial(_read_some, db, key, level, block), chunks) for row in rows]
+
+
+def _read_some(db: str, key: str, level: int, block: int, paths: Sequence[str]) -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
+    with _reader(db) as c:
+        for part in batched(paths, PATHS_PER_QUERY):
+            out += [(p, zlib.decompress(data)) for p, data in c.execute(
+                f"SELECT path, data FROM levels WHERE key=? AND level=? AND block=? AND path IN ({_marks(part)}) ORDER BY path",
+                (key, level, block, *part))]
+    return out
+
+
+class Workers:
+    """The block workers: BLOCK_WORKERS processes that read and join stored blocks, started on a thread of their own by
+    the first block that is theirs to read, and used once each has answered."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pool: ProcessPoolExecutor | None = None  # once each has answered
+        self.starting = False
+
+    def ready(self) -> ProcessPoolExecutor | None:
+        """The workers once they answer; the first call starts them."""
+        with self.lock:
+            if self.pool is None and not self.starting:
+                self.starting = True
+                threading.Thread(target=self.start, name="trex-workers", daemon=True).start()
+            return self.pool
+
+    def start(self) -> None:
+        """Start the workers and wait for each to answer; they stay unused if one does not."""
+        pool = ProcessPoolExecutor(BLOCK_WORKERS, mp_context=mp_context(), initializer=worker_init)
+        try:
+            for started in [pool.submit(time.sleep, STARTING) for _ in range(BLOCK_WORKERS)]:
+                started.result()
+        except (RuntimeError, OSError) as e:
+            print(f"[trex] block workers: {e!r}", file=sys.stderr, flush=True)
+            pool.shutdown(wait=False)
+            return
+        with self.lock:
+            self.pool = pool
+
+    def drop(self, pool: ProcessPoolExecutor) -> None:
+        """Stop using `pool`, which failed; the next block that is the workers' starts them anew."""
+        with self.lock:
+            if self.pool is pool:
+                self.pool, self.starting = None, False
+        pool.shutdown(wait=False)
+
+
+_workers = Workers()
+_reading_here = threading.Lock()  # the asking thread reading a block the workers would
+
+
+def _stored(db: str, key: str, level: int, index: int, paths: Sequence[str], seq: bytes) -> bytes:
+    """`stored_block`: by the block workers when the runs are more than BLOCK_ALONE and the workers are up; else (and
+    when they fail) by the asking thread, one block of that many runs at a time."""
+    if len(paths) <= BLOCK_ALONE:
+        return stored_block(db, key, level, index, paths, seq)
+    pool = _workers.ready()
+    if pool is not None:
+        try:
+            return _shared(pool, db, key, level, index, paths, seq)
+        except (RuntimeError, OSError) as e:
+            print(f"[trex] block worker: {e!r}", file=sys.stderr, flush=True)
+            _workers.drop(pool)
+    with _reading_here:
+        return stored_block(db, key, level, index, paths, seq)
+
+
+def _shared(pool: ProcessPoolExecutor, db: str, key: str, level: int, index: int, paths: Sequence[str], seq: bytes) -> bytes:
+    """`stored_block` by the workers of `pool`, each reading a slice of the runs: a slice for every worker, of at least
+    BLOCK_ALONE runs and at most SLICE."""
+    slices = max(-(-len(paths) // SLICE), min(BLOCK_WORKERS, len(paths) // max(BLOCK_ALONE, 1)), 1)
+    size = -(-len(paths) // slices)
+    asked = [pool.submit(stored_block, db, key, level, index, paths[i:i + size], seq[4 * i:4 * (i + size)])
+             for i in range(0, len(paths), size)]
+    bodies = [f.result() for f in asked]
+    return bodies[0] if len(bodies) == 1 else bk.chain(bodies, paths)
+
+
 class Explorer:
     """The index of what `origin` holds, under `cache_root`, kept current by `start` (or `sync`); `close` releases it.
     An index is held by one Explorer at a time: another of the same origin takes the next one free (`<hash>-1`, ...),
@@ -581,20 +796,18 @@ class Explorer:
         (self.cache_dir / "root.txt").write_text(origin.key + "\n")
         self.db_path = self.cache_dir / "index.sqlite"
         self._writer = self._connect()
-        for sql in TABLES.values():
-            self._writer.execute(sql)
+        self._writer.execute(TABLES["cache"])
         v = self._writer.execute("SELECT value FROM cache WHERE key='version'").fetchone()
         if v is None or int(v[0]) != CACHE_VERSION:
             self._writer.execute("BEGIN IMMEDIATE")
             for t in [r[0] for r in self._writer.execute("SELECT name FROM sqlite_master WHERE type='table' AND name != 'cache'")]:
                 self._writer.execute(f"DROP TABLE {t}")
-            for name, sql in TABLES.items():
-                if name != "cache":
-                    self._writer.execute(sql)
             self._writer.execute("INSERT OR REPLACE INTO cache VALUES ('version', ?)", (str(CACHE_VERSION),))
             self._writer.execute("COMMIT")
             self._writer.execute("VACUUM")  # the dropped tables' pages go back to the disk
             shutil.rmtree(self.cache_dir / "levels", ignore_errors=True)
+        for sql in TABLES.values():
+            self._writer.execute(sql)
         self._write_lock = threading.Lock()  # serializes every use of `_writer`
         self.lock = threading.Lock()
         self.hub = Hub()
@@ -655,6 +868,7 @@ class Explorer:
         while not self._readers.empty():
             self._readers.get_nowait().close()
         self._lock_file.close()
+        _forget_readers(str(self.db_path))
         self.origin.close()
 
     def _connect(self) -> sqlite3.Connection:
@@ -911,8 +1125,8 @@ class Explorer:
     # ---- blocks ----
 
     def buckets_bodies(self, asks: Sequence[Ask]) -> list[bytes]:
-        """`buckets_body` of each ask, in order."""
-        return [self.buckets_body(a.key, a.level, a.block, a.scope, a.runs, a.which) for a in asks]
+        """`buckets_body` of each ask, in order (`at_once`)."""
+        return at_once(lambda a: self.buckets_body(a.key, a.level, a.block, a.scope, a.runs, a.which), asks, for_workers)
 
     def buckets_body(self, key: str, level: int, index: int, scope: str = "", runs: Sequence[str] | None = None,
                      which: Which = "all") -> bytes:
@@ -936,8 +1150,22 @@ class Explorer:
 
     def _block(self, key: str, level: int, index: int, paths: list[str]) -> bytes:
         """Block `index` of `level` of `key` of runs `paths` (in path order). A run whose top level is `level` or finer
-        is cut from the finished runs' merged level (`_level`), or merged from its top level when it is running; any
-        other run's block is the one stored (`_stored`)."""
+        is merged from top levels (`_from_tops`); any other run's block is the one stored (`stored_block`), and when
+        every run's is, those are the answer as they are."""
+        parts, deep = self._from_tops(key, level, index, paths)
+        seq = self._compiled(paths)
+        if deep:
+            body = _stored(str(self.db_path), key, level, index, [paths[i] for i in deep], seq[deep].astype("<u4").tobytes())
+            if len(deep) == len(paths):
+                return body
+            b = bk.decode(body).buckets
+            parts.append(b.of(np.array(deep, np.int32)[b.run]))
+        return bk.encode(level, index, paths, seq, bk.union(parts))
+
+    def _from_tops(self, key: str, level: int, index: int, paths: list[str]) -> tuple[list[Buckets], list[int]]:
+        """Block `index` of `level` of `key` of the runs of `paths` whose top level is `level` or finer, as buckets of their
+        places in `paths`: finished ones cut from the finished runs' merged level (`_level`), running ones merged from
+        their top levels. And the places of the other runs, in order."""
         lo, hi = index * bk.BLOCK, (index + 1) * bk.BLOCK
         done, tops, _ = self._runs(key)
         positions = self._positions(key)
@@ -959,28 +1187,7 @@ class Explorer:
             part = bk.cut(st.at(level, np.flatnonzero(near).astype(np.int32)), lo, hi)
             parts.append(part.of(others[part.run].astype(np.int32)))
             deep += [int(i) for i in others[~near]]
-        got = self._stored(key, level, index, [paths[i] for i in deep]) if deep else {}
-        parts += [b.of(np.full(b.run.size, i, np.int32)) for i in sorted(deep) if (b := got.get(paths[i])) is not None]
-        return bk.encode(level, index, paths, self._compiled(paths), bk.union(parts))
-
-    def _stored(self, key: str, level: int, index: int, paths: Sequence[str]) -> dict[str, Buckets]:
-        """Block `index` of `level` of `key` of each of `paths` holding buckets there, from its stored levels; below its
-        finest level, that level's buckets refined."""
-        out: dict[str, Buckets] = {}
-        c = self.reader()
-        try:
-            fine: dict[str, int] = {}
-            for part in batched(paths, PATHS_PER_QUERY):
-                fine.update(c.execute(f"SELECT path, fine FROM metrics WHERE key=? AND path IN ({_marks(part)})", (key, *part)))
-            for src in sorted({max(f, level) for f in fine.values()}):
-                for part in batched([p for p, f in fine.items() if max(f, level) == src], PATHS_PER_QUERY):
-                    for p, data in c.execute(f"SELECT path, data FROM levels WHERE key=? AND level=? AND block=? AND path IN ({_marks(part)})",
-                                             (key, src, index >> (src - level), *part)):
-                        b = unpack(data)
-                        out[p] = b if src == level else bk.cut(bk.refine(b, src, level), index * bk.BLOCK, (index + 1) * bk.BLOCK)
-        finally:
-            self.release(c)
-        return out
+        return parts, sorted(deep)
 
     def _tops(self, key: str, paths: Sequence[str]) -> Stack:
         """The top levels of `key` of runs `paths` (in path order), read from the index."""

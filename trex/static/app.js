@@ -15,6 +15,8 @@ const HIDE_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="
 const MENU_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="3" cy="8" r="1.5" fill="currentColor"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/><circle cx="13" cy="8" r="1.5" fill="currentColor"/></svg>';
 const SPREAD_SHOWN = 8; // values listed per config key that varies
 const FRAME_BUDGET_MS = 12; // chart drawing per frame
+const AIM_MS = 40; // between fetches for a zoom being dragged
+const HOLD_MS = 120; // a chart whose columns are being rebuilt for a new view waits this long for them before drawing
 const PLAN_IDLE_MS = 250; // block planning interval while the view is unchanged
 const OUTLIERS = [[0, "off"], [0.01, "1–99%"], [0.05, "5–95%"]];
 const $ = (s) => document.querySelector(s);
@@ -406,6 +408,8 @@ class App {
     this.charts = new Map();
     this.mediaPanels = new Map();
     this.xrange = null;
+    this.lead = null; // metric of the chart last pressed: its demand is planned first
+    this.holdUntil = 0; // until when charts wait for columns being rebuilt (`due`)
     this.tree = [];
     const q = new URLSearchParams(location.hash.slice(1));
     this.opts = hashOpts(q);
@@ -1769,13 +1773,12 @@ class App {
     }
   }
 
-  /** Mark the charts of `keys` dirty: drawn at once for work the view asked for, once it is all done; paced when
-   * `streamed`. */
+  /** Mark the charts of `keys` dirty: drawn on the next frame for work the view asked for (the data layer tells of a
+   * metric once its columns are rebuilt, so a chart never draws some of them); paced when `streamed`. */
   onData(keys, streamed = false) {
     if (!keys || !this.runList) return this.redrawAll();
     const first = this.markDirty(keys); // a chart still showing nothing draws on the next frame
-    if (!streamed) this.urgent = true;
-    if (!streamed && !this.data.busy) this.schedule(true);
+    if (!streamed) this.schedule(true);
     else if (first) this.nextFrame();
     else this.schedule(false);
   }
@@ -1823,7 +1826,7 @@ class App {
     this.raf = null;
     if (!this.runList) return;
     if (!this.round) {
-      this.round = [...this.charts.values()].filter((c) => (c.visible || c.full) && c.dirty);
+      this.round = [...this.charts.values()].filter((c) => this.due(c));
       (this.paced = !this.urgent), (this.urgent = false); // paced: drawing streamed rows only
     }
     const t0 = performance.now(), n = this.prepareRound();
@@ -1834,7 +1837,21 @@ class App {
     for (const c of this.round) c.draw();
     this.round = null;
     if (drew || this.planSoon) this.replan(this.planSoon), (this.planSoon = false);
-    if ([...this.charts.values()].some((c) => (c.visible || c.full) && c.dirty)) this.schedule(this.urgent && !this.data.busy);
+    if ([...this.charts.values()].some((c) => this.due(c))) this.schedule(this.urgent);
+  }
+
+  /** Whether chart c is to be drawn: shown and dirty, and not waiting for columns being rebuilt for a view set less
+   * than HOLD_MS ago (it then draws once, with them; one showing nothing draws at once). */
+  due(c) {
+    if (!(c.visible || c.full) || !c.dirty) return false;
+    return !(c.view?.lines.length && performance.now() < this.holdUntil && this.data.pending(c.key));
+  }
+
+  /** Let charts wait for their columns (`due`) from now, drawing whatever they have once HOLD_MS have passed. */
+  hold() {
+    this.holdUntil = performance.now() + HOLD_MS;
+    clearTimeout(this.holdTimer);
+    this.holdTimer = setTimeout(() => this.nextFrame(), HOLD_MS);
   }
 
   /** Prepare the round's charts not yet prepared or computed by a worker, until FRAME_BUDGET_MS of preparing here
@@ -1882,9 +1899,9 @@ class App {
     return 600;
   }
 
-  /** What chart c shows, for `Data.plan`; `pw` its plot width until it is laid out. */
-  demand(c, runs, pw = 600) {
-    const o = this.panelOpts(c.key), zoom = this.xrange && this.xrange[2] === o.xmode ? this.xrange : null;
+  /** What chart c shows, for `Data.plan`, were the x zoom `range`; `pw` its plot width until it is laid out. */
+  demand(c, runs, pw = 600, range = this.xrange) {
+    const o = this.panelOpts(c.key), zoom = range && range[2] === o.xmode ? range : null;
     const x0 = o.xmin ?? zoom?.[0] ?? null, x1 = o.xmax ?? zoom?.[1] ?? null;
     return { key: c.key, runs, xmode: o.xmode, zoomed: x0 !== null || x1 !== null, x0: x0 ?? -Infinity, x1: x1 ?? Infinity,
              pw: c.w ? c.pw : pw, many: this.data.runsWith(runs, c.key).length > this.coarseAbove(o) };
@@ -1903,24 +1920,46 @@ class App {
     if (this.planTimer && this.planDue <= due) return;
     clearTimeout(this.planTimer);
     this.planDue = due;
-    this.planTimer = setTimeout(() => {
-      this.planTimer = null;
-      this.plannedAt = performance.now();
-      if (!this.runList) return;
-      const demands = new Map(); // one per metric, from its widest visible chart
-      for (const c of this.charts.values()) {
-        if (!(c.visible || c.full)) continue;
-        const d = { ...this.demand(c, this.shown), runsSig: this.shownSig }, had = demands.get(d.key);
-        if (!had || d.pw > had.pw) demands.set(d.key, d);
-      }
-      this.data.plan([...demands.values()]);
-    }, due - performance.now());
+    this.planTimer = setTimeout(() => this.plan(), due - performance.now());
+  }
+
+  /** Tell the data layer what the visible charts show, now. */
+  plan() {
+    clearTimeout(this.planTimer);
+    this.planTimer = null;
+    this.plannedAt = performance.now();
+    if (this.runList) this.data.plan(this.demands());
+  }
+
+  /** What the visible charts show, were the x zoom `range`: one demand per metric, from its widest chart, the metric
+   * of the chart last pressed (`lead`) first. */
+  demands(range = this.xrange) {
+    const out = new Map();
+    for (const c of this.charts.values()) {
+      if (!(c.visible || c.full)) continue;
+      const d = { ...this.demand(c, this.shown, 600, range), runsSig: this.shownSig }, had = out.get(d.key);
+      if (!had || d.pw > had.pw) out.set(d.key, d);
+    }
+    const lead = out.get(this.lead);
+    return lead ? [lead, ...[...out.values()].filter((d) => d !== lead)] : [...out.values()];
+  }
+
+  /** While a zoom to x range r ([x0, x1, xmode]) is being dragged: have the blocks the charts would then want fetched,
+   * for where the drag is every AIM_MS. */
+  aimZoom(r) {
+    this.aim = r;
+    this.aimTimer ||= setTimeout(() => {
+      this.aimTimer = null;
+      if (this.runList && this.aim) this.data.fetchFor(this.demands(this.aim));
+    }, AIM_MS);
   }
 
   /** Shared x zoom [x0, x1, xmode], or null. */
   setXRange(r) {
     this.xrange = r;
-    this.replan(true, 0); // its blocks are asked for before the charts redraw
+    this.aim = null;
+    this.plan(); // before the charts redraw: its blocks are asked for, and charts whose blocks are here wait for their columns
+    this.hold();
     this.updateZoomButton();
     this.redrawAll();
   }

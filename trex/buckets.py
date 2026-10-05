@@ -286,12 +286,18 @@ def unframe(data: bytes) -> list[bytes]:
     return out
 
 
-def decode(blob: bytes) -> BucketArray:
-    """The bucket array `blob` encodes; ValueError unless it is one."""
+def names(blob: bytes) -> list[str]:
+    """The runs bucket array `blob` names; ValueError unless it is one."""
     if blob[:4] != MAGIC:
         raise ValueError("bad bucket array magic")
+    _, _, _, runs, _, nbytes, _ = HEAD.unpack_from(blob)
+    return blob[32:32 + nbytes].decode().split("\0") if runs else []
+
+
+def decode(blob: bytes) -> BucketArray:
+    """The bucket array `blob` encodes; ValueError unless it is one."""
+    paths = names(blob)
     _, level, base, runs, count, nbytes, _ = HEAD.unpack_from(blob)
-    paths = blob[32:32 + nbytes].decode().split("\0") if runs else []
     at = 32 + _pad(nbytes)
     first = np.frombuffer(blob, np.uint32, runs + 1, at)
     at += _pad(4 * (runs + 1))
@@ -306,6 +312,68 @@ def decode(blob: bytes) -> BucketArray:
     return BucketArray(level, paths, seq, Buckets(run, base * BLOCK + offset.astype(np.int64), np.frombuffer(blob, np.float32, count, at),
                                              soff, np.frombuffer(blob, np.float32, count, at + 4 * count),
                                              np.frombuffer(blob, np.uint32, count, at + 8 * count)))
+
+
+def _assemble(level: int, base: int, paths: Sequence[str], first: Sequence[int], seq: bytes,
+              cols: Sequence[Sequence[memoryview]]) -> bytes:
+    """`encode`'s bytes for runs `paths`, run i's buckets [first[i], first[i + 1]), given the bytes of `seq` and, in
+    `cols`, pieces of the buckets' offsets, step offsets, means, mean runtimes and counts."""
+    names, zeros, count = "\0".join(paths).encode(), bytes(8), first[-1]
+    firsts = np.asarray(first, "<u4").tobytes()
+    return b"".join([HEAD.pack(MAGIC, level, base, len(paths), count, len(names), 0), names, zeros[:-len(names) % 8],
+                     firsts, zeros[:-len(firsts) % 8], seq, zeros[:-len(seq) % 8], *cols[0], zeros[:-2 * count % 8],
+                     *cols[1], zeros[:-2 * count % 8], *cols[2], *cols[3], *cols[4]])
+
+
+def _columns(blob: bytes, at: int, count: int, cols: Sequence[list[memoryview]]) -> None:
+    """Append to `cols` the five bucket columns of bucket array `blob`, which begin at byte `at`."""
+    m, wide = memoryview(blob), _pad(2 * count)
+    cols[0].append(m[at:at + 2 * count])
+    cols[1].append(m[at + wide:at + wide + 2 * count])
+    at += 2 * wide
+    for k in range(3):
+        cols[2 + k].append(m[at + 4 * k * count:at + 4 * (k + 1) * count])
+
+
+def join(level: int, base: int, paths: Sequence[str], seq: Sequence[int] | npt.NDArray[np.integer],
+         blobs: Sequence[bytes | None]) -> bytes:
+    """Bucket array of runs `paths` (holding rows `seq`) of block `base` of `level`, run i's buckets those of blobs[i],
+    its one-run array of that block (no buckets for None): what `encode` makes of them, without decoding them.
+    ValueError unless each is such an array."""
+    first, cols = [0], (list[memoryview](), list[memoryview](), list[memoryview](), list[memoryview](), list[memoryview]())
+    for blob in blobs:
+        count = 0
+        if blob is not None:
+            magic, lv, b, runs, count, nbytes, _ = HEAD.unpack_from(blob)
+            if (magic, lv, b, runs, nbytes) != (MAGIC, level, base, 1, 0) or len(blob) != 48 + 2 * _pad(2 * count) + 12 * count:
+                raise ValueError("not a one-run bucket array of the block")
+            _columns(blob, 48, count, cols)
+        first.append(first[-1] + count)
+    return _assemble(level, base, paths, first, np.asarray(seq, "<u4").tobytes(), cols)
+
+
+def chain(arrays: Sequence[bytes], paths: Sequence[str]) -> bytes:
+    """One bucket array holding, in order, the runs of `arrays` (bucket arrays of one block of one level, at least one),
+    named `paths`: what `encode` makes of their buckets, without decoding them. ValueError unless they are that."""
+    first, seqs = [0], list[memoryview]()
+    cols = (list[memoryview](), list[memoryview](), list[memoryview](), list[memoryview](), list[memoryview]())
+    _, level, base, *_ = HEAD.unpack_from(arrays[0])
+    for blob in arrays:
+        magic, lv, b, runs, count, nbytes, _ = HEAD.unpack_from(blob)
+        at = 32 + _pad(nbytes)
+        seq_at = at + _pad(4 * (runs + 1))
+        cols_at = seq_at + _pad(4 * runs)
+        if (magic, lv, b) != (MAGIC, level, base) or len(blob) != cols_at + 2 * _pad(2 * count) + 12 * count:
+            raise ValueError("not bucket arrays of one block")
+        start = first[-1]
+        first += [start + end for end in np.frombuffer(blob, "<u4", runs, at + 4).tolist()]
+        if first[-1] != start + count:
+            raise ValueError("bucket array length mismatch")
+        seqs.append(memoryview(blob)[seq_at:seq_at + 4 * runs])
+        _columns(blob, cols_at, count, cols)
+    if len(first) != len(paths) + 1:
+        raise ValueError("as many names as runs")
+    return _assemble(level, base, paths, first, b"".join(seqs), cols)
 
 
 def stack(paths: Sequence[str], seq: npt.NDArray[np.uint32], level: npt.NDArray[np.int8], blobs: Sequence[bytes],

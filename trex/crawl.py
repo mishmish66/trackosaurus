@@ -6,9 +6,7 @@ while it grows. Rows the levels do not hold yet, and media files, come from the 
 
 import contextlib
 import json
-import multiprocessing
 import os
-import signal
 import sqlite3
 import sys
 import time
@@ -17,14 +15,14 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
-from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Final
 
 from . import buckets as bk, chunks
 from .buckets import Buckets
 from .format import (DB, INFO_FILE, JSONValue, RunState, as_dict, as_float, as_run_state, as_str, as_str_list, snapshot)
-from .index import ROWS_EVENT_MAX, Block, Explorer, MediaRecord, Metric, Public, Rows, RunRecord, Sig, Summary, Update, pack, unpack, wire
+from .index import (ROWS_EVENT_MAX, Block, Explorer, MediaRecord, Metric, Public, Rows, RunRecord, Sig, Summary, Update, mp_context, pack,
+                    unpack, wire, worker_init)
 from .journal import JOURNAL
 
 CRASH_AFTER = 300.0  # seconds without a heartbeat after which a running run shows as crashed
@@ -269,20 +267,6 @@ class _Batch:
         self.updates, self.t0 = [], time.time()
 
 
-def _worker_init() -> None:
-    """Scan workers leave Ctrl-C to the main process, which stops them."""
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-
-def _mp_context() -> BaseContext:
-    """Fresh worker interpreters that import only trex (the main process runs threads)."""
-    if "forkserver" in multiprocessing.get_all_start_methods():
-        ctx = multiprocessing.get_context("forkserver")
-        ctx.set_forkserver_preload([__name__])
-        return ctx
-    return multiprocessing.get_context("spawn")
-
-
 def default_workers() -> int:
     """$TREX_WORKERS, else the CPU count up to 32."""
     env = os.environ.get("TREX_WORKERS")
@@ -417,7 +401,7 @@ class Crawl:
     def _sync_pool(self, ex: Explorer, todo: Sequence[tuple[str, Path, Sig]]) -> None:
         jobs = deque(self._job(ex, *t) for t in todo)
         batch = _Batch(ex)
-        pool = ProcessPoolExecutor(max_workers=min(self.workers, len(todo)), mp_context=_mp_context(), initializer=_worker_init)
+        pool = ProcessPoolExecutor(max_workers=min(self.workers, len(todo)), mp_context=mp_context(), initializer=worker_init)
         pending: dict[Future[Update | None], Job] = {}
         try:
             while (jobs or pending) and not ex.stopped:

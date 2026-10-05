@@ -11,15 +11,16 @@ import json
 import queue
 import threading
 from collections.abc import Generator, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-
-import numpy as np
 
 from . import buckets as bk
 from .format import JSONValue, RunState
-from .index import Ask, Explorer, MediaRecord, RunMeta, RunsView, RunView, dumps, sse_text
+from .index import Ask, Explorer, MediaRecord, RunMeta, RunsView, RunView, at_once, dumps, for_workers, sse_text
 
 type SseEvent = tuple[str, str]  # (kind, JSON text)
+
+_asking = ThreadPoolExecutor(8, thread_name_prefix="trex-ask")  # every workspace's requests to its members
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,11 @@ class Member:
 
     name: str
     src: Explorer
+
+
+def _block_of(part: tuple[Member, Ask]) -> bytes:
+    """A member's answer to its part of a block request."""
+    return part[0].src.buckets_bodies([part[1]])[0]
 
 
 def parse_sse(text: str) -> Iterator[SseEvent]:
@@ -147,13 +153,14 @@ class Workspace:
         return _with_run(m.src.rows_json(mp, start), mp, path)
 
     def buckets_bodies(self, asks: Sequence[Ask]) -> list[bytes]:
-        """Each block as `Explorer.buckets_bodies` answers it, of every member's runs it names, run ids renamed, in id
-        order."""
-        out: list[bytes] = []
-        for a in asks:
-            bodies = [(m, m.src.buckets_bodies([part])[0]) for m, part in self._parts(a)]
-            out.append(self._join(a, [(m, body) for m, body in bodies if body]))
-        return out
+        """Each block as `Explorer.buckets_bodies` answers it, of every member's runs it names (`_join`), the members
+        asked at once."""
+        return at_once(self._block, asks, for_workers)
+
+    def _block(self, a: Ask) -> bytes:
+        parts = self._parts(a)
+        bodies = at_once(_block_of, parts, lambda part: for_workers(part[1]), _asking)
+        return self._join(a, [(m, body) for (m, _), body in zip(parts, bodies, strict=True) if body])
 
     def _parts(self, a: Ask) -> list[tuple[Member, Ask]]:
         """Each member's part of an ask: its folder of the scope, or the runs it holds of those named."""
@@ -167,22 +174,10 @@ class Workspace:
         return [(m, replace(a, scope="", runs=mine[m.name])) for m in self.members if m.name in mine]
 
     def _join(self, ask: Ask, parts: Sequence[tuple[Member, bytes]]) -> bytes:
-        """One bucket array of the members' arrays of a block, run ids renamed, in id order."""
-        paths: list[str] = []
-        seqs: list[np.ndarray] = []
-        bs: list[bk.Buckets] = []
-        for m, body in parts:
-            a = bk.decode(body)
-            bs.append(a.buckets.of(a.buckets.run + len(paths)))
-            paths += [self.ws_id(m, p) for p in a.paths]
-            seqs.append(a.seq)
-        seq = np.concatenate(seqs) if seqs else np.empty(0, np.uint32)
-        order = np.argsort(np.array(paths, dtype=object), kind="stable").astype(np.int64)
-        rank = np.empty(len(paths), np.int32)
-        rank[order] = np.arange(len(paths), dtype=np.int32)
-        b = bk.concat(bs)
-        b = bk.take(b.of(rank[b.run]), np.argsort(rank[b.run], kind="stable"))
-        return bk.encode(ask.level, ask.block, [paths[int(i)] for i in order], seq[order], b)
+        """One bucket array of the members' arrays of a block: each member's runs in turn, their ids renamed."""
+        if not parts:
+            return bk.encode(ask.level, ask.block, [], [], bk.empty())
+        return bk.chain([body for _, body in parts], [self.ws_id(m, p) for m, body in parts for p in bk.names(body)])
 
     def messages(self, prefix: str, stop: threading.Event) -> Generator[bytes, None, None]:
         """Every member's stream under `prefix`, run ids renamed, as SSE messages; until `stop`."""

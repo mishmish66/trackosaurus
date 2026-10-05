@@ -210,3 +210,35 @@ test("agg's interquartile mean agrees with the CLI's on a hand-checked group", (
   assert.deepEqual([s.iqm[0], s.iqmh[0]], [5, 5]);
   assert.ok(Math.abs(s.iqmse[0] - Math.sqrt(26 / 20)) < 1e-12);
 });
+
+/** A bucket array of one run holding every bucket of block `base` of `level`, each of one row: its mean `mean(q)`, its
+ * mean step `frac` of the way through the bucket (buckets.encode). */
+function fullBlock(level, base, mean, frac = 0.25) {
+  const n = 256, buf = new ArrayBuffer(48 + 2 * 512 + 12 * n);
+  new Int32Array(buf, 0, 8).set([0x31424b54, level, base, 0, 1, n, 0, 0]);
+  new Uint32Array(buf, 32, 2).set([0, n]);
+  new Uint16Array(buf, 48, n).set(Array.from({ length: n }, (_, q) => q));
+  new Uint16Array(buf, 48 + 512, n).fill(Math.floor(frac * 65536));
+  new Float32Array(buf, 48 + 1024, n).set(Array.from({ length: n }, (_, q) => mean(q)));
+  new Uint32Array(buf, 48 + 1024 + 8 * n, n).fill(1);
+  return { v: K.bucketViews(buf), row: 0 };
+}
+
+test("a column takes each step from the finest level whose blocks hold it, in step order, however the levels' blocks lie", () => {
+  const coarse = fullBlock(4, 0, (q) => 4000 + q), fine = fullBlock(0, 9, (q) => q);
+  const mid = [0, 1, 2].map((base) => fullBlock(2, base, (q) => 2000 + 256 * base + q));
+  const cases = { "three levels": [coarse, mid[0], mid[2], fine], "two levels, blocks apart": [coarse, mid[0], mid[2]],
+                  "two levels, blocks side by side": [coarse, mid[1], mid[2]], "one level": [mid[2], mid[0], mid[1]] };
+  const blockOf = ({ v }) => [v.base * 256 * 2 ** v.level, (v.base + 1) * 256 * 2 ** v.level];
+  for (const [name, parts] of Object.entries(cases)) {
+    const held = (level, x) => parts.some((p) => p.v.level < level && blockOf(p)[0] <= x && x < blockOf(p)[1]);
+    const want = [];
+    for (const { v } of parts) for (let q = 0; q < v.count; q++) if (!held(v.level, K.bucketStep(v, q))) want.push([K.bucketStep(v, q), v.mean[q]]);
+    want.sort((a, b) => a[0] - b[0]);
+    for (const order of [parts, [...parts].reverse()]) {
+      const col = K.buildColumn(order, { s: [], v: [], t: [], q: [], n: 0 }, undefined, false);
+      assert.deepEqual(Array.from({ length: col.n }, (_, i) => [col.s[i], col.v[i]]), want, name);
+      assert.ok(col.sorted[0] && [...col.w.subarray(0, col.n)].every((w) => w === 1), name);
+    }
+  }
+});

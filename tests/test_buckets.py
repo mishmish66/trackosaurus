@@ -177,6 +177,43 @@ def test_a_stack_refuses_arrays_of_many_runs() -> None:
         bk.stack(["x"], np.zeros(1, np.uint32), np.zeros(1, np.int8), [bk.encode(9, 0, ["a", "b"], [10, 10], b)], [0])
 
 
+def block_of(seed: int, n: int = 3000) -> bk.Buckets:
+    """One run's buckets of block 2 of level 2 (none for no rows)."""
+    return bk.cut(bk.bucketize(*rows(n, seed=seed), 2), 512, 768) if n else bk.empty()
+
+
+def test_joined_one_run_arrays_are_the_array_of_their_buckets_runs_without_one_included() -> None:
+    names, blocks = ["a", "b/c", "d", "e"], [block_of(0), None, block_of(2, n=0), block_of(3)]
+    blobs = [None if b is None else bk.encode(2, 2, [""], [0], b) for b in blocks]
+    whole = bk.union([run_at(b, i) for i, b in enumerate(blocks) if b is not None])
+    assert bk.join(2, 2, names, [10, 0, 7, 9], blobs) == bk.encode(2, 2, names, [10, 0, 7, 9], whole)
+    assert bk.join(2, 2, [], [], []) == bk.encode(2, 2, [], [], bk.empty())
+
+
+def test_joining_refuses_arrays_of_another_block_or_of_several_runs() -> None:
+    one, two = bk.encode(2, 2, [""], [0], block_of(0)), bk.encode(2, 2, ["a", "b"], [1, 1], bk.union([run_at(block_of(i), i) for i in (0, 1)]))
+    for bad in (bk.encode(3, 2, [""], [0], bk.empty()), bk.encode(2, 1, [""], [0], bk.empty()), two, one[:-8], b"XXXX" + one[4:]):
+        with pytest.raises(ValueError):
+            bk.join(2, 2, ["r"], [0], [bad])
+
+
+def test_chained_arrays_are_the_array_of_all_their_runs_in_order() -> None:
+    parts = [[block_of(0), block_of(1, n=0)], list[bk.Buckets](), [block_of(2)], [block_of(3), block_of(4), block_of(5, n=40)]]
+    arrays = [bk.encode(2, 2, [f"m{k}/r{i}" for i in range(len(bs))], [100 * k + i for i in range(len(bs))],
+                        bk.union([run_at(b, i) for i, b in enumerate(bs)])) for k, bs in enumerate(parts)]
+    every = [b for bs in parts for b in bs]
+    names, seq = [f"r{i}" for i in range(len(every))], [100 * k + i for k, bs in enumerate(parts) for i in range(len(bs))]
+    assert bk.chain(arrays, names) == bk.encode(2, 2, names, seq, bk.union([run_at(b, i) for i, b in enumerate(every)]))
+    assert bk.chain(arrays[:1], names[:2]) == bk.encode(2, 2, names[:2], seq[:2], bk.decode(arrays[0]).buckets)
+
+
+def test_chaining_refuses_arrays_of_different_blocks_and_names_that_do_not_fit_the_runs() -> None:
+    here, there = bk.encode(2, 2, ["a"], [1], block_of(0)), bk.encode(2, 3, ["b"], [1], bk.empty())
+    for arrays, names in (([here, there], ["a", "b"]), ([here, here], ["a"]), ([here[:-8]], ["a"])):
+        with pytest.raises(ValueError):
+            bk.chain(arrays, names)
+
+
 def level_of(parts: Sequence[bk.Part], level: int) -> tuple[bk.Buckets, list[int]]:
     """The buckets of `level` among `parts`, and the blocks holding them."""
     mine = [p for p in parts if p.level == level]

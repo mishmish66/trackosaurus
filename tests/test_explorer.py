@@ -13,6 +13,8 @@ import urllib.request
 import uuid
 import zlib
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -330,6 +332,134 @@ def test_blocks_below_a_runs_finest_level_are_refined_from_it_without_the_run_fi
     shutil.rmtree(root / "r")
     for lv, i in [(-1, 3), (-3, 40)]:
         assert close(of_run(block(ex, "loss", lv, i, runs=["r"]), "r"), expected(rows, "loss", lv, i), lv)
+
+
+def stored_runs(root: Path) -> list[str]:
+    """Three finished runs of `loss` a step apart, of different lengths; their ids and one of no run."""
+    for r, n in (("a", 3000), ("b", 2000), ("c", 900)):
+        write_chunked(root / r, chunked([(float(i), i / 2, {"loss": (i % 7) / (i + 1)}) for i in range(n)], [n]))
+    return ["a", "b", "c", "none"]
+
+
+STORED_ASKS = [(0, 3), (2, 1), (-1, 3)]  # (level, block): levels stored, and one finer than the finest stored
+
+
+def test_block_workers_answer_stored_blocks_as_the_asking_thread_does_however_many_threads_read_them(
+        root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runs = stored_runs(root)
+    ex = explorer(root, tmp_path)
+
+    def answers() -> list[bytes]:
+        return [ex.buckets_body("loss", level, i, runs=runs) for level, i in STORED_ASKS]
+
+    monkeypatch.setattr(trex_index, "BLOCK_ALONE", 10 ** 9)
+    here = answers()
+    assert all(bk.decode(body).buckets.run.size for body in here)
+    monkeypatch.setattr(trex_index, "READ_ALONE", 1)
+    assert answers() == here
+    monkeypatch.setattr(trex_index, "BLOCK_ALONE", 0)
+    workers = trex_index.Workers()
+    monkeypatch.setattr(trex_index, "_workers", workers)
+    workers.start()
+    asked: list[object] = []
+    pool = workers.pool
+    assert pool is not None
+    submit = pool.submit
+
+    def counted(*args: Any) -> Future[Any]:
+        asked.append(args)
+        return submit(*args)
+
+    monkeypatch.setattr(pool, "submit", counted)
+    try:
+        assert answers() == here and workers.pool is pool
+        slices = len(asked)
+        assert slices > len(STORED_ASKS)
+        none = trex_index.Ask("loss", 0, 3, runs=[])
+        together = ex.buckets_bodies([none, *(trex_index.Ask("loss", level, i, runs=runs) for level, i in STORED_ASKS)])
+        assert together == [ex.buckets_body("loss", 0, 3, runs=[]), *here] and len(asked) == 2 * slices
+    finally:
+        pool.shutdown()
+
+
+def test_a_read_connection_is_kept_for_the_next_reader_until_its_file_is_replaced_or_forgotten(tmp_path: Path) -> None:
+    def closed(c: sqlite3.Connection) -> bool:
+        try:
+            c.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            return True
+        return False
+
+    db = tmp_path / "index.sqlite"
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE t(x)")
+    c.close()
+    with trex_index._reader(str(db)) as first:
+        pass
+    with trex_index._reader(str(db)) as again:
+        assert again is first
+    shutil.copy(db, tmp_path / "copy.sqlite")
+    os.replace(tmp_path / "copy.sqlite", db)
+    with trex_index._reader(str(db)) as second:
+        assert second is not first and closed(first)
+    trex_index._forget_readers(str(db))
+    assert closed(second)
+    with trex_index._reader(str(db)) as third:
+        trex_index._forget_readers(str(db))
+    assert closed(third)
+
+
+def test_block_workers_that_do_not_start_stay_unused(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    class Dead:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def submit(self, *args: object) -> NoReturn:
+            raise OSError("no processes")
+
+        def shutdown(self, wait: bool) -> None:
+            pass
+
+    monkeypatch.setattr(trex_index, "ProcessPoolExecutor", Dead)
+    workers = trex_index.Workers()
+    workers.start()
+    assert workers.pool is None and "no processes" in capsys.readouterr().err
+
+
+def test_the_first_block_that_is_the_workers_starts_them_and_is_answered_by_the_asking_thread(
+        root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runs = stored_runs(root)
+    ex = explorer(root, tmp_path)
+    here = ex.buckets_body("loss", 0, 3, runs=runs)
+    started = threading.Event()
+    workers = trex_index.Workers()
+    monkeypatch.setattr(workers, "start", started.set)
+    monkeypatch.setattr(trex_index, "_workers", workers)
+    monkeypatch.setattr(trex_index, "BLOCK_ALONE", 0)
+    assert ex.buckets_body("loss", 0, 3, runs=runs) == here and started.wait(10)
+    assert ex.buckets_body("loss", 0, 3, runs=runs) == here
+
+
+def test_a_block_is_answered_by_the_asking_thread_once_the_block_workers_are_gone(root: Path, tmp_path: Path,
+                                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    class Gone:
+        def submit(self, *args: object) -> NoReturn:
+            raise BrokenProcessPool("gone")
+
+        def shutdown(self, wait: bool) -> None:
+            pass
+
+    runs = stored_runs(root)
+    ex = explorer(root, tmp_path)
+    here = ex.buckets_body("loss", 0, 3, runs=runs)
+    started = threading.Event()
+    workers = trex_index.Workers()
+    monkeypatch.setattr(workers, "start", started.set)
+    monkeypatch.setattr(workers, "pool", Gone())
+    monkeypatch.setattr(trex_index, "_workers", workers)
+    monkeypatch.setattr(trex_index, "BLOCK_ALONE", 0)
+    assert ex.buckets_body("loss", 0, 3, runs=runs) == here and workers.pool is None
+    assert ex.buckets_body("loss", 0, 3, runs=runs) == here and started.wait(10)
 
 
 def test_a_growing_runs_blocks_hold_its_compiled_rows_and_its_run_file_gives_the_rows_after_them(root: Path, tmp_path: Path) -> None:

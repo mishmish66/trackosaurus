@@ -548,7 +548,7 @@ export function buildColumn(parts, tail, level, stored = true) {
   else {
     const layers = layersOf(parts);
     emitBuckets(layers, col);
-    emitTail(layers, tail, level ?? (layers.length ? layers[layers.length - 1].level : 0), col);
+    if (tail.n) emitTail(layers, tail, level ?? (layers.length ? layers[layers.length - 1].level : 0), col);
   }
   const c = Col.adopt(col.s, col.v, col.t, col.n, col.w);
   if (stored) holdStore(c, { ...loc, cap });
@@ -578,13 +578,29 @@ function stepsOf(v) {
 
 /** emitBuckets of parts of one level: each part's buckets, parts by block. */
 function oneLevel(parts, col) {
-  if (parts.length > 1) parts = [...parts].sort((a, b) => a.v.base - b.v.base);
-  let n = 0;
+  emitWithin(parts.length > 1 ? [...parts].sort((a, b) => a.v.base - b.v.base) : parts, -Infinity, Infinity, col);
+}
+
+/** The buckets of `parts` (of one level, by block) at steps in [lo, hi), appended to col. */
+function emitWithin(parts, lo, hi, col) {
+  const s = col.s, cv = col.v, ct = col.t, cw = col.w;
+  let n = col.n;
   for (const { v, row } of parts) {
-    const w = 2 ** v.level, base = v.base * BLOCK, { offset, soff, mean, tmean } = v, cnt = v.n;
-    for (let q = v.first[row], end = v.first[row + 1]; q < end; q++) {
-      col.s[n] = (base + offset[q] + (soff[q] + 0.5) / SOFF_SCALE) * w;
-      (col.v[n] = mean[q]), (col.t[n] = tmean[q]), (col.w[n] = cnt[q]), n++;
+    const w = 2 ** v.level, base = v.base * BLOCK, { offset, soff, mean, tmean } = v, cnt = v.n, end = v.first[row + 1];
+    if ((base + BLOCK) * w <= lo || base * w >= hi) continue;
+    let q = v.first[row];
+    if (base * w < lo) { // the first bucket at a step from lo on: steps rise with the buckets
+      let b = end;
+      while (q < b) {
+        const m = (q + b) >> 1;
+        if ((base + offset[m] + (soff[m] + 0.5) / SOFF_SCALE) * w < lo) q = m + 1;
+        else b = m;
+      }
+    }
+    for (; q < end; q++) {
+      const x = (base + offset[q] + (soff[q] + 0.5) / SOFF_SCALE) * w;
+      if (x >= hi) break;
+      (s[n] = x), (cv[n] = mean[q]), (ct[n] = tmean[q]), (cw[n] = cnt[q]), n++;
     }
   }
   col.n = n;
@@ -614,27 +630,63 @@ function inRanges(ranges, x) {
   return lo < ranges.length && ranges[lo][0] <= x;
 }
 
-/** The layers' buckets each finer layer leaves them, into col in step order (sorted when there are several layers). */
+/** The layers' buckets each finer layer leaves them, into col in step order. */
 function emitBuckets(layers, col) {
-  for (let k = 0; k < layers.length; k++) {
-    const finer = layers.slice(0, k);
-    for (const { v, row } of layers[k].parts) {
-      for (let q = v.first[row]; q < v.first[row + 1]; q++) {
-        const x = bucketStep(v, q);
-        if (finer.some((f) => inRanges(f.ranges, x))) continue;
-        (col.s[col.n] = x), (col.v[col.n] = v.mean[q]), (col.t[col.n] = v.tmean[q]), (col.w[col.n] = v.n[q]), col.n++;
-      }
-    }
+  const K = layers.length, fine = layers[0]?.ranges;
+  if (K === 2 && fine.every((r, i) => !i || fine[i - 1][1] === r[0])) {
+    // the finer layer's blocks join into one range of steps: the coarser layer's buckets before it, its own, those after
+    emitWithin(layers[1].parts, -Infinity, fine[0][0], col);
+    emitWithin(layers[0].parts, -Infinity, Infinity, col);
+    emitWithin(layers[1].parts, fine[fine.length - 1][1], Infinity, col);
+  } else {
+    // each layer's in turn, which are in step order, then merged by step
+    const starts = new Int32Array(K + 1);
+    for (let k = 0; k < K; k++) (starts[k] = col.n), emitLayer(layers, k, col);
+    starts[K] = col.n;
+    if (K > 1) mergeByStep(col, starts);
   }
-  if (layers.length > 1) sortPoints(col);
   if (col.n) (col.lv = levelAt(layers, col.s[col.n - 1])), (col.b = Math.floor(col.s[col.n - 1] / 2 ** col.lv));
 }
 
-function sortPoints(col) {
-  const order = Array.from({ length: col.n }, (_, i) => i).sort((a, b) => col.s[a] - col.s[b]);
-  for (const k of ["s", "v", "t", "w"]) {
-    const a = col[k].slice(0, col.n);
-    order.forEach((j, i) => (col[k][i] = a[j]));
+/** Layer k's buckets at steps no finer layer's blocks hold, appended to col. */
+function emitLayer(layers, k, col) {
+  const at = new Int32Array(k); // per finer layer, its first range ending beyond the step: steps only rise within a layer
+  let n = col.n;
+  for (const { v, row } of layers[k].parts) {
+    const w = 2 ** v.level, base = v.base * BLOCK, { offset, soff, mean, tmean } = v, cnt = v.n;
+    for (let q = v.first[row], end = v.first[row + 1]; q < end; q++) {
+      const x = (base + offset[q] + (soff[q] + 0.5) / SOFF_SCALE) * w;
+      if (k && heldFiner(layers, k, at, x)) continue;
+      (col.s[n] = x), (col.v[n] = mean[q]), (col.t[n] = tmean[q]), (col.w[n] = cnt[q]), n++;
+    }
+  }
+  col.n = n;
+}
+
+/** Whether a layer finer than layer k holds step x, steps asked for in rising order (`at` follows them). */
+function heldFiner(layers, k, at, x) {
+  for (let f = 0; f < k; f++) {
+    const ranges = layers[f].ranges;
+    while (at[f] < ranges.length && ranges[at[f]][1] <= x) at[f]++;
+    if (at[f] < ranges.length && ranges[at[f]][0] <= x) return true;
+  }
+  return false;
+}
+
+let merging = new Float64Array(4096); // the points being merged: step, value, runtime, count each
+
+/** Sort col's points by step, given that those of [starts[k], starts[k + 1]) are sorted for each k; ties keep their
+ * order. */
+function mergeByStep(col, starts) {
+  const m = col.n, K = starts.length - 1, { s, v, t, w } = col;
+  if (merging.length < 4 * m) merging = new Float64Array(8 * m);
+  const b = merging, pos = starts.slice(0, K);
+  for (let i = 0; i < m; i++) (b[4 * i] = s[i]), (b[4 * i + 1] = v[i]), (b[4 * i + 2] = t[i]), (b[4 * i + 3] = w[i]);
+  for (let n = 0; n < m; n++) {
+    let k = -1;
+    for (let j = 0; j < K; j++) if (pos[j] < starts[j + 1] && (k < 0 || b[4 * pos[j]] < b[4 * pos[k]])) k = j;
+    const i = 4 * pos[k]++;
+    (s[n] = b[i]), (v[n] = b[i + 1]), (t[n] = b[i + 2]), (w[n] = b[i + 3]);
   }
 }
 

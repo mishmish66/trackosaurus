@@ -8,6 +8,9 @@ import { asNumber } from "./where.js";
 
 const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
 
+/** Run f in a task of its own, at once where the browser has no delay for it (nested timers wait 4 ms). */
+const soon = (f) => void (globalThis.scheduler?.postTask ? globalThis.scheduler.postTask(f) : setTimeout(f, 0));
+
 /** What this page and the server say to each other (server.PROTOCOL); the page states a mismatch. */
 export const PROTOCOL = 7;
 /** URL prefix of what the page shows: a directory ("/d/<id>") or a workspace ("/w/<name>"), else "" (the node's home). */
@@ -28,7 +31,8 @@ const FINE_BLOCKS = 8; // blocks of a finer level one chart's view may take
 const SCOPE_MIN = 64; // runs of a chart missing a block above which one request asks for the scope's finished runs...
 const SCOPE_SHARE = 4; // ...when they are also at least 1 / SCOPE_SHARE of the chart's runs
 const RUNS_PER_REQUEST = 2000; // run ids one request names
-const REBUILD_SLICE_MS = 8; // column rebuilds per task, in ms
+const REBUILD_SLICE_MS = 8; // column rebuilds per task, in ms...
+const REBUILD_WHOLE_MS = 32; // ...or up to this to finish a metric's, so its chart draws them all at once
 const PREFETCH_IDLE_MS = 50; // quiet time before fetching ahead
 export const LINE_PX_PER_BUCKET = 2; // chart width per bucket a line needs
 export const DENSITY_PX_PER_BUCKET = 8; // the same in a density heatmap or group statistics of many runs
@@ -114,9 +118,11 @@ export class Data {
     this.posts = 0; // requests in flight for plans
     this.planBlocks = 0; // blocks they ask for
     this.aheadPosts = 0; // requests in flight fetching ahead
+    this.aimPosts = 0; // those of them for a zoom being dragged
     this.aheadAsked = new Set(); // askId of each request fetching ahead has made
     this.rebuildQ = new Map(); // "run\0key" -> [run, key] awaiting rebuildSoon
-    this.rebuildT = 0;
+    this.rebuildLeft = new Map(); // metric -> how many of them are its
+    this.rebuilding = false; // a task rebuilding them is under way
     this.prefetchT = 0;
     this.planned = null; // inputs of the last plan
     this.touched = new Set();
@@ -148,13 +154,15 @@ export class Data {
     this.charts.clear();
     clearTimeout(this.prefetchT);
     this.rebuildQ.clear();
+    this.rebuildLeft.clear();
     this.gen++;
   }
 
   newRun(meta) {
     const r = { id: meta.id, meta, seq: meta.compiled ?? 0, mseq: meta.mseq, cols: new Map(), built: new Map(), tail: [],
                 tailSeq0: meta.compiled ?? 0, pending: [], hbExpect: null, resyncs: 0, resyncInFlight: false, holding: false };
-    // built: key -> inputs of its column; holding: events wait in `pending` until a resync finishes
+    // built: key -> {sig, layers} (the inputs of its column, and the layers of its chart then); holding: events wait in
+    // `pending` until a resync finishes
     this.runs.set(r.id, r);
     this.version++;
     this.countKeys(r, meta.keys || [], 1);
@@ -314,14 +322,23 @@ export class Data {
     return true;
   }
 
-  /** Show chart `key`'s wanted layers once they are all here, rebuilding the columns it draws. */
+  /** Show chart `key`'s wanted layers once they are all here, and have the columns it draws that were not built for
+   * the layers it shows rebuilt. */
   settleChart(key, ch) {
     const same = ch.ready && JSON.stringify(ch.ready) === JSON.stringify(ch.want);
-    if (!same && this.complete(key, ch.want, ch.runs)) {
-      ch.ready = ch.want;
-      this.touched.add(key);
-    }
-    if (ch.ready) for (const r of ch.runs) if (!ch.many || r.meta.state === "running") this.rebuildSoon(r, key);
+    if (!same && this.complete(key, ch.want, ch.runs)) (ch.ready = ch.want), this.touched.add(key);
+    if (!ch.ready) return;
+    for (const r of ch.runs) if (r.built.get(key)?.layers !== ch.ready && this.drawsColumn(ch, r)) this.rebuildSoon(r, key);
+  }
+
+  /** Whether chart ch draws run r from a column (one of many runs is drawn from its buckets unless it is running). */
+  drawsColumn(ch, r) {
+    return !ch.many || r.meta.state === "running";
+  }
+
+  /** Whether `layers` hold block `index` of `level`. */
+  shows(layers, level, index) {
+    return !!layers && [layers.coarse, layers.fine].some((L) => L && L.level === level && L.indices.includes(index));
   }
 
   // ---- blocks ----
@@ -363,7 +380,8 @@ export class Data {
     return hi >= lo ? [lo, hi] : null;
   }
 
-  /** Keep answer `got` ({buf, bytes, paths}) of request x: each run it names as its entry of the block. */
+  /** Keep answer `got` ({buf, bytes, paths}) of request x: each run it names as its entry of the block. Returns those
+   * runs. */
   addArray(x, got) {
     const { loc } = adoptStore(got.buf);
     const v = bucketViews(got.buf);
@@ -373,15 +391,19 @@ export class Data {
     const id = blockId(x.key, x.level, x.index);
     let b = this.blocks.get(id);
     if (!b) this.blocks.set(id, (b = { runs: new Map(), used: performance.now() }));
+    const runs = [];
     got.paths.forEach((p, row) => {
-      if (!this.runs.has(p)) return;
+      const r = this.runs.get(p);
+      if (!r) return;
       this.unref(b, p);
       b.runs.set(p, { a, row });
       a.refs++;
+      runs.push(r);
     });
     if (!a.refs) this.release(a);
     this.dropArrays();
     this.version++;
+    return runs;
   }
 
   /** Remove run `id`'s entry from block b, releasing its array when nothing else refers to it. */
@@ -443,7 +465,7 @@ export class Data {
       if (!batch.length) continue;
       this.posts++;
       this.planBlocks += batch.length;
-      this.send(batch, false).finally(() => {
+      this.send(batch).finally(() => {
         this.posts--;
         this.planBlocks -= batch.length;
         if (!this.busy) this.ui.status(this.summary());
@@ -466,25 +488,28 @@ export class Data {
   }
 
   /** Request the blocks of `batch` ([x, its record]) in one request and take their answers in: the charts they complete
-   * show their new layers, and what the view asked for (not `ahead`) is drawn. */
-  async send(batch, ahead) {
+   * show their new layers. */
+  async send(batch) {
     const gen = this.gen;
     try {
       const got = await this.fetchMany(batch.map(([x]) => x));
       if (gen !== this.gen) return;
-      batch.forEach(([x], i) => got[i] && this.take(x, got[i], ahead));
+      batch.forEach(([x], i) => got[i] && this.take(x, got[i]));
       this.flush();
     } finally {
       for (const [x, asked] of batch) if (--asked.n === 0) this.inflight.delete(blockId(x.key, x.level, x.index));
     }
   }
 
-  /** Keep answer `got` of request x; its chart shows the layers it completes. */
-  take(x, got, ahead) {
-    this.addArray(x, got);
-    const ch = this.charts.get(x.key);
-    if (ch) this.settleChart(x.key, ch);
-    if (!ahead) this.touched.add(x.key);
+  /** Keep answer `got` of request x: its chart shows the layers it completes, and when it shows this block, the
+   * columns of the runs the answer holds are rebuilt. */
+  take(x, got) {
+    const runs = this.addArray(x, got), ch = this.charts.get(x.key);
+    if (!ch) return;
+    this.settleChart(x.key, ch);
+    if (!this.shows(ch.ready, x.level, x.index)) return;
+    for (const r of runs) if (this.drawsColumn(ch, r)) this.rebuildSoon(r, x.key);
+    this.touched.add(x.key);
   }
 
   /** The answers of requests `xs`, null for a block not answered, fetched by a worker. */
@@ -527,9 +552,29 @@ export class Data {
       }
       if (!batch.length) return;
       this.aheadPosts++;
-      this.send(batch, true).finally(() => {
+      this.send(batch).finally(() => {
         this.aheadPosts--;
         this.prefetch();
+      });
+    }
+  }
+
+  /** Fetch ahead, now, the blocks the charts would want were they to show `demands` (a zoom being dragged), spread
+   * over the request slots; nothing while an earlier such fetch is under way. */
+  fetchFor(demands) {
+    if (this.aimPosts) return;
+    const out = [];
+    for (const d of demands) this.wantedAhead(d, out);
+    const size = Math.min(BATCH_BLOCKS, Math.ceil(out.length / PARALLEL));
+    for (let i = 0; i < out.length; i += size) {
+      const batch = out.slice(i, i + size).map((x) => [x, this.asking(x)]).filter(([, asked]) => asked);
+      if (!batch.length) continue;
+      this.aheadPosts++;
+      this.aimPosts++;
+      this.send(batch).finally(() => {
+        this.aheadPosts--;
+        this.aimPosts--;
+        this.pump();
       });
     }
   }
@@ -595,31 +640,52 @@ export class Data {
   rebuild(r, key) {
     const parts = this.partsOf(r, key);
     if (!parts) return;
-    const tail = this.tailOf(r, key);
+    const tail = this.tailOf(r, key), had = r.built.get(key);
     const sig = `${parts.map((p) => `${p.a.id}:${p.row}`).join()}|${r.tailSeq0}|${tail.n}`;
-    if (r.cols.has(key) && r.built.get(key) === sig) return;
-    r.built.set(key, sig);
+    r.built.set(key, { sig, layers: this.charts.get(key).ready });
+    if (r.cols.has(key) && had?.sig === sig) return;
     r.cols.set(key, buildColumn(parts, tail, this.levelOf(key) ?? 0));
-    this.pruneTail(r);
+    if (r.tail.length) this.pruneTail(r);
     this.touched.add(key);
   }
 
-  /** Rebuild columns later, a few milliseconds per task, so a view change never blocks input. */
+  /** Rebuild run r's column of `key` later, in a task of rebuilds, so a view change never blocks input. */
   rebuildSoon(r, key) {
-    this.rebuildQ.set(`${r.id}\0${key}`, [r, key]);
-    if (this.rebuildT) return;
-    const slice = () => {
-      const t0 = performance.now();
+    const id = `${r.id}\0${key}`;
+    if (!this.rebuildQ.has(id)) this.rebuildLeft.set(key, (this.rebuildLeft.get(key) || 0) + 1);
+    this.rebuildQ.set(id, [r, key]);
+    if (this.rebuilding) return;
+    this.rebuilding = true;
+    soon(() => this.rebuildSome());
+  }
+
+  /** Whether columns of metric `key` await rebuilding. */
+  pending(key) {
+    return this.rebuildLeft.has(key);
+  }
+
+  /** Rebuild queued columns for REBUILD_SLICE_MS, going on to finish a metric's within REBUILD_WHOLE_MS; then tell
+   * the UI of the metrics done, and go on in another task while some are left. */
+  rebuildSome() {
+    const t0 = performance.now();
+    let last = null;
+    try {
       for (const [id, [r, key]] of this.rebuildQ) {
+        const spent = performance.now() - t0;
+        if (spent > REBUILD_WHOLE_MS || (spent > REBUILD_SLICE_MS && key !== last)) break;
+        last = key;
         this.rebuildQ.delete(id);
+        const left = this.rebuildLeft.get(key) - 1;
+        if (left) this.rebuildLeft.set(key, left);
+        else this.rebuildLeft.delete(key);
         if (this.runs.get(r.id) === r) this.rebuild(r, key);
-        if (performance.now() - t0 > REBUILD_SLICE_MS) break;
       }
       this.flush();
-      this.rebuildT = this.rebuildQ.size ? setTimeout(slice, 0) : 0;
-      this.settle();
-    };
-    this.rebuildT = setTimeout(slice, 0);
+    } finally {
+      this.rebuilding = this.rebuildQ.size > 0;
+      if (this.rebuilding) soon(() => this.rebuildSome());
+    }
+    this.settle();
   }
 
   /** Drop the first tail rows while every metric's blocks hold them: rows before every block's (and the compiled
@@ -651,12 +717,14 @@ export class Data {
     return { s, v, t, q, n: s.length };
   }
 
-  /** Tell the UI which metrics changed: `streamed` when by rows from live runs, else by work for its view. */
+  /** Tell the UI which metrics changed: `streamed` when by rows from live runs; else by work for its view, each once
+   * none of its columns awaits rebuilding. */
   flush(streamed = false) {
-    if (!this.touched.size) return;
+    const keys = new Set();
+    for (const k of this.touched) if (streamed || !this.rebuildLeft.has(k)) keys.add(k);
+    if (!keys.size) return;
+    for (const k of keys) this.touched.delete(k);
     this.version++;
-    const keys = this.touched;
-    this.touched = new Set();
     this.flushKeys();
     this.ui.data(keys, streamed);
   }

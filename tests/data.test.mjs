@@ -114,3 +114,101 @@ test("a run that appears while the scope is being listed reaches the page throug
     globalThis.fetch = realFetch;
   }
 });
+
+/** Let queued tasks (column rebuilds, request answers) run. */
+const tasks = () => new Promise((ok) => setTimeout(ok, 5));
+const demandOf = (runs, zoom = null) => ({ key: "loss", runs, runsSig: "a", xmode: 0, zoomed: !!zoom, x0: zoom ? zoom[0] : -Infinity,
+                                         x1: zoom ? zoom[1] : Infinity, pw: 600, many: false });
+
+/** A Data of n finished runs whose chart of `loss` shows its coarse layer, and what its UI was told of: {d, runs, told}. */
+async function shown(n) {
+  const told = [], d = new Data({ ...UI, data: (keys) => told.push([...keys]) });
+  d.fetchMany = async (xs) => xs.map((x) => emptyArray(x.level, x.index, runs.map((r) => r.id), runs.map(() => 10)));
+  const runs = Array.from({ length: n }, (_, i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, compiled: 10, keys: ["loss"], summary: { _step: 1000 },
+                                                             state: "finished" }));
+  d.plan([demandOf(runs)]);
+  await tasks();
+  return { d, runs, told };
+}
+
+test("a chart's columns are built once its layers are here, and again only for the runs whose blocks change", async () => {
+  const { d, runs } = await shown(3), ch = d.charts.get("loss"), { level, indices } = ch.ready.coarse;
+  const built = runs.map((r) => r.cols.get("loss"));
+  assert.ok(built.every(Boolean));
+  d.plan([{ ...demandOf(runs), runsSig: "b" }]);
+  await tasks();
+  assert.deepEqual(runs.map((r) => r.cols.get("loss") === built[runs.indexOf(r)]), [true, true, true]);
+  d.take({ key: "loss", level, index: indices[0] }, emptyArray(level, indices[0], ["r1"], [10]));
+  await tasks();
+  assert.deepEqual(runs.map((r) => r.cols.get("loss") === built[runs.indexOf(r)]), [true, false, true]);
+});
+
+test("a run left out while its chart's layers changed gets a column of the layers shown once it is back", async () => {
+  const { d, runs } = await shown(2), zoom = [100, 120], fine = d.layersOf(demandOf(runs, zoom), runs).fine;
+  for (const index of fine.indices) d.take({ key: "loss", level: fine.level, index }, emptyArray(fine.level, index, ["r0", "r1"], [10, 10])); // fetched ahead
+  const coarse = runs[1].cols.get("loss");
+  d.plan([demandOf(runs.slice(0, 1), zoom)]);
+  await tasks();
+  assert.deepEqual([d.charts.get("loss").ready.fine, runs[1].cols.get("loss") === coarse], [fine, true]);
+  d.plan([demandOf(runs, zoom)]);
+  await tasks();
+  assert.ok(runs[1].cols.get("loss") !== coarse);
+});
+
+test("the UI hears of a metric once none of its columns awaits rebuilding", async () => {
+  const { d, runs, told } = await shown(2);
+  told.length = 0;
+  for (const r of runs) d.rebuildSoon(r, "loss");
+  d.touched.add("loss");
+  d.flush();
+  assert.deepEqual([told, d.pending("loss")], [[], true]);
+  await tasks();
+  assert.deepEqual([told, d.pending("loss"), d.busy], [[["loss"]], false, false]);
+});
+
+test("rows streamed for a run are told of at once, whatever awaits rebuilding", async () => {
+  const { d, runs, told } = await shown(2);
+  told.length = 0;
+  d.rebuildSoon(runs[1], "loss");
+  d.onRows(runs[0], { run: "r0", seq0: 10, rows: [[1001, 5, { loss: 1 }]] });
+  assert.deepEqual(told, [["loss"]]);
+});
+
+test("the blocks of a zoom being dragged are fetched before it is set, once", async () => {
+  const { d, runs } = await shown(3), asked = [], answer = d.fetchMany;
+  d.fetchMany = (xs) => (asked.push(...xs.map((x) => `${x.level}|${x.index}`)), answer(xs));
+  const zoom = demandOf(runs, [100, 120]), fine = d.layersOf(zoom, runs).fine;
+  assert.ok(fine && fine.level < d.charts.get("loss").ready.coarse.level);
+  d.fetchFor([zoom]);
+  d.fetchFor([zoom]);
+  assert.deepEqual(asked, fine.indices.map((i) => `${fine.level}|${i}`));
+  await tasks();
+  assert.equal(d.plan([zoom]), 0);
+  assert.deepEqual([asked.length, d.charts.get("loss").ready.fine], [fine.indices.length, fine]);
+  await tasks();
+  assert.ok(runs.every((r) => r.cols.has("loss")));
+});
+
+test("columns queued behind one whose rebuild throws are still rebuilt", async () => {
+  const { d, runs } = await shown(2), rebuild = d.rebuild.bind(d), errors = [], built = [], timer = globalThis.setTimeout;
+  d.rebuild = (r, key) => {
+    if (r === runs[0]) throw new Error("bad column");
+    built.push(r.id);
+    rebuild(r, key);
+  };
+  globalThis.setTimeout = (f, ms) => timer(() => {
+    try {
+      f();
+    } catch (e) {
+      errors.push(e.message);
+    }
+  }, ms);
+  try {
+    for (const r of runs) d.rebuildSoon(r, "loss");
+    await tasks();
+    await tasks();
+  } finally {
+    globalThis.setTimeout = timer;
+  }
+  assert.deepEqual([errors, built, d.pending("loss"), d.rebuilding], [["bad column"], ["r1"], false, false]);
+});

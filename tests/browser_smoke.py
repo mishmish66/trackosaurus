@@ -362,7 +362,7 @@ def file_columns(run_dir: Path) -> tuple[int, dict[str, int], int]:
 
 READY = ("window.app && app.data.runs.size > 0 && app.charts.size > 0 && !app.data.queue.length && !app.data.posts"
          " && [...app.charts.values()].some((c) => c.view)")
-SETTLED = READY + " && !app.data.busy && !app.round && !app.raf && !app.planTimer"
+SETTLED = READY + " && app.runList.length === app.data.runs.size && !app.data.busy && !app.round && !app.raf && !app.planTimer"
 
 
 def group_levels_smoke(page: Page, url: str) -> bool:
