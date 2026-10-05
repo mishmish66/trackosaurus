@@ -24,7 +24,7 @@ from trex import index as trex_index
 from trex.crawl import Crawl
 from trex.format import FORMAT, connect_ro, connect_rw
 from trex.index import Explorer
-from trex.daemon import resolve_root
+from trex.node import Node, resolve_root
 from trex.server import bind, serve
 from trex.server import urls as server_urls
 
@@ -753,7 +753,7 @@ def test_refuses_to_crawl_home_or_filesystem_root():
 @pytest.fixture
 def http(root, tmp_path, http_server):
     ex = Explorer(Crawl(root), tmp_path / "cache")
-    return ex, http_server(serve(ex, "127.0.0.1", 0))
+    return ex, http_server(serve(helpers.node_of(ex), "127.0.0.1", 0))
 
 
 def test_http_scopes_runs_by_folder_and_serves_media_with_ranges(http, root):
@@ -954,12 +954,12 @@ def test_server_urls_bracket_ipv6_hosts():
     assert server_urls(servers) == ["http://127.0.0.1:13898/", "http://[::1]:13899/"]
 
 
-def test_binding_an_explicit_port_in_use_is_an_error():
+def test_binding_an_explicit_port_in_use_is_an_error(tmp_path):
     with socket.socket() as taken:
         taken.bind(("127.0.0.1", 0))
         taken.listen()
         with pytest.raises(OSError):
-            bind(None, ["127.0.0.1"], taken.getsockname()[1])
+            bind(Node(tmp_path / "cache"), ["127.0.0.1"], taken.getsockname()[1])
 
 
 def test_close_stops_polling_ends_subscriptions_and_closes_connections(root, tmp_path):

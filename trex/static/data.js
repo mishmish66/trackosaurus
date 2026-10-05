@@ -10,8 +10,8 @@ const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
 
 /** What this page and the server say to each other (server.PROTOCOL); the page states a mismatch. */
 export const PROTOCOL = 7;
-/** URL prefix of what the page shows: a daemon's tracked directory ("/r/<name>") or workspace ("/w/<name>"), else "". */
-export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/[rw]\/[^/]+(?=\/)/) || [""])[0];
+/** URL prefix of what the page shows: a directory ("/d/<id>") or a workspace ("/w/<name>"), else "" (the node's home). */
+export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/[wd]\/[^/]+(?=\/)/) || [""])[0];
 
 /** URL of a media record's file; content-addressed, so browsers cache it as immutable. */
 export const mediaURL = (rec) => `${BASE}/m/${encodeURIComponent(rec.run)}/${rec.file}`;

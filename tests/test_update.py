@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from trex import server, update
-from trex.daemon import Roots
+from trex.node import Node
 
 from helpers import get_json, post_json, wait_for
 
@@ -52,7 +52,7 @@ def test_install_failure_carries_uvs_output(monkeypatch, tmp_path):
 @pytest.fixture
 def daemon_http(tmp_path, monkeypatch, http_server):
     """(url, restarts) of an in-process daemon server whose updates install from a fake source."""
-    srv = server.serve(None, "127.0.0.1", 0, Roots(tmp_path / "cache", tmp_path / "state" / "roots.json"))
+    srv = server.serve(Node(tmp_path / "cache", tmp_path / "state" / "roots.json"), "127.0.0.1", 0)
     restarts = []
     srv.restart = lambda: restarts.append(time.time())
     monkeypatch.setattr(update, "updates", lambda: {"source": "git+https://x", "available": True, "reason": ""})
@@ -64,7 +64,7 @@ def test_an_update_that_installs_a_new_commit_restarts_the_daemon(daemon_http, m
     commits = iter(["old", "new"])
     monkeypatch.setattr(update, "installed", lambda: {"version": "0.1.0", "commit": next(commits)})
     monkeypatch.setattr(update, "install", lambda source: f"installed {source}")
-    status, body = post_json(f"{url}/api/daemon/update")
+    status, body = post_json(f"{url}/api/node/update")
     assert status == 200 and body["updated"] and (body["from"]["commit"], body["to"]["commit"]) == ("old", "new")
     assert wait_for(lambda: len(restarts) == 1)
 
@@ -74,18 +74,18 @@ def test_the_daemon_reports_the_trex_it_runs_not_one_installed_since(daemon_http
     commits = iter(["old", "new"])
     monkeypatch.setattr(update, "installed", lambda: {"version": "0.1.0", "commit": next(commits)})
     monkeypatch.setattr(update, "install", lambda source: "installed")
-    running = get_json(f"{url}/api/daemon")["install"]
-    assert post_json(f"{url}/api/daemon/update")[1]["to"]["commit"] == "new"
-    assert get_json(f"{url}/api/daemon")["install"] == running == update.RUNNING
+    running = get_json(f"{url}/api/node")["install"]
+    assert post_json(f"{url}/api/node/update")[1]["to"]["commit"] == "new"
+    assert get_json(f"{url}/api/node")["install"] == running == update.RUNNING
 
 
 def test_an_update_that_changes_nothing_keeps_the_daemon_running(daemon_http, monkeypatch):
     url, restarts = daemon_http
     monkeypatch.setattr(update, "installed", lambda: {"version": "0.1.0", "commit": "same"})
     monkeypatch.setattr(update, "install", lambda source: "already installed")
-    assert post_json(f"{url}/api/daemon/update") == (200, {"updated": False, "from": {"version": "0.1.0", "commit": "same"},
+    assert post_json(f"{url}/api/node/update") == (200, {"updated": False, "from": {"version": "0.1.0", "commit": "same"},
                                                        "to": {"version": "0.1.0", "commit": "same"}, "output": "already installed"})
-    assert post_json(f"{url}/api/daemon/update")[0] == 200
+    assert post_json(f"{url}/api/node/update")[0] == 200
     time.sleep(server.RESTART_DELAY + 0.2)
     assert restarts == []
 
@@ -98,8 +98,8 @@ def test_a_failed_update_reports_uvs_output_and_can_be_retried(daemon_http, monk
         raise update.UpdateError("fatal: could not read from remote")
 
     monkeypatch.setattr(update, "install", fail)
-    assert post_json(f"{url}/api/daemon/update") == (502, {"error": "fatal: could not read from remote"})
-    assert post_json(f"{url}/api/daemon/update")[0] == 502 and restarts == []
+    assert post_json(f"{url}/api/node/update") == (502, {"error": "fatal: could not read from remote"})
+    assert post_json(f"{url}/api/node/update")[0] == 502 and restarts == []
 
 
 def test_a_second_update_during_the_first_is_refused(daemon_http, monkeypatch):
@@ -112,10 +112,10 @@ def test_a_second_update_during_the_first_is_refused(daemon_http, monkeypatch):
 
     monkeypatch.setattr(update, "installed", lambda: {"version": "0.1.0", "commit": "same"})
     monkeypatch.setattr(update, "install", install)
-    first = threading.Thread(target=post_json, args=(f"{url}/api/daemon/update",))
+    first = threading.Thread(target=post_json, args=(f"{url}/api/node/update",))
     first.start()
     assert started.wait(10)
-    assert post_json(f"{url}/api/daemon/update")[0] == 409
+    assert post_json(f"{url}/api/node/update")[0] == 409
     release.set()
     first.join()
 
@@ -123,13 +123,13 @@ def test_a_second_update_during_the_first_is_refused(daemon_http, monkeypatch):
 def test_unavailable_updates_are_refused_with_the_reason(daemon_http, monkeypatch):
     url, restarts = daemon_http
     monkeypatch.setattr(update, "updates", lambda: {"source": None, "available": False, "reason": "TREX_SOURCE is not set"})
-    assert post_json(f"{url}/api/daemon/update") == (400, {"error": "updates are unavailable: TREX_SOURCE is not set"})
+    assert post_json(f"{url}/api/node/update") == (400, {"error": "updates are unavailable: TREX_SOURCE is not set"})
     assert restarts == []
 
 
 def test_a_server_without_a_restart_hook_has_no_update(tmp_path, http_server):
-    url = http_server(server.serve(None, "127.0.0.1", 0, Roots(tmp_path / "cache", tmp_path / "state" / "roots.json")))
-    assert post_json(f"{url}/api/daemon/update")[0] == 404
+    url = http_server(server.serve(Node(tmp_path / "cache", tmp_path / "state" / "roots.json"), "127.0.0.1", 0))
+    assert post_json(f"{url}/api/node/update")[0] == 404
 
 
 @pytest.mark.skipif(not Path(update.uv()).exists(), reason="needs uv")

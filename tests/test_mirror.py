@@ -15,7 +15,7 @@ from trex.index import Dump, Explorer
 from trex.mirror import Pull, Unreachable, Upstream
 from trex.server import Server
 
-from helpers import PNG, committed_rows, wait_for, write_run
+from helpers import PNG, committed_rows, node_of, wait_for, write_run
 
 type Source = tuple[Explorer, Server, str]
 
@@ -35,7 +35,7 @@ def source(runs: Path, tmp_path: Path, http_server: Callable[[Server], str]) -> 
     """The upstream: an Explorer of `runs`, indexed, its server and the URL serving it."""
     ex = Explorer(Crawl(runs, 1), tmp_path / "source-cache")
     ex.sync()
-    srv = server.serve(ex, "127.0.0.1", 0)
+    srv = server.serve(node_of(ex), "127.0.0.1", 0)
     return ex, srv, http_server(srv)
 
 
@@ -157,7 +157,7 @@ def test_a_run_gone_from_the_upstream_leaves_the_mirror(source: Source, runs: Pa
 def test_a_mirror_of_a_mirror_holds_what_the_source_holds(source: Source, tmp_path: Path, http_server: Callable[[Server], str]) -> None:
     ex, _, url = source
     hub = synced(url, tmp_path / "hub-cache")
-    leaf = synced(http_server(server.serve(hub, "127.0.0.1", 0)), tmp_path / "leaf-cache")
+    leaf = synced(http_server(server.serve(node_of(hub), "127.0.0.1", 0)), tmp_path / "leaf-cache")
     assert held(leaf) == held(ex) and leaf.runs("") == ex.runs("")
     assert blocks(leaf, "acc", ["b/r3"]) == blocks(ex, "acc", ["b/r3"])
     assert leaf.media_path("a/r1", ex.runs("a/r1").media[0].file).read_bytes() == PNG

@@ -396,7 +396,7 @@ def test_systemd_unit_runs_this_trex_and_restarts_it_after_an_update(capsys, tmp
     main(["systemd-unit", "--host", "127.0.0.1", "--port", "9000", "--source", "git+https://example.org/trex"])
     unit = capsys.readouterr().out
     lines = set(unit.splitlines())
-    assert f"ExecStart={shlex.join([sys.executable, '-m', 'trex', 'daemon', '--host', '127.0.0.1', '--port', '9000'])}" in lines
+    assert f"ExecStart={shlex.join([sys.executable, '-m', 'trex', 'serve', '--host', '127.0.0.1', '--port', '9000'])}" in lines
     assert {"Environment=TREX_SOURCE=git+https://example.org/trex", "SuccessExitStatus=75", "RestartForceExitStatus=75",
             "Restart=on-failure", "WantedBy=default.target"} <= lines
     if shutil.which("systemd-analyze"):
@@ -421,7 +421,7 @@ def test_launchd_plist_runs_this_trex_and_restarts_it_after_an_update(capsys, tm
     main(["launchd-plist", "--host", "127.0.0.1", "--port", "9000", "--allow-host", "box.tailnet.ts.net",
           "--cache", str(tmp_path / "cache"), "--source", "git+https://example.org/trex"])
     agent = plistlib.loads(capsys.readouterr().out.encode())
-    assert agent["ProgramArguments"] == [sys.executable, "-m", "trex", "daemon", "--host", "127.0.0.1",
+    assert agent["ProgramArguments"] == [sys.executable, "-m", "trex", "serve", "--host", "127.0.0.1",
                                          "--allow-host", "box.tailnet.ts.net", "--port", "9000"]
     env = agent["EnvironmentVariables"]
     assert {"TREX_SOURCE": "git+https://example.org/trex", "TREX_CACHE": str((tmp_path / "cache").resolve())}.items() <= env.items()
@@ -451,7 +451,7 @@ def test_version_names_the_installed_trex(capsys):
     assert re.fullmatch(r"trex \d+\.\d+\.\d+\S*( \([0-9a-f]{12}\))?\n", out)
 
 
-def test_systemd_unit_passes_allowed_host_names_to_the_daemon(capsys):
+def test_systemd_unit_passes_allowed_host_names_to_trex(capsys):
     main(["systemd-unit", "--allow-host", "box.tailnet.ts.net"])
     assert "--allow-host box.tailnet.ts.net" in capsys.readouterr().out.split("ExecStart=")[1].splitlines()[0]
 

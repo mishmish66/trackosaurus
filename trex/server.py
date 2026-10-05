@@ -1,4 +1,9 @@
-"""HTTP server for the explorer UI (started by `trex serve`; see cli.py)."""
+"""HTTP + SSE for a node (`trex.node`): its UI and its API, for browsers and for the other trex pulling from it.
+
+`/` is the node's home view (`Node.home_view`), `/w/<name>/` a workspace, `/d/<id>/` one directory; under each, the
+same API: runs, blocks, rows, the stream, media, dumps. `/api/node` and the routes under it manage the node;
+`/api/holdings` lists what it holds for other trex.
+"""
 
 import contextlib
 import errno
@@ -11,20 +16,16 @@ import socket
 import socketserver
 import sys
 import threading
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, cast
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from typing import Any, Final, cast
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import buckets as bk, remote, update
-from .daemon import Node, host_name, link_url, root_url, workspace_url
-from .workspace import Workspace
 from .index import Ask, Explorer, Have, Which, dumps
-
-if TYPE_CHECKING:
-    from .daemon import Roots
+from .node import Node, dir_base, link_url, resolve_root, workspace_url
+from .workspace import Workspace
 
 type Query = dict[str, str]
 type RouteFn = Callable[..., None]
@@ -32,8 +33,7 @@ type RouteFn = Callable[..., None]
 STATIC: Final = Path(__file__).parent / "static"
 DEFAULT_PORT: Final = 13898
 PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
-ROOT_PREFIX: Final = re.compile(r"/([rwd])/([^/]+)(/.*)?")  # a directory's URLs by name (r) or id (d), a workspace's (w)
-STANDALONE: Final = Node(uuid.uuid4().hex[:16], host_name())  # this process, when it serves one directory
+ROOT_PREFIX: Final = re.compile(r"/([wd])/([^/]+)(/.*)?")  # a directory's URLs (d, by id), a workspace's (w, by name)
 PROTOCOL: Final = 7  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
 WHICH: Final[dict[str, Which]] = {"all": "all", "finished": "finished", "running": "running"}
 MAX_ASKS: Final = 256  # blocks one POST /api/buckets may ask for
@@ -84,8 +84,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @property
     def ex(self) -> "Explorer | Workspace":
-        """What this request is for: the served directory, or the daemon's tracked directory (/r/<name>/) or
-        workspace (/w/<name>/)."""
+        """What this request is for: the node's home view, a directory (/d/<id>/) or a workspace (/w/<name>/)."""
         if self._ex is None:
             raise KeyError("runs directory")
         return self._ex
@@ -137,30 +136,22 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def _scope(self, path: str, query: str) -> str | None:
-        """Choose what the request is for and return the path within it, or None after redirecting a daemon page
-        that names no tracked directory or workspace, or lacks its trailing slash. The daemon's own root is the
-        view of every tracked directory."""
-        self._ex = self.srv.explorer
-        if self.srv.roots is None:
-            pm = ROOT_PREFIX.fullmatch(path)
-            if pm is not None and pm[1] == "d" and self._ex is not None and unquote(pm[2]) == standalone_id(self._ex):
-                return pm[3] or "/"
-            return path
+        """Choose what the request is for and return the path within it, or None after redirecting a page that names no
+        directory or workspace, or lacks its trailing slash."""
+        node = self.srv.node
         pm = ROOT_PREFIX.fullmatch(path)
         if pm is None:
-            self._ex = self.srv.roots.everything()
+            self._ex = node.home_view()
             return path
         kind, name, rest = pm[1], unquote(pm[2]), pm[3]
-        roots = self.srv.roots
         try:
-            entry = roots.get(name) if kind == "r" else roots.by_id(name) if kind == "d" else roots.workspace(name)
+            self._ex = node.by_id(name) if kind == "d" else node.workspace(name)
         except KeyError:
             if rest in (None, "/"):
                 return self.redirect("/", permanent=False)
             raise
         if rest is None:
             return self.redirect(path + "/" + (f"?{query}" if query else ""))
-        self._ex = entry
         return rest
 
     def redirect(self, location: str, permanent: bool = True) -> None:
@@ -265,75 +256,75 @@ class Handler(BaseHTTPRequestHandler):
     def info(self, q: Query) -> None:
         self._json({**self.ex.info(), "protocol": PROTOCOL})
 
-    @route("GET", r"/api/daemon")
-    def daemon(self, q: Query) -> None:
-        """{daemon, node, roots: [{name, root, id, url, state, error, link}], links: [{url, name, state, error}],
-        workspaces: [{name, url, members}], history: [root], install, updates}: whether this is the daemon, which node it
-        is, its directories, the trex it pulls from and its workspaces, the remembered directories and links it does not
-        serve, the trex it runs, and whether it can update."""
-        roots = self.srv.roots
-        if roots is None:
-            return self._json({"daemon": False, "node": STANDALONE._asdict(), "roots": [], "links": [], "workspaces": [],
-                               "history": [], "install": None, "updates": None})
-        self._json({"daemon": True, "node": roots.node._asdict(), "roots": roots.served(), "links": roots.links_info(),
-                    "workspaces": roots.workspace_list(), "history": roots.history(), "install": update.RUNNING,
+    @route("GET", r"/api/node")
+    def node(self, q: Query) -> None:
+        """{node: {id, name}, saves, home, dirs: [{name, root, id, url, state, error, link}], links: [{url, name, state,
+        error}], workspaces: [{name, url, members}], history: [root], install, updates}: which node this is, whether it
+        saves what it holds, the directory `/` shows (none: every one), its directories, the trex it pulls from and its
+        workspaces, the remembered directories and links it does not serve, the trex it runs, and whether it can
+        update."""
+        node = self.srv.node
+        self._json({"node": node.identity.wire(), "saves": node.saves, "home": node.home,
+                    "dirs": [d.wire() for d in node.served()], "links": [link.wire() for link in node.links_info()],
+                    "workspaces": node.workspace_list(), "history": node.history(), "install": update.RUNNING,
                     "updates": update.updates()})
 
     @route("GET", r"/api/holdings")
     def holdings(self, q: Query) -> None:
-        """{node: {id, name}, dirs: [{id, via}]}: this trex, and each directory it holds with the nodes it came through,
-        from the one that crawls it to this one; another trex pulls each from /d/<id>/."""
-        roots, ex = self.srv.roots, self.srv.explorer
-        if roots is not None:
-            return self._json(roots.holdings())
-        dirs = [] if ex is None else [{"id": standalone_id(ex), "via": [STANDALONE.id]}]
-        self._json({"node": STANDALONE._asdict(), "dirs": dirs})
+        """{node: {id, name}, dirs: [{id, via}]}: this node, and each directory it holds with the nodes it came through,
+        from the one crawling it to this one; another trex pulls each from /d/<id>/."""
+        self._json(self.srv.node.holdings().wire())
 
-    @property
-    def daemon_roots(self) -> "Roots":
-        if self.srv.roots is None:
-            raise KeyError("daemon")
-        return self.srv.roots
+    def body_json(self) -> dict[str, Any]:
+        """The JSON object of the body; ValueError for anything else."""
+        req = json.loads(self.body())
+        if not isinstance(req, dict):
+            raise ValueError("expected a JSON object")
+        return cast(dict[str, Any], req)
 
     def body_field(self, field: str) -> str:
         """String `field` of the JSON body."""
-        req = json.loads(self.body())
-        if not isinstance(req, dict) or not isinstance(req.get(field), str):
+        value = self.body_json().get(field)
+        if not isinstance(value, str):
             raise ValueError(f"expected {{{field}}}")
-        return req[field]
+        return value
 
-    @route("POST", r"/api/daemon/add")
-    def daemon_add(self, q: Query) -> None:
-        """Body: {path}: absolute, ~/…, host:path for a remote directory (which this waits to start), or http://host:port
-        for a trex to pull every directory of. Response: {name, url} (the root view's for a trex), or 400 with {error}
-        for a path it refuses, a remote that fails to start or a trex that does not answer."""
-        roots, path = self.daemon_roots, self.body_field("path").strip()
+    @route("POST", r"/api/node/add")
+    def node_add(self, q: Query) -> None:
+        """Body: {path, id?}: absolute, ~/…, host:path for a remote directory (which this waits to start), or
+        http://host:port for a trex to pull every directory of; `id` names a local directory (a node asking this one to
+        crawl it). Response: {name, id, url} (none and the root view's for a trex), or 400 with {error} for a path it
+        refuses, a remote that fails to start or a trex that does not answer."""
+        node, path, d = self.srv.node, self.body_field("path").strip(), self.body_json().get("id")
         try:
             if not remote.parse(path) and not link_url(path) and not Path(path).expanduser().is_absolute():
                 raise ValueError(f"{path} is not an absolute path, host:path or http://host:port")
-            name = roots.track(path)
+            got = node.add(resolve_root(path, force=False), str(d)) if isinstance(d, str) else node.track(path)
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
-        self._json({"name": name, "url": root_url(name) if name else "/"})
+        if got is None:
+            return self._json({"name": None, "id": None, "url": "/"})
+        self._json({"name": node.names()[got], "id": got, "url": dir_base(got) + "/"})
 
-    @route("POST", r"/api/daemon/remove")
-    def daemon_remove(self, q: Query) -> None:
-        """Body: {name}: a directory's name, or a link's url. Stops serving that directory, or pulling from that trex;
-        400 for a directory pulled from a link."""
+    @route("POST", r"/api/node/remove")
+    def node_remove(self, q: Query) -> None:
+        """Body: {name} (a directory's name, or a link's url) or {id}. Stops serving that directory, or pulling from that
+        trex; 400 for a directory pulled from a link."""
+        node, req = self.srv.node, self.body_json()
         try:
-            self.daemon_roots.remove(self.body_field("name"))
+            node.remove_dir(str(req["id"])) if "id" in req else node.remove(self.body_field("name"))
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
         self._json({"ok": True})
 
-    @route("POST", r"/api/daemon/update")
-    def daemon_update(self, q: Query) -> None:
+    @route("POST", r"/api/node/update")
+    def node_update(self, q: Query) -> None:
         """Install the newest trex from $TREX_SOURCE and, if that changed it, restart the daemon.
-        Response: {updated, from, to, output}; 400 when updates are unavailable, 409 during another update,
-        502 when the install fails."""
+        Response: {updated, from, to, output}; 404 for a node that is not a daemon, 400 when updates are unavailable,
+        409 during another update, 502 when the install fails."""
         restart = self.srv.restart
-        if self.srv.roots is None or restart is None:
-            raise KeyError("daemon")
+        if restart is None:
+            raise KeyError("a daemon")
         can = update.updates()
         if not can["available"] or can["source"] is None:
             return self._json({"error": f"updates are unavailable: {can['reason']}"}, 400)
@@ -353,27 +344,27 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.srv.updating.release()
 
-    @route("POST", r"/api/daemon/workspace")
-    def daemon_workspace(self, q: Query) -> None:
-        """Body: {name, members: [tracked directory names], old?: name being renamed}. Response {url}, or 400."""
-        req = json.loads(self.body())
-        if not isinstance(req, dict) or not isinstance(req.get("members"), list):
+    @route("POST", r"/api/node/workspace")
+    def node_workspace(self, q: Query) -> None:
+        """Body: {name, members: [directory names], old?: name being renamed}. Response {url}, or 400."""
+        req = self.body_json()
+        if not isinstance(req.get("members"), list):
             raise ValueError("expected {name, members, old?}")
         try:
-            self.daemon_roots.set_workspace(str(req.get("name", "")), [str(m) for m in req["members"]],
-                                            str(req["old"]) if req.get("old") else None)
+            self.srv.node.set_workspace(str(req.get("name", "")), [str(m) for m in req["members"]],
+                                        str(req["old"]) if req.get("old") else None)
         except (ValueError, KeyError) as e:
             return self._json({"error": str(e)}, 400)
         self._json({"url": workspace_url(str(req["name"]).strip())})
 
-    @route("POST", r"/api/daemon/workspace/delete")
-    def daemon_workspace_delete(self, q: Query) -> None:
-        self.daemon_roots.delete_workspace(self.body_field("name"))
+    @route("POST", r"/api/node/workspace/delete")
+    def node_workspace_delete(self, q: Query) -> None:
+        self.srv.node.delete_workspace(self.body_field("name"))
         self._json({"ok": True})
 
-    @route("POST", r"/api/daemon/history/clear")
-    def daemon_clear_history(self, q: Query) -> None:
-        self.daemon_roots.clear_history()
+    @route("POST", r"/api/node/history/clear")
+    def node_clear_history(self, q: Query) -> None:
+        self.srv.node.clear_history()
         self._json({"ok": True})
 
     @route("GET", r"/api/tree")
@@ -454,12 +445,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Server(ThreadingHTTPServer):
-    """A server whose open connections end when it closes."""
+    """A node's server, whose open connections end when it closes."""
 
     daemon_threads = True
     request_queue_size = 128
-    explorer: Explorer | None = None
-    roots: "Roots | None" = None
+    node: Node
     restart: Callable[[], None] | None = None  # ends the daemon so that its service manager starts the updated one
     updating: threading.Lock  # held during an update, and from a successful one until the restart
     names: frozenset[str] = frozenset()  # host names besides IP addresses that requests may address it by
@@ -506,17 +496,12 @@ class UnixServer(Server):
         Path(str(self.server_address)).unlink(missing_ok=True)
 
 
-def serve_unix(explorer: Explorer, path: Path) -> Server:
-    """Unstarted server for one directory on the Unix socket `path`."""
+def serve_unix(node: Node, path: Path) -> Server:
+    """Unstarted server for `node` on the Unix socket `path`."""
     path.unlink(missing_ok=True)
     srv = UnixServer(cast(Any, str(path)), Handler)  # an AF_UNIX address is a path
-    srv.explorer, srv.names, srv.updating = explorer, host_names(), threading.Lock()
+    srv.node, srv.names, srv.updating = node, host_names(), threading.Lock()
     return srv
-
-
-def standalone_id(ex: Explorer) -> str:
-    """The id of the directory a standalone server serves."""
-    return f"{STANDALONE.name}:{ex.origin.key}"
 
 
 def _is_ip(name: str) -> bool:
@@ -533,24 +518,22 @@ def host_names(hosts: Sequence[str] = (), allow: Sequence[str] = ()) -> frozense
     return frozenset(n.lower() for n in names)
 
 
-def serve(explorer: Explorer | None, host: str, port: int, roots: "Roots | None" = None, allow: Sequence[str] = ()) -> Server:
-    """Unstarted server on host:port (IPv6 if host has a colon) for one directory, or the daemon's `roots`;
-    `allow` adds host names it answers to."""
+def serve(node: Node, host: str, port: int, allow: Sequence[str] = ()) -> Server:
+    """Unstarted server for `node` on host:port (IPv6 if host has a colon); `allow` adds host names it answers to."""
     srv = (Server6 if ":" in host else Server)((host, port), Handler)
-    srv.explorer, srv.roots, srv.names = explorer, roots, host_names([host], allow)
+    srv.node, srv.names = node, host_names([host], allow)
     srv.updating = threading.Lock()
     return srv
 
 
-def bind(explorer: Explorer | None, hosts: Sequence[str], port: int | None, roots: "Roots | None" = None,
-         allow: Sequence[str] = ()) -> list[Server]:
-    """Unstarted servers on every host at `port`, or without one at the first free port from DEFAULT_PORT."""
+def bind(node: Node, hosts: Sequence[str], port: int | None, allow: Sequence[str] = ()) -> list[Server]:
+    """Unstarted servers for `node` on every host at `port`, or without one at the first free port from DEFAULT_PORT."""
     ports = [port] if port is not None else range(DEFAULT_PORT, DEFAULT_PORT + PORT_TRIES)
     for p in ports:
         servers: list[Server] = []
         try:
             for h in hosts:
-                servers.append(serve(explorer, h, p, roots, allow))
+                servers.append(serve(node, h, p, allow))
             return servers
         except OSError as e:
             for s in servers:

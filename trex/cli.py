@@ -8,6 +8,7 @@ import plistlib
 import re
 import shlex
 import signal
+import socket
 import sqlite3
 import sys
 import threading
@@ -21,12 +22,11 @@ from typing import Annotated, Final, Literal, NamedTuple
 
 import typer
 
-from . import daemon, query as Q, remote, update
+from . import control, query as Q, remote, update
 from .compact import InUse, compact
-from .daemon import Roots, resolve_root
 from .format import DB, JSONValue, as_dict, as_str
-from .crawl import Crawl
-from .index import Explorer, RunsView
+from .index import RunsView
+from .node import Node, link_url, resolve_root
 from .server import DEFAULT_PORT, Server, bind, serve_unix, urls
 from .where import as_number, compile_where
 
@@ -318,11 +318,10 @@ ServiceSource = Annotated[str | None, typer.Option(envvar="TREX_SOURCE", show_en
                                "git+https://github.com/mishmish66/trackosaurus; '' for no update button).")]
 
 
-def listen(explorer: Explorer | None, hosts: list[str] | None, port: int | None, allow: list[str] | None,
-           roots: Roots | None = None) -> list[Server]:
+def listen(node: Node, hosts: list[str] | None, port: int | None, allow: list[str] | None) -> list[Server]:
     """`server.bind`; ValueError when an address is unavailable."""
     try:
-        return bind(explorer, hosts or ["127.0.0.1"], port, roots, allow or [])
+        return bind(node, hosts or ["127.0.0.1"], port, allow or [])
     except OSError as e:
         where = f"{', '.join(hosts or ['127.0.0.1'])} port {port or f'from {DEFAULT_PORT}'}"
         raise ValueError(f"cannot listen on {where}: {e.strerror or e}") from e
@@ -348,44 +347,107 @@ def run_servers(servers: Sequence[Server], banner: Sequence[str]) -> None:
             srv.server_close()
 
 
-def add_to_daemon(root: str, force: bool, yes: bool) -> bool:
-    """Offer to add `root` (a path, host:path or http://host:port) to a running daemon; whether it was added."""
-    status = daemon.request({"op": "status"})
+def given(spec: str, force: bool) -> str:
+    """`spec` as a node takes it: a local path resolved (ValueError for one it refuses), host:path and URLs as they are."""
+    return spec if remote.parse(spec) or link_url(spec) else str(resolve_root(spec, force))
+
+
+def hand_to_node(specs: Sequence[str], force: bool, yes: bool) -> bool:
+    """Offer `specs` to this machine's running node; whether one runs."""
+    status = control.request({"op": "status"})
     if status is None:
         return False
     url = urls[0] if isinstance(urls := status.get("urls"), list) and urls else "?"
-    if not (yes or not sys.stdin.isatty() or typer.confirm(f"Add {root} to the trex daemon at {url}?", default=True)):
-        return False
-    reply = daemon.request({"op": "add", "path": root, "force": force}) or {"error": "the daemon stopped"}
-    if "error" in reply:
-        raise ValueError(reply["error"])
-    typer.echo(f"trex daemon {'pulling' if daemon.link_url(root) else 'serving'} {typer.style(root, bold=True)} at {reply['url']}")
+    if not specs:
+        typer.echo(f"trex is already running at {url}")
+    for spec in specs:
+        if not (yes or not sys.stdin.isatty() or typer.confirm(f"Add {spec} to the trex at {url}?", default=True)):
+            continue
+        reply = control.request({"op": "add", "path": spec, "force": force}) or {"error": "trex stopped"}
+        if "error" in reply:
+            raise ValueError(reply["error"])
+        typer.echo(f"trex {'pulling' if link_url(spec) else 'serving'} {typer.style(spec, bold=True)} at {reply['url']}")
     return True
 
 
-@command("serve")
-def serve_cmd(runs_dir: PathArg, host: Hosts = None, port: Port = None, allow_host: AllowHosts = None, cache: Cache = None,
+@command("serve", "daemon")
+def serve_cmd(specs: Annotated[list[str] | None, typer.Argument(metavar="[DIR | HOST:PATH | http://HOST:PORT]...", show_default=False,
+                                                                help="Runs directories to crawl here, or on HOST over ssh, "
+                                                                     "and trex to pull every directory of.")] = None,
+              host: Hosts = None, port: Port = None, allow_host: AllowHosts = None,
+              cache: Annotated[str | None, typer.Option(help="Cache directory (default $TREX_CACHE or ~/.cache/trex).")] = None,
               force: Force = False,
-              yes: Annotated[bool, typer.Option("--yes", "-y", help="Add to a running daemon without asking.")] = False,
-              standalone: Annotated[bool, typer.Option("--standalone", help="Serve on its own even if a daemon runs.")] = False,
+              yes: Annotated[bool, typer.Option("--yes", "-y", help="Hand them to the running trex without asking.")] = False,
+              temporary: Annotated[bool, typer.Option("--temporary", help="Run a trex of its own that keeps nothing once it "
+                                                      "exits, even while another runs.")] = False,
+              name: Annotated[str | None, typer.Option(help="Name of this trex, which begins the ids of the directories it crawls "
+                                                         "(default the host's, kept once chosen).")] = None,
               unix: Annotated[str | None, typer.Option("--unix", metavar="SOCKET", help="Listen on this Unix socket instead.")] = None,
               exit_on_eof: Annotated[bool, typer.Option("--exit-on-eof", hidden=True)] = False) -> None:
-    """Crawl a runs directory and serve the web UI, or add it to a running `trex daemon`, which also serves host:path
-    directories over ssh and pulls every directory of another trex given as http://host:port."""
-    if remote.parse(runs_dir) or daemon.link_url(runs_dir):
-        if not add_to_daemon(runs_dir, force, yes=True):
-            raise ValueError("host:path directories and http://host:port trex are served by `trex daemon`; start one first")
+    """Serve runs directories, and the trex to pull from, with the web UI: this machine's trex, started when none runs
+    (keeping what it holds in $TREX_DAEMON_DIR, by default ~/.local/state/trex), else handed them."""
+    given_specs = [given(s, force) for s in specs or []]
+    if not temporary and hand_to_node(given_specs, force, yes):
         return
-    root = resolve_root(runs_dir, force)
-    if not standalone and add_to_daemon(str(root), force, yes):
-        return
-    ex = Explorer(Crawl(root), cache_dir(cache)).start()
-    servers = [serve_unix(ex, Path(unix))] if unix else listen(ex, host, port, allow_host)
-    where = f"unix:{unix}" if unix else "  ".join(urls(servers))
+    node = Node(Path(cache).expanduser() if cache else control.default_cache(), None if temporary else control.state_dir() / "roots.json", name)
+    servers = [serve_unix(node, Path(unix))] if unix else listen(node, host, port, allow_host)
+    run_node(node, servers, given_specs, force, exit_on_eof)
+
+
+def run_node(node: Node, servers: list[Server], specs: Sequence[str], force: bool, exit_on_eof: bool) -> None:
+    """Serve `node` on `servers`, holding `specs` besides what it saved, until interrupted (or, with `exit_on_eof`, until
+    stdin closes); a node that keeps nothing shows the one directory it is given as its home. After an update, exit with
+    RESTART_STATUS."""
+    ctl = _control(node, servers) if node.saves else None
+    held = [node.track(s, force, wait=False) for s in specs]
+    if not node.saves and len(held) == 1 and held[0] and not remote.parse(specs[0]):
+        node.home = held[0]
+    restarting = _restarts(servers) if node.saves else None
     if exit_on_eof:
         signal.signal(signal.SIGTERM, _interrupt)
         threading.Thread(target=_exit_on_eof, name="trex-stdin", daemon=True).start()
-    run_servers(servers, [f"trex serving {typer.style(str(root), bold=True)} on {where}  cache={ex.cache_dir.resolve()}"])
+    try:
+        run_servers(servers, _banner(node, servers, ctl))
+    finally:
+        if ctl is not None:
+            ctl.shutdown()
+            ctl.server_close()
+        node.close()
+    if restarting is not None and restarting.is_set():
+        typer.echo(f"trex: updated; exiting with status {update.RESTART_STATUS} for its service manager to restart it")
+        sys.exit(update.RESTART_STATUS)
+
+
+def _banner(node: Node, servers: Sequence[Server], ctl: control.ControlServer | None) -> list[str]:
+    """What a starting trex prints: where it serves (its first line, which a session over ssh waits for), then what it
+    holds."""
+    where = "  ".join(urls(servers)) if servers[0].address_family != socket.AF_UNIX else f"unix:{servers[0].server_address}"
+    return [f"trex serving {node.identity.name} on {where}  cache={node.cache}" + (f"  socket={ctl.path}" if ctl else ""),
+            *(f"  {d.name}  {d.root}" for d in node.served()), *(f"  pulling {link.url}" for link in node.links_info())]
+
+
+def _restarts(servers: Sequence[Server]) -> threading.Event:
+    """Give the servers a way to end them for an update to take effect; set once it does."""
+    restarting = threading.Event()
+
+    def restart() -> None:
+        restarting.set()
+        servers[0].shutdown()
+
+    for srv in servers:
+        srv.restart = restart
+    return restarting
+
+
+def _control(node: Node, servers: Sequence[Server]) -> control.ControlServer:
+    """This machine's trex's control socket, with what `node` saved loaded; exits when another trex runs."""
+    try:
+        ctl = control.ControlServer(control.socket_path(), node, urls(servers))
+    except RuntimeError as e:
+        sys.exit(f"trex: {e}")
+    threading.Thread(target=ctl.serve_forever, name="trex-control", daemon=True).start()
+    node.load()
+    return ctl
 
 
 def _exit_on_eof() -> None:
@@ -395,54 +457,14 @@ def _exit_on_eof() -> None:
     os.kill(os.getpid(), signal.SIGTERM)
 
 
-@command("daemon")
-def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]...", help="Runs directories to add.", show_default=False)] = None,
-               host: Hosts = None, port: Port = None, allow_host: AllowHosts = None,
-               cache: Annotated[str | None, typer.Option(help="Cache directory (default $TREX_CACHE or ~/.cache/trex).")] = None,
-               name: Annotated[str | None, typer.Option(help="Name of this trex, which begins the ids of the directories it crawls "
-                                                         "(default the host's, kept once chosen).")] = None,
-               force: Force = False) -> None:
-    """Serve several runs directories from one server; `trex serve DIR` offers to add to it."""
-    roots = daemon.Roots(Path(cache).expanduser() if cache else daemon.default_cache(), daemon.state_dir() / "roots.json", name)
-    servers = listen(None, host, port, allow_host, roots)
-    try:
-        control = daemon.ControlServer(daemon.socket_path(), roots, urls(servers))
-    except RuntimeError as e:
-        sys.exit(f"trex daemon: {e}")
-
-    restarting = threading.Event()
-
-    def restart() -> None:
-        restarting.set()
-        servers[0].shutdown()
-
-    for srv in servers:
-        srv.restart = restart
-    threading.Thread(target=control.serve_forever, name="trex-control", daemon=True).start()
-    roots.load()
-    for d in dirs or []:
-        roots.track(d, force, wait=False)
-    banner = [f"trex daemon {roots.node.name} on {'  '.join(urls(servers))}  socket={control.path}  cache={roots.cache}",
-              *(f"  {r['name']}  {r['root']}" for r in roots.served()), *(f"  pulling {link['url']}" for link in roots.links_info())]
-    try:
-        run_servers(servers, banner)
-    finally:
-        control.shutdown()
-        control.server_close()
-        roots.close()
-    if restarting.is_set():
-        typer.echo(f"trex daemon: updated; exiting with status {update.RESTART_STATUS} for its service manager to restart it")
-        sys.exit(update.RESTART_STATUS)
-
-
 UNIT: Final = """\
-# trex daemon as a systemd user service:
+# trex as a systemd user service:
 #   trex systemd-unit{args} > ~/.config/systemd/user/trex.service
 #   systemctl --user daemon-reload && systemctl --user enable --now trex
 #   loginctl enable-linger "$USER"     # keep it running while logged out
 #   journalctl --user -u trex -f       # its log
 [Unit]
-Description=trex daemon: experiment explorer for several runs directories
+Description=trex: experiment explorer
 StartLimitIntervalSec=0
 
 [Service]
@@ -454,7 +476,7 @@ Environment=NO_COLOR=1
 {env}# An address that is not up yet (Tailscale at boot) fails the start; retry until it is.
 Restart=on-failure
 RestartSec=2
-# After an update the daemon exits with {status} to be started again on the new trex.
+# After an update trex exits with {status} to be started again on the new trex.
 SuccessExitStatus={status}
 RestartForceExitStatus={status}
 TimeoutStopSec=30
@@ -464,8 +486,8 @@ WantedBy=default.target
 """
 
 
-def daemon_args(hosts: list[str], allow: list[str]) -> list[str]:
-    """The `trex daemon` options a service passes for `hosts` and allowed host names."""
+def service_args(hosts: list[str], allow: list[str]) -> list[str]:
+    """The `trex serve` options a service passes for `hosts` and allowed host names."""
     return [*(a for h in hosts for a in ("--host", h)), *(a for n in allow for a in ("--allow-host", n))]
 
 
@@ -488,18 +510,18 @@ def service_path(*extra: str) -> str:
 
 def systemd_unit(hosts: list[str], port: int, allow: list[str], cache: str | None, source: str | None) -> str:
     """The unit for `trex systemd-unit`."""
-    host_args = daemon_args(hosts, allow)
+    host_args = service_args(hosts, allow)
     options = [*(["--port", str(port)] if port != DEFAULT_PORT else []), *(["--cache", cache] if cache else []),
                *(["--source", source] if source else [])]
     return UNIT.format(args="".join(f" {shlex.quote(a)}" for a in host_args + options), status=update.RESTART_STATUS,
                        env="".join(f"Environment={k}={v}\n" for k, v in service_env(cache, source).items()), path=service_path(),
-                       exec_start=shlex.join([sys.executable, "-m", "trex", "daemon", *host_args, "--port", str(port)]))
+                       exec_start=shlex.join([sys.executable, "-m", "trex", "serve", *host_args, "--port", str(port)]))
 
 
 @command("systemd-unit")
 def systemd_unit_cmd(host: Hosts = None, port: ServicePort = DEFAULT_PORT, allow_host: AllowHosts = None,
                      cache: ServiceCache = None, source: ServiceSource = None) -> None:
-    """Print a systemd user unit that runs `trex daemon` on this trex; its header says how to install it."""
+    """Print a systemd user unit that runs `trex serve` on this trex; its header says how to install it."""
     source = service_source(source)
     typer.echo(systemd_unit(host or [], port, allow_host or [], cache, source), nl=False)
     warn_not_tool_install("systemd-unit", source)
@@ -513,13 +535,13 @@ def warn_not_tool_install(command: str, source: str | None) -> None:
 
 
 PLIST_HEAD: Final = """\
-<!-- trex daemon as a launchd agent, running while you are logged in:
+<!-- trex as a launchd agent, running while you are logged in:
        trex launchd-plist > ~/Library/LaunchAgents/trex.plist
        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/trex.plist
        launchctl kickstart -k gui/$(id -u)/trex    restart it
        launchctl bootout gui/$(id -u)/trex         stop and unload it
        tail -f ~/Library/Logs/trex.log             its log
-     A failed start (an address that is not up yet) is retried; after an update the daemon exits with
+     A failed start (an address that is not up yet) is retried; after an update trex exits with
      {status} to be started again on the new trex. -->
 """
 
@@ -530,7 +552,7 @@ def launchd_plist(hosts: list[str], port: int, allow: list[str], cache: str | No
            **service_env(cache, source)}
     log = str(Path.home() / "Library" / "Logs" / "trex.log")
     agent = {"Label": "trex",
-             "ProgramArguments": [sys.executable, "-m", "trex", "daemon", *daemon_args(hosts, allow), "--port", str(port)],
+             "ProgramArguments": [sys.executable, "-m", "trex", "serve", *service_args(hosts, allow), "--port", str(port)],
              "EnvironmentVariables": env, "RunAtLoad": True,
              "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 2, "ExitTimeOut": 30,
              "StandardOutPath": log, "StandardErrorPath": log}
@@ -541,7 +563,7 @@ def launchd_plist(hosts: list[str], port: int, allow: list[str], cache: str | No
 @command("launchd-plist")
 def launchd_plist_cmd(host: Hosts = None, port: ServicePort = DEFAULT_PORT, allow_host: AllowHosts = None,
                       cache: ServiceCache = None, source: ServiceSource = None) -> None:
-    """Print a launchd agent (macOS) that runs `trex daemon` on this trex; its header says how to install it."""
+    """Print a launchd agent (macOS) that runs `trex serve` on this trex; its header says how to install it."""
     source = service_source(source)
     typer.echo(launchd_plist(host or [], port, allow_host or [], cache, source), nl=False)
     warn_not_tool_install("launchd-plist", source)

@@ -536,6 +536,12 @@ def interactions_smoke(page, url):
     return not failed
 
 
+def dir_pages(url):
+    """{name: page path} of every directory the trex at `url` serves."""
+    with urllib.request.urlopen(f"{url}/api/node") as r:
+        return {x["name"]: x["url"] for x in json.loads(r.read())["dirs"]}
+
+
 def daemon_smoke(page, runs, tmp, env, out, errors):
     """Whether the daemon's root shows every tracked directory (a folder in it as `/ name`), a workspace made in the panel (opened from the trex
     brand) merges them and opens though its URL was visited before it existed, and the panel removes, adds and
@@ -543,13 +549,14 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
     of `errors`."""
     port = free_port()
     url = f"http://127.0.0.1:{port}"
-    daemon = subprocess.Popen([sys.executable, "-m", "trex", "daemon", str(runs / "sweep"), "--port", str(port),
+    daemon = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs / "sweep"), "--port", str(port),
                                "--cache", str(tmp / "cache")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     row = "#menu .mrow:has(.ml:text-is('{}'))"
     try:
         daemon.stdout.readline()
         subprocess.run([sys.executable, "-m", "trex", "serve", str(runs / "live"), "-y"], check=True, env=env)
-        with urllib.request.urlopen(f"{url}/r/sweep/api/runs") as r1, urllib.request.urlopen(f"{url}/r/live/api/runs") as r2:
+        page_of = dir_pages(url)
+        with urllib.request.urlopen(f"{url}{page_of['sweep']}api/runs") as r1, urllib.request.urlopen(f"{url}{page_of['live']}api/runs") as r2:
             total = len(json.loads(r1.read())["runs"]) + len(json.loads(r2.read())["runs"])
         page.goto(f"{url}/w/both/")
         page.goto(f"{url}/")
@@ -573,14 +580,14 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         page.wait_for_function(READY, timeout=30000)
         page.click(".brand")
         page.click(row.format("live") + " .mitem")
-        page.wait_for_url(f"{url}/r/live/")
+        page.wait_for_url(f"{url}{page_of['live']}")
         page.wait_for_function(READY, timeout=30000)
         page.once("dialog", lambda d: d.accept())
         page.click(".brand")
         page.click(row.format("live") + " .chev")
         page.wait_for_url(f"{url}/")
         page.wait_for_function(READY, timeout=30000)
-        page.goto(f"{url}/r/sweep/")
+        page.goto(f"{url}{page_of['sweep']}")
         page.wait_for_function(READY, timeout=30000)
         page.click(".brand")
         page.fill("#menu .madd input", str(tmp / "no-such-dir"))
@@ -592,7 +599,7 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         if len(refused) != 1 or "400" not in refused[0]:
             errors += refused
         page.click("#menu .mrecent .mitem")
-        page.wait_for_url(f"{url}/r/live/")
+        page.wait_for_url(f"{url}{page_of['live']}")
         page.wait_for_function(READY, timeout=30000)
         page.click(".brand")
         page.wait_for_selector("#menu .mrow")
@@ -600,9 +607,9 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         recent_left = page.query_selector("#menu .mrecent") is not None
         panel_text = page.inner_text("#menu")
         tidy = "null" not in panel_text.split() and "unknown" not in panel_text
-        with urllib.request.urlopen(f"{url}/api/daemon") as r:
+        with urllib.request.urlopen(f"{url}/api/node") as r:
             d = json.loads(r.read())
-        left, workspaces = [x["name"] for x in d["roots"]], [(w["name"], w["members"]) for w in d["workspaces"]]
+        left, workspaces = [x["name"] for x in d["dirs"]], [(w["name"], w["members"]) for w in d["workspaces"]]
         print(f"daemon: root shows {root[0]}/{total} runs in {root[2]} as {root[1]!r}, a folder in it as {crumbs}; workspace of both shows "
               f"{merged[0]}/{total}, dir field {merged[1]}; removed live, re-added it from history; tracking {left}, "
               f"workspaces {workspaces}, history {d['history']}, panel tidy {tidy}")
@@ -618,7 +625,7 @@ def link_smoke(page, tmp, env, out, upstream):
     of that directory with the link."""
     port = free_port()
     url = f"http://127.0.0.1:{port}"
-    daemon = subprocess.Popen([sys.executable, "-m", "trex", "daemon", "--port", str(port), "--cache", str(tmp / "cache-links"),
+    daemon = subprocess.Popen([sys.executable, "-m", "trex", "serve", "--port", str(port), "--cache", str(tmp / "cache-links"),
                                "--name", "laptop"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env={**env, "TREX_DAEMON_DIR": str(tmp / "daemon-links")})
     try:
@@ -637,10 +644,10 @@ def link_smoke(page, tmp, env, out, upstream):
         page.once("dialog", lambda d: d.accept())
         page.click("#menu .mrow:has(.ms:text-is('%s')) .chev" % upstream)
         page.wait_for_selector(".dhome .madd input", timeout=30000)
-        with urllib.request.urlopen(f"{url}/api/daemon") as r:
+        with urllib.request.urlopen(f"{url}/api/node") as r:
             d = json.loads(r.read())
-        print(f"links: pulled {want} runs from {upstream}; panel rows {rows}; after removing the link: roots {d['roots']}, links {d['links']}")
-        return want > 0 and len(rows) == 2 and rows[0] == ["runs", False] and rows[1][1] and d["roots"] == [] == d["links"]
+        print(f"links: pulled {want} runs from {upstream}; panel rows {rows}; after removing the link: directories {d['dirs']}, links {d['links']}")
+        return want > 0 and len(rows) == 2 and rows[0] == ["runs", False] and rows[1][1] and d["dirs"] == [] == d["links"]
     finally:
         daemon.terminate()
         daemon.wait()
@@ -873,7 +880,7 @@ def main():
     subprocess.run([sys.executable, "-c", NESTED_WRITER, str(runs)], check=True)
     port = free_port()
     env = {**os.environ, "TREX_DAEMON_DIR": str(tmp / "daemon"), "TREX_REFRESH": "1"}
-    server = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs), "--standalone", "--port", str(port),
+    server = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs), "--temporary", "--port", str(port),
                                "--cache", str(tmp / "cache")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     url = f"http://127.0.0.1:{port}"
     ok, failed = True, []

@@ -13,11 +13,11 @@ Log:
     run.log({"train/loss": loss}, step=step)
     run.finish()
 
-Explore in a browser or a terminal (`trex --help`); `trex.daemon` serves many directories under systemd or launchd:
+Explore in a browser or a terminal (`trex --help`); `trex.node` runs trex as a service, crawls other machines over
+ssh and pulls what other trex hold:
 
     trex serve runs      # http://127.0.0.1:13898
     trex tree runs
-    trex daemon
 
 The UI's filter box and `trex ls -w` take a name search or a SQL WHERE clause (`trex.where`):
 

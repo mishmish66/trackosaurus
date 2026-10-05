@@ -11,7 +11,7 @@ import pytest
 
 import trex
 from trex import buckets as bk, server
-from trex.daemon import Roots
+from trex.node import Node, dir_base
 from trex.index import Explorer
 from trex.workspace import Member, Workspace
 
@@ -32,15 +32,15 @@ def dirs(tmp_path):
 
 
 @pytest.fixture
-def roots(tmp_path, home):
-    r = Roots(tmp_path / "cache", tmp_path / "state" / "roots.json")
-    yield r
-    r.close()
+def node(tmp_path, home):
+    n = Node(tmp_path / "cache", tmp_path / "state" / "roots.json")
+    yield n
+    n.close()
 
 
 @pytest.fixture
-def http(roots, http_server):
-    return http_server(server.serve(None, "127.0.0.1", 0, roots))
+def http(node, http_server):
+    return http_server(server.serve(node, "127.0.0.1", 0))
 
 
 def blocks(base, **body):
@@ -52,18 +52,16 @@ def runs_with_buckets(a):
     return [p for i, p in enumerate(a.paths) if (a.buckets.run == i).any()]
 
 
-def tracked(roots, *paths):
+def tracked(node, *paths):
     for p in paths:
-        roots.add(p)
-    for name in (r["name"] for r in roots.served()):
-        assert roots.get(name).ready.wait(10)
-    return [r["name"] for r in roots.served()]
+        assert node.by_id(node.add(p)).ready.wait(10)
+    return [d.name for d in node.served()]
 
 
-def test_a_workspace_merges_its_members_folders_and_tells_apart_runs_at_one_path(roots, dirs, http):
-    a, b = tracked(roots, *dirs)
+def test_a_workspace_merges_its_members_folders_and_tells_apart_runs_at_one_path(node, dirs, http):
+    a, b = tracked(node, *dirs)
     assert (a, b) == ("runs<a>", "runs<b>")
-    assert post_json(f"{http}/api/daemon/workspace", {"name": "both", "members": [a, b]}) == (200, {"url": "/w/both/"})
+    assert post_json(f"{http}/api/node/workspace", {"name": "both", "members": [a, b]}) == (200, {"url": "/w/both/"})
     body = get_json(f"{http}/w/both/api/runs")
     assert sorted((r["id"], r["dir"]) for r in body["runs"]) == [
         ("sac/r1", a), ("sac/r2", a), ("sac/r3", b), ("shared/x", a), ("shared/x<runs<b>>", b)]
@@ -74,12 +72,12 @@ def test_a_workspace_merges_its_members_folders_and_tells_apart_runs_at_one_path
     assert get_json(f"{http}/w/both/api/info")["root"] == "workspace:both"
 
 
-def test_workspace_buckets_rows_and_media_come_from_the_member_holding_the_run(roots, dirs, http):
-    a, b = tracked(roots, *dirs)
-    roots.set_workspace("both", [a, b])
+def test_workspace_buckets_rows_and_media_come_from_the_member_holding_the_run(node, dirs, http):
+    a, b = tracked(node, *dirs)
+    node.set_workspace("both", [a, b])
     got = blocks(f"{http}/w/both", runs=["sac/r3", "shared/x", "shared/x<runs<b>>", "missing"])
-    direct_b = blocks(f"{http}/r/{urllib.parse.quote(b)}", runs=["sac/r3", "shared/x"])
-    direct_a = blocks(f"{http}/r/{urllib.parse.quote(a)}", runs=["shared/x"])
+    direct_b = blocks(f"{http}{dir_base(node.id_of(b))}", runs=["sac/r3", "shared/x"])
+    direct_a = blocks(f"{http}{dir_base(node.id_of(a))}", runs=["shared/x"])
     assert got.paths == ["sac/r3", "shared/x", "shared/x<runs<b>>"] and runs_with_buckets(got) == got.paths
     for path, direct, there in (("sac/r3", direct_b, "sac/r3"), ("shared/x", direct_a, "shared/x"), ("shared/x<runs<b>>", direct_b, "shared/x")):
         mine, theirs = got.buckets.run == got.paths.index(path), direct.buckets.run == direct.paths.index(there)
@@ -93,16 +91,16 @@ def test_workspace_buckets_rows_and_media_come_from_the_member_holding_the_run(r
     assert request(f"{http}/w/both/m/{urllib.parse.quote('shared/x', safe='')}/{media[5]}")[2] == PNG
 
 
-def test_a_workspace_block_holds_every_members_runs_under_its_scope(roots, dirs, http):
-    a, b = tracked(roots, *dirs)
-    roots.set_workspace("both", [a, b])
+def test_a_workspace_block_holds_every_members_runs_under_its_scope(node, dirs, http):
+    a, b = tracked(node, *dirs)
+    node.set_workspace("both", [a, b])
     got = blocks(f"{http}/w/both", scope="sac")
     assert got.paths == ["sac/r1", "sac/r2", "sac/r3"] and runs_with_buckets(got) == got.paths
 
 
-def test_a_workspace_answers_a_batch_as_each_block_alone(roots, dirs, http):
-    a, b = tracked(roots, *dirs)
-    roots.set_workspace("both", [a, b])
+def test_a_workspace_answers_a_batch_as_each_block_alone(node, dirs, http):
+    a, b = tracked(node, *dirs)
+    node.set_workspace("both", [a, b])
     asks = [{"key": "loss", "level": 20, "index": 0, "scope": "sac"}, {"key": "loss", "level": 3, "index": 0, "runs": ["sac/r3", "shared/x"]},
             {"key": "loss", "level": 20, "index": 0, "scope": "shared", "which": "finished"}]
     alone = [post_bytes(f"{http}/w/both/api/buckets", {"blocks": [ask]}) for ask in asks]
@@ -110,9 +108,9 @@ def test_a_workspace_answers_a_batch_as_each_block_alone(roots, dirs, http):
     assert together == [bk.unframe(x)[0] for x in alone]
 
 
-def test_a_workspace_streams_live_rows_of_every_member(roots, dirs, http):
-    a, b = tracked(roots, *dirs)
-    roots.set_workspace("both", [a, b])
+def test_a_workspace_streams_live_rows_of_every_member(node, dirs, http):
+    a, b = tracked(node, *dirs)
+    node.set_workspace("both", [a, b])
     run = trex.init(dirs[1] / "sac" / "live", commit_interval=0.05)
     run.log({"loss": 1.0}, step=0)
     assert wait_for(lambda: committed_rows(dirs[1] / "sac" / "live") == 1)
@@ -145,14 +143,14 @@ def test_a_workspace_streams_live_rows_of_every_member(roots, dirs, http):
     assert ("rows", "sac/live", None) in got
 
 
-def test_a_remote_member_merges_like_a_local_one(roots, dirs, http, tmp_path):
+def test_a_remote_member_merges_like_a_local_one(node, dirs, http, tmp_path):
     remote_runs = tmp_path / "far" / "runs"
     write_run(remote_runs / "sac" / "r9", image=True)
-    tracked(roots, dirs[0])
-    roots.add_remote(f"box:{remote_runs}")
-    local, far = (r["name"] for r in roots.served())
+    tracked(node, dirs[0])
+    node.add_remote(f"box:{remote_runs}")
+    local, far = (d.name for d in node.served())
     assert (local, far) == ("runs<a>", "runs<box>")
-    roots.set_workspace("mixed", [local, far])
+    node.set_workspace("mixed", [local, far])
 
     def ids():
         return sorted((r["id"], r["dir"]) for r in get_json(f"{http}/w/mixed/api/runs?path=sac")["runs"])
@@ -168,13 +166,13 @@ def test_a_remote_member_merges_like_a_local_one(roots, dirs, http, tmp_path):
     assert set(blocks(f"{http}/w/mixed", scope="", which="finished").paths) >= {"sac/r1", "sac/r9"}
 
 
-def test_a_remote_members_live_rows_reach_the_workspace_stream(roots, dirs, http, tmp_path):
+def test_a_remote_members_live_rows_reach_the_workspace_stream(node, dirs, http, tmp_path):
     remote_runs = tmp_path / "far" / "runs"
     run = trex.init(remote_runs / "live", commit_interval=0.05)
     run.log({"loss": 1.0}, step=0)
-    tracked(roots, dirs[0])
-    roots.add_remote(f"box:{remote_runs}")
-    roots.set_workspace("mixed", [r["name"] for r in roots.served()])
+    tracked(node, dirs[0])
+    node.add_remote(f"box:{remote_runs}")
+    node.set_workspace("mixed", [d.name for d in node.served()])
     assert wait_for(lambda: "live" in [r["id"] for r in get_json(f"{http}/w/mixed/api/runs")["runs"]])
     got, opened = [], threading.Event()
 
@@ -202,55 +200,55 @@ def test_a_remote_members_live_rows_reach_the_workspace_stream(roots, dirs, http
     assert got == ["live"]
 
 
-def test_an_unreachable_member_leaves_the_others_working(roots, dirs, http):
-    tracked(roots, dirs[0])
-    roots.add_remote("box:/no/such/runs", wait=False)
-    a, far = (r["name"] for r in roots.served())
-    roots.set_workspace("mixed", [a, far])
-    assert wait_for(lambda: [r["state"] for r in roots.served() if r["name"] == far] == ["unreachable"])
+def test_an_unreachable_member_leaves_the_others_working(node, dirs, http):
+    tracked(node, dirs[0])
+    node.add_remote("box:/no/such/runs", wait=False)
+    a, far = (d.name for d in node.served())
+    node.set_workspace("mixed", [a, far])
+    assert wait_for(lambda: [d.state for d in node.served() if d.name == far] == ["unreachable"])
     assert sorted(r["id"] for r in get_json(f"{http}/w/mixed/api/runs")["runs"]) == ["sac/r1", "sac/r2", "shared/x"]
     assert runs_with_buckets(blocks(f"{http}/w/mixed", runs=["sac/r1"])) == ["sac/r1"]
 
 
-def test_workspaces_are_saved_and_lose_members_that_stop_being_tracked(roots, dirs, http, tmp_path):
-    a, b = tracked(roots, *dirs)
-    roots.set_workspace("both", [a, b])
-    roots.set_workspace("just-a", [a])
-    again = Roots(tmp_path / "cache2", tmp_path / "state" / "roots.json")
+def test_workspaces_are_saved_and_lose_members_that_stop_being_tracked(node, dirs, http, tmp_path):
+    a, b = tracked(node, *dirs)
+    node.set_workspace("both", [a, b])
+    node.set_workspace("just-a", [a])
+    again = Node(tmp_path / "cache2", tmp_path / "state" / "roots.json")
     again.load()
     try:
         assert [(w["name"], w["members"]) for w in again.workspace_list()] == [("both", [a, b]), ("just-a", [a])]
     finally:
         again.close()
-    roots.remove(b)
-    assert [(w["name"], w["members"]) for w in roots.workspace_list()] == [("both", ["runs"]), ("just-a", ["runs"])]
-    assert post_json(f"{http}/api/daemon/workspace/delete", {"name": "just-a"}) == (200, {"ok": True})
-    assert [w["name"] for w in get_json(f"{http}/api/daemon")["workspaces"]] == ["both"]
+    node.remove(b)
+    assert [(w["name"], w["members"]) for w in node.workspace_list()] == [("both", ["runs"]), ("just-a", ["runs"])]
+    assert post_json(f"{http}/api/node/workspace/delete", {"name": "just-a"}) == (200, {"ok": True})
+    assert [w["name"] for w in get_json(f"{http}/api/node")["workspaces"]] == ["both"]
 
 
-def test_a_workspace_can_be_renamed_and_names_are_checked(roots, dirs, http):
-    a, b = tracked(roots, *dirs)
-    roots.set_workspace("one", [a])
-    assert post_json(f"{http}/api/daemon/workspace", {"name": "two", "members": [a, b], "old": "one"})[0] == 200
-    assert [w["name"] for w in roots.workspace_list()] == ["two"]
+def test_a_workspace_can_be_renamed_and_names_are_checked(node, dirs, http):
+    a, b = tracked(node, *dirs)
+    node.set_workspace("one", [a])
+    assert post_json(f"{http}/api/node/workspace", {"name": "two", "members": [a, b], "old": "one"})[0] == 200
+    assert [w["name"] for w in node.workspace_list()] == ["two"]
     for bad in ({"name": "", "members": [a]}, {"name": "x/y", "members": [a]}, {"name": "z", "members": ["nope"]}):
-        assert post_json(f"{http}/api/daemon/workspace", bad)[0] == 400
-    roots.set_workspace("three", [b])
-    assert post_json(f"{http}/api/daemon/workspace", {"name": "three", "members": [a], "old": "two"})[0] == 400
+        assert post_json(f"{http}/api/node/workspace", bad)[0] == 400
+    node.set_workspace("three", [b])
+    assert post_json(f"{http}/api/node/workspace", {"name": "three", "members": [a], "old": "two"})[0] == 400
 
 
-def test_the_daemon_root_serves_the_page(roots, dirs, http):
-    tracked(roots, *dirs)
+def test_a_nodes_root_serves_the_page(node, dirs, http):
+    tracked(node, *dirs)
     assert b'/static/app.js' in request(f"{http}/")[2]
     assert request(f"{http}/w/nope/")[2] == request(f"{http}/")[2]
 
 
-def test_the_daemon_root_shows_every_tracked_directory_as_a_top_level_folder(roots, tmp_path, http):
+def test_a_nodes_root_shows_every_directory_as_a_top_level_folder(node, tmp_path, http):
     a, b = tmp_path / "x" / "a" / "runs", tmp_path / "y" / "a" / "runs"
     write_run(a / "sac" / "r1", image=True)
     write_run(b / "sac" / "r1")
     trex.folder_info(a / "sac", note="from x")
-    names = tracked(roots, a, b)
+    names = tracked(node, a, b)
     assert names == ["runs<x/a>", "runs<y/a>"]
     body = get_json(f"{http}/api/runs")
     assert sorted((r["id"], r["dir"]) for r in body["runs"]) == [("runs<x/a>/sac/r1", "runs<x/a>"), ("runs<y/a>/sac/r1", "runs<y/a>")]
@@ -263,7 +261,7 @@ def test_the_daemon_root_shows_every_tracked_directory_as_a_top_level_folder(roo
     assert get_json(f"{http}/api/info")["root"] == "daemon:/"
 
 
-def test_an_empty_daemon_root_has_no_runs(roots, http):
+def test_an_empty_nodes_root_has_no_runs(node, http):
     assert get_json(f"{http}/api/runs") == {"runs": [], "media": [], "folders": {}}
 
 

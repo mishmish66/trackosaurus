@@ -45,41 +45,42 @@ def interrupt(p, sig=signal.SIGINT):
     return p.wait(timeout=20)
 
 
-def test_standalone_server_answers_until_interrupted(tmp_path, env):
+def test_a_temporary_trex_answers_until_interrupted(tmp_path, env):
     write_run(tmp_path / "runs" / "r")
     port = free_port()
-    p = start(env, "serve", tmp_path / "runs", "--standalone", "--port", port)
+    p = start(env, "serve", tmp_path / "runs", "--temporary", "--port", port)
     try:
         assert get_json(f"http://127.0.0.1:{port}/api/info")["root"] == str(tmp_path / "runs")
     finally:
         assert interrupt(p) == 0
 
 
-def test_daemon_takes_directories_from_serve_and_removes_its_socket_on_exit(tmp_path, env):
+def test_the_machines_trex_takes_directories_from_serve_and_removes_its_socket_on_exit(tmp_path, env):
     a, b = tmp_path / "a" / "runs", tmp_path / "b" / "logs"
     write_run(a / "r")
     write_run(b / "r")
     port = free_port()
-    p = start(env, "daemon", a, "--port", port)
+    p = start(env, "serve", a, "--port", port)
     try:
         added = subprocess.run(trex_cmd("serve", b), env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
-        assert added.returncode == 0 and f"http://127.0.0.1:{port}/r/logs/" in added.stdout
-        assert [r["root"] for r in get_json(f"http://127.0.0.1:{port}/api/daemon")["roots"]] == [str(a), str(b)]
-        second = subprocess.run(trex_cmd("daemon", "--port", free_port()), env=env, capture_output=True, text=True, timeout=60)
-        assert second.returncode != 0 and "already running" in second.stderr
+        dirs = get_json(f"http://127.0.0.1:{port}/api/node")["dirs"]
+        assert added.returncode == 0 and f"http://127.0.0.1:{port}{dirs[1]['url']}" in added.stdout
+        assert [r["root"] for r in dirs] == [str(a), str(b)]
+        again = subprocess.run(trex_cmd("serve", "--port", free_port()), env=env, capture_output=True, text=True, timeout=60)
+        assert again.returncode == 0 and f"already running at http://127.0.0.1:{port}/" in again.stdout
     finally:
         assert interrupt(p) == 0
     assert not (tmp_path / "state" / "daemon.sock").exists()
     assert json.loads((tmp_path / "state" / "roots.json").read_text())["tracked"] == [str(a), str(b)]
 
 
-def test_restarted_daemon_serves_the_directories_it_had(tmp_path, env):
+def test_a_restarted_trex_serves_the_directories_it_had(tmp_path, env):
     write_run(tmp_path / "runs" / "r")
     port = free_port()
-    assert interrupt(start(env, "daemon", tmp_path / "runs", "--port", port)) == 0
-    p = start(env, "daemon", "--port", port)
+    assert interrupt(start(env, "serve", tmp_path / "runs", "--port", port)) == 0
+    p = start(env, "serve", "--port", port)
     try:
-        assert [r["name"] for r in get_json(f"http://127.0.0.1:{port}/api/daemon")["roots"]] == ["runs"]
+        assert [r["name"] for r in get_json(f"http://127.0.0.1:{port}/api/node")["dirs"]] == ["runs"]
     finally:
         assert interrupt(p) == 0
 
@@ -95,8 +96,8 @@ def test_output_to_a_closed_pipe_ends_without_a_traceback(tmp_path, env):
     p.wait(timeout=20)
 
 
-def test_terminated_daemon_exits_cleanly_and_removes_its_socket(tmp_path, env):
-    p = start(env, "daemon", "--port", free_port())
+def test_a_terminated_trex_exits_cleanly_and_removes_its_socket(tmp_path, env):
+    p = start(env, "serve", "--port", free_port())
     assert (tmp_path / "state" / "daemon.sock").exists()
     assert interrupt(p, signal.SIGTERM) == 0
     assert not (tmp_path / "state" / "daemon.sock").exists()
@@ -130,13 +131,13 @@ def forge(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv")
-def test_update_installs_the_newest_commit_and_the_restarted_daemon_runs_it(tmp_path, env, forge):
+def test_update_installs_the_newest_commit_and_the_restarted_trex_runs_it(tmp_path, env, forge):
     source, push = forge
     env = {**env, "UV_TOOL_DIR": str(tmp_path / "tools"), "UV_TOOL_BIN_DIR": str(tmp_path / "bin"),
            "TREX_SOURCE": source, "INVOCATION_ID": "systemd"}
     subprocess.run(["uv", "tool", "install", source], env=env, check=True, capture_output=True, timeout=600)
-    daemon = [str(tmp_path / "tools" / "trex" / "bin" / "python"), "-m", "trex", "daemon", "--port", str(free_port())]
-    api = f"http://127.0.0.1:{daemon[-1]}/api/daemon"
+    daemon = [str(tmp_path / "tools" / "trex" / "bin" / "python"), "-m", "trex", "serve", "--port", str(free_port())]
+    api = f"http://127.0.0.1:{daemon[-1]}/api/node"
 
     def start_daemon():
         p = subprocess.Popen(daemon, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

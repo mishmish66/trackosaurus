@@ -36,8 +36,8 @@ const REMOTE = /^((?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s[\]]+)):(.+)$/;
 /** The last `n` characters of `s`, after an ellipsis when cut. */
 const tailOf = (s, n) => (s.length > n ? `…${s.slice(1 - n)}` : s);
 
-/** `/api/daemon`: {daemon, node, roots, links, workspaces, history, install, updates}. */
-const daemonInfo = () => getJSON("/api/daemon");
+/** `/api/node`: {node, saves, home, dirs, links, workspaces, history, install, updates}. */
+const nodeInfo = () => getJSON("/api/node");
 
 const METRIC_SORT = "metric:"; // prefix of a sort key naming a metric
 const DEFAULT_GROUP = "run~1"; // a run's directory: runs logged side by side share a line
@@ -240,7 +240,7 @@ function sectionCmp(a, b) {
   return a.media - b.media || cmpNames(a.title, b.title);
 }
 
-/** POST `body` (as JSON) to daemon `path`: [whether it succeeded, its JSON answer]. */
+/** POST `body` (as JSON) to the node's `path`: [whether it succeeded, its JSON answer]. */
 async function post(path, body = {}) {
   const r = await fetch(path, { method: "POST", body: JSON.stringify(body) });
   return [r.ok, await r.json()];
@@ -465,8 +465,8 @@ class App {
 
   async start() {
     startWorkers();
-    preload(["/api/daemon", `${BASE}/api/info`, `${BASE}/api/runs?path=${encodeURIComponent(this.opts.path)}`]);
-    if (!(await this.enterDaemon())) return;
+    preload(["/api/node", `${BASE}/api/info`, `${BASE}/api/runs?path=${encodeURIComponent(this.opts.path)}`]);
+    if (!(await this.enterNode())) return;
     await this.data.init();
     const root = this.data.rootKey;
     this.hidden = new Set(store.get(`hidden:${root}`, []));
@@ -483,37 +483,36 @@ class App {
     });
   }
 
-  /** Under the daemon, its state (else null), and the trex brand opening its panel. False when it tracks nothing,
-   * after showing the panel in place of the page. */
-  async enterDaemon() {
-    const d = await daemonInfo();
-    this.daemon = d.daemon ? d : null;
-    if (!d.daemon) return true;
+  /** The node's state, and the trex brand opening its panel. False when the node holds nothing, after showing the panel
+   * in place of the page. */
+  async enterNode() {
+    const d = await nodeInfo();
+    this.node = d;
     const brand = $(".brand");
     brand.classList.add("brandlink");
-    brand.title = "workspaces and tracked directories";
+    brand.title = "workspaces and directories";
     brand.onclick = (e) => this.rootMenu(e.currentTarget);
-    if (BASE || d.roots.length) return true;
-    this.daemonHome(d);
+    if (BASE || d.dirs.length) return true;
+    this.nodeHome(d);
     return false;
   }
 
-  /** The page of a daemon that tracks nothing: its panel, to add a directory. */
-  daemonHome(d) {
+  /** The page of a node that holds nothing: its panel, to add a directory. */
+  nodeHome(d) {
     $("#status").textContent = "";
     $("#crumbPath").replaceChildren(h("span", { className: "seg current rootseg" }, h("span", { className: "crumb", textContent: "/" })));
-    $("#panels").replaceChildren(h("div", { className: "dhome" }, this.daemonPanel(d, async () => this.daemonHome(await daemonInfo()))));
+    $("#panels").replaceChildren(h("div", { className: "dhome" }, this.nodePanel(d, async () => this.nodeHome(await nodeInfo()))));
   }
 
   async rootMenu(anchor) {
-    const d = await daemonInfo();
-    this.daemon = d;
-    menu.open(anchor, this.daemonPanel(d, () => this.rootMenu(anchor)));
+    const d = await nodeInfo();
+    this.node = d;
+    menu.open(anchor, this.nodePanel(d, () => this.rootMenu(anchor)));
   }
 
-  /** The daemon's workspaces and tracked directories: open, edit or remove one, add a directory (by path, as
-   * host:path, or from the remembered ones) or a workspace. `refresh` redraws the panel. */
-  daemonPanel(d, refresh) {
+  /** The node's workspaces, directories and the trex it pulls from: open, edit or remove one, add a directory (by path,
+   * as host:path, from the remembered ones) or a trex to pull from, or a workspace. `refresh` redraws the panel. */
+  nodePanel(d, refresh) {
     const err = h("div", { className: "merr" });
     const panel = h("div", { className: "dpanel" });
     const show = (...kids) => panel.replaceChildren(...kids.filter((k) => k != null));
@@ -533,7 +532,7 @@ class App {
         h("span", { className: "ml", textContent: w.name }), h("span", { className: "ms", textContent: w.members.join(" · ") || "empty" })),
       h("button", { className: "chev", textContent: "✎", title: "edit this workspace", onclick: () => edit(w) }),
       h("button", { className: "chev", textContent: "×", title: "delete this workspace (its directories stay tracked)",
-        onclick: () => this.forget(`Delete workspace ${w.name}? Its directories stay tracked.`, "/api/daemon/workspace/delete",
+        onclick: () => this.forget(`Delete workspace ${w.name}? Its directories stay tracked.`, "/api/node/workspace/delete",
           { name: w.name }, w.url, refresh) })));
   }
 
@@ -541,20 +540,20 @@ class App {
   workspaceEditor(d, ws, done) {
     const err = h("div", { className: "merr" });
     const name = h("input", { type: "text", placeholder: "workspace name", value: ws?.name || "", spellcheck: false });
-    const boxes = d.roots.map((r) => h("input", { type: "checkbox", checked: !!ws?.members.includes(r.name), value: r.name }));
+    const boxes = d.dirs.map((r) => h("input", { type: "checkbox", checked: !!ws?.members.includes(r.name), value: r.name }));
     const save = async () => {
-      const [ok, j] = await post("/api/daemon/workspace", { name: name.value, members: boxes.filter((b) => b.checked).map((b) => b.value), old: ws?.name });
+      const [ok, j] = await post("/api/node/workspace", { name: name.value, members: boxes.filter((b) => b.checked).map((b) => b.value), old: ws?.name });
       if (ok) openPage(j.url);
       else err.textContent = j.error;
     };
     return h("div", {}, h("div", { className: "mtitle", textContent: ws ? `edit ${ws.name}` : "new workspace" }),
       h("div", { className: "madd" }, name),
-      ...d.roots.map((r, i) => h("label", { className: "mitem mcheck", title: r.root }, boxes[i],
+      ...d.dirs.map((r, i) => h("label", { className: "mitem mcheck", title: r.root }, boxes[i],
         h("span", { className: "ml", textContent: r.name }), h("span", { className: "ms", textContent: tailOf(r.root, 36) }))),
       err, h("div", { className: "mfoot" }, h("button", { textContent: "cancel", onclick: done }), h("button", { textContent: "save", onclick: save })));
   }
 
-  /** After `question` is confirmed, POST body to daemon `path`; then leave the page for "/" if it showed `url`, else
+  /** After `question` is confirmed, POST body to the node's `path`; then leave the page for "/" if it showed `url`, else
    * refresh the panel. */
   async forget(question, path, body, url, refresh) {
     if (!confirm(question)) return;
@@ -567,7 +566,7 @@ class App {
   linkRows(d) {
     const unlink = async (l) => {
       if (!confirm(`Stop pulling from ${l.url}? What only it offers is no longer served here.`)) return;
-      await post("/api/daemon/remove", { name: l.url });
+      await post("/api/node/remove", { name: l.url });
       openPage("/");
     };
     return d.links.map((l) => h("div", { className: "mrow" },
@@ -584,24 +583,24 @@ class App {
     const add = async (path) => {
       const link = /^http:\/\//.test(path.trim()), host = link ? null : REMOTE.exec(path.trim())?.[1];
       [err.textContent, note.textContent] = ["", link ? `asking ${path.trim()}…` : host ? `starting trex on ${host}…` : ""];
-      const [ok, j] = await post("/api/daemon/add", { path: path.trim() });
+      const [ok, j] = await post("/api/node/add", { path: path.trim() });
       note.textContent = "";
       if (ok) openPage(j.url);
       else err.textContent = j.error;
     };
     const input = h("input", { type: "text", placeholder: "/path/to/runs, ~/runs, host:path or http://host:port", spellcheck: false,
       onkeydown: (e) => e.key === "Enter" && add(input.value) });
-    const served = d.roots.map((r) => h("div", { className: "mrow" },
+    const served = d.dirs.map((r) => h("div", { className: "mrow" },
       h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || (r.link ? `${r.root}, pulled from ${r.link}` : r.root),
         onclick: () => openPage(r.url) },
         h("span", { className: "ml", textContent: r.name }),
         h("span", { className: "ms", textContent: tailOf(r.root, 36) + (r.state === "local" || r.state === "connected" ? "" : ` · ${r.state}`) })),
       r.link ? null : h("button", { className: "chev", textContent: "×", title: "stop tracking this directory (its files are kept)",
-        onclick: () => this.forget(`Stop serving ${r.root}? Its run files are kept.`, "/api/daemon/remove", { name: r.name }, r.url, refresh) })));
+        onclick: () => this.forget(`Stop serving ${r.root}? Its run files are kept.`, "/api/node/remove", { name: r.name }, r.url, refresh) })));
     const recent = d.history.map((path) => h("button", { className: "mitem", title: `track ${path}`, onclick: () => add(path) },
       h("span", { className: "micon", textContent: "+" }), h("span", { className: "ml", textContent: tailOf(path, 56) })));
     const clear = async () => {
-      await post("/api/daemon/history/clear");
+      await post("/api/node/history/clear");
       refresh();
     };
     return [served.length ? h("div", { className: "mlist" }, ...served) : h("div", { className: "mhint", textContent: "none tracked" }),
@@ -610,22 +609,22 @@ class App {
         h("div", { className: "mlist" }, ...recent), h("button", { className: "mclear", textContent: "clear history", onclick: clear })) : null];
   }
 
-  /** The daemon's trex version, with an update button when it can update itself. */
+  /** The node's trex version, with an update button when it can update itself. */
   versionRow(d, err) {
     const { install: inst, updates: up } = d;
     const label = h("span", { className: "ms", textContent: `trex ${inst.version}${inst.commit ? ` · ${inst.commit.slice(0, 7)}` : ""}`,
       title: up.available ? `updates from ${up.source}` : `no update button: ${up.reason}` });
     const btn = up.available ? h("button", { className: "mclear", textContent: "update", title: `install the newest trex from ${up.source} and restart`,
-      onclick: () => this.updateDaemon(btn, err) }) : null;
+      onclick: () => this.updateNode(btn, err) }) : null;
     return h("div", { className: "mfoot" }, label, btn);
   }
 
-  /** Update the daemon; after it restarts on a new trex, reload the page. */
-  async updateDaemon(btn, err) {
+  /** Update the node; after it restarts on a new trex, reload the page. */
+  async updateNode(btn, err) {
     btn.disabled = true;
     btn.textContent = "updating…";
     err.textContent = "";
-    const [ok, j] = await post("/api/daemon/update");
+    const [ok, j] = await post("/api/node/update");
     if (!ok || !j.updated) {
       btn.disabled = false;
       btn.textContent = "update";
@@ -635,7 +634,7 @@ class App {
     btn.textContent = "restarting…";
     for (let i = 0; i < 240; i++) {
       await new Promise((ok) => setTimeout(ok, 500));
-      const d = await daemonInfo().catch(() => null);
+      const d = await nodeInfo().catch(() => null);
       if (d?.install && JSON.stringify(d.install) === JSON.stringify(j.to)) break;
     }
     location.reload();
@@ -827,8 +826,10 @@ class App {
   }
 
   get rootName() {
-    if (this.daemon && !BASE) return "/";
-    const here = [...(this.daemon?.workspaces || []), ...(this.daemon?.roots || [])].find((r) => r.url === `${BASE}/`);
+    const node = this.node;
+    if (!BASE && !node?.home) return "/";
+    const here = BASE ? [...(node?.workspaces || []), ...(node?.dirs || [])].find((r) => r.url === `${BASE}/`)
+      : node?.dirs.find((r) => r.id === node.home);
     return here?.name || this.data.info?.name || "runs";
   }
 
@@ -851,8 +852,8 @@ class App {
     };
     const chart = o.chart && this.charts.has(o.chart);
     seg(this.rootName, "", { current: !parts.length && !depth && !chart, cls: "rootseg" });
-    if (this.daemon && BASE) path.unshift(h("span", { className: "seg" }, h("button", { className: "crumb", textContent: "/",
-      title: "every tracked directory", onclick: () => openPage("/") })));
+    if (BASE) path.unshift(h("span", { className: "seg" }, h("button", { className: "crumb", textContent: "/",
+      title: "home", onclick: () => openPage("/") })));
     parts.forEach((p, i) => seg(p, parts.slice(0, i + 1).join("/"),
       { current: i === parts.length - 1 && !depth && !chart, siblingsOf: parts.slice(0, i).join("/") }));
     o.focus.forEach((level, i) => {

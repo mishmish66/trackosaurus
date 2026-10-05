@@ -12,6 +12,8 @@ from typing import Any
 import trex
 from trex import chunks, journal, query
 from trex.format import snapshot
+from trex.index import Explorer
+from trex.node import Node
 
 PNG: bytes = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
 
@@ -110,3 +112,12 @@ def merge(c: sqlite3.Connection, seq0: int, stop: int) -> int:
     m = chunks.prepare_merge(c, seq0, stop)
     chunks.apply_merge(c, m)
     return len(m.commits)
+
+
+def node_of(ex: Explorer) -> Node:
+    """A node that keeps nothing, serving `ex` alone as its home."""
+    node = Node(ex.cache_dir.parent)
+    d = f"{node.identity.name}:{ex.origin.key}"
+    node.hold(d, ex, ex.origin.key)
+    node.home = d
+    return node

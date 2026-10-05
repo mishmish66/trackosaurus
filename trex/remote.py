@@ -1,5 +1,6 @@
-"""Remote runs directories (`host:path`): the daemon copies this trex there as a wheel over ssh (once per content),
-runs it with uvx on a Unix socket that ssh forwards back, and mirrors the directory from it (`trex.mirror`)."""
+"""Machines reached over ssh: a node copies this trex to a host as a wheel (once per content) and runs it there with
+uvx, as a node that saves nothing, on a Unix socket that ssh forwards back (`Remote`, one session per host). The node
+here then links to it (`node.Link.ssh`) and asks it to crawl the `host:path` directories it tracks there."""
 
 import base64
 import collections
@@ -17,8 +18,9 @@ import tempfile
 import threading
 import uuid
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, NamedTuple, Self
+from typing import Final, Self
 
 SPEC: Final = re.compile(r"(?P<host>(?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s\[\]]+)):(?P<path>.+)")
 ADD_TIMEOUT: Final = 120.0  # seconds an add waits for the first start (uvx may install trex first)
@@ -32,7 +34,8 @@ WHEELS: Final = ".cache/trex/wheels"  # where a remote home keeps the copies of 
 NEEDS_WHEEL: Final = "trex needs its wheel"  # a session's first line when the remote lacks this trex's wheel
 
 
-class Address(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class Address:
     host: str  # [user@]host, as ssh takes it
     path: str  # as typed; ~ is the remote home
 
@@ -81,15 +84,15 @@ def wheel() -> tuple[str, bytes]:
     return build_wheel(Path(__file__).parent)
 
 
-def remote_command(addr: Address, sock: str, wheel_name: str) -> str:
-    """The shell command that serves `addr.path` on the Unix socket `sock`, until its stdin closes, from the wheel
-    `wheel_name` in WHEELS (or prints NEEDS_WHEEL and ends when that is missing), on Python REMOTE_PYTHON with numpy
-    from a wheel (the newest one for the host's glibc, as old cluster systems need), its index on the host's local disk
-    (never shared by two hosts, as a network home would be) and at most 4 index workers unless $TREX_WORKERS says
-    otherwise there (remote hosts are often shared)."""
+def remote_command(host: str, sock: str, wheel_name: str) -> str:
+    """The shell command that runs a trex node named for `host` on the Unix socket `sock`, until its stdin closes, from
+    the wheel `wheel_name` in WHEELS (or prints NEEDS_WHEEL and ends when that is missing), on Python REMOTE_PYTHON
+    with numpy from a wheel (the newest one for the host's glibc, as old cluster systems need), its index on the host's
+    local disk (never shared by two hosts, as a network home would be) and at most 4 index workers unless
+    $TREX_WORKERS says otherwise there (remote hosts are often shared)."""
     whl = f'"$HOME/{WHEELS}/{wheel_name}"'
     serve = (f"uvx --python {REMOTE_PYTHON} --no-build-package numpy --from {whl} trex serve "
-             + shlex.join([addr.path, "--standalone", "--unix", sock, "--exit-on-eof"]))
+             + shlex.join(["--temporary", "--unix", sock, "--exit-on-eof", "--name", host.split("@")[-1]]))
     script = (f'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"; command -v uvx >/dev/null || '
               f'{{ echo "{NO_UV}" >&2; exit 127; }}; test -f {whl} || {{ echo "{NEEDS_WHEEL}"; exit 0; }}; '
               f'NO_COLOR=1 PYTHONUNBUFFERED=1 TREX_WORKERS="${{TREX_WORKERS:-4}}" exec {serve} --cache "${{TMPDIR:-/tmp}}/trex-cache-$(id -u)"')
@@ -116,11 +119,10 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 
 
 class Remote:
-    """A remote runs directory served over ssh; reconnects with backoff until `close`."""
+    """A trex node run on `host` over ssh; reconnects with backoff until `close`."""
 
-    def __init__(self, spec: str, addr: Address) -> None:
-        self.spec = spec
-        self.addr = addr
+    def __init__(self, host: str) -> None:
+        self.host = host
         self.local = Path(tempfile.gettempdir()) / f"trex-{os.getuid()}-{uuid.uuid4().hex[:12]}.sock"
         self.state = "starting"  # starting, connected or unreachable
         self.error = ""
@@ -129,8 +131,13 @@ class Remote:
         self._proc: subprocess.Popen[str] | None = None
         self._thread: threading.Thread | None = None
 
+    @property
+    def closing(self) -> bool:
+        """Whether `close` was called."""
+        return self._closed.is_set()
+
     def start(self) -> Self:
-        self._thread = threading.Thread(target=self._supervise, name=f"trex-remote-{self.addr.host}", daemon=True)
+        self._thread = threading.Thread(target=self._supervise, name=f"trex-remote-{self.host}", daemon=True)
         self._thread.start()
         return self
 
@@ -157,7 +164,7 @@ class Remote:
         """One ssh session, after sending this trex's wheel when the remote lacks it (if `send`); whether it
         connected."""
         sock = f"/tmp/trex-{uuid.uuid4().hex[:16]}.sock"
-        cmd = [*ssh(), "-L", f"{self.local}:{sock}", self.addr.host, remote_command(self.addr, sock, wheel()[0])]
+        cmd = [*ssh(), "-L", f"{self.local}:{sock}", self.host, remote_command(self.host, sock, wheel()[0])]
         self.state, self.error = "starting", ""
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -195,7 +202,7 @@ class Remote:
     def _send(self) -> str | None:
         """Copy this trex's wheel to the remote's WHEELS over ssh; None when it arrived, else why not."""
         name, data = wheel()
-        cmd = [*ssh(), self.addr.host, upload_command(name)]
+        cmd = [*ssh(), self.host, upload_command(name)]
         try:
             done = subprocess.run(cmd, input=data, capture_output=True, timeout=ADD_TIMEOUT)
         except (OSError, subprocess.TimeoutExpired) as e:
