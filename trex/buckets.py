@@ -17,6 +17,9 @@ Encoding, little-endian:
     u16 offset[count] (bucket - base * BLOCK), padded to 8,
     u16 soff[count] (the mean step's offset in bucket widths, times SOFF_SCALE, rounded down), padded to 8,
     f32 mean[count], f32 tmean[count], u32 n[count]
+
+Many arrays in one body (`frame`): u32 count, u32 length[count], padded to 8, then each array, padded to 8; an empty
+one stands for a block not answered.
 """
 
 import math
@@ -217,6 +220,27 @@ def encode(level: int, base: int, paths: Sequence[str], seq: Sequence[int] | npt
     for a in (first, np.asarray(seq, "<u4"), offset.astype("<u2"), b.soff.astype("<u2")):
         parts += [a.tobytes(), b"\0" * (-a.nbytes % 8)]
     return b"".join([*parts, b.mean.astype("<f4").tobytes(), b.tmean.astype("<f4").tobytes(), b.n.astype("<u4").tobytes()])
+
+
+def frame(bodies: Sequence[bytes]) -> bytes:
+    """`bodies` (bucket arrays, or empty) in one body."""
+    head = struct.pack(f"<{len(bodies) + 1}I", len(bodies), *(len(b) for b in bodies))
+    parts = [head, b"\0" * (-len(head) % 8)]
+    for b in bodies:
+        parts += [b, b"\0" * (-len(b) % 8)]
+    return b"".join(parts)
+
+
+def unframe(data: bytes) -> list[bytes]:
+    """The bodies `frame` joined into `data`."""
+    (n,) = struct.unpack_from("<I", data)
+    at, out = _pad(4 * (n + 1)), list[bytes]()
+    for k in struct.unpack_from(f"<{n}I", data, 4):
+        out.append(data[at:at + k])
+        at += _pad(k)
+    if at != len(data):
+        raise ValueError("framed bucket arrays length mismatch")
+    return out
 
 
 def decode(blob: bytes) -> BucketArray:

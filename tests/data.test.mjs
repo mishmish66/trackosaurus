@@ -17,7 +17,7 @@ function emptyArray(level, index, paths, seqs) {
 
 function withRuns(n, running = 0) {
   const d = new Data(UI);
-  d.fetch = async () => null; // no server
+  d.fetchMany = async (xs) => xs.map(() => null); // no server
   const runs = Array.from({ length: n }, (_, i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, kept_seq: 10, keys: ["loss"], summary: { _step: 1000 },
                                                              state: i < running ? "running" : "finished" }));
   return { d, runs };
@@ -63,4 +63,29 @@ test("a tail of 200000 rows gives every row of the metric with its sequence numb
   const tail = Array.from({ length: 200000 }, (_, i) => [i + 5, i, i % 2 ? { x: i } : {}]);
   const got = new Data(UI).tailOf({ tail, tailSeq0: 7 }, "x", 9);
   assert.deepEqual([got.n, got.s[0], got.q[0], got.q[got.n - 1]], [99999, 8, 10, 200006]);
+});
+
+test("queued requests go out spread over the free request slots, one batch each", () => {
+  const { d, runs } = withRuns(4), sent = [];
+  d.fetchMany = (xs) => (sent.push(xs.length), new Promise(() => {}));
+  for (let index = 0; index < 22; index++) d.need("loss", 0, index, runs, d.queue);
+  d.pump();
+  assert.deepEqual([sent.length, sent.reduce((a, b) => a + b, 0), d.queue.length], [5, 22, 0]);
+});
+
+test("fetching ahead asks for every chart's wanted layers before finer levels of the charts shown", () => {
+  const demands = [];
+  const d = new Data({ ...UI, ahead: () => demands });
+  d.fetchMany = async (xs) => xs.map(() => null);
+  const runs = Array.from({ length: 3 }, (_, i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, kept_seq: 10, keys: ["loss", "acc"],
+                                                               summary: { _step: 1000 }, state: "finished" }));
+  const demand = (key) => ({ key, runs, runsSig: "a", xmode: 0, zoomed: false, x0: -Infinity, x1: Infinity, pw: 600, many: false });
+  demands.push(demand("loss"), demand("acc"));
+  d.plan([demands[0]]);
+  const ch = d.charts.get("loss"), { level, indices } = ch.want.coarse;
+  for (const index of indices) d.addArray({ key: "loss", level, index }, emptyArray(level, index, ["r0", "r1", "r2"], [10, 10, 10]));
+  d.settleChart("loss", ch);
+  const asks = d.nextAhead(100), finer = asks.findIndex((x) => x.key === "loss");
+  assert.ok(asks.some((x) => x.key === "acc") && finer > asks.findLastIndex((x) => x.key === "acc"));
+  assert.ok(asks.filter((x) => x.key === "loss").every((x) => x.level < level));
 });

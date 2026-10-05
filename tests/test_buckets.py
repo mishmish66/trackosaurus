@@ -125,6 +125,15 @@ def test_a_bucket_array_round_trips_its_runs_rows_and_buckets():
     assert same(a.buckets, b)
 
 
+def test_framed_arrays_come_back_as_they_went_in_empty_ones_included():
+    arrays = [bk.encode(0, 0, ["r"], [n], bk.bucketize(np.arange(n * 1.0), np.arange(n * 1.0), np.arange(n * 1.0), 0)) for n in (3, 10)]
+    bodies = [arrays[0], b"", arrays[1]]
+    data = bk.frame(bodies)
+    assert len(data) % 8 == 0 and bk.unframe(data) == bodies
+    with pytest.raises(ValueError, match="length"):
+        bk.unframe(data[:-8])
+
+
 def test_decoding_rejects_foreign_or_truncated_bytes():
     blob = bk.encode(0, 0, ["r"], [3], bk.bucketize(np.arange(10.0), np.arange(10.0), np.arange(10.0), 0))
     with pytest.raises(ValueError, match="magic"):

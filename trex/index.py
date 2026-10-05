@@ -42,6 +42,17 @@ type Summary = dict[str, float | str]
 """Last value of every metric (non-finite as strings), plus _step and _runtime."""
 
 type Which = Literal["all", "finished", "running"]
+
+
+class Ask(NamedTuple):
+    """Block `block` of `level` of `key`: of the runs `runs` (ids), or else of the runs under `scope` in state `which`."""
+
+    key: str
+    level: int
+    block: int
+    scope: str = ""
+    runs: Sequence[str] | None = None
+    which: Which = "all"
 """The runs of a scope a block request takes: all, or the finished or the running ones."""
 type Event = tuple[str, object]
 """(SSE event name, data); data that is a str is already JSON."""
@@ -984,6 +995,10 @@ class Explorer:
                     if in_scope(p, prefix) and st["state"] == "running"}
 
     # ---- buckets ----
+
+    def buckets_bodies(self, asks: Sequence[Ask]) -> list[bytes]:
+        """`buckets_body` of each ask, in order."""
+        return [self.buckets_body(*a) for a in asks]
 
     def buckets_body(self, key: str, level: int, index: int, scope: str = "", runs: Sequence[str] | None = None,
                      which: Which = "all") -> bytes:

@@ -1,6 +1,6 @@
 // A pool.js worker: group statistics, or each run's bin means, of the page's charts, over columns and bucket arrays in
 // the memory it shares; and bucket arrays fetched into that memory.
-import { BinCache, Col, RAW, aggGroups, binRows, bucketPaths, bucketViews, buildColumn, runColumn } from "./kernel.js";
+import { BinCache, Col, RAW, aggGroups, binRows, bucketPaths, bucketViews, buildColumn, runColumn, unframe } from "./kernel.js";
 
 const chunks = new Map(); // shared chunk id -> its Float64Array
 const arrays = new Map(); // "chunk:generation:offset" -> bucketViews of the bucket array there
@@ -10,7 +10,7 @@ const charts = new Map(); // chart -> {cache (its binnings), views (its columns,
 
 onmessage = ({ data: m }) => {
   if (m.buf) return chunks.set(m.chunk, new Float64Array(m.buf));
-  if (m.kind === "fetch") return fetchArray(m);
+  if (m.kind === "fetch") return fetchArrays(m);
   let st = charts.get(m.chart);
   if (!st) charts.set(m.chart, (st = { cache: new BinCache(), views: new Map() }));
   const groups = columns(m, st), p = m.p;
@@ -23,16 +23,21 @@ onmessage = ({ data: m }) => {
   postMessage({ job: m.job, main, raws }, raws ? [main.buffer, raws.buffer] : [main.buffer]);
 };
 
-/** Fetch a bucket array (POST m.body to m.url) into a SharedArrayBuffer of its own, read as it streams in (far faster
- * than arrayBuffer() in Chromium), so the page only takes it over. */
-async function fetchArray(m) {
+/** Fetch bucket arrays (POST m.body to m.url, answered as buckets.frame joins them), read as they stream in (far faster
+ * than arrayBuffer() in Chromium), each into a SharedArrayBuffer of its own, so the page only takes them over. */
+async function fetchArrays(m) {
   try {
     const res = await fetch(m.url, { method: "POST", body: m.body });
-    if (!res.ok) return postMessage({ job: m.job, status: res.status, buf: null, bytes: 0 });
-    const [buf, bytes] = await readShared(res), v = bucketViews(buf, 0);
-    postMessage({ job: m.job, status: res.status, buf, bytes, paths: bucketPaths(buf, v) });
+    if (!res.ok) return postMessage({ job: m.job, status: res.status, arrays: [], bytes: 0 });
+    const [all, bytes] = await readShared(res), arrays = [];
+    for (const { off, len } of unframe(all)) {
+      const buf = len ? new SharedArrayBuffer(Math.ceil(len / 8) * 8) : null;
+      if (buf) new Uint8Array(buf).set(new Uint8Array(all, off, len));
+      arrays.push(buf && { buf, bytes: len, paths: bucketPaths(buf, bucketViews(buf, 0)) });
+    }
+    postMessage({ job: m.job, status: res.status, arrays, bytes });
   } catch (e) {
-    postMessage({ job: m.job, status: 0, buf: null, bytes: 0, error: String(e) });
+    postMessage({ job: m.job, status: 0, arrays: [], bytes: 0, error: String(e) });
   }
 }
 

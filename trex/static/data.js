@@ -2,14 +2,14 @@
 // stream. A run's column of a metric is built from its buckets in its chart's blocks (`buildColumn`) plus the rows
 // streamed since those buckets were made; a gap or a missed heartbeat resyncs the run.
 
-import { BLOCK, SHARED, adoptStore, bucketPaths, bucketStep, bucketViews, buildColumn, freeStore } from "./kernel.js";
-import { PARALLEL as WORKERS, fetchArrayOnWorker } from "./pool.js";
+import { BLOCK, SHARED, adoptStore, bucketPaths, bucketStep, bucketViews, buildColumn, freeStore, unframe } from "./kernel.js";
+import { PARALLEL as WORKERS, fetchArraysOnWorker } from "./pool.js";
 import { asNumber } from "./where.js";
 
 const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
 
 /** What this page and the server say to each other (server.PROTOCOL); the page states a mismatch. */
-export const PROTOCOL = 5;
+export const PROTOCOL = 6;
 /** URL prefix of what the page shows: a daemon's tracked directory ("/r/<name>") or workspace ("/w/<name>"), else "". */
 export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/[rw]\/[^/]+(?=\/)/) || [""])[0];
 
@@ -19,15 +19,17 @@ export const mediaURL = (rec) => `${BASE}/m/${encodeURIComponent(rec.run)}/${rec
 const MIN_LEVEL = -20, MAX_LEVEL = 62; // levels a block may have (buckets.MIN_LEVEL, MAX_LEVEL)
 const POINT_BUDGET = 1.5e6; // buckets one chart draws across all its runs
 const PARALLEL = 5; // requests in flight: the browser's six connections to a host, less the stream's
-const ARRAY_BYTES = 384e6; // bucket arrays kept, the least recently used dropped beyond
-const AHEAD_BYTES = 256e6; // arrays fetched ahead of need, at most
+const PREFETCH_PARALLEL = 2; // of them fetching ahead, at most
+const BATCH_BLOCKS = 32; // blocks one request asks for, at most (server.MAX_ASKS)
+const ARRAY_BYTES = 2e9; // bucket arrays kept, the least recently used dropped beyond
+const AHEAD_BYTES = 1.5e9; // arrays fetched ahead of need, at most
 const KEEP_MS = 2000; // an array used this recently is not dropped
 const FINE_BLOCKS = 8; // blocks of a finer level one chart's view may take
 const SCOPE_MIN = 64; // runs of a chart missing a block above which one request asks for the scope's finished runs...
 const SCOPE_SHARE = 4; // ...when they are also at least 1 / SCOPE_SHARE of the chart's runs
 const RUNS_PER_REQUEST = 2000; // run ids one request names
 const REBUILD_SLICE_MS = 8; // column rebuilds per task, in ms
-const PREFETCH_IDLE_MS = 400; // quiet time before the next block fetched ahead
+const PREFETCH_IDLE_MS = 50; // quiet time before fetching ahead
 export const LINE_PX_PER_BUCKET = 2; // chart width per bucket a line needs
 export const DENSITY_PX_PER_BUCKET = 8; // the same in a density heatmap or group statistics of many runs
 const NO_TAIL = Object.freeze({ s: [], v: [], t: [], q: [], n: 0 });
@@ -47,6 +49,9 @@ export function hasKey(r, key) {
 
 /** Id of block (key, level, index). */
 const blockId = (key, level, index) => `${key}|${level}|${index}`;
+
+/** What request x asks for: its block, and its runs or the scope's. */
+const askId = (x) => `${blockId(x.key, x.level, x.index)}|${x.runs === null ? "" : x.runs.map((r) => r.id).join("\0")}`;
 
 /** The blocks of `level` covering steps [lo, hi]: {level, indices}. */
 function covering(level, lo, hi) {
@@ -76,15 +81,20 @@ export async function getJSON(url) {
   return r.json();
 }
 
-/** A bucket array answer fetched on the page (when no worker fetches it): {status, buf, bytes, paths}. */
-async function fetchArrayHere(url, body) {
+/** Bucket arrays answering a POST fetched on the page (when no worker fetches them), as fetchArraysOnWorker gives
+ * them. */
+async function fetchArraysHere(url, body) {
   try {
     const res = await fetch(url, { method: "POST", body });
-    if (!res.ok) return { status: res.status, buf: null, bytes: 0 };
-    const buf = await res.arrayBuffer(), v = bucketViews(buf);
-    return { status: res.status, buf, bytes: buf.byteLength, paths: bucketPaths(buf, v) };
+    if (!res.ok) return { status: res.status, arrays: [], bytes: 0 };
+    const all = await res.arrayBuffer();
+    const arrays = unframe(all).map(({ off, len }) => {
+      const buf = len ? all.slice(off, off + Math.ceil(len / 8) * 8) : null;
+      return buf && { buf, bytes: len, paths: bucketPaths(buf, bucketViews(buf)) };
+    });
+    return { status: res.status, arrays, bytes: all.byteLength };
   } catch (e) {
-    return { status: 0, buf: null, bytes: 0, error: String(e) };
+    return { status: 0, arrays: [], bytes: 0, error: String(e) };
   }
 }
 
@@ -114,15 +124,17 @@ export class Data {
     this.blocks = new Map(); // blockId -> {runs: Map(run id -> {a (array), row}), used}
     this.charts = new Map(); // metric -> {want ({coarse, fine} layers), ready (the layers shown), runs, many} of the last plan
     this.queue = []; // requests to send: {key, level, index, runs (null: the scope's finished runs)}
-    this.inflight = new Map(); // blockId -> {scope (asked for the scope's finished runs), runs (ids asked for)}
-    this.posts = 0; // requests in flight
+    this.inflight = new Map(); // blockId -> {scope (asked for the scope's finished runs), runs (ids asked for), n (requests)}
+    this.posts = 0; // requests in flight for plans
+    this.planBlocks = 0; // blocks they ask for
+    this.aheadPosts = 0; // requests in flight fetching ahead
+    this.aheadAsked = new Set(); // askId of each request fetching ahead has made
     this.rebuildQ = new Map(); // "run\0key" -> [run, key] awaiting rebuildSoon
     this.rebuildT = 0;
     this.prefetchT = 0;
-    this.prefetching = false;
     this.planned = null; // inputs of the last plan
     this.touched = new Set();
-    this.stats = { requests: 0, bytes: 0 };
+    this.stats = { blocks: 0, bytes: 0 };
   }
 
   async init() {
@@ -141,6 +153,7 @@ export class Data {
     this.folders = {};
     this.queue = [];
     this.inflight.clear();
+    this.aheadAsked.clear();
     for (const a of this.arrays.values()) freeStore(a.loc);
     this.arrays.clear();
     this.arrayBytes = 0;
@@ -235,7 +248,7 @@ export class Data {
     for (const d of demands) this.planChart(d, queue);
     this.queue = queue;
     this.pump();
-    const n = this.queue.length + this.inflight.size;
+    const n = this.queue.length + this.planBlocks;
     this.ui.status(n ? `loading ${n} blocks…` : this.summary());
     return n;
   }
@@ -281,9 +294,9 @@ export class Data {
 
   /** Queue requests for block (key, level, index) of the runs of `runs` that lack it, or hold a running run's buckets
    * older than its kept ones: the scope's finished runs in one request when many lack it, by run ids otherwise. */
-  need(key, level, index, runs, queue) {
+  need(key, level, index, runs, queue, touch = true) {
     const id = blockId(key, level, index), have = this.blocks.get(id), asked = this.inflight.get(id);
-    if (have) have.used = performance.now();
+    if (have && touch) have.used = performance.now();
     const missing = runs.filter((r) => !this.current(have?.runs.get(r.id), r) && !asked?.runs.has(r.id)
                                        && !(asked?.scope && r.meta.state !== "running"));
     const finished = missing.filter((r) => r.meta.state !== "running");
@@ -426,19 +439,21 @@ export class Data {
 
   // ---- fetching ----
 
+  /** Send the queued requests, spread over the free request slots, BATCH_BLOCKS a request at most. */
   pump() {
-    while (this.posts < PARALLEL && this.queue.length) {
-      const x = this.queue.shift(), id = blockId(x.key, x.level, x.index);
-      let asked = this.inflight.get(id);
-      if (!asked) this.inflight.set(id, (asked = { scope: false, runs: new Set(), n: 0 }));
-      if (x.runs === null ? asked.scope : x.runs.every((r) => asked.runs.has(r.id))) continue;
-      if (x.runs === null) asked.scope = true;
-      else for (const r of x.runs) asked.runs.add(r.id);
-      asked.n++;
+    while (this.posts + this.aheadPosts < PARALLEL && this.queue.length) {
+      const free = PARALLEL - this.posts - this.aheadPosts, size = Math.min(BATCH_BLOCKS, Math.ceil(this.queue.length / free));
+      const batch = [];
+      while (batch.length < size && this.queue.length) {
+        const x = this.queue.shift(), asked = this.asking(x);
+        if (asked) batch.push([x, asked]);
+      }
+      if (!batch.length) continue;
       this.posts++;
-      this.fetchBlock(x).finally(() => {
+      this.planBlocks += batch.length;
+      this.send(batch, false).finally(() => {
         this.posts--;
-        if (--asked.n === 0) this.inflight.delete(id);
+        this.planBlocks -= batch.length;
         if (!this.busy) this.ui.status(this.summary());
         this.pump();
         this.settle();
@@ -446,27 +461,51 @@ export class Data {
     }
   }
 
-  /** Request x's answer: by a worker into shared memory, else here. */
-  async fetch(x) {
-    const url = new URL(`${BASE}/api/buckets`, typeof location === "undefined" ? "http://localhost/" : location.href).href;
-    const body = JSON.stringify(x.runs === null ? { key: x.key, level: x.level, index: x.index, scope: this.scope, which: "finished" }
-      : { key: x.key, level: x.level, index: x.index, runs: x.runs.map((r) => r.id) });
-    const got = await (WORKERS ? fetchArrayOnWorker(url, body) : fetchArrayHere(url, body));
-    if (got.error) console.warn("block fetch failed", got.error);
-    this.stats.requests++;
-    this.stats.bytes += got.bytes;
-    return got.buf ? got : null;
+  /** Mark request x under way: its block's record of what is asked for, or null when all x asks for already is. */
+  asking(x) {
+    const id = blockId(x.key, x.level, x.index);
+    let asked = this.inflight.get(id);
+    if (!asked) this.inflight.set(id, (asked = { scope: false, runs: new Set(), n: 0 }));
+    if (x.runs === null ? asked.scope : x.runs.every((r) => asked.runs.has(r.id))) return null;
+    if (x.runs === null) asked.scope = true;
+    else for (const r of x.runs) asked.runs.add(r.id);
+    asked.n++;
+    return asked;
   }
 
-  /** Fetch block request x and take its answer in; the charts it completes show their new layers. */
-  async fetchBlock(x) {
-    const gen = this.gen, got = await this.fetch(x);
-    if (!got || gen !== this.gen) return;
+  /** Request the blocks of `batch` ([x, its record]) in one request and take their answers in: the charts they complete
+   * show their new layers, and what the view asked for (not `ahead`) is drawn. */
+  async send(batch, ahead) {
+    const gen = this.gen;
+    try {
+      const got = await this.fetchMany(batch.map(([x]) => x));
+      if (gen !== this.gen) return;
+      batch.forEach(([x], i) => got[i] && this.take(x, got[i], ahead));
+      this.flush();
+    } finally {
+      for (const [x, asked] of batch) if (--asked.n === 0) this.inflight.delete(blockId(x.key, x.level, x.index));
+    }
+  }
+
+  /** Keep answer `got` of request x; its chart shows the layers it completes. */
+  take(x, got, ahead) {
     this.addArray(x, got);
     const ch = this.charts.get(x.key);
     if (ch) this.settleChart(x.key, ch);
-    this.touched.add(x.key);
-    this.flush();
+    if (!ahead) this.touched.add(x.key);
+  }
+
+  /** The answers of requests `xs`, null for a block not answered: by a worker into shared memory, else here. */
+  async fetchMany(xs) {
+    const url = new URL(`${BASE}/api/buckets`, typeof location === "undefined" ? "http://localhost/" : location.href).href;
+    const blocks = xs.map((x) => (x.runs === null ? { key: x.key, level: x.level, index: x.index, scope: this.scope, which: "finished" }
+      : { key: x.key, level: x.level, index: x.index, runs: x.runs.map((r) => r.id) }));
+    const body = JSON.stringify({ blocks });
+    const got = await (WORKERS ? fetchArraysOnWorker(url, body) : fetchArraysHere(url, body));
+    if (got.error) console.warn("block fetch failed", got.error);
+    this.stats.blocks += got.arrays.filter(Boolean).length;
+    this.stats.bytes += got.bytes;
+    return xs.map((_, i) => got.arrays[i] || null);
   }
 
   /** Whether blocks are queued or being fetched, or columns await rebuilding. */
@@ -484,51 +523,66 @@ export class Data {
 
   // ---- fetching ahead ----
 
-  /** Fetch the next block a view may need (`nextAhead`) when the store is idle; then the one after. */
-  async prefetch() {
-    if (this.busy || this.prefetching) return;
-    const x = this.nextAhead();
-    if (!x) return;
-    const gen = this.gen;
-    this.prefetching = true;
-    try {
-      const got = await this.fetch(x);
-      if (got && gen === this.gen) this.addArray(x, got);
-    } finally {
-      this.prefetching = false;
+  /** While no plan's requests are under way, fetch what charts may soon show (`nextAhead`), each request once: BATCH_BLOCKS
+   * a request, PREFETCH_PARALLEL requests at a time, one after another until nothing is left or AHEAD_BYTES is reached. */
+  prefetch() {
+    while (!this.busy && this.aheadPosts < PREFETCH_PARALLEL) {
+      const batch = [];
+      for (const x of this.nextAhead(BATCH_BLOCKS)) {
+        const asked = this.asking(x);
+        this.aheadAsked.add(askId(x));
+        if (asked) batch.push([x, asked]);
+      }
+      if (!batch.length) return;
+      this.aheadPosts++;
+      this.send(batch, true).finally(() => {
+        this.aheadPosts--;
+        this.prefetch();
+      });
     }
-    if (gen === this.gen) this.settle();
   }
 
-  /** The first block not here that a chart may soon show (`ui.ahead`: demands, visible charts first): its wanted
-   * layers when it shows none yet, else the two levels below its finest, over the steps it shows; while the blocks
-   * no chart uses hold less than AHEAD_BYTES. */
-  nextAhead() {
+  /** Up to n requests, not made ahead before, for blocks a chart may soon show (`ui.ahead`: demands, nearest the view
+   * first): every chart's wanted layers first, then finer levels of the shown ones; while the blocks no chart uses hold
+   * less than AHEAD_BYTES. */
+  nextAhead(n) {
+    if (this.aheadBytes() >= AHEAD_BYTES) return [];
+    const demands = this.ui.ahead?.() || [], out = [];
+    for (const pass of [(d, q) => this.wantedAhead(d, q), (d, q) => this.finerAhead(d, q)]) {
+      for (const d of demands) {
+        const q = [];
+        pass(d, q);
+        out.push(...q.filter((x) => !this.aheadAsked.has(askId(x))));
+        if (out.length >= n) return out.slice(0, n);
+      }
+    }
+    return out;
+  }
+
+  /** Bytes of the blocks no chart shows or wants. */
+  aheadBytes() {
     const used = this.inUse();
-    let ahead = 0;
-    for (const [id, b] of this.blocks) if (!used.has(id)) ahead += this.blockBytes(b);
-    if (ahead >= AHEAD_BYTES) return null;
-    for (const d of this.ui.ahead?.() || []) {
-      const runs = this.runsWith(d.runs, d.key).filter((r) => r.meta.state !== "running");
-      if (runs.length) {
-        const x = this.aheadOf(d, runs);
-        if (x) return x;
-      }
-    }
-    return null;
+    let n = 0;
+    for (const [id, b] of this.blocks) if (!used.has(id)) n += this.blockBytes(b);
+    return n;
   }
 
-  /** The first block of demand d's layers (or the two levels below them, when shown) that lacks one of `runs`. */
-  aheadOf(d, runs) {
-    const want = this.layersOf(d, runs), finest = want.fine || want.coarse, steps = this.stepsOf(finest);
-    const next = this.charts.get(d.key)?.ready ? [1, 2].map((up) => covering(finest.level - up, ...steps)) : [want.coarse, want.fine];
-    for (const L of next) {
-      for (const index of L && L.indices.length <= FINE_BLOCKS ? L.indices : []) {
-        const id = blockId(d.key, L.level, index), b = this.blocks.get(id);
-        if (!this.inflight.has(id) && (!b || runs.some((r) => !b.runs.has(r.id)))) return { key: d.key, level: L.level, index, runs: runs.length >= SCOPE_MIN ? null : runs };
-      }
+  /** Requests (into `out`) for the blocks of the layers demand d wants that lack one of its runs. */
+  wantedAhead(d, out) {
+    const runs = this.runsWith(d.runs, d.key), want = this.layersOf(d, runs);
+    for (const L of [want.coarse, want.fine]) for (const index of L ? L.indices : []) this.need(d.key, L.level, index, runs, out, false);
+  }
+
+  /** Requests (into `out`) for the blocks of the two levels below the finest the chart of demand d shows, over the steps
+   * it shows. */
+  finerAhead(d, out) {
+    const ready = this.charts.get(d.key)?.ready;
+    if (!ready) return;
+    const runs = this.runsWith(d.runs, d.key), finest = ready.fine || ready.coarse, steps = this.stepsOf(finest);
+    for (const up of [1, 2]) {
+      const L = covering(finest.level - up, ...steps);
+      for (const index of L.indices.length <= FINE_BLOCKS ? L.indices : []) this.need(d.key, L.level, index, runs, out, false);
     }
-    return null;
   }
 
   /** [lo, hi] steps of a layer's blocks. */
@@ -539,7 +593,7 @@ export class Data {
 
   summary() {
     const s = this.stats;
-    return `${this.runs.size} runs · ${s.requests} blocks fetched (${(s.bytes / 1e6).toFixed(1)} MB)`;
+    return `${this.runs.size} runs · ${s.blocks} blocks fetched (${(s.bytes / 1e6).toFixed(1)} MB)`;
   }
 
   // ---- columns ----

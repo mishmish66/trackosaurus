@@ -518,6 +518,14 @@ export function bucketViews(buf, off = 0) {
 }
 
 /** The run paths of bucket array `v` (bucketViews of `buf`). */
+/** Where the bucket arrays of a body buckets.frame made lie: [{off, len}] in order, len 0 for a block not answered. */
+export function unframe(buf) {
+  const n = new Uint32Array(buf, 0, 1)[0], out = [];
+  let at = pad8(4 * (n + 1));
+  for (const len of new Uint32Array(buf, 4, n)) out.push({ off: at, len }), (at += pad8(len));
+  return out;
+}
+
 export function bucketPaths(buf, v) {
   return v.runs ? new TextDecoder().decode(new Uint8Array(buf, v.names[0], v.names[1]).slice()).split("\0") : [];
 }

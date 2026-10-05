@@ -1844,19 +1844,32 @@ class App {
     b.onclick = () => location.reload();
   }
 
-  /** What to fetch ahead (`Data.nextAhead`): each chart's demand over the shown runs, visible charts first. */
+  /** What to fetch ahead (`Data.nextAhead`): each chart's demand over the shown runs, the visible first, then the nearest
+   * the view. */
   aheadOf() {
     if (!this.runList) return [];
-    const charts = [...this.charts.values()].sort((a, b) => (b.visible || b.full) - (a.visible || a.full)), seen = new Set();
-    return charts.filter((c) => !seen.has(c.key) && seen.add(c.key)).map((c) => this.demand(c, this.shown));
+    const box = $("#panels").getBoundingClientRect(), mid = (box.top + box.bottom) / 2, pw = this.gridPw(), seen = new Set();
+    const far = (c) => {
+      if (c.visible || c.full) return -1;
+      const b = c.el.getBoundingClientRect();
+      return b.height ? Math.abs((b.top + b.bottom) / 2 - mid) : Infinity; // folded away: last
+    };
+    return [...this.charts.values()].filter((c) => c.el.isConnected).map((c) => [far(c), c]).sort((a, b) => a[0] - b[0])
+      .filter(([, c]) => !seen.has(c.key) && seen.add(c.key)).map(([, c]) => this.demand(c, this.shown, pw));
   }
 
-  /** What chart c shows, for `Data.plan`. */
-  demand(c, runs) {
+  /** The plot width of the grid's charts, from one laid out (600 before any is). */
+  gridPw() {
+    for (const c of this.charts.values()) if (c.w && !c.full) return c.pw;
+    return 600;
+  }
+
+  /** What chart c shows, for `Data.plan`; `pw` its plot width until it is laid out. */
+  demand(c, runs, pw = 600) {
     const o = this.panelOpts(c.key), zoom = this.xrange && this.xrange[2] === o.xmode ? this.xrange : null;
     const x0 = o.xmin ?? zoom?.[0] ?? null, x1 = o.xmax ?? zoom?.[1] ?? null;
     return { key: c.key, runs, xmode: o.xmode, zoomed: x0 !== null || x1 !== null, x0: x0 ?? -Infinity, x1: x1 ?? Infinity,
-             pw: c.w ? c.pw : 600, many: this.data.runsWith(runs, c.key).length > this.coarseAbove(o) };
+             pw: c.w ? c.pw : pw, many: this.data.runsWith(runs, c.key).length > this.coarseAbove(o) };
   }
 
   /** Runs above which a chart with options `o` draws its runs from bins of their buckets: group statistics, or a

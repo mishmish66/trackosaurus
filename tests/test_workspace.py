@@ -12,6 +12,7 @@ import pytest
 import trex
 from trex import buckets as bk, server
 from trex.daemon import Roots
+from trex.index import Explorer
 from trex.workspace import Member, Workspace
 
 import helpers
@@ -44,7 +45,7 @@ def http(roots, http_server):
 
 def blocks(base, **body):
     """The bucket array answering a request for every step of `loss` at base/api/buckets."""
-    return bk.decode(post_bytes(f"{base}/api/buckets", {"key": "loss", "level": 20, "index": 0, **body}))
+    return bk.decode(bk.unframe(post_bytes(f"{base}/api/buckets", {"blocks": [{"key": "loss", "level": 20, "index": 0, **body}]}))[0])
 
 
 def runs_with_buckets(a):
@@ -97,6 +98,19 @@ def test_a_workspace_block_holds_every_members_runs_under_its_scope(roots, dirs,
     roots.set_workspace("both", [a, b])
     got = blocks(f"{http}/w/both", scope="sac")
     assert got.paths == ["sac/r1", "sac/r2", "sac/r3"] and runs_with_buckets(got) == got.paths
+
+
+def test_a_workspace_answers_a_batch_as_each_block_alone_asking_each_member_once(roots, dirs, http, monkeypatch):
+    a, b = tracked(roots, *dirs)
+    roots.set_workspace("both", [a, b])
+    asks = [{"key": "loss", "level": 20, "index": 0, "scope": "sac"}, {"key": "loss", "level": 3, "index": 0, "runs": ["sac/r3", "shared/x"]},
+            {"key": "loss", "level": 20, "index": 0, "scope": "shared", "which": "finished"}]
+    alone = [post_bytes(f"{http}/w/both/api/buckets", {"blocks": [ask]}) for ask in asks]
+    calls = []
+    answer = Explorer.buckets_bodies
+    monkeypatch.setattr(Explorer, "buckets_bodies", lambda ex, part: calls.append(len(part)) or answer(ex, part))
+    together = bk.unframe(post_bytes(f"{http}/w/both/api/buckets", {"blocks": asks}))
+    assert together == [bk.unframe(x)[0] for x in alone] and sorted(calls) == [3, 3]
 
 
 def test_a_workspace_streams_live_rows_of_every_member(roots, dirs, http):

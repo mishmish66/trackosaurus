@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { Col, IQM, STATS, X_STEP, aggGroups, binRows, bucketPaths, bucketStep, bucketViews, buildColumn } from "../trex/static/kernel.js";
+import { Col, IQM, STATS, X_STEP, aggGroups, binRows, bucketPaths, bucketStep, bucketViews, buildColumn, unframe } from "../trex/static/kernel.js";
 import { smoothScale } from "../trex/static/plot.js";
 import { asNumber } from "../trex/static/where.js";
 
@@ -34,6 +34,12 @@ function sameColumn(got, want, at, tol) {
     assert.equal(got.w[i], want.w[i], `${at} point ${i} count`);
   }
 }
+
+test("a framed body unframes to the bucket arrays Python framed, an empty one included", () => {
+  const buf = Uint8Array.from(Buffer.from(CASES.frame.body, "base64")).buffer;
+  const got = unframe(buf).map(({ off, len }) => Buffer.from(new Uint8Array(buf, off, len)).toString("base64"));
+  assert.deepEqual(got, CASES.frame.parts);
+});
 
 test("bucket arrays decode to the runs and buckets the Python encoder wrote, f32 fields exactly", () => {
   for (const c of CASES.arrays) {

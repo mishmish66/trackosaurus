@@ -18,11 +18,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from . import remote, update
+from . import buckets as bk, remote, update
 from .daemon import root_url, workspace_url
 from .remote import Remote
 from .workspace import Far, Workspace
-from .index import Explorer, Which, dumps
+from .index import Ask, Explorer, Which, dumps
 
 if TYPE_CHECKING:
     from .daemon import Roots
@@ -39,8 +39,9 @@ HOP_HEADERS: Final = frozenset({"connection", "keep-alive", "transfer-encoding",
 ISOLATION: Final = {"Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp",
                     "Cross-Origin-Resource-Policy": "same-origin"}
 ROOT_PREFIX: Final = re.compile(r"/([rw])/([^/]+)(/.*)?")  # a tracked directory's (r) or workspace's (w) URLs
-PROTOCOL: Final = 5  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
+PROTOCOL: Final = 6  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
 WHICH: Final[dict[str, Which]] = {"all": "all", "finished": "finished", "running": "running"}
+MAX_ASKS: Final = 256  # blocks one POST /api/buckets may ask for
 RESTART_DELAY: Final = 0.5  # seconds between answering an update and restarting, so the answer is sent
 CTYPES: Final = {
     ".html": "text/html; charset=utf-8",
@@ -424,18 +425,14 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("POST", r"/api/buckets")
     def post_buckets(self, q: Query) -> None:
-        """Body: {key, level, index, and runs (a list of run ids) or scope and which (all, finished or running)}.
-        Response: that block of those runs as a bucket array (`Explorer.buckets_body`)."""
+        """Body: {blocks: [{key, level, index, and runs (a list of run ids) or scope and which (all, finished or
+        running)}]}, at most MAX_ASKS. Response: those blocks of those runs as bucket arrays (`Explorer.buckets_body`) in
+        one body (`buckets.frame`)."""
         req = json.loads(self.body())
-        if not isinstance(req, dict) or not isinstance(req.get("key"), str):
-            raise ValueError("expected {key, level, index, scope | runs, which}")
-        runs, which = req.get("runs"), WHICH.get(str(req.get("which", "all")))
-        if runs is not None and (not isinstance(runs, list) or not all(isinstance(r, str) for r in runs)):
-            raise ValueError("runs: a list of run ids")
-        if which is None:
-            raise ValueError("which: all, finished or running")
-        body = self.ex.buckets_body(req["key"], _whole(req.get("level")), _whole(req.get("index")), str(req.get("scope", "")),
-                                    runs, which)
+        blocks = req.get("blocks") if isinstance(req, dict) else None
+        if not isinstance(blocks, list) or not 0 < len(blocks) <= MAX_ASKS:
+            raise ValueError(f"expected {{blocks: [{{key, level, index, scope | runs, which}}]}} of 1 to {MAX_ASKS}")
+        body = bk.frame(self.ex.buckets_bodies([_ask(b) for b in blocks]))
         self.send(body, "application/octet-stream", headers={"Cache-Control": "no-store"}, compress=not self._loopback())
 
     def _loopback(self) -> bool:
@@ -558,6 +555,22 @@ def urls(servers: Sequence[Server]) -> list[str]:
         host, port = str(s.server_address[0]), s.server_address[1]
         out.append(f"http://{f'[{host}]' if ':' in host else host}:{port}/")
     return out
+
+
+def _ask(b: object) -> Ask:
+    """A block request of POST /api/buckets; ValueError unless it is one."""
+    if not isinstance(b, dict) or not isinstance(key := cast(dict[str, object], b).get("key"), str):
+        raise ValueError("a block: {key, level, index, scope | runs, which}")
+    d = cast(dict[str, object], b)
+    runs, which = d.get("runs"), WHICH.get(str(d.get("which", "all")))
+    if runs is not None and (not isinstance(runs, list) or not all(isinstance(r, str) for r in cast(list[object], runs))):
+        raise ValueError("runs: a list of run ids")
+    if which is None:
+        raise ValueError("which: all, finished or running")
+    level = _whole(d.get("level"))
+    if not bk.MIN_LEVEL <= level <= bk.MAX_LEVEL:
+        raise ValueError(f"level {level} out of range")
+    return Ask(key, level, _whole(d.get("index")), str(d.get("scope", "")), cast(list[str] | None, runs), which)
 
 
 def _whole(v: object) -> int:

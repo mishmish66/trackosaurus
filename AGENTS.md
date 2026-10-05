@@ -80,9 +80,9 @@ them WebGL falls back to software and timings mean nothing.
   run's *kept* buckets of every metric: one array at the finest level whose blocks are as wide as the run
   (`buckets.level_for`), so at most two blocks. Growing runs get new kept buckets every `KEPT_REFRESH` seconds
   (`TREX_KEPT_REFRESH`) and when they finish or crash. The index never holds a full copy of the data.
-- **Server**: `POST /api/buckets {key, level, index, scope | runs, which}` answers one block of one metric for a
-  list of runs, or for the runs of a folder in state `which` (`all`, `finished`, `running`), as a bucket array
-  (`Explorer.buckets_body`). A run that keeps its buckets at the level or finer is merged from them: a finished run
+- **Server**: `POST /api/buckets {blocks: [{key, level, index, scope | runs, which}]}` (at most `server.MAX_ASKS`)
+  answers each block of one metric for a list of runs, or for the runs of a folder in state `which` (`all`,
+  `finished`, `running`), as a bucket array (`Explorer.buckets_body`), all in one body (`buckets.frame`). A run that keeps its buckets at the level or finer is merged from them: a finished run
   from its metric's merged level (`Explorer._level`: every finished run's kept buckets decoded at once,
   `buckets.stack`, merged on threads), a running one from its kept buckets read from the index. A run that keeps
   coarser buckets has the block built from its run file (`build_block`, on a process pool beyond `INLINE_BUILDS`).
@@ -100,8 +100,9 @@ them WebGL falls back to software and timings mean nothing.
   (`Roots.everything`, a nested `Workspace`), and the trex brand opens the panel that manages them. Names follow Emacs's uniquify (`runs<chush>`)
   and change when a collision appears or ends; specs (paths, `host:path`) are the stable keys.
 - **Workspace**: answers the Explorer interface by asking its members in parallel. A run id is the
-  member's path, or `path<member>` when an earlier member holds the same path; `resolve` maps it back. Its block
-  answers join its members' bucket arrays, run ids renamed (`Workspace.buckets_body`).
+  member's path, or `path<member>` when an earlier member holds the same path; `resolve` maps it back. It asks each
+  member once per request for its part of every block, and joins the members' bucket arrays per block, run ids renamed
+  (`Workspace.buckets_bodies`).
   Its stream merges the members' streams, renaming run ids in every event (`Workspace._rename_event`).
   `/api/daemon` lists the directories, the remembered ones and the running trex; directories are
   added over the control socket (mode 0600) or HTTP and removed over HTTP. An update installs
@@ -118,7 +119,8 @@ them WebGL falls back to software and timings mean nothing.
   `FINE_BLOCKS` blocks): levels with buckets about `LINE_PX_PER_BUCKET` wide on screen (`DENSITY_PX_PER_BUCKET` for a
   chart of many runs) within a point budget, rounded so they change only when a span crosses a power of two, as kept
   levels do. When many finished runs lack a block, one request asks for the folder's finished runs; other runs are
-  asked for by id, and a running run again once its kept buckets are newer. Answers fill one store, `Data.blocks`
+  asked for by id, and a running run again once its kept buckets are newer. Requests go out in batches of at most
+  `BATCH_BLOCKS` blocks, spread over the free request slots (`Data.pump`). Answers fill one store, `Data.blocks`
   (block -> run -> its row of a bucket array); a chart shows its wanted layers once every block holds every run, and
   keeps showing the previous ones until then. A run drawn as a line has a column (`kernel.buildColumn`): its buckets in
   the shown blocks, a finer level's where its blocks lie and the coarse level's elsewhere, then the streamed rows those
@@ -126,16 +128,18 @@ them WebGL falls back to software and timings mean nothing.
   more runs than it draws one by one (`App.coarseAbove`: group statistics, or a heatmap) bins its finished runs from
   their buckets in its finest shown blocks (`Data.partsOf`), its running ones from their columns. Binning weights each
   point by the rows it stands for, so a bin's mean is the mean of the rows in it. Workers fetch blocks straight into
-  shared memory (`pool.fetchArrayOnWorker`), which the page takes over (`kernel.adoptStore`, up to `ARRAY_BYTES`;
-  blocks no chart uses go first).
+  shared memory, each array of a batch into a buffer of its own (`pool.fetchArraysOnWorker`), which the page takes over
+  (`kernel.adoptStore`, up to `ARRAY_BYTES`; blocks no chart uses go first).
 - **Workers**: every response carries COOP/COEP headers (`server.ISOLATION`), so the page is cross-origin isolated and
   `buildColumn` puts columns in `SharedArrayBuffer` chunks (`kernel.columnStore`). Each chart's binning runs on one
   worker of the pool (`pool.js`), which keeps that chart's binnings; a run's buckets in one block become a column viewing
   the array (`kernel.runColumn`). A draw round waits for its charts' workers and draws them together. `?shared=0`, or a
   page that is not isolated, computes them on the page instead.
-- **Fetching ahead**: once the store is idle, `Data.prefetch` fetches one block at a time (`Data.nextAhead`, while the
-  blocks no chart uses hold less than `AHEAD_BYTES`): for each chart, visible ones first, its wanted layers when it
-  shows none yet, else the two levels below its finest over the steps it shows. Fetched blocks wait in the store.
+- **Fetching ahead**: while no plan's requests are under way, `Data.prefetch` keeps `PREFETCH_PARALLEL` batches in
+  flight (`Data.nextAhead`, each request once a page, while the blocks no chart uses hold less than `AHEAD_BYTES`):
+  every chart's wanted layers first, visible charts first and then the nearest the view (`App.aheadOf`), then the two
+  levels below the finest each shown chart shows over the steps it shows. Fetched blocks wait in the store, so a
+  scroll finds the charts' blocks already there.
 - **Rendering**: WebGL2; a browser without it gets no charts, and a lost context keeps the charts as drawn until it is
   restored. Above 300 lines a chart draws a
   density heatmap. No upload overwrites GPU data a queued draw may read: each draw's line table
@@ -159,7 +163,8 @@ them WebGL falls back to software and timings mean nothing.
 - **Cache version.** Bump `CACHE_VERSION` in `index.py` whenever what the index stores, or how it
   derives it, changes. An older index is then rebuilt instead of silently misread.
 - **Shared formats across languages.** Change all of these together:
-  - bucket arrays: `buckets.py` and `bucketViews` in `static/kernel.js`. Buckets leave NaN out; a bucket's mean, mean
+  - bucket arrays and their framing: `buckets.py` (`encode`, `frame`) and `bucketViews`, `unframe` in
+    `static/kernel.js`. Buckets leave NaN out; a bucket's mean, mean
     step, mean runtime and count are of its finite values, or of its infinities when it has none (the mean then
     infinite, NaN with both signs);
   - columns from buckets and streamed rows: `buckets.bucketize` / `merge` and `buildColumn` in `static/kernel.js`
@@ -178,7 +183,7 @@ them WebGL falls back to software and timings mean nothing.
   - run filters and field names: `where.py` and `static/where.js` (`compileWhere`, `runField`), `query.py` `get`;
     both suites run the cases in `tests/where_cases.json`.
 
-  Bucket arrays, live tails, layered levels, binning, smoothing and group statistics are checked across languages by `tests/shared_cases.json`, which
+  Bucket arrays and their framing, live tails, layered levels, binning, smoothing and group statistics are checked across languages by `tests/shared_cases.json`, which
   `tests/test_shared_cases.py` writes from the Python side (`TREX_WRITE_CASES=1`) and `tests/shared_cases.test.mjs`
   reads.
 - **Other sites cannot use the server.** `Handler._refusal` answers only requests whose Host is an

@@ -110,8 +110,8 @@ def test_remote_directories_are_served_through_the_daemon(roots, runs, http, hom
     media = listing["media"][0]
     status, headers, data = request(f"{base}/m/{urllib.parse.quote('a/r1', safe='')}/{media[5]}", headers={"Range": "bytes=8-11"})
     assert status == 206 and data == bytes(range(4)) and headers["Content-Range"].startswith("bytes 8-11/")
-    body = b'{"key": "loss", "level": 20, "index": 0, "runs": ["a/r1"]}'
-    answer = bk.decode(urllib.request.urlopen(urllib.request.Request(f"{base}/api/buckets", data=body, method="POST")).read())
+    body = b'{"blocks": [{"key": "loss", "level": 20, "index": 0, "runs": ["a/r1"]}]}'
+    answer = bk.decode(bk.unframe(urllib.request.urlopen(urllib.request.Request(f"{base}/api/buckets", data=body, method="POST")).read())[0])
     assert answer.paths == ["a/r1"] and answer.buckets.run.size >= 1
 
 

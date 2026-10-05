@@ -1,5 +1,5 @@
-"""Cases of the formats the Python and browser code share (bucket arrays, live tails, layered levels, binning, smoothing, group
-statistics), written from the Python implementations into shared_cases.json, which tests/shared_cases.test.mjs checks the browser's
+"""Cases of the formats the Python and browser code share (bucket arrays and their framing, live tails, layered levels, binning,
+smoothing, group statistics), written from the Python implementations into shared_cases.json, which tests/shared_cases.test.mjs checks the browser's
 against.
 TREX_WRITE_CASES=1 rewrites the file."""
 
@@ -179,8 +179,16 @@ def stats_cases() -> list[dict[str, object]]:
     return out
 
 
+def frame_case(arrays: list[dict[str, object]]) -> dict[str, object]:
+    """The case arrays in one body (`buckets.frame`), an empty one among them."""
+    bodies = [base64.b64decode(str(c["blob"])) for c in arrays]
+    bodies.insert(1, b"")
+    return {"body": b64(bk.frame(bodies)), "parts": [b64(b) for b in bodies]}
+
+
 def build_cases() -> dict[str, object]:
-    return {"arrays": array_cases(), "tails": tail_cases(), "layers": layer_cases(), "bins": bin_cases(),
+    arrays = array_cases()
+    return {"arrays": arrays, "frame": frame_case(arrays), "tails": tail_cases(), "layers": layer_cases(), "bins": bin_cases(),
             "smoothing": smoothing_cases(), "stats": stats_cases()}
 
 

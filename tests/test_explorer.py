@@ -396,25 +396,31 @@ def test_a_changed_cache_version_deletes_the_saved_levels(root, tmp_path, monkey
     assert saved_levels(explorer(root, tmp_path)) == []
 
 
-def test_http_buckets_answers_the_block_and_info_states_the_protocol(http, root):
+def test_http_buckets_answers_every_block_asked_in_one_body_and_info_states_the_protocol(http, root):
     ex, url = http
     for name in ("x/r1", "x/r2"):
         write_run(root / name, 300)
     ex.rewalk()
     ex.poll()
 
-    def post(body):
-        return urllib.request.urlopen(urllib.request.Request(f"{url}/api/buckets", data=json.dumps(body).encode())).read()
+    def post(*blocks):
+        body = json.dumps({"blocks": list(blocks)}).encode()
+        return bk.unframe(urllib.request.urlopen(urllib.request.Request(f"{url}/api/buckets", data=body)).read())
 
-    assert post({"key": "loss", "level": 0, "index": 0, "scope": "x"}) == ex.buckets_body("loss", 0, 0, "x")
-    assert post({"key": "loss", "level": 0, "index": 1, "runs": ["x/r2"]}) == ex.buckets_body("loss", 0, 1, runs=["x/r2"])
-    assert post({"key": "loss", "level": 2, "index": 0, "scope": "x", "which": "finished"}) == ex.buckets_body("loss", 2, 0, "x", None, "finished")
+    assert post({"key": "loss", "level": 0, "index": 0, "scope": "x"}, {"key": "loss", "level": 0, "index": 1, "runs": ["x/r2"]},
+                {"key": "loss", "level": 2, "index": 0, "scope": "x", "which": "finished"}) == [
+        ex.buckets_body("loss", 0, 0, "x"), ex.buckets_body("loss", 0, 1, runs=["x/r2"]), ex.buckets_body("loss", 2, 0, "x", None, "finished")]
+    ok = {"key": "loss", "level": 0, "index": 0}
     for bad in ({"key": "loss", "level": 0.5, "index": 0}, {"key": "loss", "level": 0, "index": 0, "which": "some"},
                 {"key": "loss", "level": bk.MAX_LEVEL + 1, "index": 0}, {"key": "loss", "level": 0, "index": 0, "runs": "x/r1"},
                 {"level": 0, "index": 0}):
         with pytest.raises(urllib.error.HTTPError) as e:
-            post(bad)
+            post(ok, bad)
         assert e.value.code == 400, bad
+    for blocks in ([], [ok] * (server.MAX_ASKS + 1)):
+        with pytest.raises(urllib.error.HTTPError) as e:
+            post(*blocks)
+        assert e.value.code == 400
     with urllib.request.urlopen(f"{url}/api/info") as r:
         assert json.loads(r.read())["protocol"] == server.PROTOCOL
 
@@ -787,7 +793,8 @@ def test_http_media_ranges_cover_suffixes_open_ends_and_unsatisfiable_starts(htt
     ("GET", "/api/nothing", None, 404),
     ("POST", "/api/buckets", b'["not", "an object"]', 400),
     ("POST", "/api/buckets", b"not json", 400),
-    ("POST", "/api/buckets", b'{"key": "loss", "level": 0, "index": 0, "which": "fine"}', 400),
+    ("POST", "/api/buckets", b'{"key": "loss", "level": 0, "index": 0}', 400),
+    ("POST", "/api/buckets", b'{"blocks": [{"key": "loss", "level": 0, "index": 0, "which": "fine"}]}', 400),
 ])
 def test_http_bad_requests_are_client_errors_with_a_json_message(http, root, method, path, body, status):
     ex, url = http

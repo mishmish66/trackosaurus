@@ -19,7 +19,7 @@ import numpy as np
 from urllib.parse import quote
 
 from . import buckets as bk
-from .index import HEARTBEAT, Explorer, Which, dumps, sse_text
+from .index import HEARTBEAT, Ask, Explorer, dumps, sse_text
 from .remote import Remote
 
 STREAM_READ_TIMEOUT: Final = 3 * HEARTBEAT  # seconds without a byte after which a member's stream is reopened
@@ -67,10 +67,10 @@ class Far:
     def rows_json(self, path: str, start: int) -> str:
         return self._call("GET", f"/api/rows?path={quote(path)}&from={start}").decode()
 
-    def buckets_body(self, key: str, level: int, index: int, scope: str, runs: Sequence[str] | None,
-                     which: Which) -> bytes:
-        body = {"key": key, "level": level, "index": index, "scope": scope, "which": which}
-        return self._call("POST", "/api/buckets", json.dumps({**body, "runs": list(runs)} if runs is not None else body).encode())
+    def buckets_bodies(self, asks: Sequence[Ask]) -> list[bytes]:
+        blocks = [{"key": a.key, "level": a.level, "index": a.block, "scope": a.scope, "runs": None if a.runs is None else list(a.runs),
+                   "which": a.which} for a in asks]
+        return bk.unframe(self._call("POST", "/api/buckets", json.dumps({"blocks": blocks}).encode()))
 
     def messages(self, prefix: str, stop: threading.Event) -> Generator[bytes, None, None]:
         """The remote server's stream, a message at a time, reopened when it drops, until `stop`."""
@@ -228,35 +228,47 @@ class Workspace:
         m, mp = self.resolve(path)
         return _with_run(m.src.rows_json(mp, start), mp, path)
 
-    def buckets_body(self, key: str, level: int, index: int, scope: str = "", runs: Sequence[str] | None = None,
-                     which: Which = "all") -> bytes:
-        """The block as `Explorer.buckets_body` answers it, of every member's runs it names, run ids renamed, in id
-        order."""
-        if runs is None:
-            calls = [(m, mp, None) for m, mp in self._scope(scope)]
-        else:
-            by_member: dict[str, list[str]] = {}
-            for r in runs:
+    def buckets_bodies(self, asks: Sequence[Ask]) -> list[bytes]:
+        """Each block as `Explorer.buckets_bodies` answers it, of every member's runs it names, run ids renamed, in id
+        order; one request to each member."""
+        per: dict[str, list[tuple[int, Ask]]] = {}  # member -> (ask, its part of the ask)
+        for i, a in enumerate(asks):
+            if a.runs is None:
+                for m, mp in self._scope(a.scope):
+                    per.setdefault(m.name, []).append((i, a._replace(scope=mp)))
+                continue
+            mine: dict[str, list[str]] = {}
+            for r in a.runs:
                 with contextlib.suppress(KeyError):
                     m, mp = self.resolve(r)
-                    by_member.setdefault(m.name, []).append(mp)
-            calls = [(m, "", by_member[m.name]) for m in self.members if m.name in by_member]
-        bodies = list(self._pool.map(lambda c: _try(lambda: c[0].src.buckets_body(key, level, index, c[1], c[2], which)), calls))
+                    mine.setdefault(m.name, []).append(mp)
+            for name, paths in mine.items():
+                per.setdefault(name, []).append((i, a._replace(scope="", runs=paths)))
+        members = {m.name: m for m in self.members}
+        calls = list(per.items())
+        answers = self._pool.map(lambda c: _try(lambda: members[c[0]].src.buckets_bodies([a for _, a in c[1]])), calls)
+        parts: list[list[tuple[Member, bytes]]] = [[] for _ in asks]
+        for (name, items), bodies in zip(calls, answers, strict=True):
+            for (i, _), body in zip(items, bodies or [], strict=False):
+                if body:
+                    parts[i].append((members[name], body))
+        return [self._join(a.level, a.block, got) for a, got in zip(asks, parts, strict=True)]
+
+    def _join(self, level: int, index: int, parts: Sequence[tuple[Member, bytes]]) -> bytes:
+        """One bucket array of the members' arrays of a block, run ids renamed, in id order."""
         paths: list[str] = []
         seqs: list[np.ndarray] = []
-        parts: list[bk.Buckets] = []
-        for (m, _, _), body in zip(calls, bodies, strict=True):
-            if body is None:
-                continue
+        bs: list[bk.Buckets] = []
+        for m, body in parts:
             a = bk.decode(body)
-            parts.append(a.buckets._replace(run=a.buckets.run + len(paths)))
+            bs.append(a.buckets._replace(run=a.buckets.run + len(paths)))
             paths += [self.ws_id(m, p) for p in a.paths]
             seqs.append(a.seq)
         seq = np.concatenate(seqs) if seqs else np.empty(0, np.uint32)
         order = np.argsort(np.array(paths, dtype=object), kind="stable").astype(np.int64)
         rank = np.empty(len(paths), np.int32)
         rank[order] = np.arange(len(paths), dtype=np.int32)
-        b = bk.union(parts)
+        b = bk.union(bs)
         b = b._replace(run=rank[b.run])
         b = bk.take(b, np.argsort(b.run, kind="stable"))
         return bk.encode(level, index, [paths[i] for i in order], seq[order], b)

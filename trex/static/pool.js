@@ -70,9 +70,9 @@ function refer(c, refs, q) {
 
 let fetches = 0;
 
-/** POST `body` to `url` on a worker, which reads the bucket array it answers into shared memory: a promise of
- * {status, buf (SharedArrayBuffer, null unless the answer was a bucket array), bytes, paths (its runs)}. */
-export function fetchArrayOnWorker(url, body) {
+/** POST `body` to `url` on a worker, which reads the bucket arrays it answers into shared memory: a promise of
+ * {status, arrays ({buf (SharedArrayBuffer), bytes, paths (its runs)}, null for a block not answered), bytes}. */
+export function fetchArraysOnWorker(url, body) {
   const ws = pool(), job = ++jobs;
   return new Promise((ok) => {
     answers.set(job, ok);
