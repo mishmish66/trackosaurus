@@ -172,6 +172,14 @@ def merge(b: Buckets, up: int | Ints) -> Buckets:
                    (np.add.reduceat(b.tmean * w, starts) / nn).astype(np.float32), nn.astype(np.uint32))
 
 
+def refine(b: Buckets, level: int, finer: int) -> Buckets:
+    """Buckets `b` of `level` as buckets of the finer level `finer`, each where its mean step lies: a bucket of one row
+    is that row's; one of several rows stays one, at their mean step."""
+    s = b.step(level) / 2.0 ** finer
+    bucket = np.floor(s).astype(np.int64)
+    return b._replace(bucket=bucket, soff=_quantized(s - bucket))
+
+
 def cut(b: Buckets, lo: int, hi: int, take: npt.NDArray[np.bool_] | None = None) -> Buckets:
     """The buckets of `b` in [lo, hi) of the runs `take` marks (all when None)."""
     keep = (b.bucket >= lo) & (b.bucket < hi)
@@ -304,6 +312,29 @@ def kept(steps: Floats, values: Floats, times: Floats, seq: int) -> bytes:
     level = level_for(float(steps.max() - steps.min()))
     b = bucketize(steps, values, times, level)
     return encode(level, int(b.bucket[0]) // BLOCK if b.run.size else 0, [""], [seq], b)
+
+
+def finest(steps: Floats) -> int:
+    """The level whose buckets hold about one value of a run's `steps` each: their median spacing's, rounded down."""
+    gaps = np.diff(np.unique(steps))
+    return max(MIN_LEVEL, int(np.floor(np.log2(np.median(gaps))))) if gaps.size else MAX_LEVEL
+
+
+def pyramid(steps: Floats, values: Floats, times: Floats, seq: int) -> tuple[int, list[tuple[int, int, bytes]]]:
+    """A run's rows `seq` (steps, values, runtimes) at every level from `finest` up to below its kept level: (the finest
+    level, [(level, block, one-run bucket array)] of each block holding buckets)."""
+    fine = finest(steps)
+    top = level_for(float(steps.max() - steps.min())) if steps.size else MIN_LEVEL
+    out: list[tuple[int, int, bytes]] = []
+    b = bucketize(steps, values, times, fine) if fine < top else empty()
+    for level in range(fine, top):
+        blocks = b.bucket // BLOCK
+        cuts = np.flatnonzero(np.r_[True, blocks[1:] != blocks[:-1], True])
+        for lo, hi in zip(cuts[:-1].tolist(), cuts[1:].tolist()):
+            part = Buckets(b.run[lo:hi], b.bucket[lo:hi], b.mean[lo:hi], b.soff[lo:hi], b.tmean[lo:hi], b.n[lo:hi])
+            out.append((level, int(blocks[lo]), encode(level, int(blocks[lo]), [""], [seq], part)))
+        b = merge(b, 1)
+    return fine, out
 
 
 def built(steps: Floats, values: Floats, times: Floats, seq: int, level: int, index: int) -> bytes:

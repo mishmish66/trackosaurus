@@ -18,6 +18,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 from collections import OrderedDict, deque
 from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
@@ -77,6 +78,15 @@ class KeptRecord(NamedTuple):
     data: bytes
 
 
+class Compiled(NamedTuple):
+    """A metric of a run at every level below its kept one (`buckets.pyramid`): the finest level, and (level, block,
+    compressed one-run bucket array) of each block holding buckets."""
+
+    key: str
+    fine: int
+    blocks: list[tuple[int, int, bytes]]
+
+
 class Public(TypedDict):
     """Metadata from the run file."""
 
@@ -98,11 +108,13 @@ class Prev(TypedDict):
     kept_seq: int
     kept_t: float
     kept_state: RunState | None
+    pyramid_seq: int
+    pyramid_t: float
 
 
 class Job(TypedDict):
-    """A run to scan and how: `want_rows` when a browser watches it, `kept_refresh` seconds between rebuilds of a
-    growing run's kept buckets."""
+    """A run to scan and how: `want_rows` when a browser watches it, `kept_refresh` and `pyramid_refresh` seconds
+    between rebuilds of a growing run's kept buckets and compiles of its finer levels."""
 
     path: str
     dir: str
@@ -110,6 +122,7 @@ class Job(TypedDict):
     prev: Prev | None
     crash_after: float
     kept_refresh: float
+    pyramid_refresh: float
     want_rows: bool
 
 
@@ -130,6 +143,7 @@ class ScanResult(TypedDict):
     keys: list[str]
     summary: Summary | None
     kept: list[KeptRecord] | None
+    pyramid: list[Compiled] | None
     rows: str | None
 
 
@@ -148,6 +162,8 @@ class RunRecord(TypedDict):
     kept_seq: int
     kept_t: float
     kept_state: RunState | None
+    pyramid_seq: int
+    pyramid_t: float
 
 
 class RunMeta(TypedDict):
@@ -182,11 +198,12 @@ class RunView(TypedDict):
     run: RunMeta
     media: list[MediaRecord]
 
-CACHE_VERSION: Final = 13  # bump whenever what the index stores changes; older caches are rebuilt
+CACHE_VERSION: Final = 14  # bump whenever what the index stores changes; older caches are rebuilt
 CRASH_AFTER = 300.0  # seconds without a heartbeat after which a running run shows as crashed
 POLL: Final = 1.0  # seconds between polls of known runs
 REWALK: Final = 3.0  # seconds between walks of the root for new and removed runs
 KEPT_REFRESH = float(os.environ.get("TREX_KEPT_REFRESH", "10"))  # seconds between rebuilds of a growing run's kept buckets
+PYRAMID_REFRESH = float(os.environ.get("TREX_PYRAMID_REFRESH", "300"))  # seconds between compiles of a growing run's finer levels
 SKIP_DIRS: Final = frozenset({"node_modules", "__pycache__"})
 INLINE_BYTES = 5 << 20  # polls whose run files grew by at most this many bytes are read in the main process
 BATCH_RUNS: Final = 256  # scan results per index transaction
@@ -214,6 +231,12 @@ TABLES: Final = {
     # a run's buckets of a metric at the level it keeps them at (a one-run bucket array); seq: the rows they hold
     "kept": "CREATE TABLE IF NOT EXISTS kept(path TEXT, key TEXT, level INTEGER, seq INTEGER, data BLOB, PRIMARY KEY(key, path))",
     "kept_path": "CREATE INDEX IF NOT EXISTS kept_path ON kept(path)",
+    # a run's buckets of a metric at every level below its kept one (compressed one-run bucket arrays, those holding
+    # buckets), and per run and metric the finest of those levels and the rows they hold
+    "pyramid": "CREATE TABLE IF NOT EXISTS pyramid(key TEXT, level INTEGER, block INTEGER, path TEXT, data BLOB, "
+               "PRIMARY KEY(key, level, block, path))",
+    "pyramid_path": "CREATE INDEX IF NOT EXISTS pyramid_path ON pyramid(path)",
+    "compiled": "CREATE TABLE IF NOT EXISTS compiled(path TEXT, key TEXT, fine INTEGER, seq INTEGER, PRIMARY KEY(key, path))",
 }
 
 
@@ -324,14 +347,22 @@ def _last_values(c: sqlite3.Connection, names: Mapping[int, str]) -> dict[str, f
     return out
 
 
-def _kept_arrays(c: sqlite3.Connection, names: Mapping[int, str], stop: int) -> list[KeptRecord]:
-    """Every metric's kept buckets over rows [0, stop)."""
-    out: list[KeptRecord] = []
-    for kid, name in sorted(names.items(), key=lambda kv: kv[1]):
+def _compile(c: sqlite3.Connection, names: Mapping[int, str], stop: int, kept: bool,
+             finer: bool) -> tuple[list[KeptRecord] | None, list[Compiled] | None]:
+    """Every metric's kept buckets over rows [0, stop) when `kept`, and its levels below them when `finer`; each metric
+    read once."""
+    ks: list[KeptRecord] = []
+    ps: list[Compiled] = []
+    for kid, name in sorted(names.items(), key=lambda kv: kv[1]) if kept or finer else []:
         s, v, t = chunks.metric(c, kid, stop=stop)
-        if s.size:
-            out.append(KeptRecord(name, bk.level_for(float(s.max() - s.min())), bk.kept(s, v, t, stop)))
-    return out
+        if not s.size:
+            continue
+        if kept:
+            ks.append(KeptRecord(name, bk.level_for(float(s.max() - s.min())), bk.kept(s, v, t, stop)))
+        if finer:
+            fine, blocks = bk.pyramid(s, v, t, stop)
+            ps.append(Compiled(name, fine, [(level, i, zlib.compress(blob, 1)) for level, i, blob in blocks]))
+    return (ks if kept else None), (ps if finer else None)
 
 
 def scan(job: Job) -> ScanResult | None:
@@ -348,7 +379,8 @@ def scan(job: Job) -> ScanResult | None:
         prev = None if reset else prev
         names = chunks.key_names(c)
         summary = _summary(c, names, seq) if prev is None or seq != prev["seq"] else None
-        kept = _kept_arrays(c, names, seq) if _kept_due(prev, seq, state, job["kept_refresh"]) else None
+        kept, pyramid = _compile(c, names, seq, _kept_due(prev, seq, state, job["kept_refresh"]),
+                                 _pyramid_due(prev, seq, state, job["pyramid_refresh"]))
         text = (_rows_event(path, prev["seq"], chunks.rows(c, prev["seq"], seq))
                 if prev and _rows_wanted(job, prev, seq) else None)
         mseq = prev["mseq"] if prev else 0
@@ -359,7 +391,7 @@ def scan(job: Job) -> ScanResult | None:
     return {"path": path, "sig": sig, "uid": str(meta["id"]), "reset": reset, "fresh": prev is None,
             "seq": seq, "mseq": mseq + len(media), "media": media,
             "state": state, "heartbeat": heartbeat, "public": _public(meta, state), "keys": sorted(names.values()),
-            "summary": summary, "kept": kept, "rows": text}
+            "summary": summary, "kept": kept, "pyramid": pyramid, "rows": text}
 
 
 def _state(meta: Mapping[str, JSONValue], crash_after: float) -> tuple[RunState, float | None]:
@@ -383,6 +415,25 @@ def _kept_due(prev: Prev | None, seq: int, state: RunState, refresh: float) -> b
         return True
     stale = prev["kept_seq"] != seq or prev["kept_state"] != state
     return stale and (state != "running" or time.time() - prev["kept_t"] >= refresh)
+
+
+def _pyramid_due(prev: Prev | None, seq: int, state: RunState, refresh: float) -> bool:
+    """Finer levels are compiled for a new run, and for a changed one when it stopped running or `refresh` passed."""
+    if prev is None:
+        return True
+    return prev["pyramid_seq"] != seq and (state != "running" or time.time() - prev["pyramid_t"] >= refresh)
+
+
+def _refined(data: bytes | None, fine: int, level: int, index: int, seq: int) -> bytes:
+    """Block `index` of `level` from compressed block `data` of level `fine` (or none): as it is when `fine` is `level`,
+    else its buckets refined to `level` and cut to the block."""
+    if data is None:
+        return bk.encode(level, index, [""], [seq], bk.empty())
+    blob = zlib.decompress(data)
+    if fine == level:
+        return blob
+    b = bk.cut(bk.refine(bk.decode(blob).buckets, fine, level), index * bk.BLOCK, (index + 1) * bk.BLOCK)
+    return bk.encode(level, index, [""], [seq], b)
 
 
 def _rewritten(prev: Prev, uid: JSONValue, rows: int, media: int) -> bool:
@@ -521,7 +572,8 @@ def _record(r: ScanResult, cur: RunRecord | None) -> RunRecord:
             "summary": r["summary"] if r["summary"] is not None else cur["summary"] if cur else {},
             "sig": r["sig"], "heartbeat": r["heartbeat"], "public": r["public"], "state": r["state"],
             "kept_seq": cur["kept_seq"] if cur else -1, "kept_t": cur["kept_t"] if cur else 0.0,
-            "kept_state": cur["kept_state"] if cur else None}
+            "kept_state": cur["kept_state"] if cur else None, "pyramid_seq": cur["pyramid_seq"] if cur else -1,
+            "pyramid_t": cur["pyramid_t"] if cur else 0.0}
 
 
 def _bytes_of(sig: Sig) -> int:
@@ -767,9 +819,10 @@ class Explorer:
         prev: Prev | None = None
         if st:
             prev = {"uid": st["uid"], "seq": st["seq"], "mseq": st["mseq"], "kept_seq": st["kept_seq"],
-                    "kept_t": st["kept_t"], "kept_state": st["kept_state"]}
+                    "kept_t": st["kept_t"], "kept_state": st["kept_state"], "pyramid_seq": st["pyramid_seq"],
+                    "pyramid_t": st["pyramid_t"]}
         return {"path": path, "dir": str(d), "sig": sig, "prev": prev, "crash_after": CRASH_AFTER,
-                "kept_refresh": KEPT_REFRESH, "want_rows": self.hub.watched(path)}
+                "kept_refresh": KEPT_REFRESH, "pyramid_refresh": PYRAMID_REFRESH, "want_rows": self.hub.watched(path)}
 
     def _sync_inline(self, todo: Sequence[tuple[str, Path, Sig]]) -> None:
         batch = _Batch(self)
@@ -877,6 +930,13 @@ class Explorer:
             self._writer.executemany("INSERT INTO kept VALUES (?,?,?,?,?)",
                                      [(path, k.key, k.level, r["seq"], k.data) for k in r["kept"]])
             st.update(kept_seq=r["seq"], kept_t=now, kept_state=r["state"])
+        if r["pyramid"] is not None:
+            for t in ("pyramid", "compiled"):
+                self._writer.execute(f"DELETE FROM {t} WHERE path=?", (path,))
+            self._writer.executemany("INSERT INTO pyramid VALUES (?,?,?,?,?)",
+                                     [(p.key, level, i, path, data) for p in r["pyramid"] for level, i, data in p.blocks])
+            self._writer.executemany("INSERT INTO compiled VALUES (?,?,?,?)", [(path, p.key, p.fine, r["seq"]) for p in r["pyramid"]])
+            st.update(pyramid_seq=r["seq"], pyramid_t=now)
         self._writer.execute("INSERT OR REPLACE INTO runs VALUES (?, ?)", (path, dumps(st)))
         return st, ev + _events(r, cur, st)
 
@@ -889,7 +949,7 @@ class Explorer:
         """Delete a run's index rows inside the caller's write transaction."""
         rec = self.records.get(path)
         self._bump(rec["keys"] if rec else list(self._gens))
-        for t in ("runs", "media", "kept"):
+        for t in ("runs", "media", "kept", "pyramid", "compiled"):
             self._writer.execute(f"DELETE FROM {t} WHERE path=?", (path,))
 
     # ---- queries ----
@@ -1050,11 +1110,35 @@ class Explorer:
             fine += [int(i) for i in others[~near]]
         if fine:
             fine.sort()
-            st = bk.stack([paths[i] for i in fine], [blob for blob, _ in self._build_many([paths[i] for i in fine], key, level, index)])
+            blobs = self._compiled(key, level, index, [paths[i] for i in fine])
+            todo = [paths[i] for i in fine if paths[i] not in blobs]
+            for p, (blob, _) in zip(todo, self._build_many(todo, key, level, index) if todo else [], strict=True):
+                blobs[p] = blob
+            st = bk.stack([paths[i] for i in fine], [blobs[paths[i]] for i in fine])
             pos = np.array(fine, np.int32)
             seq[pos] = st.seq
             parts.append(st.buckets._replace(run=pos[st.buckets.run]))
         return bk.encode(level, index, paths, seq, bk.union(parts))
+
+    def _compiled(self, key: str, level: int, index: int, paths: Sequence[str]) -> dict[str, bytes]:
+        """Block `index` of `level` of `key` of each of `paths` whose levels are compiled from every row it has: its one-run
+        bucket array, empty where it has no buckets; below the finest level compiled, that level's buckets refined."""
+        with self.lock:
+            rows_now = {p: self.records[p]["seq"] for p in paths if p in self.records}
+        c = self.reader()
+        try:
+            have = {p: (fine, n) for p, fine, n in c.execute("SELECT path, fine, seq FROM compiled WHERE key=?", (key,))
+                    if rows_now.get(p) == n}
+            out: dict[str, bytes] = {}
+            for fine in sorted({max(fine, level) for fine, _ in have.values()}):
+                block = index >> (fine - level)
+                rows = dict(c.execute("SELECT path, data FROM pyramid WHERE key=? AND level=? AND block=?", (key, fine, block)))
+                for p, (f, n) in have.items():
+                    if max(f, level) == fine:
+                        out[p] = _refined(rows.get(p), fine, level, index, n)
+        finally:
+            self.release(c)
+        return out
 
     def _runs(self, key: str) -> tuple[list[str], npt.NDArray[np.int8], npt.NDArray[np.uint32]]:
         """The finished runs of `key` in path order, the level each keeps its buckets at and the rows they hold: from

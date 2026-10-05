@@ -120,9 +120,9 @@ def run_points(root, path, key):
 def index_dump(ex):
     """Everything the index stores, without access and build times."""
     c = sqlite3.connect(ex.db_path)
-    out = {t: c.execute(f"SELECT * FROM {t} ORDER BY 1, 2").fetchall() for t in ("runs", "media", "kept")}
+    out = {t: sorted(c.execute(f"SELECT * FROM {t}").fetchall()) for t in ("runs", "media", "kept", "pyramid", "compiled")}
     c.close()
-    out["runs"] = [(p, {k: v for k, v in json.loads(s).items() if k != "kept_t"}) for p, s in out["runs"]]
+    out["runs"] = [(p, {k: v for k, v in json.loads(s).items() if k not in ("kept_t", "pyramid_t")}) for p, s in out["runs"]]
     return out
 
 
@@ -156,6 +156,14 @@ def of_run(a, path):
 def same(a, b):
     """Whether two runs' buckets are equal (NaN equal to NaN)."""
     return all(np.array_equal(x, y, equal_nan=x.dtype.kind == "f") for x, y in zip(a[1:], b[1:], strict=True))
+
+
+def close(a, b, level):
+    """Whether two runs' buckets of `level` hold the same buckets and counts, with means, steps and runtimes equal to
+    float32 rounding (merged from finer buckets, as against bucketized from rows)."""
+    return (np.array_equal(a.bucket, b.bucket) and np.array_equal(a.n, b.n)
+            and np.allclose(a.mean, b.mean, rtol=1e-6, atol=1e-6, equal_nan=True) and np.allclose(a.tmean, b.tmean, rtol=1e-6)
+            and np.allclose(a.step(level), b.step(level), atol=2.0 ** level * 4 / bk.SOFF_SCALE))
 
 
 def test_a_finished_run_keeps_each_metrics_buckets_holding_every_finite_point(root, tmp_path):
@@ -265,7 +273,7 @@ def test_requests_on_a_kept_alive_connection_answer_without_waiting_for_delayed_
     assert sorted(times[1:])[2] < 0.02, times
 
 
-def test_a_block_holds_runs_from_their_kept_buckets_or_their_run_files(root, tmp_path):
+def test_a_block_holds_runs_from_their_kept_buckets_or_their_compiled_levels(root, tmp_path):
     write_run(root / "a" / "short", 600)
     write_run(root / "a" / "long", 5000)
     live = write_run(root / "a" / "live", 600, finish=False)
@@ -276,7 +284,7 @@ def test_a_block_holds_runs_from_their_kept_buckets_or_their_run_files(root, tmp
     a = block(ex, "loss", level, 0, "a", which="finished")
     assert a.paths == ["a/long", "a/short"] and list(a.seq) == [5000, 600]
     s, v, t = run_points(root, "a/long", "loss")
-    assert same(of_run(a, "a/long"), bk.cut(bk.bucketize(s, v, t, level), 0, bk.BLOCK))
+    assert close(of_run(a, "a/long"), bk.cut(bk.bucketize(s, v, t, level), 0, bk.BLOCK), level)
     assert same(of_run(a, "a/short"), bk.cut(bk.merge(kept_of(ex, "a/short", "loss").buckets, 1), 0, bk.BLOCK))
     every = block(ex, "loss", level, 0, "a")
     assert every.paths == ["a/live", "a/long", "a/short"] and list(every.seq) == [600, 5000, 600]
@@ -286,16 +294,41 @@ def test_a_block_holds_runs_from_their_kept_buckets_or_their_run_files(root, tmp
     live.finish()
 
 
-def test_a_block_builds_what_runs_keep_coarser_on_the_process_pool_as_the_run_files_hold_it(root, tmp_path, monkeypatch):
+def test_a_finished_runs_finer_blocks_come_from_its_compiled_levels_without_its_run_file(root, tmp_path, monkeypatch):
+    rows = mixed_rows(5000)
+    write_chunked(root / "r", chunked(rows, [1000] * 5))
+    ex = explorer(root, tmp_path)
+    monkeypatch.setattr(trex_index, "build_block", lambda *a: pytest.fail("read the run file"))
+    for lv, i in [(4, 1), (2, 3)]:
+        assert close(of_run(block(ex, "loss", lv, i, runs=["r"]), "r"), expected(rows, "loss", lv, i), lv)
+
+
+def test_blocks_below_the_finest_compiled_level_are_refined_from_it_without_the_run_file(root, tmp_path, monkeypatch):
+    rows = [(float(i), i / 2, {"loss": 1 / (i + 1)}) for i in range(3000)]  # a step apart: compiled down to level 0
+    write_chunked(root / "r", chunked(rows, [1000] * 3))
+    ex = explorer(root, tmp_path)
+    monkeypatch.setattr(trex_index, "build_block", lambda *a: pytest.fail("read the run file"))
+    for lv, i in [(-1, 3), (-3, 40)]:
+        assert close(of_run(block(ex, "loss", lv, i, runs=["r"]), "r"), expected(rows, "loss", lv, i), lv)
+
+
+def test_a_block_builds_what_runs_have_not_compiled_yet_on_the_process_pool_as_the_run_files_hold_it(root, tmp_path, monkeypatch):
     monkeypatch.setattr(trex_index, "INLINE_BUILDS", 0)
-    for name in ("a/r1", "a/r2"):
-        write_run(root / name, 3000)
+    runs = [write_run(root / name, 3000, finish=False) for name in ("a/r1", "a/r2")]
+    assert wait_for(lambda: [committed_rows(root / p) for p in ("a/r1", "a/r2")] == [3000, 3000])
     ex = explorer(root, tmp_path, workers=2)
+    for run in runs:
+        for i in range(3000, 3100):
+            run.log({"loss": 1.0 / (i + 1)}, step=i)
+    assert wait_for(lambda: [committed_rows(root / p) for p in ("a/r1", "a/r2")] == [3100, 3100])
+    ex.poll()
     level = kept_of(ex, "a/r1", "loss").level - 1
     a = block(ex, "loss", level, 0, "a")
     assert a.paths == ["a/r1", "a/r2"]
     for p in a.paths:
         assert same(of_run(a, p), bk.decode(trex_index.build_block(str(root / p), "loss", level, 0)[0]).buckets)
+    for run in runs:
+        run.finish()
 
 
 def test_a_finished_block_stays_while_running_runs_grow_and_changes_once_one_finishes(root, tmp_path, monkeypatch):
@@ -418,13 +451,13 @@ def test_http_buckets_answers_every_block_asked_in_one_body_and_info_states_the_
         assert json.loads(r.read())["protocol"] == server.PROTOCOL
 
 
-def test_blocks_finer_than_a_run_keeps_are_built_from_its_file(root, tmp_path):
+def test_blocks_finer_than_a_run_keeps_hold_its_rows_at_that_level(root, tmp_path):
     rows = mixed_rows(5000)
     write_chunked(root / "r", chunked(rows, [1000] * 5))
     ex = explorer(root, tmp_path)
-    for k, lv, i in [("loss", 2, 3), ("lr", 0, 7), ("x", -1, 0), ("loss", 5, 99)]:
+    for k, lv, i in [("loss", 2, 3), ("lr", 0, 7), ("x", -1, 0), ("loss", 5, 99), ("loss", -3, 0)]:
         a = block(ex, k, lv, i, runs=["r"])
-        assert (a.paths, list(a.seq), a.level) == (["r"], [5000], lv) and same(of_run(a, "r"), expected(rows, k, lv, i))
+        assert (a.paths, list(a.seq), a.level) == (["r"], [5000], lv) and close(of_run(a, "r"), expected(rows, k, lv, i), lv)
     assert block(ex, "nope", 0, 0, runs=["r"]).paths == [] and block(ex, "loss", 0, 0, runs=["nope"]).paths == []
     with pytest.raises(ValueError):
         ex.buckets_body("loss", bk.MAX_LEVEL + 1, 0, runs=["r"])

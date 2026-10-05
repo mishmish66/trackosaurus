@@ -78,14 +78,17 @@ them WebGL falls back to software and timings mean nothing.
   count-weighted, as `bucketize` would make them) and `cut` (a block, or some runs).
 - **Index** (`<cache>/<hash of root>/index.sqlite`): per-run metadata, last values, metric names, media, and each
   run's *kept* buckets of every metric: one array at the finest level whose blocks are as wide as the run
-  (`buckets.level_for`), so at most two blocks. Growing runs get new kept buckets every `KEPT_REFRESH` seconds
-  (`TREX_KEPT_REFRESH`) and when they finish or crash. The index never holds a full copy of the data.
+  (`buckets.level_for`), so at most two blocks; and its *compiled* levels (`pyramid`, `compiled`): every level below
+  the kept one down to where a bucket holds about one row (`buckets.pyramid`, the finest from the median step spacing),
+  as compressed one-run blocks. Growing runs get new kept buckets every `KEPT_REFRESH` seconds (`TREX_KEPT_REFRESH`)
+  and newly compiled levels every `PYRAMID_REFRESH` (`TREX_PYRAMID_REFRESH`), and both when they finish or crash.
 - **Server**: `POST /api/buckets {blocks: [{key, level, index, scope | runs, which}]}` (at most `server.MAX_ASKS`)
   answers each block of one metric for a list of runs, or for the runs of a folder in state `which` (`all`,
   `finished`, `running`), as a bucket array (`Explorer.buckets_body`), all in one body (`buckets.frame`). A run that keeps its buckets at the level or finer is merged from them: a finished run
   from its metric's merged level (`Explorer._level`: every finished run's kept buckets decoded at once,
   `buckets.stack`, merged on threads), a running one from its kept buckets read from the index. A run that keeps
-  coarser buckets has the block built from its run file (`build_block`, on a process pool beyond `INLINE_BUILDS`).
+  coarser buckets has the block read from its compiled levels when they hold every row it has (`Explorer._compiled`),
+  else built from its run file (`build_block`, on a process pool beyond `INLINE_BUILDS`).
   The levels from a metric's
   coarsest kept one to `LEVELS_AHEAD` above it are merged ahead of requests and saved beside the index
   (`<cache>/levels/<metric>-<digest>/`, one `.npy` per array, memory-mapped when read), at most once a metric every `LEVELS_SAVE_EVERY` seconds and up to

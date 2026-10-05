@@ -176,6 +176,41 @@ def test_a_run_keeps_its_buckets_at_the_finest_level_whose_blocks_its_steps_fit_
     assert_buckets(a.buckets, by_bucket(steps, values, times, a.level), a.level)
 
 
+@pytest.mark.parametrize("gaps", [False, True])
+def test_a_pyramid_holds_every_level_from_about_a_value_a_bucket_to_below_the_kept_one_as_built_blocks(gaps):
+    steps, values, times = rows(3000, gaps=gaps)
+    steps = np.round(steps)
+    fine, blocks = bk.pyramid(steps, values, times, 3000)
+    top = bk.level_for(float(steps.max() - steps.min()))
+    assert fine == int(np.floor(np.log2(float(np.median(np.diff(np.unique(steps).astype(np.float64))))))) and fine < top
+    assert sorted({level for level, _, _ in blocks}) == list(range(fine, top))
+    for level, index, blob in blocks:
+        got, want = bk.decode(blob), bk.decode(bk.built(steps, values, times, 3000, level, index))
+        assert (got.level, list(got.seq)) == (want.level, list(want.seq))
+        assert list(got.buckets.bucket) == list(want.buckets.bucket) and list(got.buckets.n) == list(want.buckets.n)
+        np.testing.assert_allclose(got.buckets.mean, want.buckets.mean, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(got.buckets.tmean, want.buckets.tmean, rtol=1e-6)
+        np.testing.assert_allclose(got.buckets.step(level), want.buckets.step(level), atol=2.0 ** level * 4 / SOFF_SCALE)
+    for level in range(fine, top):
+        held = {i for lv, i, _ in blocks if lv == level}
+        assert held == {int(i) for i in np.unique(np.floor(steps[~np.isnan(values)] / 2.0 ** level) // BLOCK)}
+
+
+@pytest.mark.parametrize("finer", [1, 3])
+def test_refined_buckets_of_single_rows_are_the_buckets_of_those_rows_at_the_finer_level(finer):
+    steps = np.arange(0.0, 4000.0, 2.0)
+    values = np.sin(steps)
+    b, want = bk.refine(bk.bucketize(steps, values, steps, 1), 1, 1 - finer), by_bucket(steps, values, steps, 1 - finer)
+    assert list(b.bucket) == list(want) and list(b.n) == [w[3] for w in want.values()]
+    np.testing.assert_allclose(b.mean, [w[0] for w in want.values()], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(b.step(1 - finer), [w[1] for w in want.values()], atol=2.0 / SOFF_SCALE)  # as exact as level 1 holds them
+
+
+def test_a_run_whose_kept_buckets_hold_a_value_each_has_no_finer_levels():
+    steps = np.arange(100.0)
+    assert bk.pyramid(steps, steps, steps, 100) == (0, [])
+
+
 def test_a_built_block_holds_the_buckets_of_its_step_range():
     steps, values, times = rows(5000)
     a = bk.decode(bk.built(steps, values, times, 5000, 3, 2))
