@@ -16,7 +16,7 @@ import pytest
 from trex import buckets as bk, daemon, remote, server, update
 from trex.cli import main
 from trex.daemon import ControlServer, Roots
-from trex.mirror import Mirror
+from trex.mirror import Pull
 from trex.remote import Address, Remote
 
 from helpers import post_json, request, wait_for, write_run
@@ -29,8 +29,8 @@ def sessions(home):
 def session(roots, name):
     """The ssh session of the remote directory `name`."""
     entry = roots.get(name)
-    assert isinstance(entry, Mirror) and isinstance(entry.session, Remote)
-    return entry.session
+    assert isinstance(entry.origin, Pull) and isinstance(entry.origin.session, Remote)
+    return entry.origin.session
 
 
 @pytest.fixture
@@ -166,7 +166,7 @@ def test_a_remote_directory_answers_from_its_copy_while_its_host_is_unreachable(
     (home / ".local" / "bin" / "uvx").unlink()
     os.kill(sessions(home)[-1][0], signal.SIGKILL)
     gone = lambda: [(r["state"], "uv is not installed" in r["error"]) for r in json.loads(request(f"{http}/api/daemon")[2])["roots"]]
-    assert wait_for(lambda: gone() == [("unreachable", True)] and not roots.get(name).connected)
+    assert wait_for(lambda: gone() == [("unreachable", True)] and not roots.get(name).origin.connected)
     assert sorted(r["id"] for r in json.loads(request(f"{base}/api/runs")[2])["runs"]) == ["a/r1", "b/r2"]
 
 

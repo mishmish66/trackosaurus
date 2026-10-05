@@ -55,8 +55,9 @@ from typing import Final, NamedTuple, TypedDict, cast
 from urllib.parse import quote, urlsplit
 
 from . import remote
+from .crawl import Crawl
 from .index import Explorer
-from .mirror import Mirror, Unreachable, Upstream
+from .mirror import Pull, Unreachable, Upstream
 from .remote import Remote, UnixHTTPConnection
 from .workspace import Member, Workspace
 
@@ -290,7 +291,7 @@ class Roots:
         with self.lock:
             if d not in self.specs:
                 self._unpull(d)
-                self.entries[d], self.specs[d] = Explorer(Path(spec), self.cache).start(), spec
+                self.entries[d], self.specs[d] = Explorer(Crawl(spec), self.cache).start(), spec
                 self._changed(spec)
             return self.names()[d]
 
@@ -308,7 +309,7 @@ class Roots:
         if wait and r.settled.wait(remote.ADD_TIMEOUT) and r.state == "unreachable":
             r.close()
             raise ValueError(f"cannot serve {spec}: {r.error}")
-        m = Mirror(Upstream(lambda timeout: UnixHTTPConnection(r.local, timeout), spec), self.cache, spec, session=r)
+        m = Explorer(Pull(Upstream(lambda timeout: UnixHTTPConnection(r.local, timeout), spec), spec, session=r), self.cache)
         with self.lock:
             if spec in self.specs:
                 m.close()
@@ -363,10 +364,10 @@ class Roots:
                     self.pulled[d] = Pulled(held.link, (link.offers or {})[d])
                     continue
                 entry = self.entries.get(d)
-                if isinstance(entry, Mirror):
-                    entry.retarget(Upstream.at(url, dir_base(d)))
+                if entry is not None and isinstance(entry.origin, Pull):
+                    entry.origin.retarget(Upstream.at(url, dir_base(d)))
                 else:
-                    self.entries[d] = Mirror(Upstream.at(url, dir_base(d)), self.cache, d).start()
+                    self.entries[d] = Explorer(Pull(Upstream.at(url, dir_base(d)), d), self.cache).start()
                 self.pulled[d] = Pulled(url, via)
                 self._changed(None)
             for d, p in list(self.pulled.items()):
@@ -376,7 +377,7 @@ class Roots:
                     del self.pulled[d]
                     self._changed(None)
         for e in closing:
-            threading.Thread(target=e.close, name=f"trex-close-{e.root.name}", daemon=True).start()
+            threading.Thread(target=e.close, name=f"trex-close-{e.origin.key}", daemon=True).start()
 
     def _offers(self) -> dict[str, tuple[str, list[str]]]:
         """{directory id: (link url, via)}: for each directory the links offer that this trex does not crawl, the link
@@ -444,9 +445,7 @@ class Roots:
         self._pull.set()
         with self.lock:
             entries, self.entries, self.specs, self.pulled = list(self.entries.values()), {}, {}, {}
-            views, self._views = list(self._views.values()), {}
-        for v in views:
-            v.close()
+            self._views = {}
         for entry in entries:
             entry.close()
 
@@ -464,14 +463,14 @@ class Roots:
             return [self._info(d, names[d]) for d in self.entries]
 
     def _info(self, d: str, name: str) -> RootInfo:
-        e, pulled = self.entries[d], self.pulled.get(d)
+        origin, pulled = self.entries[d].origin, self.pulled.get(d)
         state, error = "local", ""
-        if isinstance(e, Mirror) and isinstance(e.session, Remote):
-            state, error = e.session.state, e.session.error or e.error
-        elif isinstance(e, Mirror) and pulled is not None:
+        if isinstance(origin, Pull) and isinstance(origin.session, Remote):
+            state, error = origin.session.state, origin.session.error or origin.error
+        elif isinstance(origin, Pull) and pulled is not None:
             link = self.links.get(pulled.link)
-            state = "connected" if e.connected else link.state if link else "unreachable"
-            error = (link.error if link else "") or e.error
+            state = "connected" if origin.connected else link.state if link else "unreachable"
+            error = (link.error if link else "") or origin.error
         return {"name": name, "root": self.specs.get(d, d), "id": d, "url": root_url(name), "state": state,
                 "error": error, "link": pulled.link if pulled else None}
 
@@ -547,8 +546,6 @@ class Roots:
         if spec is not None:
             self._history = [spec, *(r for r in self._history if r != spec)][:HISTORY_MAX]
             _write_json(self.history_path, self._history)
-        for v in self._views.values():
-            v.close()
         self._views = {}
         _write_json(self.state, {"tracked": list(self.specs.values()), "links": list(self.links),
                                  "workspaces": [{"name": w, "members": m} for w, m in self.workspaces.items()]})

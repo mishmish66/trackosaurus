@@ -4,6 +4,7 @@ import pytest
 
 from trex import daemon, server
 from trex.daemon import Roots
+from trex.crawl import Crawl
 from trex.index import Explorer
 
 from helpers import get_json, post_json, request, wait_for, write_run
@@ -47,7 +48,7 @@ def vias(roots, *nodes):
 
 def synced(roots):
     """Whether every directory `roots` pulls holds its runs."""
-    return all(len(roots.entries[d].runs("")["runs"]) == 1 for d in list(roots.pulled))
+    return all(len(roots.entries[d].runs("").runs) == 1 for d in list(roots.pulled))
 
 
 def test_a_trex_pulls_every_directory_another_holds_and_names_them_alike(node):
@@ -126,7 +127,7 @@ def test_a_directory_moves_to_another_link_when_its_link_is_removed(node):
     c.remove(a_url)
     assert wait_for(lambda: vias(c, a, b, c) == {own(a): ["A", "B", "C"]})
     assert c.entries[own(a)] is mirror and c.pulled[own(a)].link == b_url
-    assert wait_for(lambda: mirror.connected) and [r["id"] for r in mirror.runs("")["runs"]] == ["r1"]
+    assert wait_for(lambda: mirror.origin.connected) and [r.id for r in mirror.runs("").runs] == ["r1"]
 
 
 def test_links_are_saved_and_pulled_again_after_a_restart(node, tmp_path):
@@ -168,9 +169,8 @@ def test_directories_are_served_by_id_by_a_daemon_and_by_a_standalone_server(nod
     a, _, a_url = node("A")
     d = urllib.parse.quote(own(a), safe="")
     assert wait_for(lambda: [r["id"] for r in get_json(f"{a_url}/d/{d}/api/runs")["runs"]] == ["r1"])
-    alone = Explorer(tmp_path / "files" / "A" / "runs", tmp_path / "alone-cache")
-    alone.rewalk()
-    alone.poll()
+    alone = Explorer(Crawl(tmp_path / "files" / "A" / "runs"), tmp_path / "alone-cache")
+    alone.sync()
     url = http_server(server.serve(alone, "127.0.0.1", 0))
     holdings = get_json(f"{url}/api/holdings")
     ((only,),) = [[x["id"] for x in holdings["dirs"]]]

@@ -125,10 +125,10 @@ def row_count(c: sqlite3.Connection) -> int:
 
 
 def metric(c: sqlite3.Connection, key_id: int, stop: int | None = None, step_lo: float | None = None,
-           step_hi: float | None = None) -> Series:
-    """One metric's points in rows [0, stop), in commits meeting [step_lo, step_hi] if given."""
-    q = "SELECT r.seq0, r.n, r.data, k.data FROM chunk k JOIN rowmeta r ON r.seq0 = k.seq0 WHERE k.key_id = ?"
-    args: list[float] = [key_id]
+           step_hi: float | None = None, start: int = 0) -> Series:
+    """One metric's points in rows [start, stop), in commits meeting [step_lo, step_hi] if given."""
+    q = "SELECT r.seq0, r.n, r.data, k.data FROM chunk k JOIN rowmeta r ON r.seq0 = k.seq0 WHERE k.key_id = ? AND r.seq0 + r.n > ?"
+    args: list[float] = [key_id, start]
     if stop is not None:
         q += " AND r.seq0 < ?"
         args.append(stop)
@@ -148,9 +148,9 @@ def metric(c: sqlite3.Connection, key_id: int, stop: int | None = None, step_lo:
         idx, v = decode(blob)
         if idx is not None:
             s, t = s[idx], t[idx]
-        if stop is not None and stop - seq0 < n:
+        if (stop is not None and stop - seq0 < n) or start > seq0:
             at: npt.NDArray[np.int64] = np.arange(n, dtype=np.int64) if idx is None else idx.astype(np.int64)
-            keep = at < stop - seq0
+            keep = (at >= start - seq0) & (at < (n if stop is None else stop - seq0))
             s, v, t = s[keep], v[keep], t[keep]
         S.append(s)
         V.append(v)

@@ -872,7 +872,7 @@ def main():
     subprocess.run([sys.executable, str(REPO / "examples/demo.py"), str(runs / "sweep"), "--seeds", "3", "--steps", "1500"], check=True)
     subprocess.run([sys.executable, "-c", NESTED_WRITER, str(runs)], check=True)
     port = free_port()
-    env = {**os.environ, "TREX_DAEMON_DIR": str(tmp / "daemon"), "TREX_KEPT_REFRESH": "1"}
+    env = {**os.environ, "TREX_DAEMON_DIR": str(tmp / "daemon"), "TREX_REFRESH": "1"}
     server = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs), "--standalone", "--port", str(port),
                                "--cache", str(tmp / "cache")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     url = f"http://127.0.0.1:{port}"

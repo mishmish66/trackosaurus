@@ -9,7 +9,7 @@ import { asNumber } from "./where.js";
 const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
 
 /** What this page and the server say to each other (server.PROTOCOL); the page states a mismatch. */
-export const PROTOCOL = 6;
+export const PROTOCOL = 7;
 /** URL prefix of what the page shows: a daemon's tracked directory ("/r/<name>") or workspace ("/w/<name>"), else "". */
 export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/[rw]\/[^/]+(?=\/)/) || [""])[0];
 
@@ -36,7 +36,7 @@ const NO_TAIL = Object.freeze({ s: [], v: [], t: [], q: [], n: 0 });
 
 /** Metadata of a run known only by its id until it is resynced. */
 const placeholderMeta = (id, seq = 0, mseq = 0) =>
-  ({ id, seq, mseq, kept_seq: 0, keys: [], summary: {}, config: {}, tags: [], name: id, state: "running" });
+  ({ id, seq, mseq, compiled: 0, keys: [], summary: {}, config: {}, tags: [], name: id, state: "running" });
 
 /** Whether run r logs metric `key` (a set kept in step with r.meta.keys). */
 export function hasKey(r, key) {
@@ -63,7 +63,7 @@ const clampLevel = (l) => Math.min(MAX_LEVEL, Math.max(MIN_LEVEL, l));
 
 /** The level of buckets splitting `span` steps into at most about `buckets` and at least half as many: the finest level
  * whose blocks are as wide as the span (buckets.level_for), coarser by whole levels, so that it changes only when the
- * span crosses a power of two, as a run's kept level does. */
+ * span crosses a power of two, as a run's top level does. */
 const levelFor = (span, buckets) => clampLevel(Math.ceil(Math.log2(Math.max(span, 2 ** MIN_LEVEL) / BLOCK)) + Math.ceil(Math.log2(BLOCK / Math.max(buckets, 1))));
 
 const early = new Map(); // url -> its response, requested by `preload` and not yet taken
@@ -152,8 +152,8 @@ export class Data {
   }
 
   newRun(meta) {
-    const r = { id: meta.id, meta, seq: meta.kept_seq ?? 0, mseq: meta.mseq, cols: new Map(), built: new Map(), tail: [],
-                tailSeq0: meta.kept_seq ?? 0, pending: [], hbExpect: null, resyncs: 0, resyncInFlight: false, holding: false };
+    const r = { id: meta.id, meta, seq: meta.compiled ?? 0, mseq: meta.mseq, cols: new Map(), built: new Map(), tail: [],
+                tailSeq0: meta.compiled ?? 0, pending: [], hbExpect: null, resyncs: 0, resyncInFlight: false, holding: false };
     // built: key -> inputs of its column; holding: events wait in `pending` until a resync finishes
     this.runs.set(r.id, r);
     this.version++;
@@ -285,7 +285,7 @@ export class Data {
   }
 
   /** Queue requests for block (key, level, index) of the runs of `runs` that lack it, or hold a running run's buckets
-   * older than its kept ones: the scope's finished runs in one request when many lack it, by run ids otherwise. */
+   * older than its compiled ones: the scope's finished runs in one request when many lack it, by run ids otherwise. */
   need(key, level, index, runs, queue, touch = true) {
     const id = blockId(key, level, index), have = this.blocks.get(id), asked = this.inflight.get(id);
     if (have && touch) have.used = performance.now();
@@ -300,7 +300,7 @@ export class Data {
 
   /** Whether block entry e holds run r's buckets as they now are. */
   current(e, r) {
-    return !!e && e.a.seq[e.row] >= r.meta.kept_seq;
+    return !!e && e.a.seq[e.row] >= r.meta.compiled;
   }
 
   /** Whether every block of `layers` holds every run of `runs` (any version of a running one's). */
@@ -622,10 +622,10 @@ export class Data {
     this.rebuildT = setTimeout(slice, 0);
   }
 
-  /** Drop the first tail rows while every metric's blocks hold them: rows before every block's (and the kept buckets')
-   * sequence number, at steps before the end of the blocks shown. */
+  /** Drop the first tail rows while every metric's blocks hold them: rows before every block's (and the compiled
+   * levels') sequence number, at steps before the end of the blocks shown. */
   pruneTail(r) {
-    let keep = r.meta.kept_seq, end = Infinity;
+    let keep = r.meta.compiled, end = Infinity;
     for (const key of r.cols.keys()) {
       const ready = this.charts.get(key)?.ready;
       if (ready) end = Math.min(end, this.stepsOf(ready.coarse)[1]);
@@ -674,7 +674,7 @@ export class Data {
       this.setMeta(r, j.run);
       r.mseq = j.run.mseq;
       this.setMedia(j.media, r.id);
-      const from = j.run.kept_seq;
+      const from = j.run.compiled;
       const rows = from < j.run.seq ? await getJSON(`${BASE}/api/rows?path=${encodeURIComponent(r.id)}&from=${from}`) : { seq0: from, rows: [] };
       if (this.runs.get(r.id) !== r) return;
       r.tail = [];
@@ -785,12 +785,12 @@ export class Data {
     const r = this.runs.get(meta.id);
     if (!r) {
       const n = this.newRun(meta);
-      if (meta.seq > meta.kept_seq || meta.mseq > 0) this.resync(n);
+      if (meta.seq > meta.compiled || meta.mseq > 0) this.resync(n);
     } else {
       const summary = r.meta.summary;
-      const before = r.meta.kept_seq;
+      const before = r.meta.compiled;
       this.setMeta(r, { ...meta, summary: { ...meta.summary, ...summary } });
-      if (meta.kept_seq !== before) this.ui.data(new Set(r.cols.keys()), true); // its blocks are due again
+      if (meta.compiled !== before) this.ui.data(new Set(r.cols.keys()), true); // its blocks are due again
       // The stream is ordered, so every row and media item this meta counts has already been delivered.
       if (!r.holding && (r.seq < meta.seq || r.mseq < meta.mseq)) {
         console.warn(`run ${r.id}: meta says ${meta.seq},${meta.mseq}, have ${r.seq},${r.mseq}`);

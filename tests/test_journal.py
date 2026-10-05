@@ -8,6 +8,7 @@ import pytest
 import trex
 from trex import buckets as bk, chunks, journal, query
 from trex.format import DB, SCHEMA, connect_ro
+from trex.crawl import Crawl
 from trex.index import Explorer
 
 from helpers import committed_rows, readback, wait_for
@@ -177,17 +178,16 @@ def test_the_explorer_follows_a_live_journaled_run(tmp_path):
     run = trex.init(root / "r", commit_interval=0.02)
     log_some(run, 50)
     assert wait_for(lambda: committed_rows(root / "r") == 50)
-    ex = Explorer(root, tmp_path / "cache")
-    ex.rewalk()
-    ex.poll()
-    assert ex.run_meta("r")["seq"] == 50
+    ex = Explorer(Crawl(root), tmp_path / "cache")
+    ex.sync()
+    assert ex.run_meta("r").seq == 50
     log_some(run, 30, start=50)
     run.log_image("img", np.zeros((4, 4, 3), np.uint8), step=60)
     assert wait_for(lambda: committed_rows(root / "r") == 80 and len(query.read_media(root / "r")) == 1)
-    ex.poll()
+    ex.sync()
     meta = ex.run_meta("r")
-    assert (meta["seq"], meta["mseq"]) == (80, 1)
+    assert (meta.seq, meta.mseq) == (80, 1)
     run.finish()
-    ex.poll()
-    assert ex.run_meta("r")["state"] == "finished" and bk.decode(ex.buckets_body("loss", 20, 0, runs=["r"])).buckets.run.size
+    ex.sync()
+    assert ex.run_meta("r").state == "finished" and bk.decode(ex.buckets_body("loss", 20, 0, runs=["r"])).buckets.run.size
     assert sorted(os.listdir(root / "r")) == sorted(["media", DB, journal.JOURNAL])

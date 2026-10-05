@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, NamedTuple
 
 import typer
 
@@ -25,6 +25,7 @@ from . import daemon, query as Q, remote, update
 from .compact import InUse, compact
 from .daemon import Roots, resolve_root
 from .format import DB, JSONValue, as_dict, as_str
+from .crawl import Crawl
 from .index import Explorer, RunsView
 from .server import DEFAULT_PORT, Server, bind, serve_unix, urls
 from .where import as_number, compile_where
@@ -152,14 +153,26 @@ class Selection:
             return resolve_root(p.parent, self.force), p.name
         return resolve_root(p, self.force), ""
 
-    def records(self) -> tuple[list[Q.Record], RunsView, Explorer, str]:
-        """(selected records, the folder's runs view, its index (closed), prefix)."""
+    def records(self) -> "Selected":
+        """The selected runs, from the index of their root brought up to date."""
         root, prefix = self.scope()
-        with Q.open_index(root, cache_dir(self.cache)) as ex:
+        ex, crawl = Q.open_index(root, cache_dir(self.cache))
+        with ex:
             view = ex.runs(prefix)
         tests = [where_test(w) for w in self.where]
-        recs = [r for r in Q.records(view, ex.dirs) if all(t(lambda f, r=r: Q.get(r, f)) for t in tests)]
-        return recs, view, ex, prefix
+        recs = [r for r in Q.records(view, crawl.dirs) if all(t(lambda f, r=r: Q.get(r, f)) for t in tests)]
+        return Selected(recs, view, crawl.root, ex.cache_dir, prefix)
+
+
+class Selected(NamedTuple):
+    """Runs a command selected: their records, their folder's runs view, the root indexed, its cache directory, and
+    the folder's path under the root."""
+
+    recs: list[Q.Record]
+    view: RunsView
+    root: Path
+    cache: Path
+    prefix: str
 
 
 def cache_dir(cache: str | None) -> str:
@@ -366,7 +379,7 @@ def serve_cmd(runs_dir: PathArg, host: Hosts = None, port: Port = None, allow_ho
     root = resolve_root(runs_dir, force)
     if not standalone and add_to_daemon(str(root), force, yes):
         return
-    ex = Explorer(root, cache_dir(cache)).start()
+    ex = Explorer(Crawl(root), cache_dir(cache)).start()
     servers = [serve_unix(ex, Path(unix))] if unix else listen(ex, host, port, allow_host)
     where = f"unix:{unix}" if unix else "  ".join(urls(servers))
     if exit_on_eof:
@@ -543,7 +556,7 @@ def ls_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
            paths: Annotated[bool, typer.Option("--paths", help="Print only absolute run directories (to pipe into series/diff -).")] = False,
            fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """List runs, with filters, sorting and chosen columns."""
-    recs = Selection(path, where or [], root, cache, force).records()[0]
+    recs = Selection(path, where or [], root, cache, force).records().recs
     recs = Q.sort_records(recs, sort or "path")[:limit or None]
     fmt = out_format(fmt, as_json)
     if paths:
@@ -668,7 +681,7 @@ def groups_cmd(path: PathArg = ".",
                sort: Annotated[str | None, typer.Option("--sort", "-s", help="Columns to sort by; default the first metric, descending.")] = None,
                limit: Limit = None, fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Aggregate runs into groups with a median or mean and its 95% CI."""
-    recs, _, _, prefix = Selection(path, where or [], root, cache, force).records()
+    recs, _, _, _, prefix = Selection(path, where or [], root, cache, force).records()
     fmt, fields = out_format(fmt, as_json), group_by_fields(group_by, str(path), root)
     spec = GroupSpec(_csv(metric or []), reduce, at, x, center, stats=fmt in ("json", "jsonl"))
     keys = [metric_key(m) for m in spec.metrics]
@@ -703,7 +716,7 @@ def keys_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
                      "last_median": st.get("median"), "last_max": st.get("max")})
     paths = {r["path"] for r in recs}
     media: dict[tuple[str, str], list[str]] = {}
-    for m in view["media"]:
+    for m in view.media:
         if m.run in paths and (not rx or rx.search(m.key)):
             media.setdefault((m.key, m.kind), []).append(m.run)
     rows += [{"key": k, "kind": kind, "runs": len(set(rs)), "items": len(rs)} for (k, kind), rs in sorted(media.items())]
@@ -748,9 +761,9 @@ def tree_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
              runs: Annotated[bool, typer.Option("--runs", help="Also list runs under each shown folder.")] = False,
              fmt: Fmt = "table", as_json: Json = False) -> None:
     """Folder tree with run counts by state and folder notes."""
-    recs, view, ex, prefix = Selection(path, where or [], root, cache, force).records()
-    tree = folder_tree(recs, prefix, prefix or ex.root.name)
-    notes = view["folders"]
+    recs, view, top, _, prefix = Selection(path, where or [], root, cache, force).records()
+    tree = folder_tree(recs, prefix, prefix or top.name)
+    notes = view.folders
     fmt = out_format(fmt, as_json)
 
     def folder_json(node: Folder, level: int) -> dict[str, object]:
@@ -1006,12 +1019,12 @@ def index_cmd(path: PathArg = ".", root: Root = None, cache: Cache = None, force
               fmt: Fmt = "table", as_json: Json = False) -> None:
     """Build or refresh the cache for a runs directory and report counts."""
     t0 = time.time()
-    recs, _, ex, prefix = Selection(path, [], root, cache, force).records()
+    recs, _, top, cached, prefix = Selection(path, [], root, cache, force).records()
     states: dict[str, int] = {}
     for r in recs:
         states[r["state"]] = states.get(r["state"], 0) + 1
-    out = {"root": str(ex.root), "path": prefix, "runs": len(recs), "states": states,
-           "cache": str(ex.cache_dir.resolve()), "seconds": round(time.time() - t0, 3)}
+    out = {"root": str(top), "path": prefix, "runs": len(recs), "states": states,
+           "cache": str(cached.resolve()), "seconds": round(time.time() - t0, 3)}
     fmt = out_format(fmt, as_json)
     emit([out], None if fmt in ("json", "jsonl") else list(out), fmt, width=None)
 

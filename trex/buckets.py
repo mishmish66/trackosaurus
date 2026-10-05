@@ -24,8 +24,9 @@ one stands for a block not answered.
 
 import math
 import struct
-from collections.abc import Sequence
-from typing import Final, NamedTuple
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, Final
 
 import numpy as np
 import numpy.typing as npt
@@ -41,7 +42,8 @@ type Ints = npt.NDArray[np.int64]
 type Floats = npt.NDArray[np.float64]
 
 
-class Buckets(NamedTuple):
+@dataclass(frozen=True, slots=True, eq=False)
+class Buckets:
     """Buckets at one level, in run then bucket order: run (an index into the runs they belong to), bucket (from step
     0), mean, mean step offset (times SOFF_SCALE, rounded down), mean runtime and count."""
 
@@ -53,15 +55,28 @@ class Buckets(NamedTuple):
     n: npt.NDArray[np.uint32]
 
     @property
+    def columns(self) -> tuple[npt.NDArray[Any], ...]:
+        """Its arrays, in COLUMNS order."""
+        return self.run, self.bucket, self.mean, self.soff, self.tmean, self.n
+
+    @property
     def nbytes(self) -> int:
-        return sum(x.nbytes for x in self)
+        return sum(x.nbytes for x in self.columns)
 
     def step(self, level: int) -> Floats:
         """Each bucket's mean step."""
         return (self.bucket + (self.soff + 0.5) / SOFF_SCALE) * 2.0 ** level
 
+    def of(self, run: npt.NDArray[np.int32]) -> "Buckets":
+        """These buckets as those of runs `run`."""
+        return replace(self, run=run)
 
-class BucketArray(NamedTuple):
+
+COLUMNS: Final = ("run", "bucket", "mean", "soff", "tmean", "n")  # the arrays of Buckets, by name
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class BucketArray:
     """A decoded bucket array: its level, its runs' paths, the rows of each its buckets hold, and the buckets."""
 
     level: int
@@ -70,7 +85,8 @@ class BucketArray(NamedTuple):
     buckets: Buckets
 
 
-class Stack(NamedTuple):
+@dataclass(frozen=True, slots=True, eq=False)
+class Stack:
     """Buckets of many runs, each at a level of its own: the runs' paths, rows held and levels, and the buckets (each
     at its run's level)."""
 
@@ -87,6 +103,26 @@ class Stack(NamedTuple):
             take[runs] = True
             b = select(b, take[b.run])
         return merge(b, level - self.level[b.run].astype(np.int64))
+
+
+@dataclass(frozen=True, slots=True)
+class Span:
+    """How a metric of a run is compiled: at every level from `fine` to `top`, the finest at which its steps [lo, hi]
+    lie in at most two blocks."""
+
+    fine: int
+    top: int
+    lo: float
+    hi: float
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Part:
+    """One run's buckets of block `block` of level `level`."""
+
+    level: int
+    block: int
+    buckets: Buckets
 
 
 def empty() -> Buckets:
@@ -177,7 +213,7 @@ def refine(b: Buckets, level: int, finer: int) -> Buckets:
     is that row's; one of several rows stays one, at their mean step."""
     s = b.step(level) / 2.0 ** finer
     bucket = np.floor(s).astype(np.int64)
-    return b._replace(bucket=bucket, soff=_quantized(s - bucket))
+    return replace(b, bucket=bucket, soff=_quantized(s - bucket))
 
 
 def cut(b: Buckets, lo: int, hi: int, take: npt.NDArray[np.bool_] | None = None) -> Buckets:
@@ -192,9 +228,8 @@ def union(parts: Sequence[Buckets]) -> Buckets:
         return parts[0]
     if not parts:
         return empty()
-    run = np.concatenate([p.run for p in parts])
-    order = np.argsort(run, kind="stable")
-    return Buckets(*(np.concatenate(field)[order] for field in zip(*parts, strict=True)))
+    both = concat(parts)
+    return take(both, np.argsort(both.run, kind="stable"))
 
 
 def _finite_first(finite: npt.NDArray[np.bool_], starts: npt.NDArray[np.intp]) -> npt.NDArray[np.bool_]:
@@ -273,11 +308,13 @@ def decode(blob: bytes) -> BucketArray:
                                              np.frombuffer(blob, np.uint32, count, at + 8 * count)))
 
 
-def stack(paths: Sequence[str], blobs: Sequence[bytes]) -> Stack:
-    """The Stack of runs `paths` from each one's one-run bucket array, read with numpy gathers over all their bytes at
-    once (headers too); ValueError unless each is one."""
+def stack(paths: Sequence[str], seq: npt.NDArray[np.uint32], level: npt.NDArray[np.int8], blobs: Sequence[bytes],
+          owner: Sequence[int]) -> Stack:
+    """The Stack of runs `paths`, holding rows `seq` at levels `level`, of one-run bucket arrays `blobs`, blob i of run
+    owner[i] (in run then bucket order), read with numpy gathers over all their bytes at once (headers too); ValueError
+    unless each is a one-run array."""
     if not blobs:
-        return Stack(list(paths), np.empty(0, np.uint32), np.empty(0, np.int8), empty())
+        return Stack(list(paths), seq, level, empty())
     joined = b"".join(blobs)
     lens = np.fromiter(map(len, blobs), np.int64, len(blobs))
     at = np.cumsum(lens) - lens  # each array's start, in bytes (arrays are 8-byte multiples)
@@ -289,29 +326,19 @@ def stack(paths: Sequence[str], blobs: Sequence[bytes]) -> Stack:
     if np.any(lens != 48 + 2 * (-(-2 * counts // 8) * 8) + 12 * counts):
         raise ValueError("bucket array length mismatch")
     i32 = np.frombuffer(joined, "<i4")
-    level, base = i32[w + 1], i32[w + 3].astype(np.int64) * 2 ** 32 + u32[w + 2]
+    base = i32[w + 3].astype(np.int64) * 2 ** 32 + u32[w + 2]
     k = np.arange(int(counts.sum())) - np.repeat(np.cumsum(counts) - counts, counts)  # position within its array
     c, start = np.repeat(counts, counts), np.repeat(at, counts)
     offs = start + 48  # each bucket's array's offsets, in bytes
     f32at = (offs + 2 * (-(-2 * c // 8) * 8)) // 4 + k  # its mean, in words
     u16 = np.frombuffer(joined, "<u2")
     f32 = np.frombuffer(joined, "<f4")
-    b = Buckets(np.repeat(np.arange(len(blobs), dtype=np.int32), counts), np.repeat(base, counts) * BLOCK + u16[offs // 2 + k],
+    b = Buckets(np.repeat(np.asarray(owner, np.int32), counts), np.repeat(base, counts) * BLOCK + u16[offs // 2 + k],
                 f32[f32at], u16[(offs + -(-2 * c // 8) * 8) // 2 + k], f32[f32at + c], u32[f32at + 2 * c])
-    return Stack(list(paths), u32[w + 10].copy(), level.astype(np.int8), b)
+    return Stack(list(paths), seq, level, b)
 
 
 # ---- one run ----
-
-
-def kept(steps: Floats, values: Floats, times: Floats, seq: int) -> bytes:
-    """A run's rows `seq` (steps, values, runtimes) as the bucket array it keeps: at the finest level whose blocks are
-    as wide as its steps (`level_for`), which then lie in at most two of them."""
-    if not steps.size:
-        return encode(0, 0, [""], [seq], empty())
-    level = level_for(float(steps.max() - steps.min()))
-    b = bucketize(steps, values, times, level)
-    return encode(level, int(b.bucket[0]) // BLOCK if b.run.size else 0, [""], [seq], b)
 
 
 def finest(steps: Floats) -> int:
@@ -320,26 +347,62 @@ def finest(steps: Floats) -> int:
     return max(MIN_LEVEL, int(np.floor(np.log2(np.median(gaps))))) if gaps.size else MAX_LEVEL
 
 
-def pyramid(steps: Floats, values: Floats, times: Floats, seq: int) -> tuple[int, list[tuple[int, int, bytes]]]:
-    """A run's rows `seq` (steps, values, runtimes) at every level from `finest` up to below its kept level: (the finest
-    level, [(level, block, one-run bucket array)] of each block holding buckets)."""
-    fine = finest(steps)
-    top = level_for(float(steps.max() - steps.min())) if steps.size else MIN_LEVEL
-    out: list[tuple[int, int, bytes]] = []
-    b = bucketize(steps, values, times, fine) if fine < top else empty()
-    for level in range(fine, top):
-        blocks = b.bucket // BLOCK
-        cuts = np.flatnonzero(np.r_[True, blocks[1:] != blocks[:-1], True])
-        for lo, hi in zip(cuts[:-1].tolist(), cuts[1:].tolist()):
-            part = Buckets(b.run[lo:hi], b.bucket[lo:hi], b.mean[lo:hi], b.soff[lo:hi], b.tmean[lo:hi], b.n[lo:hi])
-            out.append((level, int(blocks[lo]), encode(level, int(blocks[lo]), [""], [seq], part)))
+def pyramid(steps: Floats, values: Floats, times: Floats) -> tuple[Span, list[Part]]:
+    """A metric's points (steps, values, runtimes, at least one) at every level from the finest (`finest`, at most the
+    top) to the top, each level merged from the one below: how it is compiled, and every block holding buckets."""
+    lo, hi = float(steps.min()), float(steps.max())
+    top = level_for(hi - lo)
+    fine = min(finest(steps), top)
+    b = bucketize(steps, values, times, fine)
+    out: list[Part] = []
+    for level in range(fine, top + 1):
+        out += [Part(level, block, part) for block, part in by_block(b)]
         b = merge(b, 1)
-    return fine, out
+    return Span(fine, top, lo, hi), out
 
 
-def built(steps: Floats, values: Floats, times: Floats, seq: int, level: int, index: int) -> bytes:
-    """Block `index` of `level` of a run's rows `seq` (steps, values, runtimes), as a one-run bucket array."""
-    lo, hi = block_range(level, index)
-    keep = (steps >= lo) & (steps < hi)
-    b = cut(bucketize(steps[keep], values[keep], times[keep], level), index * BLOCK, (index + 1) * BLOCK)
-    return encode(level, index, [""], [seq], b)
+def grow(span: Span, steps: Floats, values: Floats, times: Floats, stored: Callable[[int, int], Buckets],
+         held: Callable[[int], list[int]]) -> tuple[Span, list[Part]]:
+    """What changes when points (steps, values, runtimes, at least one) join a metric compiled as `span`, whose blocks
+    are `stored(level, block)` (empty where none) and `held(level)` (the blocks of a level): how it is compiled, and
+    the blocks that change. Those are the blocks the points fall in at the finest level and every block above them,
+    merged from the ones below as `pyramid` merges, and each level above `span.top` that its new steps need, whole."""
+    lo, hi = min(span.lo, float(steps.min())), max(span.hi, float(steps.max()))
+    top = max(span.top, level_for(hi - lo))
+    changed = {block: combine(stored(span.fine, block), part)
+               for block, part in by_block(bucketize(steps, values, times, span.fine))}
+    out: list[Part] = []
+    for level in range(span.fine, top + 1):
+        out += [Part(level, block, changed[block]) for block in sorted(changed)]
+        if level == top:
+            break
+        below, parents = changed, {block >> 1 for block in changed}
+        if level >= span.top:  # the level above is new: every block of this one feeds it
+            parents |= {block >> 1 for block in held(level)}
+        changed = {p: merge(concat([below[c] if c in below else stored(level, c) for c in (2 * p, 2 * p + 1)]), 1)
+                   for p in parents}
+    return Span(span.fine, top, lo, hi), out
+
+
+def combine(a: Buckets, b: Buckets) -> Buckets:
+    """One run's buckets `a` and `b` of one level together, those in the same bucket merged as `bucketize` merges rows."""
+    both = concat([a, b])
+    return merge(take(both, np.argsort(both.bucket, kind="stable")), 0)
+
+
+def concat(parts: Sequence[Buckets]) -> Buckets:
+    """The buckets of `parts`, in order."""
+    if not parts:
+        return empty()
+    return Buckets(np.concatenate([p.run for p in parts]), np.concatenate([p.bucket for p in parts]),
+                   np.concatenate([p.mean for p in parts]), np.concatenate([p.soff for p in parts]),
+                   np.concatenate([p.tmean for p in parts]), np.concatenate([p.n for p in parts]))
+
+
+def by_block(b: Buckets) -> list[tuple[int, Buckets]]:
+    """One run's buckets `b` by the block holding them, in block order."""
+    if not b.run.size:
+        return []
+    blocks = b.bucket // BLOCK
+    cuts: list[int] = np.flatnonzero(np.r_[True, blocks[1:] != blocks[:-1], True]).tolist()
+    return [(int(blocks[lo]), take(b, np.arange(lo, hi))) for lo, hi in zip(cuts[:-1], cuts[1:])]

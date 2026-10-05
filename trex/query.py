@@ -12,6 +12,7 @@ from typing import Final, Literal, NotRequired, TypedDict, cast
 from . import chunks
 from .format import (DB, INFO_FILE, JSONValue, MediaKind, RunState, as_dict, as_float, as_run_state, as_str, as_str_list,
                      key_names, snapshot)
+from .crawl import Crawl
 from .index import Explorer, RunsView
 from .where import as_number, text_of
 
@@ -104,27 +105,27 @@ def is_run(path: PathLike) -> bool:
 
 # ---- run sets (through the explorer index) ----
 
-def open_index(root: PathLike, cache: PathLike) -> Explorer:
-    """Explorer index of `root`, brought up to date with the run files."""
-    ex = Explorer(root, cache)
-    ex.rewalk()
-    ex.poll()
-    return ex
+def open_index(root: PathLike, cache: PathLike) -> tuple[Explorer, Crawl]:
+    """The index of `root`, brought up to date with the run files, and the crawl that did."""
+    crawl = Crawl(root)
+    ex = Explorer(crawl, cache)
+    ex.sync()
+    return ex, crawl
 
 
 def records(view: RunsView, dirs: Mapping[str, Path]) -> list[Record]:
     """One flat record per run of an Explorer's runs view; `dirs`: the run directory of each run."""
     media: dict[str, int] = {}
-    for m in view["media"]:
-        media[m.run] = media.get(m.run, 0) + 1
+    for item in view.media:
+        media[item.run] = media.get(item.run, 0) + 1
     out: list[Record] = []
-    for m in view["runs"]:
-        s = m["summary"]
+    for m in view.runs:
+        s = m.summary
         out.append({
-            "path": m["id"], "name": m["name"], "parent": m["parent"], "state": m["state"],
-            "step": s.get("_step"), "runtime": s.get("_runtime"), "rows": m["seq"], "media": media.get(m["id"], 0),
-            "created": m["created"], "updated": m["updated"], "tags": m["tags"], "dir": str(dirs[m["id"]]), "visible": True,
-            "config": m["config"], "info": m["info"],
+            "path": m.id, "name": m.name, "parent": m.parent, "state": m.state,
+            "step": s.get("_step"), "runtime": s.get("_runtime"), "rows": m.seq, "media": media.get(m.id, 0),
+            "created": m.created, "updated": m.updated, "tags": m.tags, "dir": str(dirs[m.id]), "visible": True,
+            "config": m.config, "info": m.info,
             "summary": {k: v for k, v in s.items() if not k.startswith("_")},
         })
     return out

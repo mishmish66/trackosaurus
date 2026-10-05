@@ -48,6 +48,9 @@ def test_metric_row_and_step_windows(db):
     ids = write_commits(db, TRAIN_EVAL)
     assert list(chunks.metric(db, ids["loss"], stop=4)[1]) == [1.0, 1.5, 0.9, 0.8]
     assert list(chunks.metric(db, ids["loss"], step_lo=2.5)[0]) == [2.0, 3.0]
+    assert list(chunks.metric(db, ids["loss"], start=2)[1]) == [0.9, 0.8, 0.7]
+    assert list(chunks.metric(db, ids["loss"], stop=5, start=1)[1]) == [1.5, 0.9, 0.8]
+    assert list(chunks.metric(db, ids["eval"], start=2)[1]) == [8.0] and chunks.metric(db, ids["loss"], start=6)[0].size == 0
     assert chunks.metric(db, 99)[0].size == 0
 
 

@@ -34,7 +34,7 @@ DEFAULT_PORT: Final = 13898
 PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
 ROOT_PREFIX: Final = re.compile(r"/([rwd])/([^/]+)(/.*)?")  # a directory's URLs by name (r) or id (d), a workspace's (w)
 STANDALONE: Final = Node(uuid.uuid4().hex[:16], host_name())  # this process, when it serves one directory
-PROTOCOL: Final = 6  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
+PROTOCOL: Final = 7  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
 WHICH: Final[dict[str, Which]] = {"all": "all", "finished": "finished", "running": "running"}
 MAX_ASKS: Final = 256  # blocks one POST /api/buckets may ask for
 MAX_DUMPS: Final = 256  # runs one POST /api/dumps may ask for
@@ -384,12 +384,12 @@ class Handler(BaseHTTPRequestHandler):
     @route("GET", r"/api/runs")
     def runs(self, q: Query) -> None:
         ex, prefix = self.ex, q.get("path", "")
-        body = ex.runs_body(prefix) if isinstance(ex, Explorer) else dumps(ex.runs(prefix)).encode()
+        body = ex.runs_body(prefix) if isinstance(ex, Explorer) else dumps(ex.runs(prefix).wire()).encode()
         self.send(body, "application/json", 200, {"Cache-Control": "no-store"}, compress=not self._loopback())
 
     @route("GET", r"/api/run")
     def run(self, q: Query) -> None:
-        self._json(self.ex.run(q["path"]))
+        self._json(self.ex.run(q["path"]).wire())
 
     @route("GET", r"/api/rows")
     def rows(self, q: Query) -> None:
@@ -397,15 +397,15 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("POST", r"/api/dumps")
     def dumps(self, q: Query) -> None:
-        """Body: {runs: [{path, and unless the mirror asking holds nothing of it: uid, mseq, kept, pyramid (the rows its
-        kept buckets and compiled levels hold)}]}, at most MAX_DUMPS. Response: each run's index rows the mirror lacks
+        """Body: {runs: [{path, and unless the mirror asking holds nothing of it: uid, mseq, compiled, rebuilt (the rows
+        its levels hold and their rebuild)}]}, at most MAX_DUMPS. Response: each run's index rows the mirror lacks
         (`Explorer.dump`) in one body (`buckets.frame`), empty for a run this directory does not have."""
         ex, req = self.ex, json.loads(self.body())
         runs = req.get("runs") if isinstance(req, dict) else None
         if not isinstance(ex, Explorer):
             raise KeyError("a directory")
         if not isinstance(runs, list) or not 0 < len(runs) <= MAX_DUMPS:
-            raise ValueError(f"expected {{runs: [{{path, uid?, mseq?, kept?, pyramid?}}]}} of 1 to {MAX_DUMPS}")
+            raise ValueError(f"expected {{runs: [{{path, uid?, mseq?, compiled?, rebuilt?}}]}} of 1 to {MAX_DUMPS}")
         self.send(bk.frame(ex.dump_many([_held(r) for r in runs])), "application/octet-stream",
                   headers={"Cache-Control": "no-store"})
 
@@ -454,6 +454,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Server(ThreadingHTTPServer):
+    """A server whose open connections end when it closes."""
+
     daemon_threads = True
     request_queue_size = 128
     explorer: Explorer | None = None
@@ -461,6 +463,24 @@ class Server(ThreadingHTTPServer):
     restart: Callable[[], None] | None = None  # ends the daemon so that its service manager starts the updated one
     updating: threading.Lock  # held during an update, and from a successful one until the restart
     names: frozenset[str] = frozenset()  # host names besides IP addresses that requests may address it by
+
+    def __init__(self, address: Any, handler: type[BaseHTTPRequestHandler]) -> None:
+        self._open: set[socket.socket] = set()  # the connections being served
+        super().__init__(address, handler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        self._open.add(request)
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request: Any) -> None:
+        self._open.discard(request)
+        super().shutdown_request(request)
+
+    def server_close(self) -> None:
+        super().server_close()
+        for request in list(self._open):
+            with contextlib.suppress(OSError):
+                request.shutdown(socket.SHUT_RDWR)
 
 
 class Server6(Server):
@@ -496,7 +516,7 @@ def serve_unix(explorer: Explorer, path: Path) -> Server:
 
 def standalone_id(ex: Explorer) -> str:
     """The id of the directory a standalone server serves."""
-    return f"{STANDALONE.name}:{ex.root}"
+    return f"{STANDALONE.name}:{ex.origin.key}"
 
 
 def _is_ip(name: str) -> bool:
@@ -553,10 +573,7 @@ def _held(r: object) -> tuple[str, Have | None]:
     """A run of POST /api/dumps and what the mirror asking holds of it; ValueError unless it is one."""
     if not isinstance(r, dict) or not isinstance(path := r.get("path"), str):
         raise ValueError(f"not a run: {r!r}")
-    if "uid" not in r:
-        return path, None
-    return path, {"uid": str(r["uid"]), "mseq": _whole(r.get("mseq", 0)), "kept_seq": _whole(r.get("kept", -1)),
-                  "pyramid_seq": _whole(r.get("pyramid", -1))}
+    return path, Have.read(r) if "uid" in r else None
 
 
 def _ask(b: object) -> Ask:

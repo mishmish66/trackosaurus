@@ -18,7 +18,7 @@ function emptyArray(level, index, paths, seqs) {
 function withRuns(n, running = 0) {
   const d = new Data(UI);
   d.fetchMany = async (xs) => xs.map(() => null); // no server
-  const runs = Array.from({ length: n }, (_, i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, kept_seq: 10, keys: ["loss"], summary: { _step: 1000 },
+  const runs = Array.from({ length: n }, (_, i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, compiled: 10, keys: ["loss"], summary: { _step: 1000 },
                                                              state: i < running ? "running" : "finished" }));
   return { d, runs };
 }
@@ -77,7 +77,7 @@ test("fetching ahead asks for every chart's wanted layers before finer levels of
   const demands = [];
   const d = new Data({ ...UI, ahead: () => demands });
   d.fetchMany = async (xs) => xs.map(() => null);
-  const runs = Array.from({ length: 3 }, (_, i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, kept_seq: 10, keys: ["loss", "acc"],
+  const runs = Array.from({ length: 3 }, (_, i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, compiled: 10, keys: ["loss", "acc"],
                                                                summary: { _step: 1000 }, state: "finished" }));
   const demand = (key) => ({ key, runs, runsSig: "a", xmode: 0, zoomed: false, x0: -Infinity, x1: Infinity, pw: 600, many: false });
   demands.push(demand("loss"), demand("acc"));
@@ -91,7 +91,7 @@ test("fetching ahead asks for every chart's wanted layers before finer levels of
 });
 
 test("a run that appears while the scope is being listed reaches the page through the stream it opened first", async () => {
-  const sources = [], meta = (id) => ({ id, seq: 1, mseq: 0, kept_seq: 1, keys: [], summary: {}, state: "finished" });
+  const sources = [], meta = (id) => ({ id, seq: 1, mseq: 0, compiled: 1, keys: [], summary: {}, state: "finished" });
   const realFetch = globalThis.fetch;
   let answer;
   globalThis.EventSource = class {

@@ -11,6 +11,7 @@ import pytest
 from trex import daemon, server
 from trex.cli import main
 from trex.daemon import ControlServer, Roots, unique_names
+from trex.crawl import Crawl
 from trex.index import Explorer
 
 from helpers import get_json, post_json, request, wait_for, write_run
@@ -66,7 +67,7 @@ def test_colliding_names_are_told_apart_by_their_parents_until_the_collision_end
     assert roots.add(dirs[0]) == "runs"
     assert roots.add(dirs[1]) == "runs<b>" == roots.add(dirs[1])
     assert [(r["name"], r["root"]) for r in roots.served()] == [("runs<a>", str(dirs[0])), ("runs<b>", str(dirs[1]))]
-    again = Roots(tmp_path / "cache", state / "roots.json")
+    again = Roots(tmp_path / "cache2", state / "roots.json")
     again.load()
     assert [r["name"] for r in again.served()] == ["runs<a>", "runs<b>"]
     roots.remove("runs<a>")
@@ -89,7 +90,7 @@ def test_names_follow_emacs_uniquify(specs, want):
 def test_saved_directories_that_no_longer_exist_are_skipped(roots, dirs, tmp_path, state):
     roots.add(dirs[0])
     (state / "roots.json").write_text(json.dumps({"tracked": [str(tmp_path / "gone"), str(dirs[0])], "workspaces": []}))
-    again = Roots(tmp_path / "cache", state / "roots.json")
+    again = Roots(tmp_path / "cache2", state / "roots.json")
     again.load()
     assert [r["name"] for r in again.served()] == ["runs"]
 
@@ -121,7 +122,7 @@ def test_removing_a_directory_stops_serving_it_without_touching_its_files(roots,
 
 
 def test_standalone_server_has_no_daemon_routes(tmp_path, dirs, http_server):
-    url = http_server(server.serve(Explorer(dirs[0], tmp_path / "cache"), "127.0.0.1", 0))
+    url = http_server(server.serve(Explorer(Crawl(dirs[0]), tmp_path / "cache"), "127.0.0.1", 0))
     assert get_json(f"{url}/api/daemon") == {"daemon": False, "node": server.STANDALONE._asdict(), "roots": [], "links": [],
                                              "workspaces": [], "history": [], "install": None, "updates": None}
     assert post_json(f"{url}/api/daemon/remove", {"name": "runs"})[0] == 404
@@ -218,7 +219,7 @@ def test_http_add_refuses_relative_home_root_and_missing_paths(roots, http, path
 
 
 def test_standalone_server_refuses_daemon_changes(tmp_path, dirs, http_server):
-    url = http_server(server.serve(Explorer(dirs[0], tmp_path / "cache"), "127.0.0.1", 0))
+    url = http_server(server.serve(Explorer(Crawl(dirs[0]), tmp_path / "cache"), "127.0.0.1", 0))
     for path, body in [("add", {"path": str(dirs[1])}), ("history/clear", {})]:
         assert post_json(f"{url}/api/daemon/{path}", body)[0] == 404
 

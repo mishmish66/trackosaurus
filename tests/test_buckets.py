@@ -29,12 +29,14 @@ def by_bucket(steps, values, times, level):
     return out
 
 
-def same(a, b):
-    return all(np.array_equal(x, y, equal_nan=x.dtype.kind == "f") for x, y in zip(a, b, strict=True))
+def same(a, b, runs=True):
+    """Whether two Buckets hold the same buckets (leaving out which runs they are of unless `runs`)."""
+    return all(np.array_equal(x, y, equal_nan=x.dtype.kind == "f")
+               for x, y in zip(a.columns[not runs:], b.columns[not runs:], strict=True))
 
 
 def run_at(b, i):
-    return b._replace(run=np.full(b.run.size, i, np.int32))
+    return b.of(np.full(b.run.size, i, np.int32))
 
 
 def assert_buckets(b, want, level):
@@ -148,52 +150,129 @@ def test_an_array_refuses_buckets_beyond_its_range():
         bk.encode(0, 1, ["r"], [10], b)
 
 
-def test_a_stack_reads_many_one_run_arrays_as_decoding_each_would():
-    blobs, want = [], []
-    for i, n in enumerate([300, 1700, 0, 4000, 5]):
+def test_a_stack_reads_each_runs_one_run_arrays_as_decoding_them_would():
+    names, counts, levels = [f"r{i}" for i in range(5)], [300, 1700, 0, 4000, 5], [3, 4, 5, 6, 7]
+    blobs, owner, want = [], [], []
+    for i, n in enumerate(counts):
         s, v, t = rows(n, seed=i) if n else (np.empty(0), np.empty(0), np.empty(0))
-        blobs.append(bk.kept(s * (i + 1) - 1000 * i, v, t, n))
-        want.append(bk.decode(blobs[-1]))
-    st = bk.stack([f"r{i}" for i in range(5)], blobs)
-    assert st.paths == [f"r{i}" for i in range(5)] and list(st.seq) == [300, 1700, 0, 4000, 5]
-    assert list(st.level) == [a.level for a in want]
-    for i, a in enumerate(want):
-        got = bk.select(st.buckets, st.buckets.run == i)
-        assert same(got[1:], a.buckets[1:])
+        want.append(bk.bucketize(s * (i + 1) - 1000 * i, v, t, levels[i]))
+        for block, part in bk.by_block(want[-1]):
+            blobs.append(bk.encode(levels[i], block, [""], [0], part))
+            owner.append(i)
+    st = bk.stack(names, np.array(counts, np.uint32), np.array(levels, np.int8), blobs, owner)
+    assert st.paths == names and list(st.seq) == counts and list(st.level) == levels
+    assert len(blobs) > len(names)  # some runs lie in several blocks
+    for i, b in enumerate(want):
+        assert same(bk.select(st.buckets, st.buckets.run == i), b, runs=False)
 
 
 def test_a_stack_refuses_arrays_of_many_runs():
     b = bk.union([run_at(bk.bucketize(*rows(10, seed=i), 9), i) for i in range(2)])
     with pytest.raises(ValueError):
-        bk.stack(["x"], [bk.encode(9, 0, ["a", "b"], [10, 10], b)])
+        bk.stack(["x"], np.zeros(1, np.uint32), np.zeros(1, np.int8), [bk.encode(9, 0, ["a", "b"], [10, 10], b)], [0])
 
 
-def test_a_run_keeps_its_buckets_at_the_finest_level_whose_blocks_its_steps_fit_in_two():
-    steps, values, times = rows(5000)
-    a = bk.decode(bk.kept(steps, values, times, 5000))
-    assert a.level == bk.level_for(steps.max() - steps.min()) and list(a.seq) == [5000]
-    assert len({int(x) // BLOCK for x in a.buckets.bucket}) <= 2
-    assert_buckets(a.buckets, by_bucket(steps, values, times, a.level), a.level)
+def level_of(parts, level):
+    """The buckets of `level` among `parts`, and the blocks holding them."""
+    mine = [p for p in parts if p.level == level]
+    return bk.concat([p.buckets for p in mine]), [p.block for p in mine]
+
+
+def assert_merged(b, want, level):
+    """Buckets merged up from finer ones hold what their rows give, as closely as merged steps and float32 means do."""
+    assert list(b.bucket) == list(want) and list(b.n) == [w[3] for w in want.values()]
+    np.testing.assert_allclose(b.mean, [w[0] for w in want.values()], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(b.tmean, [w[2] for w in want.values()], rtol=1e-5)
+    np.testing.assert_allclose(b.step(level), [w[1] for w in want.values()], atol=2.0 ** level * 8 / SOFF_SCALE)
 
 
 @pytest.mark.parametrize("gaps", [False, True])
-def test_a_pyramid_holds_every_level_from_about_a_value_a_bucket_to_below_the_kept_one_as_built_blocks(gaps):
+def test_a_pyramid_holds_every_level_from_about_a_value_a_bucket_to_the_one_whose_blocks_its_steps_fit_in_two(gaps):
     steps, values, times = rows(3000, gaps=gaps)
     steps = np.round(steps)
-    fine, blocks = bk.pyramid(steps, values, times, 3000)
-    top = bk.level_for(float(steps.max() - steps.min()))
-    assert fine == int(np.floor(np.log2(float(np.median(np.diff(np.unique(steps).astype(np.float64))))))) and fine < top
-    assert sorted({level for level, _, _ in blocks}) == list(range(fine, top))
-    for level, index, blob in blocks:
-        got, want = bk.decode(blob), bk.decode(bk.built(steps, values, times, 3000, level, index))
-        assert (got.level, list(got.seq)) == (want.level, list(want.seq))
-        assert list(got.buckets.bucket) == list(want.buckets.bucket) and list(got.buckets.n) == list(want.buckets.n)
-        np.testing.assert_allclose(got.buckets.mean, want.buckets.mean, rtol=1e-6, atol=1e-6)
-        np.testing.assert_allclose(got.buckets.tmean, want.buckets.tmean, rtol=1e-6)
-        np.testing.assert_allclose(got.buckets.step(level), want.buckets.step(level), atol=2.0 ** level * 4 / SOFF_SCALE)
-    for level in range(fine, top):
-        held = {i for lv, i, _ in blocks if lv == level}
-        assert held == {int(i) for i in np.unique(np.floor(steps[~np.isnan(values)] / 2.0 ** level) // BLOCK)}
+    span, parts = bk.pyramid(steps, values, times)
+    assert span.top == bk.level_for(float(steps.max() - steps.min())) and (span.lo, span.hi) == (steps.min(), steps.max())
+    assert span.fine == int(np.floor(np.log2(float(np.median(np.diff(np.unique(steps).astype(np.float64))))))) < span.top
+    assert sorted({p.level for p in parts}) == list(range(span.fine, span.top + 1))
+    for level in range(span.fine, span.top + 1):
+        b, held = level_of(parts, level)
+        assert_merged(b, by_bucket(steps, values, times, level), level)
+        assert held == sorted({int(i) for i in np.unique(np.floor(steps[~np.isnan(values)] / 2.0 ** level) // BLOCK)})
+    assert len(level_of(parts, span.top)[1]) <= 2
+
+
+def test_a_metric_with_at_most_a_value_a_bucket_at_its_top_level_has_that_level_alone():
+    steps = np.arange(100.0)
+    span, parts = bk.pyramid(steps, steps, steps)
+    assert span.fine == span.top == bk.level_for(99.0) < 0 and [(p.level, p.block) for p in parts] == [(span.top, 0)]
+    span, parts = bk.pyramid(np.array([7.0]), np.array([1.0]), np.array([0.0]))
+    assert span == bk.Span(0, 0, 7.0, 7.0) and int(parts[0].buckets.n.sum()) == 1
+
+
+class Held:
+    """A metric's blocks as an index holds them, for `grow`."""
+
+    def __init__(self, compiled):
+        self.span, parts = compiled
+        self.blocks = {(p.level, p.block): p.buckets for p in parts}
+
+    def grow(self, steps, values, times):
+        """Grow by rows; the (level, block) of the blocks that changed."""
+        self.span, parts = bk.grow(self.span, steps, values, times, lambda level, block: self.blocks.get((level, block), bk.empty()),
+                                   lambda level: [block for at, block in self.blocks if at == level])
+        self.blocks.update({(p.level, p.block): p.buckets for p in parts})
+        return [(p.level, p.block) for p in parts]
+
+    def level(self, level):
+        return bk.concat([self.blocks[k] for k in sorted(self.blocks) if k[0] == level])
+
+
+@pytest.mark.parametrize("sizes", [[2000, 1, 1, 500, 3498], [600, 5400]])
+def test_a_metric_grown_by_rows_holds_what_compiling_every_row_holds(sizes):
+    steps, values, times = np.arange(6000.0) * 4, *rows(6000)[1:]
+    held, at = Held(bk.pyramid(steps[:sizes[0]], values[:sizes[0]], times[:sizes[0]])), sizes[0]
+    for n in sizes[1:]:
+        held.grow(steps[at:at + n], values[at:at + n], times[at:at + n])
+        at += n
+    span, parts = bk.pyramid(steps, values, times)
+    assert held.span == span and sorted(held.blocks) == sorted((p.level, p.block) for p in parts)
+    for level in range(span.fine, span.top + 1):
+        assert_merged(held.level(level), by_bucket(steps, values, times, level), level)
+
+
+def test_growing_changes_only_the_blocks_the_new_rows_fall_in_and_those_above_them():
+    steps = np.arange(60000.0)
+    held = Held(bk.pyramid(steps[:50000], steps[:50000], steps[:50000]))
+    before = dict(held.blocks)
+    changed = held.grow(steps[50000:50010], steps[50000:50010], steps[50000:50010])
+    assert changed == [(level, 50000 >> level >> 8) for level in range(held.span.fine, held.span.top + 1)]
+    assert all(same(held.blocks[k], b) for k, b in before.items() if k not in changed)
+
+
+def test_growing_past_the_top_levels_span_adds_the_levels_above_it_whole():
+    steps = np.arange(5000.0)
+    held = Held(bk.pyramid(steps[:1000], steps[:1000], steps[:1000]))
+    top = held.span.top
+    held.grow(steps[1000:], steps[1000:], steps[1000:])
+    assert held.span.top == bk.pyramid(steps, steps, steps)[0].top > top
+    for level in range(top + 1, held.span.top + 1):
+        assert_merged(held.level(level), by_bucket(steps, steps, steps, level), level)
+
+
+def test_rows_at_earlier_steps_grow_the_blocks_there():
+    steps = np.arange(0.0, 8000.0, 2.0)
+    late, early = steps >= 3000, steps < 3000
+    held = Held(bk.pyramid(steps[late], steps[late], steps[late]))
+    held.grow(steps[early], steps[early], steps[early])
+    for level in range(held.span.fine, held.span.top + 1):
+        assert_merged(held.level(level), by_bucket(steps, steps, steps, level), level)
+
+
+def test_combined_buckets_merge_where_both_hold_one_as_their_rows_together_would():
+    steps, values, times = rows(2000)
+    odd = np.arange(2000) % 2 == 1
+    got = bk.combine(bk.bucketize(steps[odd], values[odd], times[odd], 4), bk.bucketize(steps[~odd], values[~odd], times[~odd], 4))
+    assert_merged(got, by_bucket(steps, values, times, 4), 4)
 
 
 @pytest.mark.parametrize("finer", [1, 3])
@@ -204,20 +283,6 @@ def test_refined_buckets_of_single_rows_are_the_buckets_of_those_rows_at_the_fin
     assert list(b.bucket) == list(want) and list(b.n) == [w[3] for w in want.values()]
     np.testing.assert_allclose(b.mean, [w[0] for w in want.values()], rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(b.step(1 - finer), [w[1] for w in want.values()], atol=2.0 / SOFF_SCALE)  # as exact as level 1 holds them
-
-
-def test_a_run_whose_kept_buckets_hold_a_value_each_has_no_finer_levels():
-    steps = np.arange(100.0)
-    assert bk.pyramid(steps, steps, steps, 100) == (0, [])
-
-
-def test_a_built_block_holds_the_buckets_of_its_step_range():
-    steps, values, times = rows(5000)
-    a = bk.decode(bk.built(steps, values, times, 5000, 3, 2))
-    lo, hi = bk.block_range(3, 2)
-    sel = (steps >= lo) & (steps < hi)
-    assert (a.level, list(a.seq)) == (3, [5000])
-    assert_buckets(a.buckets, by_bucket(steps[sel], values[sel], times[sel], 3), 3)
 
 
 @pytest.mark.parametrize("lo,hi", [(0, 100), (250, 260), (255.5, 256.5), (1000, 5000), (-300, 300), (7, 7), (0, 2**40)])
@@ -236,6 +301,6 @@ def test_blocks_of_the_span_level_are_the_narrowest_at_least_the_span_wide(k):
 
 def test_fractional_and_negative_steps_get_valid_buckets():
     steps = np.linspace(-0.5, 0.25, 50)
-    a = bk.decode(bk.kept(steps, steps, steps, 50))
-    assert a.level < 0 and a.buckets.n.sum() == 50
-    assert np.all(np.diff(a.buckets.bucket) > 0)
+    span, parts = bk.pyramid(steps, steps, steps)
+    b, _ = level_of(parts, span.top)
+    assert span.top < 0 and b.n.sum() == 50 and np.all(np.diff(b.bucket) > 0)

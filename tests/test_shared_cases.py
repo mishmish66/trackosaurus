@@ -53,7 +53,7 @@ def array_cases() -> list[dict[str, object]]:
         for i, n in enumerate(sizes):
             if n:
                 b = bk.cut(bk.bucketize(*run_rows(n, i, level, index), level), index * bk.BLOCK, (index + 1) * bk.BLOCK)
-                parts.append(b._replace(run=np.full(b.run.size, i, np.int32)))
+                parts.append(b.of(np.full(b.run.size, i, np.int32)))
         paths, seq = [f"runs/r{i}" for i in range(len(sizes))], [3 * n + 1 for n in sizes]
         blob = bk.encode(level, index, paths, seq, bk.union(parts))
         a = bk.decode(blob)
@@ -123,7 +123,7 @@ def bin_cases() -> list[dict[str, object]]:
         if i == 1:
             values[200:208] = np.inf
         b = bk.cut(bk.bucketize(steps, values, steps * 0.5, level), 0, bk.BLOCK)
-        parts.append(b._replace(run=np.full(b.run.size, i, np.int32)))
+        parts.append(b.of(np.full(b.run.size, i, np.int32)))
         rows.append((steps, values))
     width = 2.0 ** level
     blob = bk.encode(level, 0, ["r0", "r1", "r2"], [900, 1300, 700], bk.union(parts))

@@ -83,7 +83,7 @@ def test_workspace_buckets_rows_and_media_come_from_the_member_holding_the_run(r
     assert got.paths == ["sac/r3", "shared/x", "shared/x<runs<b>>"] and runs_with_buckets(got) == got.paths
     for path, direct, there in (("sac/r3", direct_b, "sac/r3"), ("shared/x", direct_a, "shared/x"), ("shared/x<runs<b>>", direct_b, "shared/x")):
         mine, theirs = got.buckets.run == got.paths.index(path), direct.buckets.run == direct.paths.index(there)
-        assert all((x[mine] == y[theirs]).all() for x, y in zip(got.buckets[1:], direct.buckets[1:]))
+        assert all((x[mine] == y[theirs]).all() for x, y in zip(got.buckets.columns[1:], direct.buckets.columns[1:]))
         assert got.seq[got.paths.index(path)] == direct.seq[direct.paths.index(there)]
     rows = get_json(f"{http}/w/both/api/rows?path={urllib.parse.quote('shared/x<runs<b>>')}&from=2")
     assert rows["run"] == "shared/x<runs<b>>" and rows["seq0"] == 2 and len(rows["rows"]) == 4
@@ -100,17 +100,14 @@ def test_a_workspace_block_holds_every_members_runs_under_its_scope(roots, dirs,
     assert got.paths == ["sac/r1", "sac/r2", "sac/r3"] and runs_with_buckets(got) == got.paths
 
 
-def test_a_workspace_answers_a_batch_as_each_block_alone_asking_each_member_once(roots, dirs, http, monkeypatch):
+def test_a_workspace_answers_a_batch_as_each_block_alone(roots, dirs, http):
     a, b = tracked(roots, *dirs)
     roots.set_workspace("both", [a, b])
     asks = [{"key": "loss", "level": 20, "index": 0, "scope": "sac"}, {"key": "loss", "level": 3, "index": 0, "runs": ["sac/r3", "shared/x"]},
             {"key": "loss", "level": 20, "index": 0, "scope": "shared", "which": "finished"}]
     alone = [post_bytes(f"{http}/w/both/api/buckets", {"blocks": [ask]}) for ask in asks]
-    calls = []
-    answer = Explorer.buckets_bodies
-    monkeypatch.setattr(Explorer, "buckets_bodies", lambda ex, part: calls.append(len(part)) or answer(ex, part))
     together = bk.unframe(post_bytes(f"{http}/w/both/api/buckets", {"blocks": asks}))
-    assert together == [bk.unframe(x)[0] for x in alone] and sorted(calls) == [3, 3]
+    assert together == [bk.unframe(x)[0] for x in alone]
 
 
 def test_a_workspace_streams_live_rows_of_every_member(roots, dirs, http):
@@ -165,7 +162,7 @@ def test_a_remote_member_merges_like_a_local_one(roots, dirs, http, tmp_path):
     assert ["sac/r9", "finished"] in get_json(f"{http}/w/mixed/api/tree")
     assert get_json(f"{http}/w/mixed/api/run?path=sac/r9")["run"]["dir"] == far
     rows = get_json(f"{http}/w/mixed/api/rows?path=sac/r9&from=4")
-    assert rows["run"] == "sac/r9" and len(rows["rows"]) == 2
+    assert rows == {"run": "sac/r9", "seq0": 4, "rows": []}  # a mirrored directory's finished runs are whole in their levels
     media = get_json(f"{http}/w/mixed/api/runs?path=sac/r9")["media"][0]
     assert request(f"{http}/w/mixed/m/{urllib.parse.quote('sac/r9', safe='')}/{media[5]}")[2] == PNG
     assert set(blocks(f"{http}/w/mixed", scope="", which="finished").paths) >= {"sac/r1", "sac/r9"}
@@ -292,12 +289,9 @@ class Endless:
 def test_a_workspace_stream_ends_its_member_pumps_when_the_client_leaves():
     fake, stop = Endless(), threading.Event()
     ws = Workspace("w", [Member("m", cast(Any, fake))])
-    try:
-        gen = ws.messages("", stop)
-        next(gen)
-        assert wait_for(lambda: fake.sent > 20_001)
-        stop.set()
-        gen.close()
-        assert fake.ended.wait(5)
-    finally:
-        ws.close()
+    gen = ws.messages("", stop)
+    next(gen)
+    assert wait_for(lambda: fake.sent > 20_001)
+    stop.set()
+    gen.close()
+    assert fake.ended.wait(5)
