@@ -35,9 +35,6 @@ DEFAULT_PORT: Final = 13898
 PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
 HOP_HEADERS: Final = frozenset({"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
                                 "proxy-authorization", "proxy-authenticate"})
-# Every response: the page is cross-origin isolated, so the UI may share memory with its workers.
-ISOLATION: Final = {"Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp",
-                    "Cross-Origin-Resource-Policy": "same-origin"}
 ROOT_PREFIX: Final = re.compile(r"/([rw])/([^/]+)(/.*)?")  # a tracked directory's (r) or workspace's (w) URLs
 PROTOCOL: Final = 6  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
 WHICH: Final[dict[str, Which]] = {"all": "all", "finished": "finished", "running": "running"}
@@ -81,11 +78,6 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         if self.connection.family != socket.AF_UNIX:
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # each write leaves without waiting for an ACK
-
-    def end_headers(self) -> None:
-        for k, v in ISOLATION.items():
-            self.send_header(k, v)
-        super().end_headers()
 
     @property
     def srv(self) -> "Server":
@@ -184,7 +176,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._unavailable(remote, target)
             self.send_response(resp.status)
             for k, v in resp.getheaders():
-                if k.lower() not in HOP_HEADERS | {"server", "date"} | {h.lower() for h in ISOLATION}:
+                if k.lower() not in HOP_HEADERS | {"server", "date"}:
                     self.send_header(k, v)
             if resp.getheader("Content-Length") is None:
                 self.send_header("Connection", "close")

@@ -1,9 +1,9 @@
 // Line charts, drawn with WebGL (gl.js): every run's line stays on the GPU and zoom is a transform;
 // group statistics are uploaded per draw. Axes, labels and the hover overlay are Canvas 2D.
-import { BinCache, Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, aggGroups, binGrid, binRows, buildColumn, medianCiCoverage, nearest,
+import { Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, binGrid, medianCiCoverage, nearest,
          prep as kprep, visibleRange, yrange } from "./kernel.js";
 import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
-import { PARALLEL, describe, onWorker } from "./pool.js";
+import { describe, onWorker } from "./pool.js";
 import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET } from "./data.js";
 import { nonFiniteText } from "./where.js";
 
@@ -114,16 +114,6 @@ function bandOf(st, center, band, bins) {
 const ROW = Object.fromEntries(STATS.map((k, i) => [k, i])); // row of each statistic in aggGroups' result
 const WAITING = Symbol("waiting for a worker"); // what compute returns while a worker computes the chart's statistics
 let chartSlots = 0; // charts given a worker so far
-const NO_TAIL = Object.freeze({ s: [], v: [], t: [], q: [], n: 0 });
-const partsCols = new WeakMap(); // a run's buckets ({parts, level}) -> their column, built on the page
-
-/** Source c of binning as a column: itself, or the column of its buckets, built here. */
-function here(c) {
-  if (!c.parts) return c;
-  let col = partsCols.get(c);
-  if (!col) partsCols.set(c, (col = buildColumn(c.parts, NO_TAIL, c.level, false)));
-  return col;
-}
 
 /** [first, last, smallest positive] x of columns' extent `e`, widened by `more` ([first, last], or null). */
 function withExtent(e, more) {
@@ -643,26 +633,18 @@ export class Chart {
     return out;
   }
 
-  /** aggGroups of `cols` with binning p, and raw when `raw`: {main, raws}; computed here when no worker can, else by
-   * the chart's worker, null until it answers (the chart then prepares again). */
+  /** aggGroups of `cols` with binning p, and raw when `raw`: {main, raws}, by the chart's worker; null until it answers
+   * (the chart then prepares again). */
   groupStats(cols, p, raw) {
-    const d = PARALLEL ? describe(cols) : null;
-    if (!d) {
-      const local = cols.map((g) => g.map(here));
-      const cache = (this.binCache ||= new BinCache()), all = (f) => aggGroups(local, p.xmode, p.x0, p.x1, p.bins, f, p.alpha, p.scale, cache);
-      return { main: all(p.flags), raws: raw ? all(p.flags | RAW) : null };
-    }
-    return this.fromWorker("agg", d, p, raw);
+    return this.fromWorker("agg", describe(cols), p, raw);
   }
 
-  /** A heatmap's lines: each run as its bin means (`rowLines`), from the chart's worker (WAITING until it answers),
-   * else binned here. */
+  /** A heatmap's lines: each run as its bin means (`rowLines`), from the chart's worker (WAITING until it answers). */
   binnedRows(groups, v) {
     const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.floor(this.pw / DENSITY_PX_PER_BUCKET)));
     const src = this.sources(groups, true), lines = groups.filter((_, i) => src[i].length), all = src.filter((s) => s.length);
     const p = { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: v.logx ? LOGX : 0, alpha: v.alpha, scale: v.scale };
-    const d = PARALLEL ? describe(all) : null;
-    const res = d ? this.fromWorker("rows", d, p, false) : { rows: binRows(all.flat().map(here), p, (this.binCache ||= new BinCache())) };
+    const res = this.fromWorker("rows", describe(all), p, false);
     return res ? rowLines(lines, res.rows, g0, dx, bins, v.logx) : WAITING;
   }
 

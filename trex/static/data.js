@@ -2,8 +2,8 @@
 // stream. A run's column of a metric is built from its buckets in its chart's blocks (`buildColumn`) plus the rows
 // streamed since those buckets were made; a gap or a missed heartbeat resyncs the run.
 
-import { BLOCK, SHARED, adoptStore, bucketPaths, bucketStep, bucketViews, buildColumn, freeStore, unframe } from "./kernel.js";
-import { PARALLEL as WORKERS, fetchArraysOnWorker } from "./pool.js";
+import { BLOCK, adoptStore, bucketStep, bucketViews, buildColumn, freeStore } from "./kernel.js";
+import { fetchArraysOnWorker } from "./pool.js";
 import { asNumber } from "./where.js";
 
 const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
@@ -81,22 +81,7 @@ export async function getJSON(url) {
   return r.json();
 }
 
-/** Bucket arrays answering a POST fetched on the page (when no worker fetches them), as fetchArraysOnWorker gives
- * them. */
-async function fetchArraysHere(url, body) {
-  try {
-    const res = await fetch(url, { method: "POST", body });
-    if (!res.ok) return { status: res.status, arrays: [], bytes: 0 };
-    const all = await res.arrayBuffer();
-    const arrays = unframe(all).map(({ off, len }) => {
-      const buf = len ? all.slice(off, off + Math.ceil(len / 8) * 8) : null;
-      return buf && { buf, bytes: len, paths: bucketPaths(buf, bucketViews(buf)) };
-    });
-    return { status: res.status, arrays, bytes: all.byteLength };
-  } catch (e) {
-    return { status: 0, arrays: [], bytes: 0, error: String(e) };
-  }
-}
+
 
 // ---- store -----------------------------------------------------------------
 
@@ -373,7 +358,7 @@ export class Data {
 
   /** Keep answer `got` ({buf, bytes, paths}) of request x: each run it names as its entry of the block. */
   addArray(x, got) {
-    const { loc } = SHARED && got.buf instanceof SharedArrayBuffer ? adoptStore(got.buf) : { loc: null };
+    const { loc } = adoptStore(got.buf);
     const v = bucketViews(got.buf);
     const a = { id: this.nextArray++, key: x.key, level: x.level, index: x.index, v, seq: v.seq, buf: got.buf, loc, bytes: got.bytes, refs: 0 };
     this.arrays.set(a.id, a);
@@ -495,13 +480,13 @@ export class Data {
     if (!ahead) this.touched.add(x.key);
   }
 
-  /** The answers of requests `xs`, null for a block not answered: by a worker into shared memory, else here. */
+  /** The answers of requests `xs`, null for a block not answered, fetched by a worker. */
   async fetchMany(xs) {
     const url = new URL(`${BASE}/api/buckets`, typeof location === "undefined" ? "http://localhost/" : location.href).href;
     const blocks = xs.map((x) => (x.runs === null ? { key: x.key, level: x.level, index: x.index, scope: this.scope, which: "finished" }
       : { key: x.key, level: x.level, index: x.index, runs: x.runs.map((r) => r.id) }));
     const body = JSON.stringify({ blocks });
-    const got = await (WORKERS ? fetchArraysOnWorker(url, body) : fetchArraysHere(url, body));
+    const got = await fetchArraysOnWorker(url, body);
     if (got.error) console.warn("block fetch failed", got.error);
     this.stats.blocks += got.arrays.filter(Boolean).length;
     this.stats.bytes += got.bytes;

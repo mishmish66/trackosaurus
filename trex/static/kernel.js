@@ -1,6 +1,6 @@
-// Numeric kernel for the UI: resident metric columns (in memory shared with workers when the page is cross-origin
-// isolated), time-weighted EMA smoothing, per-pixel decimation, group aggregation, and axis quantiles. Pure JS
-// on typed arrays; it runs in the page and in its workers.
+// Numeric kernel for the UI: resident metric columns (in located chunks, so workers can be sent copies), time-weighted
+// EMA smoothing, per-pixel decimation, group aggregation, and axis quantiles. Pure JS on typed arrays; it runs in the
+// page and in its workers.
 
 /** `flags` bits accepted by prep, agg and yrange; IQM (agg only) adds the interquartile mean. */
 export const LOGY = 1, RAW = 2, LOGX = 4, IQM = 8;
@@ -87,21 +87,17 @@ export class Col {
   }
 }
 
-// ---- column storage shared with workers ----
+// ---- column storage, located so workers can be sent copies ----
 
-/** Whether columns live in memory the page's workers can read: a cross-origin isolated page, unless `?shared=0`. */
-export const SHARED = typeof SharedArrayBuffer === "function" && globalThis.crossOriginIsolated === true
-  && !/[?&]shared=0(&|$)/.test(globalThis.location?.search ?? "");
-const CHUNK = 1 << 22; // floats per shared chunk
-const chunks = []; // {id, gen, view (Float64Array over a SharedArrayBuffer), used, live}
+const CHUNK = 1 << 22; // floats per chunk
+const chunks = []; // {id, gen, view (Float64Array), used, live}
 const spare = []; // chunks whose columns are all gone, to be reused
 let current = null; // the chunk new columns go to
-const chunkListeners = new Set();
-const finalizer = SHARED ? new FinalizationRegistry(([id, size]) => release(id, size)) : null;
+const dropListeners = new Set();
+const finalizer = new FinalizationRegistry(([id, size]) => release(id, size));
 
-/** n floats for one column: in a shared chunk when SHARED ({view, loc: {chunk, gen, off}}), else a plain array. */
+/** n floats for one column, in a chunk: {view, loc: {chunk, gen, off, size}}. */
 export function columnStore(n) {
-  if (!SHARED) return { view: new Float64Array(n), loc: null };
   if (!current || current.used + n > current.view.length) current = takeChunk(n);
   const off = current.used;
   current.used += n;
@@ -115,12 +111,11 @@ function holdStore(c, loc) {
   if (loc) finalizer.register(c, [loc.chunk, loc.size]);
 }
 
-/** Take shared buffer `buf` (a multiple of 8 bytes, filled elsewhere) as storage of its own: {view, loc}, freed by
+/** Take buffer `buf` (a multiple of 8 bytes, filled elsewhere) as storage of its own: {view, loc}, freed by
  * freeStore(loc). */
 export function adoptStore(buf) {
   const view = new Float64Array(buf), ch = { id: chunks.length, gen: 0, view, used: view.length, live: view.length };
   chunks.push(ch);
-  for (const fn of chunkListeners) fn(ch.id, buf);
   return { view, loc: { chunk: ch.id, gen: 0, off: 0, size: view.length } };
 }
 
@@ -129,11 +124,13 @@ export function freeStore(loc) {
   if (loc) release(loc.chunk, loc.size);
 }
 
-/** Call fn(id, buffer) for every shared chunk, now and as they are made. */
-export function onChunks(fn) {
-  for (const ch of chunks) fn(ch.id, ch.view.buffer);
-  chunkListeners.add(fn);
+/** Call fn(id, gen) whenever chunk `id` of generation `gen` holds nothing anymore. */
+export function onDrops(fn) {
+  dropListeners.add(fn);
 }
+
+/** The floats of chunk `id`. */
+export const chunkView = (id) => chunks[id].view;
 
 function takeChunk(n) {
   const i = spare.findIndex((ch) => ch.view.length >= n);
@@ -142,16 +139,17 @@ function takeChunk(n) {
     (ch.gen += 1), (ch.used = 0), (ch.live = 0);
     return ch;
   }
-  const ch = { id: chunks.length, gen: 0, view: new Float64Array(new SharedArrayBuffer(8 * Math.max(CHUNK, n))), used: 0, live: 0 };
+  const ch = { id: chunks.length, gen: 0, view: new Float64Array(Math.max(CHUNK, n)), used: 0, live: 0 };
   chunks.push(ch);
-  for (const fn of chunkListeners) fn(ch.id, ch.view.buffer);
   return ch;
 }
 
 function release(id, size) {
   const ch = chunks[id];
   ch.live -= size;
-  if (ch.live <= 0 && ch !== current && !spare.includes(ch)) spare.push(ch);
+  if (ch.live > 0 || ch === current || spare.includes(ch)) return;
+  spare.push(ch);
+  for (const fn of dropListeners) fn(ch.id, ch.gen);
 }
 
 /** Column c's sortedness and extents. */
@@ -540,12 +538,11 @@ const blockSteps = ({ v }) => [v.base * BLOCK * 2 ** v.level, (v.base + 1) * BLO
  * blocks lie and no finer level's do, as points at their mean steps standing for their counts, in step order; then the
  * rows of `tail` ({s, v, t, q (sequence numbers), n}) the parts do not hold, in buckets as wide as the finest level
  * holding their place (`level` where none does), the first merged into the column's last point when in its bucket.
- * A bucket's mean is of its finite values, of its infinities when it has none. In memory shared with workers when
- * `shared`. */
-export function buildColumn(parts, tail, level, shared = true) {
+ * A bucket's mean is of its finite values, of its infinities when it has none. In a located chunk when `stored`. */
+export function buildColumn(parts, tail, level, stored = true) {
   let cap = tail.n;
   for (const p of parts) cap += p.v.first[p.row + 1] - p.v.first[p.row];
-  const { view: all, loc } = shared ? columnStore(4 * cap) : { view: new Float64Array(4 * cap), loc: null };
+  const { view: all, loc } = stored ? columnStore(4 * cap) : { view: new Float64Array(4 * cap), loc: null };
   const col = { s: all.subarray(0, cap), v: all.subarray(cap, 2 * cap), t: all.subarray(2 * cap, 3 * cap), w: all.subarray(3 * cap), n: 0, lv: 0, b: 0 };
   if (!tail.n && parts.every((p) => p.v.level === parts[0].v.level)) oneLevel(parts, col);
   else {
@@ -554,7 +551,7 @@ export function buildColumn(parts, tail, level, shared = true) {
     emitTail(layers, tail, level ?? (layers.length ? layers[layers.length - 1].level : 0), col);
   }
   const c = Col.adopt(col.s, col.v, col.t, col.n, col.w);
-  if (shared) holdStore(c, loc && { ...loc, cap });
+  if (stored) holdStore(c, { ...loc, cap });
   return c;
 }
 

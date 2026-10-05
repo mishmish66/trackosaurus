@@ -23,7 +23,7 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/query.py` | read-side queries for the CLI: records, field access, sorting, statistics, series |
 | `trex/where.py` | run filters: a SQL WHERE clause (or a name search) compiled to a test over a field getter |
 | `trex/cli.py` | `trex` command (Typer): `serve daemon systemd-unit launchd-plist ls groups keys tree show series tail media diff index compact` |
-| `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (block store, planner, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (bucket arrays, columns, smoothing, decimation, group stats), `pool.js` and `worker.js` (binning on workers over shared columns and bucket arrays, fetching into shared memory), `where.js` (run filters, run fields, filter completion); `index.html` |
+| `trex/static/` | UI, plain ES modules: `app.js` (page), `data.js` (block store, planner, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (bucket arrays, columns, smoothing, decimation, group stats), `pool.js` and `worker.js` (binning on workers over copies of the columns and bucket arrays they read, fetching), `where.js` (run filters, run fields, filter completion); `index.html` |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/`; the user guide is the `trex` and `trex.daemon` docstrings (Markdown) |
 | `docs/media/` | the docs' video tour and its poster image (left out of the sdist); the README embeds the same video, uploaded to GitHub |
@@ -127,14 +127,14 @@ them WebGL falls back to software and timings mean nothing.
   blocks do not hold, bucketed as the server would, so a live run looks the same when its buckets catch up. A chart of
   more runs than it draws one by one (`App.coarseAbove`: group statistics, or a heatmap) bins its finished runs from
   their buckets in its finest shown blocks (`Data.partsOf`), its running ones from their columns. Binning weights each
-  point by the rows it stands for, so a bin's mean is the mean of the rows in it. Workers fetch blocks straight into
-  shared memory, each array of a batch into a buffer of its own (`pool.fetchArraysOnWorker`), which the page takes over
-  (`kernel.adoptStore`, up to `ARRAY_BYTES`; blocks no chart uses go first).
-- **Workers**: every response carries COOP/COEP headers (`server.ISOLATION`), so the page is cross-origin isolated and
-  `buildColumn` puts columns in `SharedArrayBuffer` chunks (`kernel.columnStore`). Each chart's binning runs on one
-  worker of the pool (`pool.js`), which keeps that chart's binnings; a run's buckets in one block become a column viewing
-  the array (`kernel.runColumn`). A draw round waits for its charts' workers and draws them together. `?shared=0`, or a
-  page that is not isolated, computes them on the page instead.
+  point by the rows it stands for, so a bin's mean is the mean of the rows in it. Workers fetch blocks, each array
+  of a batch into a buffer of its own handed to the page (`pool.fetchArraysOnWorker`), which keeps it (`kernel.adoptStore`,
+  up to `ARRAY_BYTES`; blocks no chart uses go first).
+- **Workers**: columns and bucket arrays live in located chunks (`kernel.columnStore`, `adoptStore`: chunk, generation,
+  offset). Each chart's binning runs on one worker of the pool (`pool.js`), which keeps that chart's binnings and is sent
+  a copy of each column and array its jobs read, once (`pool.sendCopies`), dropped when the page frees the chunk; a
+  run's buckets in one block become a column viewing the array (`kernel.runColumn`). A draw round waits for its charts'
+  workers and draws them together. Nothing needs shared memory, so plain http on any host works the same.
 - **Fetching ahead**: while no plan's requests are under way, `Data.prefetch` keeps `PREFETCH_PARALLEL` batches in
   flight (`Data.nextAhead`, each request once a page, while the blocks no chart uses hold less than `AHEAD_BYTES`):
   every chart's wanted layers first, visible charts first and then the nearest the view (`App.aheadOf`), then the two

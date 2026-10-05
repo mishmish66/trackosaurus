@@ -217,7 +217,7 @@ def line_pixels_smoke(page, url):
 
 def binned_smoke(page, url, runs):
     """Whether a zoom of more runs than a chart draws one by one draws them from bins of their buckets, as group
-    statistics (each group's median per bin of its runs' means of their rows), with workers and without, and as a
+    statistics (each group's median per bin of its runs' means of their rows) from the chart's worker, and as a
     heatmap; and whether a server of another protocol is stated."""
     subprocess.run([sys.executable, "-c", MANY_WRITER, str(runs)], check=True)
 
@@ -229,23 +229,19 @@ def binned_smoke(page, url, runs):
         page.wait_for_timeout(300)
         page.wait_for_function(SETTLED, timeout=60000)
 
-    drawn = {}
-    for q in ("", "shared=0"):
-        zoomed(q, "group=run~1")
-        drawn[q] = page.evaluate("""(() => { const c = app.charts.get('loss');
-            return [c.binned, c.view.lines.map((l) => [l.label.split(' ')[0], l.g0, l.dx, [...l.center]])]; })()""")
+    zoomed("", "group=run~1")
+    binned, lines, worker = page.evaluate("""(() => { const c = app.charts.get('loss');
+        return [c.binned, c.view.lines.map((l) => [l.label.split(' ')[0], l.g0, l.dx, [...l.center]]), !!c.stats]; })()""")
     zoomed("", "group=run")
     heat = page.evaluate("(() => { const c = app.charts.get('loss'); return [c.binned, c.view.density, c.view.lines.length]; })()")
     page.evaluate("app.showProtocol(1)")
     stated = page.evaluate("[!document.querySelector('#mismatch').hidden, document.querySelector('#mismatch').title]")
-    off = {q: [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
-           for q, (_, lines) in drawn.items()}
-    groups = sorted(l[0] for l in drawn[""][1])
-    print(f"binned: a zoom of 320 runs drew bins of their buckets {drawn[''][0]} (without workers {drawn['shared=0'][0]}), groups {groups}"
-          f" of {len(drawn[''][1][0][3]) if drawn[''][1] else 0} bins, at most {max(off[''], default=1):.2g} off their exact medians "
-          f"({max(off['shared=0'], default=1):.2g} without workers); heatmap {heat}; protocol 1 stated {stated}")
-    return (drawn[""][0] is True and drawn["shared=0"][0] is True and groups == ["a", "b"] and off[""] and max(off[""]) < 1e-5
-            and off["shared=0"] and max(off["shared=0"]) < 1e-5 and heat == [True, True, 320]
+    off = [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
+    groups = sorted(l[0] for l in lines)
+    print(f"binned: a zoom of 320 runs drew bins of their buckets {binned} on its worker {worker}, groups {groups} of "
+          f"{len(lines[0][3]) if lines else 0} bins, at most {max(off, default=1):.2g} off their exact medians; heatmap {heat}; "
+          f"protocol 1 stated {stated}")
+    return (binned is True and worker and groups == ["a", "b"] and off and max(off) < 1e-5 and heat == [True, True, 320]
             and stated[0] and "the server 1" in stated[1])
 
 

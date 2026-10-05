@@ -1,15 +1,16 @@
-// A pool.js worker: group statistics, or each run's bin means, of the page's charts, over columns and bucket arrays in
-// the memory it shares; and bucket arrays fetched into that memory.
+// A pool.js worker: group statistics, or each run's bin means, of the page's charts, over copies the page sent of the
+// columns and bucket arrays they read; and bucket arrays fetched for the page.
 import { BinCache, Col, RAW, aggGroups, binRows, bucketPaths, bucketViews, buildColumn, runColumn, unframe } from "./kernel.js";
 
-const chunks = new Map(); // shared chunk id -> its Float64Array
+const copies = new Map(); // "chunk:generation" -> Map(float offset -> a copy of the page's floats from there)
 const arrays = new Map(); // "chunk:generation:offset" -> bucketViews of the bucket array there
 const ARRAY_VIEWS = 512; // views kept; more are dropped and made again when used
 const NO_TAIL = { s: [], v: [], t: [], q: [], n: 0 };
 const charts = new Map(); // chart -> {cache (its binnings), views (its columns, by location)}
 
 onmessage = ({ data: m }) => {
-  if (m.buf) return chunks.set(m.chunk, new Float64Array(m.buf));
+  if (m.copies) return keepCopies(m.copies);
+  if (m.drop) return copies.delete(`${m.drop[0]}:${m.drop[1]}`);
   if (m.kind === "fetch") return fetchArrays(m);
   let st = charts.get(m.chart);
   if (!st) charts.set(m.chart, (st = { cache: new BinCache(), views: new Map() }));
@@ -23,43 +24,44 @@ onmessage = ({ data: m }) => {
   postMessage({ job: m.job, main, raws }, raws ? [main.buffer, raws.buffer] : [main.buffer]);
 };
 
-/** Fetch bucket arrays (POST m.body to m.url, answered as buckets.frame joins them), read as they stream in (far faster
- * than arrayBuffer() in Chromium), each into a SharedArrayBuffer of its own, so the page only takes them over. */
+function keepCopies(list) {
+  for (const [chunk, gen, off, data] of list) {
+    const key = `${chunk}:${gen}`;
+    if (!copies.has(key)) copies.set(key, new Map());
+    copies.get(key).set(off, data);
+  }
+}
+
+/** This worker's copy of the floats from float `off` of chunk `chunk` (generation `gen`). */
+const floats = (chunk, gen, off) => copies.get(`${chunk}:${gen}`).get(off);
+
+/** Fetch bucket arrays (POST m.body to m.url, answered as buckets.frame joins them), each into a buffer of its own,
+ * handed over to the page. */
 async function fetchArrays(m) {
   try {
     const res = await fetch(m.url, { method: "POST", body: m.body });
     if (!res.ok) return postMessage({ job: m.job, status: res.status, arrays: [], bytes: 0 });
-    const [all, bytes] = await readShared(res), arrays = [];
+    const all = await readBody(res), arrays = [], moved = [];
     for (const { off, len } of unframe(all)) {
-      const buf = len ? new SharedArrayBuffer(Math.ceil(len / 8) * 8) : null;
-      if (buf) new Uint8Array(buf).set(new Uint8Array(all, off, len));
+      const buf = len ? new ArrayBuffer(Math.ceil(len / 8) * 8) : null;
+      if (buf) new Uint8Array(buf).set(new Uint8Array(all, off, len)), moved.push(buf);
       arrays.push(buf && { buf, bytes: len, paths: bucketPaths(buf, bucketViews(buf, 0)) });
     }
-    postMessage({ job: m.job, status: res.status, arrays, bytes });
+    postMessage({ job: m.job, status: res.status, arrays, bytes: all.byteLength }, moved);
   } catch (e) {
     postMessage({ job: m.job, status: 0, arrays: [], bytes: 0, error: String(e) });
   }
 }
 
-/** The body of `res` in a SharedArrayBuffer (a multiple of 8 bytes) and its length; filled chunk by chunk when the
- * length is known ahead (an uncompressed answer), else gathered first. */
-async function readShared(res) {
+/** The body of `res`, read as it streams in when its length is known ahead (an uncompressed answer; far faster than
+ * arrayBuffer() in Chromium). */
+async function readBody(res) {
   const len = res.headers.get("Content-Encoding") ? NaN : Number(res.headers.get("Content-Length"));
-  const reader = res.body.getReader();
-  if (!(len >= 0)) {
-    const ab = await new Response(new ReadableStream({ start: (c) => pump(reader, (v) => c.enqueue(v)).then(() => c.close()) })).arrayBuffer();
-    const buf = new SharedArrayBuffer(Math.ceil(ab.byteLength / 8) * 8);
-    new Uint8Array(buf).set(new Uint8Array(ab));
-    return [buf, ab.byteLength];
-  }
-  const buf = new SharedArrayBuffer(Math.ceil(len / 8) * 8), u8 = new Uint8Array(buf);
+  if (!(len >= 0)) return res.arrayBuffer();
+  const u8 = new Uint8Array(len), reader = res.body.getReader();
   let at = 0;
-  await pump(reader, (v) => u8.set(v, (at += v.byteLength) - v.byteLength));
-  return [buf, at];
-}
-
-async function pump(reader, take) {
-  for (let r = await reader.read(); !r.done; r = await reader.read()) take(r.value);
+  for (let r = await reader.read(); !r.done; r = await reader.read()) u8.set(r.value, at), (at += r.value.byteLength);
+  return u8.buffer;
 }
 
 /** The job's groups of columns, each the chart's view of the same column when it has one, so its binnings carry
@@ -97,7 +99,8 @@ function partsColumn(refs, q, count, level) {
     let v = arrays.get(key);
     if (!v) {
       if (arrays.size >= ARRAY_VIEWS) arrays.clear();
-      arrays.set(key, (v = bucketViews(chunks.get(refs[j]).buffer, 8 * refs[j + 2])));
+      const mine = floats(refs[j], refs[j + 1], refs[j + 2]);
+      arrays.set(key, (v = bucketViews(mine.buffer, mine.byteOffset)));
     }
     parts.push({ v, row: refs[j + 3] });
   }
@@ -105,9 +108,9 @@ function partsColumn(refs, q, count, level) {
 }
 
 function view(d, o) {
-  const all = chunks.get(d[o]), off = d[o + 2], cap = d[o + 3], bits = d[o + 5];
-  const c = Col.view(all.subarray(off, off + cap), all.subarray(off + cap, off + 2 * cap), all.subarray(off + 2 * cap, off + 3 * cap),
-                     d[o + 4], [(bits & 1) !== 0, (bits & 2) !== 0], all.subarray(off + 3 * cap, off + 4 * cap));
+  const cap = d[o + 3], bits = d[o + 5], all = floats(d[o], d[o + 1], d[o + 2]);
+  const c = Col.view(all.subarray(0, cap), all.subarray(cap, 2 * cap), all.subarray(2 * cap, 3 * cap),
+                     d[o + 4], [(bits & 1) !== 0, (bits & 2) !== 0], all.subarray(3 * cap, 4 * cap));
   c.gen = d[o + 1];
   return c;
 }

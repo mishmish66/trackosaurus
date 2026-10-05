@@ -265,13 +265,6 @@ def test_requests_on_a_kept_alive_connection_answer_without_waiting_for_delayed_
     assert sorted(times[1:])[2] < 0.02, times
 
 
-def test_every_response_isolates_the_page_so_it_may_share_memory_with_its_workers(http):
-    _, url = http
-    for path in ("/", "/static/worker.js", "/api/runs?path="):
-        with urllib.request.urlopen(f"{url}{path}") as r:
-            assert (r.headers["Cross-Origin-Opener-Policy"], r.headers["Cross-Origin-Embedder-Policy"]) == ("same-origin", "require-corp"), path
-
-
 def test_a_block_holds_runs_from_their_kept_buckets_or_their_run_files(root, tmp_path):
     write_run(root / "a" / "short", 600)
     write_run(root / "a" / "long", 5000)
