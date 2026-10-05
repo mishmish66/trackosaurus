@@ -182,6 +182,41 @@ def hidden_extent_smoke(page, url, runs):
     return both[0] == 2 and both[1] > 900 and hidden[0] == 1 and hidden[1] < 110 and back == both
 
 
+LINE_PIXELS = """(key) => {
+  const cv = app.charts.get(key).canvas, d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+  let n = 0;
+  for (let i = 0; i < d.length; i += 4) if (d[i + 3] && Math.max(d[i], d[i + 1], d[i + 2]) - Math.min(d[i], d[i + 1], d[i + 2]) > 60) n++;
+  return n;
+}"""
+
+
+def line_pixels_smoke(page, url):
+    """Whether charts put their lines on their canvases, with WebGL and with Canvas 2D: grouped, one per run in a
+    folder, and grouped again after going back, drawn as at first whatever the folder's lines drew before."""
+    chart = "app.charts.get('train/loss')"
+
+    def drawn():
+        page.wait_for_function(f"{chart}?.el.isConnected", timeout=60000)
+        page.evaluate(f"{chart}.el.scrollIntoView()")
+        page.wait_for_function(f"{SETTLED} && {chart}.view?.lines.length", timeout=60000)
+        page.wait_for_timeout(400)
+        return page.evaluate(LINE_PIXELS, "train/loss")
+
+    out = {}
+    for render in ("gl", "gl=0"):
+        page.goto(f"{url}/?pixels&{render}#path=sweep&group=lr")
+        page.wait_for_function("window.app && app.data.runs.size > 0 && app.grouped", timeout=60000)
+        grouped = drawn()
+        page.evaluate("app.setPath('sweep/width512/lr0.01')")
+        page.wait_for_function("!app.grouped", timeout=60000)
+        lines = drawn()
+        page.evaluate("history.back()")
+        page.wait_for_function("app.grouped", timeout=60000)
+        out[render] = [grouped, lines, drawn()]
+    print(f"line pixels (grouped, a folder's runs, grouped again): WebGL {out['gl']}, Canvas 2D {out['gl=0']}")
+    return all(g > 300 and n > 300 and abs(again - g) <= 0.02 * g for g, n, again in out.values())
+
+
 def binned_smoke(page, url, runs):
     """Whether a zoom of more runs than a chart draws one by one draws them from bins of their buckets, as group
     statistics (each group's median per bin of its runs' means of their rows), with workers and without, and as a
@@ -858,6 +893,7 @@ def main():
             ok &= check("flicker_smoke", flicker_smoke(page, url, runs))
             ok &= check("binned_smoke", binned_smoke(page, url, runs))
             ok &= check("hidden_extent_smoke", hidden_extent_smoke(page, url, runs))
+            ok &= check("line_pixels_smoke", line_pixels_smoke(page, url))
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])
             deadline = time.time() + 20
             while not (runs / "live").exists() and time.time() < deadline:

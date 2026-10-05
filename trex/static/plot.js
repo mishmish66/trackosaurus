@@ -767,7 +767,7 @@ export class Chart {
     const nl = view.lines.length, lines = new Table(nl), raws = new Table(nl), bands = new Table(2 * nl);
     let at = 0;
     const put = (xs, xstep, ys, ystep, len) => {
-      fillPoints(xs, xstep, ys, ystep, 0, len, staging, at, ox, oy, logx, logy);
+      fillPoints(xs, xstep, ys, ystep, len, staging, at, ox, oy, logx, logy);
       at += len;
       return at - len;
     };
