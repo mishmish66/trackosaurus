@@ -143,7 +143,9 @@ class ScanResult(TypedDict):
     keys: list[str]
     summary: Summary | None
     kept: list[KeptRecord] | None
+    kept_seq: int  # the rows `kept` holds
     pyramid: list[Compiled] | None
+    pyramid_seq: int  # the rows `pyramid` holds
     rows: str | None
 
 
@@ -166,6 +168,15 @@ class RunRecord(TypedDict):
     pyramid_t: float
 
 
+class Have(TypedDict):
+    """What a mirror holds of a run: its uid, media items, and the rows its kept buckets and compiled levels hold."""
+
+    uid: str
+    mseq: int
+    kept_seq: int
+    pyramid_seq: int
+
+
 class RunMeta(TypedDict):
     """A run, as sent to the browser."""
 
@@ -184,6 +195,7 @@ class RunMeta(TypedDict):
     mseq: int
     keys: list[str]
     kept_seq: int
+    pyramid_seq: int
 
 
 class RunsView(TypedDict):
@@ -237,6 +249,8 @@ TABLES: Final = {
                "PRIMARY KEY(key, level, block, path))",
     "pyramid_path": "CREATE INDEX IF NOT EXISTS pyramid_path ON pyramid(path)",
     "compiled": "CREATE TABLE IF NOT EXISTS compiled(path TEXT, key TEXT, fine INTEGER, seq INTEGER, PRIMARY KEY(key, path))",
+    # a mirror's folder notes (an Explorer reads its own from trex_info.json files)
+    "folders": "CREATE TABLE IF NOT EXISTS folders(path TEXT PRIMARY KEY, info TEXT NOT NULL)",
 }
 
 
@@ -391,7 +405,7 @@ def scan(job: Job) -> ScanResult | None:
     return {"path": path, "sig": sig, "uid": str(meta["id"]), "reset": reset, "fresh": prev is None,
             "seq": seq, "mseq": mseq + len(media), "media": media,
             "state": state, "heartbeat": heartbeat, "public": _public(meta, state), "keys": sorted(names.values()),
-            "summary": summary, "kept": kept, "pyramid": pyramid, "rows": text}
+            "summary": summary, "kept": kept, "kept_seq": seq, "pyramid": pyramid, "pyramid_seq": seq, "rows": text}
 
 
 def _state(meta: Mapping[str, JSONValue], crash_after: float) -> tuple[RunState, float | None]:
@@ -434,6 +448,14 @@ def _refined(data: bytes | None, fine: int, level: int, index: int, seq: int) ->
         return blob
     b = bk.cut(bk.refine(bk.decode(blob).buckets, fine, level), index * bk.BLOCK, (index + 1) * bk.BLOCK)
     return bk.encode(level, index, [""], [seq], b)
+
+
+def _lacking(have: Have | None, rec: RunRecord) -> tuple[int, bool, bool]:
+    """What a mirror holding `have` of a run lacks: (its first media item to send, whether to send the kept buckets,
+    whether to send the compiled levels); everything when it holds another uid."""
+    if have is None or have["uid"] != rec["uid"]:
+        return 0, True, True
+    return have["mseq"], have["kept_seq"] != rec["kept_seq"], have["pyramid_seq"] != rec["pyramid_seq"]
 
 
 def _rewritten(prev: Prev, uid: JSONValue, rows: int, media: int) -> bool:
@@ -928,15 +950,16 @@ class Explorer:
         if r["kept"] is not None:
             self._writer.execute("DELETE FROM kept WHERE path=?", (path,))
             self._writer.executemany("INSERT INTO kept VALUES (?,?,?,?,?)",
-                                     [(path, k.key, k.level, r["seq"], k.data) for k in r["kept"]])
-            st.update(kept_seq=r["seq"], kept_t=now, kept_state=r["state"])
+                                     [(path, k.key, k.level, r["kept_seq"], k.data) for k in r["kept"]])
+            st.update(kept_seq=r["kept_seq"], kept_t=now, kept_state=r["state"])
         if r["pyramid"] is not None:
             for t in ("pyramid", "compiled"):
                 self._writer.execute(f"DELETE FROM {t} WHERE path=?", (path,))
             self._writer.executemany("INSERT INTO pyramid VALUES (?,?,?,?,?)",
                                      [(p.key, level, i, path, data) for p in r["pyramid"] for level, i, data in p.blocks])
-            self._writer.executemany("INSERT INTO compiled VALUES (?,?,?,?)", [(path, p.key, p.fine, r["seq"]) for p in r["pyramid"]])
-            st.update(pyramid_seq=r["seq"], pyramid_t=now)
+            self._writer.executemany("INSERT INTO compiled VALUES (?,?,?,?)",
+                                     [(path, p.key, p.fine, r["pyramid_seq"]) for p in r["pyramid"]])
+            st.update(pyramid_seq=r["pyramid_seq"], pyramid_t=now)
         self._writer.execute("INSERT OR REPLACE INTO runs VALUES (?, ?)", (path, dumps(st)))
         return st, ev + _events(r, cur, st)
 
@@ -964,7 +987,41 @@ class Explorer:
             "summary": {**p["user_summary"], **st["summary"]},
             "state": st["state"], "created": p.get("created"), "updated": st["heartbeat"],
             "seq": st["seq"], "mseq": st["mseq"], "keys": st["keys"], "kept_seq": st["kept_seq"],
+            "pyramid_seq": st["pyramid_seq"],
         }
+
+    def dump(self, path: str, have: Have | None) -> bytes:
+        """Run `path`'s index rows a mirror holding `have` of it lacks, in one body (`buckets.frame`): a JSON header (its
+        record, media rows, and which kept arrays and compiled blocks follow), then those arrays, compressed; all of it
+        when `have` is of another uid. KeyError for a run it does not have."""
+        c = self.reader()
+        try:
+            c.execute("BEGIN")
+            row = c.execute("SELECT record FROM runs WHERE path=?", (path,)).fetchone()
+            if row is None:
+                raise KeyError(path)
+            rec: RunRecord = json.loads(row[0])
+            mseq, with_kept, with_pyramid = _lacking(have, rec)
+            media = c.execute("SELECT seq, step, key, kind, file FROM media WHERE path=? AND seq>=? ORDER BY seq", (path, mseq)).fetchall()
+            kept = c.execute("SELECT key, level, seq, data FROM kept WHERE path=? ORDER BY key", (path,)).fetchall() if with_kept else None
+            compiled = c.execute("SELECT key, fine, seq FROM compiled WHERE path=? ORDER BY key", (path,)).fetchall() if with_pyramid else None
+            pyramid = c.execute("SELECT key, level, block, data FROM pyramid WHERE path=?", (path,)).fetchall() if with_pyramid else None
+            c.execute("COMMIT")
+        finally:
+            self.release(c)
+        head = {"record": rec, "media": media, "kept": [k[:3] for k in kept] if kept is not None else None,
+                "compiled": compiled, "pyramid": [p[:3] for p in pyramid] if pyramid is not None else None}
+        return bk.frame([dumps(head).encode(), *(zlib.compress(k[3], 1) for k in kept or []), *(p[3] for p in pyramid or [])])
+
+    def dump_many(self, held: Sequence[tuple[str, Have | None]]) -> list[bytes]:
+        """`dump` of each (run, what a mirror holds of it); empty for a run it does not have."""
+        out: list[bytes] = []
+        for path, have in held:
+            try:
+                out.append(self.dump(path, have))
+            except KeyError:
+                out.append(b"")
+        return out
 
     def info(self) -> dict[str, object]:
         return {"root": str(self.root), "name": self.root.name, "cache": self.cache_dir.name}

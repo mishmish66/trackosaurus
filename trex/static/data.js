@@ -99,6 +99,7 @@ export class Data {
     this.keyRunsVer = -1; // ...at this `keysVer`
     this.keyRuns = new Map(); // metric -> the runs of `keyRunsSrc` that log it
     this.media = new Map(); // media key -> Map(runId -> records sorted by step)
+    this.early = null; // stream events that came while the scope's runs were being listed
     this.folders = {}; // folder path -> info dict from its trex_info.json
     this.scope = null;
     this.rootKey = "";
@@ -132,6 +133,7 @@ export class Data {
   close() {
     if (this.stream) this.stream.close();
     this.stream = null;
+    this.early = null;
     this.runs.clear();
     this.keys.clear();
     this.media.clear();
@@ -187,18 +189,23 @@ export class Data {
     this.version++;
   }
 
-  /** Load every run under folder `path` (relative to the served root; "" = everything). */
+  /** Load every run under folder `path` (relative to the served root; "" = everything). The stream opens first and
+   * its events wait until the runs are listed, so a run that appears in between is not missed. */
   async loadScope(path) {
     this.close();
     this.scope = path;
     this.ui.status("loading runs…");
+    this.early = [];
+    this.openStream();
     const j = await getJSON(`${BASE}/api/runs?path=${encodeURIComponent(path)}`);
     if (this.scope !== path) return;
     for (const meta of j.runs) this.newRun(meta);
     this.folders = j.folders || {};
     this.setMedia(j.media, null);
     this.flushKeys();
-    this.openStream();
+    const early = this.early;
+    this.early = null;
+    for (const [kind, ev] of early) this.dispatch(kind, ev);
   }
 
   flushKeys() {
@@ -695,7 +702,7 @@ export class Data {
     const es = new EventSource(`${BASE}/api/stream?path=${encodeURIComponent(this.scope)}`);
     this.stream = es;
     for (const kind of ["rows", "run", "media", "delete", "hb", "folder"]) {
-      es.addEventListener(kind, (e) => this.dispatch(kind, JSON.parse(e.data)));
+      es.addEventListener(kind, (e) => (this.early ? this.early.push([kind, JSON.parse(e.data)]) : this.dispatch(kind, JSON.parse(e.data))));
     }
     es.onopen = () => {
       this.ui.conn(true);

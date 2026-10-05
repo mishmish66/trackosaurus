@@ -89,3 +89,28 @@ test("fetching ahead asks for every chart's wanted layers before finer levels of
   assert.ok(asks.some((x) => x.key === "acc") && finer > asks.findLastIndex((x) => x.key === "acc"));
   assert.ok(asks.filter((x) => x.key === "loss").every((x) => x.level < level));
 });
+
+test("a run that appears while the scope is being listed reaches the page through the stream it opened first", async () => {
+  const sources = [], meta = (id) => ({ id, seq: 1, mseq: 0, kept_seq: 1, keys: [], summary: {}, state: "finished" });
+  const realFetch = globalThis.fetch;
+  let answer;
+  globalThis.EventSource = class {
+    constructor(url) { this.url = url; this.on = {}; sources.push(this); }
+    addEventListener(kind, fn) { this.on[kind] = fn; }
+    close() {}
+  };
+  globalThis.fetch = () => new Promise((ok) => (answer = () => ok({ ok: true, json: async () => ({ runs: [meta("a")], media: [], folders: {} }) })));
+  try {
+    const d = new Data(UI), loading = d.loadScope("");
+    assert.equal(sources.length, 1);
+    sources[0].on.run({ data: JSON.stringify(meta("b")) });
+    answer();
+    await loading;
+    assert.deepEqual([...d.runs.keys()].sort(), ["a", "b"]);
+    sources[0].on.run({ data: JSON.stringify(meta("c")) });
+    assert.deepEqual([...d.runs.keys()].sort(), ["a", "b", "c"]);
+  } finally {
+    delete globalThis.EventSource;
+    globalThis.fetch = realFetch;
+  }
+});

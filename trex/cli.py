@@ -336,7 +336,7 @@ def run_servers(servers: Sequence[Server], banner: Sequence[str]) -> None:
 
 
 def add_to_daemon(root: str, force: bool, yes: bool) -> bool:
-    """Offer to add `root` (a path or host:path) to a running daemon; whether it was added."""
+    """Offer to add `root` (a path, host:path or http://host:port) to a running daemon; whether it was added."""
     status = daemon.request({"op": "status"})
     if status is None:
         return False
@@ -346,7 +346,7 @@ def add_to_daemon(root: str, force: bool, yes: bool) -> bool:
     reply = daemon.request({"op": "add", "path": root, "force": force}) or {"error": "the daemon stopped"}
     if "error" in reply:
         raise ValueError(reply["error"])
-    typer.echo(f"trex daemon serving {typer.style(root, bold=True)} at {reply['url']}")
+    typer.echo(f"trex daemon {'pulling' if daemon.link_url(root) else 'serving'} {typer.style(root, bold=True)} at {reply['url']}")
     return True
 
 
@@ -357,11 +357,11 @@ def serve_cmd(runs_dir: PathArg, host: Hosts = None, port: Port = None, allow_ho
               standalone: Annotated[bool, typer.Option("--standalone", help="Serve on its own even if a daemon runs.")] = False,
               unix: Annotated[str | None, typer.Option("--unix", metavar="SOCKET", help="Listen on this Unix socket instead.")] = None,
               exit_on_eof: Annotated[bool, typer.Option("--exit-on-eof", hidden=True)] = False) -> None:
-    """Crawl a runs directory and serve the web UI, or add it to a running `trex daemon` (which also serves
-    host:path directories over ssh)."""
-    if remote.parse(runs_dir):
+    """Crawl a runs directory and serve the web UI, or add it to a running `trex daemon`, which also serves host:path
+    directories over ssh and pulls every directory of another trex given as http://host:port."""
+    if remote.parse(runs_dir) or daemon.link_url(runs_dir):
         if not add_to_daemon(runs_dir, force, yes=True):
-            raise ValueError("host:path directories are served by `trex daemon`; start one first")
+            raise ValueError("host:path directories and http://host:port trex are served by `trex daemon`; start one first")
         return
     root = resolve_root(runs_dir, force)
     if not standalone and add_to_daemon(str(root), force, yes):
@@ -386,9 +386,11 @@ def _exit_on_eof() -> None:
 def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]...", help="Runs directories to add.", show_default=False)] = None,
                host: Hosts = None, port: Port = None, allow_host: AllowHosts = None,
                cache: Annotated[str | None, typer.Option(help="Cache directory (default $TREX_CACHE or ~/.cache/trex).")] = None,
+               name: Annotated[str | None, typer.Option(help="Name of this trex, which begins the ids of the directories it crawls "
+                                                         "(default the host's, kept once chosen).")] = None,
                force: Force = False) -> None:
     """Serve several runs directories from one server; `trex serve DIR` offers to add to it."""
-    roots = daemon.Roots(Path(cache).expanduser() if cache else daemon.default_cache(), daemon.state_dir() / "roots.json")
+    roots = daemon.Roots(Path(cache).expanduser() if cache else daemon.default_cache(), daemon.state_dir() / "roots.json", name)
     servers = listen(None, host, port, allow_host, roots)
     try:
         control = daemon.ControlServer(daemon.socket_path(), roots, urls(servers))
@@ -407,8 +409,8 @@ def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]..
     roots.load()
     for d in dirs or []:
         roots.track(d, force, wait=False)
-    banner = [f"trex daemon on {'  '.join(urls(servers))}  socket={control.path}  cache={roots.cache}",
-              *(f"  {r['name']}  {r['root']}" for r in roots.served())]
+    banner = [f"trex daemon {roots.node.name} on {'  '.join(urls(servers))}  socket={control.path}  cache={roots.cache}",
+              *(f"  {r['name']}  {r['root']}" for r in roots.served()), *(f"  pulling {link['url']}" for link in roots.links_info())]
     try:
         run_servers(servers, banner)
     finally:

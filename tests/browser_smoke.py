@@ -612,6 +612,40 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         daemon.terminate()
         daemon.wait()
 
+def link_smoke(page, tmp, env, out, upstream):
+    """Whether a daemon tracking nothing, given another trex's http://host:port in its panel, pulls and shows every run
+    that trex holds, lists the link under "pulled from" with no way to remove the pulled directory alone, and lets go
+    of that directory with the link."""
+    port = free_port()
+    url = f"http://127.0.0.1:{port}"
+    daemon = subprocess.Popen([sys.executable, "-m", "trex", "daemon", "--port", str(port), "--cache", str(tmp / "cache-links"),
+                               "--name", "laptop"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              env={**env, "TREX_DAEMON_DIR": str(tmp / "daemon-links")})
+    try:
+        daemon.stdout.readline()
+        with urllib.request.urlopen(f"{upstream}/api/runs") as r:
+            want = len(json.loads(r.read())["runs"])
+        page.goto(f"{url}/")
+        page.wait_for_selector(".dhome .madd input")
+        page.fill(".dhome .madd input", upstream)
+        page.click(".dhome .madd button")
+        page.wait_for_function(f"window.app && app.data.runs.size === {want} && app.charts.size > 0", timeout=60000)
+        page.click(".brand")
+        page.wait_for_selector("#menu .mrow")
+        rows = page.evaluate("[...document.querySelectorAll('#menu .mrow')].map((r) => [r.querySelector('.ml').textContent, !!r.querySelector('.chev')])")
+        page.screenshot(path=str(out / "links_menu.png"))
+        page.once("dialog", lambda d: d.accept())
+        page.click("#menu .mrow:has(.ms:text-is('%s')) .chev" % upstream)
+        page.wait_for_selector(".dhome .madd input", timeout=30000)
+        with urllib.request.urlopen(f"{url}/api/daemon") as r:
+            d = json.loads(r.read())
+        print(f"links: pulled {want} runs from {upstream}; panel rows {rows}; after removing the link: roots {d['roots']}, links {d['links']}")
+        return want > 0 and len(rows) == 2 and rows[0] == ["runs", False] and rows[1][1] and d["roots"] == [] == d["links"]
+    finally:
+        daemon.terminate()
+        daemon.wait()
+
+
 NESTED_WRITER = """
 import sys, numpy as np, trex
 r = trex.init(f"{sys.argv[1]}/nested/r0")
@@ -919,6 +953,7 @@ def main():
                 print(f"{rid}: client {c['seq']} rows / {c['media']} media / column counts {counts}, "
                       f"file {n} / {mseq} / finite {finite}: {'match' if match else 'MISMATCH'}")
             print(f"dropped {client['dropped']} rows events; client {'converged' if ok else 'DIVERGED'}")
+            ok &= check("link_smoke", link_smoke(page, tmp, env, out, url))
             server.terminate()
             ok &= check("daemon_smoke", daemon_smoke(page, runs, tmp, env, out, errors))
             coverage.take()

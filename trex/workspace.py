@@ -1,4 +1,4 @@
-"""Workspaces: sets of tracked directories, local or remote, shown as one folder tree.
+"""Workspaces: sets of directories, crawled here or mirrored, shown as one folder tree.
 
 Merged (a named workspace), a run keeps its path within its tracked directory; a path that two members hold
 is shown bare for the first member that has it and as `path<member>` for the others. Nested (the daemon's
@@ -7,98 +7,26 @@ A workspace answers the same requests as an Explorer (`runs`, `buckets_body`, ..
 """
 
 import contextlib
-import http.client
 import json
 import queue
 import threading
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Final, NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
-from urllib.parse import quote
 
 from . import buckets as bk
-from .index import HEARTBEAT, Ask, Explorer, dumps, sse_text
-from .remote import Remote
-
-STREAM_READ_TIMEOUT: Final = 3 * HEARTBEAT  # seconds without a byte after which a member's stream is reopened
+from .index import Ask, Explorer, dumps, sse_text
 
 type SseEvent = tuple[str, str]  # (kind, JSON text)
 
 
-class Unavailable(Exception):
-    """A remote member is not connected."""
-
-
-class Far:
-    """A remote directory answering as an Explorer does, through its server's Unix socket."""
-
-    def __init__(self, remote: Remote) -> None:
-        self.remote = remote
-
-    def _call(self, method: str, target: str, body: bytes | None = None) -> bytes:
-        if self.remote.state != "connected":
-            raise Unavailable(self.remote.spec)
-        conn = self.remote.connection()
-        try:
-            conn.request(method, target, body=body, headers={"Host": "localhost"})
-            r = conn.getresponse()
-            data = r.read()
-        except OSError as e:
-            raise Unavailable(self.remote.spec) from e
-        finally:
-            conn.close()
-        if r.status == 404:
-            raise KeyError(target)
-        if r.status >= 400:
-            raise Unavailable(f"{self.remote.spec}: {r.status} {data[:200]!r}")
-        return data
-
-    def runs(self, prefix: str) -> dict[str, Any]:
-        return json.loads(self._call("GET", f"/api/runs?path={quote(prefix)}"))
-
-    def run(self, path: str) -> dict[str, Any]:
-        return json.loads(self._call("GET", f"/api/run?path={quote(path)}"))
-
-    def tree(self) -> list[list[str]]:
-        return json.loads(self._call("GET", "/api/tree"))
-
-    def rows_json(self, path: str, start: int) -> str:
-        return self._call("GET", f"/api/rows?path={quote(path)}&from={start}").decode()
-
-    def buckets_bodies(self, asks: Sequence[Ask]) -> list[bytes]:
-        blocks = [{"key": a.key, "level": a.level, "index": a.block, "scope": a.scope, "runs": None if a.runs is None else list(a.runs),
-                   "which": a.which} for a in asks]
-        return bk.unframe(self._call("POST", "/api/buckets", json.dumps({"blocks": blocks}).encode()))
-
-    def messages(self, prefix: str, stop: threading.Event) -> Generator[bytes, None, None]:
-        """The remote server's stream, a message at a time, reopened when it drops, until `stop`."""
-        while not stop.is_set():
-            if self.remote.state != "connected":
-                stop.wait(1.0)
-                continue
-            conn = self.remote.connection()
-            conn.timeout = STREAM_READ_TIMEOUT
-            try:
-                conn.request("GET", f"/api/stream?path={quote(prefix)}", headers={"Host": "localhost"})
-                r, msg = conn.getresponse(), b""
-                while not stop.is_set() and (line := r.readline()):
-                    msg += line
-                    if line == b"\n":
-                        yield msg
-                        msg = b""
-            except (OSError, http.client.HTTPException):
-                stop.wait(1.0)
-            finally:
-                conn.close()
-
-
 class Member(NamedTuple):
-    """A tracked directory of a workspace: its name, and the Explorer (or remote one) answering for it."""
+    """A directory of a workspace: its name, and the Explorer (or Mirror) answering for it."""
 
     name: str
-    src: Explorer | Far
+    src: Explorer
 
 
 def parse_sse(text: str) -> Iterator[SseEvent]:
@@ -285,7 +213,7 @@ class Workspace:
                         for kind, data in parse_sse(msg.decode()):
                             if not _put(q, sse_text(kind, self._rename_event(m, kind, data)), stop):
                                 return
-            except (Unavailable, OSError):
+            except OSError:
                 pass
 
         threads = [threading.Thread(target=pump, args=mp, daemon=True) for mp in self._scope(prefix)]
@@ -322,7 +250,7 @@ class Workspace:
 def _try[T](fn: Callable[[], T]) -> T | None:
     try:
         return fn()
-    except (Unavailable, KeyError):
+    except KeyError:
         return None
 
 

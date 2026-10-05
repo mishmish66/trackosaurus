@@ -21,10 +21,25 @@ or `trex launchd-plist` (default this repository), and systemd or launchd restar
 switches and manages them, and workspaces: named sets of directories whose folder trees are merged, so runs
 from several machines can be compared side by side (group by `dir`).
 
-A directory added as `host:path` (in the UI or with `trex serve host:path`) is served from that machine
+A directory added as `host:path` (in the UI or with `trex serve host:path`) is crawled on that machine
 over ssh: the daemon copies this trex there and runs it with uvx (`trex.remote`), so the machine needs only uv and an
 ssh key that works without a prompt. On a cluster, use a host that allows long-running processes, such
 as a data-transfer node; runs written by jobs on other nodes are followed through their journals.
+
+A daemon also pulls every directory another trex holds, given as `http://host:port` (in the UI or with
+`trex serve http://host:port`). Every directory it pulls or crawls over ssh is kept in its cache (`trex.mirror`),
+compiled as the trex that crawls it compiles it, so it answers at once and while that trex is unreachable; running
+runs come live from it while it answers. A laptop's daemon pulling a lab workstation's, which crawls the training
+machines over ssh, holds everything the workstation holds without reaching those machines itself:
+
+    workstation$ trex daemon                        # tracks ~/runs, gpu-box:~/runs, ...
+    laptop$ trex daemon                             # then, once:
+    laptop$ trex serve http://workstation:13898
+
+Daemons may pull from each other in any arrangement, cycles included. A directory's id is the name of the trex
+that crawls it (`--name`, the host's by default) and its path, or the `host:path` it is crawled over ssh by, and
+it is one top-level folder wherever it is held. Each trex takes a directory through the link offering it by the
+fewest trex, never one it crawls itself nor one that came through it, and drops it once that link no longer has it.
 """
 
 import json
@@ -33,25 +48,37 @@ import socket
 import socketserver
 import sys
 import threading
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Final, TypedDict, cast
-from urllib.parse import quote
+from typing import Final, NamedTuple, TypedDict, cast
+from urllib.parse import quote, urlsplit
 
 from . import remote
 from .index import Explorer
-from .remote import Remote
-from .workspace import Far, Member, Workspace
+from .mirror import Mirror, Unreachable, Upstream
+from .remote import Remote, UnixHTTPConnection
+from .workspace import Member, Workspace
 
 TIMEOUT: Final = 60.0  # seconds a client waits for the daemon's reply
 HISTORY_MAX: Final = 50  # directories remembered for re-adding
+PULL_EVERY: Final = 10.0  # seconds between asking each link what it holds
 
 
 class RootInfo(TypedDict):
     name: str
-    root: str  # a local path, or host:path
+    root: str  # how this trex holds it: a local path or host:path it crawls, else the directory's id
+    id: str
     url: str
-    state: str  # local, or a remote directory's connection state
+    state: str  # local, or a mirrored directory's connection state
+    error: str
+    link: str | None  # the link it is pulled from
+
+
+class LinkInfo(TypedDict):
+    url: str
+    name: str  # the node's name, once it answered
+    state: str  # connecting, connected or unreachable
     error: str
 
 
@@ -91,21 +118,29 @@ def workspace_url(name: str) -> str:
 def unique_names(specs: Sequence[str]) -> dict[str, str]:
     """Display names of tracked directories, as Emacs's uniquify does: the basename, and where basenames collide,
     `name<context>` with the shortest context that tells them apart (parent folders, or for a remote one its
-    host and then its parent folders)."""
+    host and then its parent folders; its parent folders alone when every one it collides with is on that host)."""
     contexts = {s: _context(s) for s in specs}
-    out: dict[str, str] = {}
     by_base: dict[str, list[str]] = {}
     for s in specs:
         by_base.setdefault(contexts[s][0], []).append(s)
+    out: dict[str, str] = {}
     for base, group in by_base.items():
-        depth = 0
-        while len(group) > 1 and len({tuple(contexts[s][1:depth + 1]) for s in group}) < len(group) and \
-                depth < max(len(contexts[s]) for s in group):
-            depth += 1
-        for s in group:
-            ctx = contexts[s][1:depth + 1]
-            out[s] = f"{base}<{'/'.join(reversed(ctx))}>" if len(group) > 1 and ctx else base
+        out.update(_told_apart(base, group, contexts))
     return out
+
+
+def _told_apart(base: str, group: Sequence[str], contexts: dict[str, list[str]]) -> dict[str, str]:
+    """Names of the specs in `group`, whose basename is `base`."""
+    if len(group) == 1:
+        return {group[0]: base}
+    ctx = {s: contexts[s][1:] for s in group}
+    hosts = {a.host if (a := remote.parse(s)) else None for s in group}
+    if len(hosts) == 1 and None not in hosts:
+        ctx = {s: c[1:] for s, c in ctx.items()}
+    depth = 0
+    while len({tuple(c[:depth]) for c in ctx.values()}) < len(group) and depth < max(map(len, ctx.values())):
+        depth += 1
+    return {s: f"{base}<{'/'.join(reversed(c[:depth]))}>" if c[:depth] else base for s, c in ctx.items()}
 
 
 def _context(spec: str) -> list[str]:
@@ -118,19 +153,101 @@ def _context(spec: str) -> list[str]:
     return [path[-1] or addr.path, addr.host.split("@")[-1].split(".")[0], *reversed([q for q in path[:-1] if q])]
 
 
-class Roots:
-    """Tracked directories served by the daemon: local ones each with a polling Explorer, remote ones (host:path)
-    each with a `Remote`, and workspaces, named sets of them; saved to `state`. Every directory added or
-    removed is remembered, most recent first, in history.json beside it."""
+class Node(NamedTuple):
+    """This trex among the ones that pull from each other: `id`, unique, is what `via` lists; `name` (the host's, unless
+    given) begins the ids of the directories it crawls."""
 
-    def __init__(self, cache: Path, state: Path) -> None:
+    id: str
+    name: str
+
+
+class Pulled(NamedTuple):
+    """Where a directory this trex does not crawl comes from: the link it is pulled through, and the nodes it came
+    through to that link, from the one that crawls it."""
+
+    link: str
+    via: list[str]
+
+
+def host_name() -> str:
+    return socket.gethostname().split(".")[0] or "localhost"
+
+
+def node_at(path: Path, name: str | None = None) -> Node:
+    """The node saved at `path`, made and saved on first use; renamed `name` when given."""
+    try:
+        saved = json.loads(path.read_text())
+        node = Node(str(saved["id"]), str(saved["name"]))
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        node = Node(uuid.uuid4().hex[:16], host_name())
+    node = node._replace(name=name or node.name)
+    try:
+        unchanged = json.loads(path.read_text()) == node._asdict()
+    except (FileNotFoundError, ValueError):
+        unchanged = False
+    if not unchanged:
+        _write_json(path, node._asdict())
+    return node
+
+
+def link_url(spec: str) -> str | None:
+    """The trex `spec` names (http://host[:port]), or None for a directory."""
+    u = urlsplit(spec.strip())
+    if u.scheme != "http" or not u.hostname:
+        return None
+    return f"http://{u.netloc}"
+
+
+def dir_base(d: str) -> str:
+    """The path under which a trex serves the directory whose id is `d`."""
+    return f"/d/{quote(d, safe='')}"
+
+
+class Link:
+    """A trex this one pulls from, at `url`: its node, and what it holds, as of the last time it answered."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.state = "connecting"  # connecting, connected or unreachable
+        self.error = ""
+        self.node: Node | None = None
+        self.offers: dict[str, list[str]] | None = None  # directory id -> the nodes it came through; None while unanswered
+
+    def refresh(self) -> None:
+        """Ask the link what it holds."""
+        try:
+            body = json.loads(Upstream.at(self.url).request("GET", "/api/holdings"))
+            self.node = Node(str(body["node"]["id"]), str(body["node"]["name"]))
+            self.offers = {str(d["id"]): [str(v) for v in d["via"]] for d in body["dirs"]}
+            self.state, self.error = "connected", ""
+        except KeyError:
+            self.offers, self.state, self.error = None, "unreachable", f"{self.url} answers with no holdings; is it a trex of this version?"
+        except (Unreachable, TypeError, ValueError) as e:
+            self.offers, self.state, self.error = None, "unreachable", str(e)
+
+
+class Roots:
+    """The directories this trex serves, by id. It crawls some (`specs`): a local path, with a polling Explorer, or
+    host:path, a `Mirror` of the trex it starts there over ssh; their ids are `node name:path` and host:path. It
+    pulls the others from its links (other trex) as Mirrors, each through the link offering it by the fewest nodes
+    that are not this one. Workspaces are named sets of directories. Saved to `state`; every directory or link added
+    or removed is remembered, most recent first, in history.json beside it."""
+
+    def __init__(self, cache: Path, state: Path, name: str | None = None) -> None:
         self.cache = cache
         self.state = state
         self.history_path = state.with_name("history.json")
+        self.node = node_at(state.with_name("node.json"), name)
         self.lock = threading.Lock()
-        self.entries: dict[str, Explorer | Remote] = {}  # by spec: path, or host:path
-        self.workspaces: dict[str, list[str]] = {}  # name -> member specs
+        self.entries: dict[str, Explorer] = {}  # directory id -> what answers for it
+        self.specs: dict[str, str] = {}  # directory id -> its spec, for the directories this trex crawls
+        self.links: dict[str, Link] = {}  # by url
+        self.pulled: dict[str, Pulled] = {}  # directory id -> where it comes from, for the directories pulled
+        self.workspaces: dict[str, list[str]] = {}  # name -> member directory ids
         self._views: dict[str, Workspace] = {}
+        self._stop = threading.Event()
+        self._pull = threading.Event()  # set to pull from the links at once
+        self._puller: threading.Thread | None = None
         try:
             saved = json.loads(self.history_path.read_text())
         except (FileNotFoundError, ValueError):
@@ -138,24 +255,30 @@ class Roots:
         self._history: list[str] = [str(r) for r in saved] if isinstance(saved, list) else []
 
     def load(self) -> None:
-        """Add the directories and workspaces saved in `state`, skipping directories that no longer exist."""
+        """Add the directories, links and workspaces saved in `state`, skipping directories that no longer exist."""
         try:
             saved = json.loads(self.state.read_text())
         except FileNotFoundError:
             return
-        for spec in map(str, saved.get("tracked", [])):
+        for spec in map(str, [*saved.get("tracked", []), *saved.get("links", [])]):
             try:
                 self.track(spec, force=True, wait=False)
             except ValueError as e:
                 print(f"[trex] skipping saved directory {spec}: {e}", file=sys.stderr, flush=True)
-        for w in saved.get("workspaces", []):
-            members = [m for m in map(str, w.get("members", [])) if m in self.entries]
-            with self.lock:
-                self.workspaces[str(w.get("name"))] = members
+        with self.lock:
+            for w in saved.get("workspaces", []):
+                self.workspaces[str(w.get("name"))] = [self._id(m) for m in map(str, w.get("members", []))]
+
+    def _id(self, spec: str) -> str:
+        """The id of the directory `spec` names: a local path is this node's."""
+        return spec if remote.parse(spec) or not Path(spec).is_absolute() else f"{self.node.name}:{spec}"
 
     def track(self, spec: str, force: bool = False, wait: bool = True) -> str:
-        """Name of the tracked directory `spec` (a path or host:path), starting to serve it if new; ValueError if it
-        cannot be served."""
+        """Name of the tracked directory `spec` (a path or host:path), starting to serve it if new, or "" for a trex to
+        pull from (http://host:port); ValueError if it cannot be served."""
+        if (url := link_url(spec)) is not None:
+            self.add_link(url, wait)
+            return ""
         if remote.parse(spec):
             return self.add_remote(spec, wait)
         return self.add(resolve_root(spec, force))
@@ -163,11 +286,13 @@ class Roots:
     def add(self, root: Path) -> str:
         """Name of the tracked directory `root`, starting to serve it if new."""
         spec = str(root.resolve())
+        d = self._id(spec)
         with self.lock:
-            if spec not in self.entries:
-                self.entries[spec] = Explorer(Path(spec), self.cache).start()
+            if d not in self.specs:
+                self._unpull(d)
+                self.entries[d], self.specs[d] = Explorer(Path(spec), self.cache).start(), spec
                 self._changed(spec)
-            return self.names()[spec]
+            return self.names()[d]
 
     def add_remote(self, spec: str, wait: bool = True) -> str:
         """Name of the tracked remote directory `spec` (host:path), starting it if new. With `wait`, wait for its
@@ -177,62 +302,183 @@ class Roots:
             raise ValueError(f"{spec} is not a host:path address")
         spec = f"{addr.host}:{addr.path}"
         with self.lock:
-            if spec in self.entries:
+            if spec in self.specs:
                 return self.names()[spec]
         r = Remote(spec, addr).start()
         if wait and r.settled.wait(remote.ADD_TIMEOUT) and r.state == "unreachable":
             r.close()
             raise ValueError(f"cannot serve {spec}: {r.error}")
+        m = Mirror(Upstream(lambda timeout: UnixHTTPConnection(r.local, timeout), spec), self.cache, spec, session=r)
         with self.lock:
-            if spec in self.entries:
-                r.close()
+            if spec in self.specs:
+                m.close()
             else:
-                self.entries[spec] = r
+                self._unpull(spec)
+                self.entries[spec], self.specs[spec] = m.start(), spec
                 self._changed(spec)
             return self.names()[spec]
 
-    def names(self) -> dict[str, str]:
-        """{spec: display name} of the tracked directories."""
-        return unique_names(list(self.entries))
+    def add_link(self, url: str, wait: bool = True) -> None:
+        """Pull every directory the trex at `url` holds. With `wait`, ask it first, and raise ValueError if it does not
+        answer or is this trex."""
+        link = Link(url)
+        if wait:
+            link.refresh()
+            if link.offers is None:
+                raise ValueError(f"cannot pull from {url}: {link.error}")
+            if link.node is not None and link.node.id == self.node.id:
+                raise ValueError(f"{url} is this trex")
+        with self.lock:
+            if url in self.links:
+                return
+            self.links[url] = link
+            self._changed(url)
+        self._reconcile()
+        with self.lock:
+            if self._puller is None:
+                self._puller = threading.Thread(target=self._pull_forever, name="trex-pull", daemon=True)
+                self._puller.start()
+        self._pull.set()
 
-    def spec(self, name: str) -> str:
-        """The spec of the tracked directory named `name`; KeyError if none."""
-        for spec, n in self.names().items():
+    def _pull_forever(self) -> None:
+        """Ask every link what it holds every PULL_EVERY seconds, or at once when asked to, and pull what it offers."""
+        while not self._stop.is_set():
+            self._pull.clear()
+            for link in list(self.links.values()):
+                link.refresh()
+            self._reconcile()
+            self._pull.wait(PULL_EVERY)
+
+    def _reconcile(self) -> None:
+        """Pull every directory the links offer that this trex does not crawl, through the link offering it by the
+        fewest nodes not counting this one, keeping a directory's link while that link offers it; stop pulling one
+        that its link, answering, no longer offers (one whose link does not answer stays, to browse)."""
+        closing: list[Explorer] = []
+        with self.lock:
+            best = self._offers()
+            for d, (url, via) in best.items():
+                held = self.pulled.get(d)
+                link = self.links.get(held.link) if held else None
+                if held is not None and link is not None and d in (link.offers or {}):
+                    self.pulled[d] = Pulled(held.link, (link.offers or {})[d])
+                    continue
+                entry = self.entries.get(d)
+                if isinstance(entry, Mirror):
+                    entry.retarget(Upstream.at(url, dir_base(d)))
+                else:
+                    self.entries[d] = Mirror(Upstream.at(url, dir_base(d)), self.cache, d).start()
+                self.pulled[d] = Pulled(url, via)
+                self._changed(None)
+            for d, p in list(self.pulled.items()):
+                link = self.links.get(p.link)
+                if d not in best and (link is None or link.offers is not None):
+                    closing.append(self.entries.pop(d))
+                    del self.pulled[d]
+                    self._changed(None)
+        for e in closing:
+            threading.Thread(target=e.close, name=f"trex-close-{e.root.name}", daemon=True).start()
+
+    def _offers(self) -> dict[str, tuple[str, list[str]]]:
+        """{directory id: (link url, via)}: for each directory the links offer that this trex does not crawl, the link
+        offering it by the fewest nodes, none of them this one."""
+        best: dict[str, tuple[str, list[str]]] = {}
+        for url, link in self.links.items():
+            for d, via in (link.offers or {}).items():
+                if d not in self.specs and self.node.id not in via and (d not in best or len(via) < len(best[d][1])):
+                    best[d] = (url, via)
+        return best
+
+    def _unpull(self, d: str) -> None:
+        """Stop pulling `d`, which this trex now crawls (inside the lock)."""
+        if self.pulled.pop(d, None) is not None:
+            threading.Thread(target=self.entries.pop(d).close, daemon=True).start()
+
+    def holdings(self) -> dict[str, object]:
+        """{node, dirs: [{id, via}]}: this trex, and each directory it holds with the nodes it came through, from the one
+        that crawls it to this one."""
+        with self.lock:
+            dirs = [{"id": d, "via": [*self.pulled[d].via, self.node.id] if d in self.pulled else [self.node.id]}
+                    for d in self.entries]
+        return {"node": self.node._asdict(), "dirs": dirs}
+
+    def names(self) -> dict[str, str]:
+        """{directory id: display name}: uniquified over the specs of the directories this trex crawls and the ids of
+        the others."""
+        shown = {d: self.specs.get(d, d) for d in self.entries}
+        names = unique_names(list(shown.values()))
+        return {d: names[s] for d, s in shown.items()}
+
+    def id_of(self, name: str) -> str:
+        """The id of the directory named `name`; KeyError if none."""
+        for d, n in self.names().items():
             if n == name:
-                return spec
+                return d
         raise KeyError(name)
 
     def remove(self, name: str) -> None:
-        """Stop serving `name` and drop it from every workspace; its index cache stays on disk."""
+        """Stop serving the directory `name` (or pulling from the link `name`) and drop it from every workspace; its
+        index cache stays on disk. ValueError for a directory pulled from a link: remove that link instead."""
+        if name in self.links:
+            return self.remove_link(name)
         with self.lock:
-            spec = self.spec(name)
-            entry = self.entries.pop(spec)
+            d = self.id_of(name)
+            if d in self.pulled:
+                raise ValueError(f"{name} comes from {self.pulled[d].link}; remove that link to stop pulling it")
+            entry, spec = self.entries.pop(d), self.specs.pop(d)
             for members in self.workspaces.values():
-                if spec in members:
-                    members.remove(spec)
+                if d in members:
+                    members.remove(d)
             self._changed(spec)
         threading.Thread(target=entry.close, name=f"trex-close-{name}", daemon=True).start()
 
-    def close(self) -> None:
-        """Stop serving every directory (they stay saved)."""
+    def remove_link(self, url: str) -> None:
+        """Stop pulling from the link `url`; what only it offered is no longer served."""
         with self.lock:
-            entries, self.entries = list(self.entries.values()), {}
+            del self.links[url]
+            self._changed(url)
+        self._reconcile()
+
+    def close(self) -> None:
+        """Stop serving every directory and pulling from every link (they stay saved)."""
+        self._stop.set()
+        self._pull.set()
+        with self.lock:
+            entries, self.entries, self.specs, self.pulled = list(self.entries.values()), {}, {}, {}
             views, self._views = list(self._views.values()), {}
         for v in views:
             v.close()
         for entry in entries:
             entry.close()
 
-    def get(self, name: str) -> Explorer | Remote:
+    def get(self, name: str) -> Explorer:
         with self.lock:
-            return self.entries[self.spec(name)]
+            return self.entries[self.id_of(name)]
+
+    def by_id(self, d: str) -> Explorer:
+        with self.lock:
+            return self.entries[d]
 
     def served(self) -> list[RootInfo]:
         with self.lock:
             names = self.names()
-            return [{"name": names[s], "root": s, "url": root_url(names[s]),
-                     "state": e.state if isinstance(e, Remote) else "local",
-                     "error": e.error if isinstance(e, Remote) else ""} for s, e in self.entries.items()]
+            return [self._info(d, names[d]) for d in self.entries]
+
+    def _info(self, d: str, name: str) -> RootInfo:
+        e, pulled = self.entries[d], self.pulled.get(d)
+        state, error = "local", ""
+        if isinstance(e, Mirror) and isinstance(e.session, Remote):
+            state, error = e.session.state, e.session.error or e.error
+        elif isinstance(e, Mirror) and pulled is not None:
+            link = self.links.get(pulled.link)
+            state = "connected" if e.connected else link.state if link else "unreachable"
+            error = (link.error if link else "") or e.error
+        return {"name": name, "root": self.specs.get(d, d), "id": d, "url": root_url(name), "state": state,
+                "error": error, "link": pulled.link if pulled else None}
+
+    def links_info(self) -> list[LinkInfo]:
+        with self.lock:
+            return [{"url": u, "name": link.node.name if link.node else "", "state": link.state, "error": link.error}
+                    for u, link in self.links.items()]
 
     # ---- workspaces ----
 
@@ -242,12 +488,12 @@ class Roots:
         if not name or "/" in name or name.startswith("."):
             raise ValueError(f"{name!r} is not a workspace name")
         with self.lock:
-            specs = [self.spec(m) for m in members]
+            ids = [self.id_of(m) for m in members]
             if name != old and name in self.workspaces:
                 raise ValueError(f"a workspace named {name} exists")
             if old is not None and old != name:
                 self.workspaces.pop(old, None)
-            self.workspaces[name] = specs
+            self.workspaces[name] = ids
             self._changed(None)
 
     def delete_workspace(self, name: str) -> None:
@@ -264,29 +510,32 @@ class Roots:
             return view
 
     def everything(self) -> Workspace:
-        """The root view: every tracked directory, each a top-level folder."""
+        """The root view: every directory, each a top-level folder."""
         with self.lock:
             view = self._views.get("")
             if view is None:
                 view = self._views[""] = Workspace("/", self._members(list(self.entries)), nested=True)
             return view
 
-    def _members(self, specs: Sequence[str]) -> list[Member]:
+    def _members(self, ids: Sequence[str]) -> list[Member]:
         names = self.names()
-        return [Member(names[s], Far(e) if isinstance(e := self.entries[s], Remote) else e) for s in specs]
+        return [Member(names[d], self.entries[d]) for d in ids if d in self.entries]
 
     def workspace_list(self) -> list[dict[str, object]]:
         with self.lock:
             names = self.names()
-            return [{"name": w, "url": workspace_url(w), "members": [names[s] for s in specs]}
-                    for w, specs in self.workspaces.items()]
+            return [{"name": w, "url": workspace_url(w), "members": [names[d] for d in ids if d in names]}
+                    for w, ids in self.workspaces.items()]
 
     # ---- history and saving ----
 
     def history(self) -> list[str]:
-        """Remembered directories that are not served, most recent first; local ones only while they exist."""
+        """Remembered directories and links that are not served, most recent first; local directories only while they
+        exist."""
         with self.lock:
-            return [r for r in self._history if r not in self.entries and (remote.parse(r) is not None or Path(r).is_dir())]
+            held = {*self.specs.values(), *self.links}
+            return [r for r in self._history if r not in held and (remote.parse(r) is not None or link_url(r) is not None
+                                                                   or Path(r).is_dir())]
 
     def clear_history(self) -> None:
         with self.lock:
@@ -301,7 +550,7 @@ class Roots:
         for v in self._views.values():
             v.close()
         self._views = {}
-        _write_json(self.state, {"tracked": list(self.entries),
+        _write_json(self.state, {"tracked": list(self.specs.values()), "links": list(self.links),
                                  "workspaces": [{"name": w, "members": m} for w, m in self.workspaces.items()]})
 
 
@@ -347,7 +596,7 @@ class ControlServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             return {"urls": self.urls, "roots": self.roots.served()}
         if req.get("op") == "add":
             name = self.roots.track(str(req.get("path")), bool(req.get("force")))
-            return {"name": name, "url": self.urls[0].rstrip("/") + root_url(name)}
+            return {"name": name, "url": self.urls[0].rstrip("/") + (root_url(name) if name else "/")}
         return {"error": f"unknown request {req.get('op')!r}"}
 
     def server_close(self) -> None:

@@ -36,7 +36,7 @@ const REMOTE = /^((?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s[\]]+)):(.+)$/;
 /** The last `n` characters of `s`, after an ellipsis when cut. */
 const tailOf = (s, n) => (s.length > n ? `…${s.slice(1 - n)}` : s);
 
-/** `/api/daemon`: {daemon, roots, workspaces, history, install, updates}. */
+/** `/api/daemon`: {daemon, node, roots, links, workspaces, history, install, updates}. */
 const daemonInfo = () => getJSON("/api/daemon");
 
 const METRIC_SORT = "metric:"; // prefix of a sort key naming a metric
@@ -520,6 +520,7 @@ class App {
     const home = () => show(h("div", { className: "mtitle", textContent: "workspaces" }), ...this.workspaceRows(d, refresh, edit),
       h("button", { className: "mclear", textContent: "+ new workspace", onclick: () => edit(null) }),
       h("div", { className: "mtitle msec", textContent: "tracked directories" }), ...this.trackedRows(d, refresh, err), err,
+      d.links.length ? h("div", { className: "mtitle msec", textContent: "pulled from" }) : null, ...this.linkRows(d),
       this.versionRow(d, err));
     const edit = (ws) => show(this.workspaceEditor(d, ws, home));
     home();
@@ -562,24 +563,40 @@ class App {
     else refresh();
   }
 
-  /** Rows of the tracked directories, the add box and the remembered directories. */
+  /** Rows of the trex this one pulls every directory of; stopping pulling from one opens the root view anew. */
+  linkRows(d) {
+    const unlink = async (l) => {
+      if (!confirm(`Stop pulling from ${l.url}? What only it offers is no longer served here.`)) return;
+      await post("/api/daemon/remove", { name: l.url });
+      openPage("/");
+    };
+    return d.links.map((l) => h("div", { className: "mrow" },
+      h("div", { className: "mitem", title: l.error || l.url },
+        h("span", { className: "ml", textContent: l.name || l.url }),
+        h("span", { className: "ms", textContent: tailOf(l.url, 36) + (l.state === "connected" ? "" : ` · ${l.state}`) })),
+      h("button", { className: "chev", textContent: "×", title: "stop pulling from this trex", onclick: () => unlink(l) })));
+  }
+
+  /** Rows of the tracked directories (one pulled from another trex is removed with its link), the add box and the
+   * remembered directories and links. */
   trackedRows(d, refresh, err) {
     const note = h("div", { className: "mhint" });
     const add = async (path) => {
-      const host = REMOTE.exec(path.trim())?.[1];
-      [err.textContent, note.textContent] = ["", host ? `starting trex on ${host}…` : ""];
+      const link = /^http:\/\//.test(path.trim()), host = link ? null : REMOTE.exec(path.trim())?.[1];
+      [err.textContent, note.textContent] = ["", link ? `asking ${path.trim()}…` : host ? `starting trex on ${host}…` : ""];
       const [ok, j] = await post("/api/daemon/add", { path: path.trim() });
       note.textContent = "";
       if (ok) openPage(j.url);
       else err.textContent = j.error;
     };
-    const input = h("input", { type: "text", placeholder: "/path/to/runs, ~/runs or host:path", spellcheck: false,
+    const input = h("input", { type: "text", placeholder: "/path/to/runs, ~/runs, host:path or http://host:port", spellcheck: false,
       onkeydown: (e) => e.key === "Enter" && add(input.value) });
     const served = d.roots.map((r) => h("div", { className: "mrow" },
-      h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || r.root, onclick: () => openPage(r.url) },
+      h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || (r.link ? `${r.root}, pulled from ${r.link}` : r.root),
+        onclick: () => openPage(r.url) },
         h("span", { className: "ml", textContent: r.name }),
         h("span", { className: "ms", textContent: tailOf(r.root, 36) + (r.state === "local" || r.state === "connected" ? "" : ` · ${r.state}`) })),
-      h("button", { className: "chev", textContent: "×", title: "stop tracking this directory (its files are kept)",
+      r.link ? null : h("button", { className: "chev", textContent: "×", title: "stop tracking this directory (its files are kept)",
         onclick: () => this.forget(`Stop serving ${r.root}? Its run files are kept.`, "/api/daemon/remove", { name: r.name }, r.url, refresh) })));
     const recent = d.history.map((path) => h("button", { className: "mitem", title: `track ${path}`, onclick: () => add(path) },
       h("span", { className: "micon", textContent: "+" }), h("span", { className: "ml", textContent: tailOf(path, 56) })));

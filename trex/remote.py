@@ -1,5 +1,5 @@
 """Remote runs directories (`host:path`): the daemon copies this trex there as a wheel over ssh (once per content),
-runs it with uvx on a Unix socket that ssh forwards back, and passes the directory's requests through to it."""
+runs it with uvx on a Unix socket that ssh forwards back, and mirrors the directory from it (`trex.mirror`)."""
 
 import base64
 import collections
@@ -25,7 +25,6 @@ ADD_TIMEOUT: Final = 120.0  # seconds an add waits for the first start (uvx may 
 BACKOFF_MAX: Final = 60.0  # seconds between reconnection attempts, at most
 CLOSE_TIMEOUT: Final = 15.0  # seconds `close` waits for the session to end
 REMOTE_PYTHON: Final = "3.12"  # the oldest Python trex supports, whose numpy wheels reach the oldest glibc
-PROXY_TIMEOUT: Final = 120.0  # seconds a passed-through request may wait for the remote server
 SSH_OPTIONS: Final = ["-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes",
                       "-o", "StreamLocalBindMask=0177", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
 NO_UV: Final = "uv is not installed on $(hostname); install it with: curl -LsSf https://astral.sh/uv/install.sh | sh"
@@ -39,9 +38,9 @@ class Address(NamedTuple):
 
 
 def parse(spec: str) -> Address | None:
-    """The remote address `spec` names in scp form ([user@]host:path), or None for a local path."""
+    """The remote address `spec` names in scp form ([user@]host:path), or None for a local path or a URL."""
     m = SPEC.fullmatch(spec.strip())
-    if m is None or Path(spec).expanduser().exists():
+    if m is None or "://" in spec or Path(spec).expanduser().exists():
         return None
     return Address(m["host"], m["path"])
 
@@ -142,9 +141,6 @@ class Remote:
             _end(proc)
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(CLOSE_TIMEOUT)
-
-    def connection(self) -> UnixHTTPConnection:
-        return UnixHTTPConnection(self.local, PROXY_TIMEOUT)
 
     def _supervise(self) -> None:
         delay = 1.0

@@ -3,7 +3,6 @@
 import contextlib
 import errno
 import gzip
-import html
 import ipaddress
 import json
 import os
@@ -12,6 +11,7 @@ import socket
 import socketserver
 import sys
 import threading
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,10 +19,9 @@ from typing import TYPE_CHECKING, Any, Final, cast
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import buckets as bk, remote, update
-from .daemon import root_url, workspace_url
-from .remote import Remote
-from .workspace import Far, Workspace
-from .index import Ask, Explorer, Which, dumps
+from .daemon import Node, host_name, link_url, root_url, workspace_url
+from .workspace import Workspace
+from .index import Ask, Explorer, Have, Which, dumps
 
 if TYPE_CHECKING:
     from .daemon import Roots
@@ -33,12 +32,12 @@ type RouteFn = Callable[..., None]
 STATIC: Final = Path(__file__).parent / "static"
 DEFAULT_PORT: Final = 13898
 PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
-HOP_HEADERS: Final = frozenset({"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
-                                "proxy-authorization", "proxy-authenticate"})
-ROOT_PREFIX: Final = re.compile(r"/([rw])/([^/]+)(/.*)?")  # a tracked directory's (r) or workspace's (w) URLs
+ROOT_PREFIX: Final = re.compile(r"/([rwd])/([^/]+)(/.*)?")  # a directory's URLs by name (r) or id (d), a workspace's (w)
+STANDALONE: Final = Node(uuid.uuid4().hex[:16], host_name())  # this process, when it serves one directory
 PROTOCOL: Final = 6  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
 WHICH: Final[dict[str, Which]] = {"all": "all", "finished": "finished", "running": "running"}
 MAX_ASKS: Final = 256  # blocks one POST /api/buckets may ask for
+MAX_DUMPS: Final = 256  # runs one POST /api/dumps may ask for
 RESTART_DELAY: Final = 0.5  # seconds between answering an update and restarting, so the answer is sent
 CTYPES: Final = {
     ".html": "text/html; charset=utf-8",
@@ -143,60 +142,26 @@ class Handler(BaseHTTPRequestHandler):
         view of every tracked directory."""
         self._ex = self.srv.explorer
         if self.srv.roots is None:
+            pm = ROOT_PREFIX.fullmatch(path)
+            if pm is not None and pm[1] == "d" and self._ex is not None and unquote(pm[2]) == standalone_id(self._ex):
+                return pm[3] or "/"
             return path
         pm = ROOT_PREFIX.fullmatch(path)
         if pm is None:
             self._ex = self.srv.roots.everything()
             return path
         kind, name, rest = pm[1], unquote(pm[2]), pm[3]
+        roots = self.srv.roots
         try:
-            entry = self.srv.roots.get(name) if kind == "r" else self.srv.roots.workspace(name)
+            entry = roots.get(name) if kind == "r" else roots.by_id(name) if kind == "d" else roots.workspace(name)
         except KeyError:
             if rest in (None, "/"):
                 return self.redirect("/", permanent=False)
             raise
         if rest is None:
             return self.redirect(path + "/" + (f"?{query}" if query else ""))
-        if isinstance(entry, Remote):
-            return self._proxy(entry, rest + (f"?{query}" if query else ""))
         self._ex = entry
         return rest
-
-    def _proxy(self, remote: Remote, target: str) -> None:
-        """Pass the request through to the remote directory's server, streaming its answer back."""
-        if remote.state != "connected":
-            return self._unavailable(remote, target)
-        conn = remote.connection()
-        try:
-            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS | {"host", "origin", "content-length"}}
-            try:
-                conn.request(self.command, target, body=self._body or None, headers={**headers, "Host": "localhost"})
-                resp = conn.getresponse()
-            except OSError:
-                return self._unavailable(remote, target)
-            self.send_response(resp.status)
-            for k, v in resp.getheaders():
-                if k.lower() not in HOP_HEADERS | {"server", "date"}:
-                    self.send_header(k, v)
-            if resp.getheader("Content-Length") is None:
-                self.send_header("Connection", "close")
-                self.close_connection = True
-            self.end_headers()
-            while chunk := resp.read1(1 << 16):
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        finally:
-            conn.close()
-
-    def _unavailable(self, remote: Remote, target: str) -> None:
-        """503: a page that reloads itself for the directory's page, else JSON."""
-        what = f"trex on {remote.addr.host} is {remote.state}" + (f": {remote.error}" if remote.error else "")
-        if target.split("?")[0] != "/":
-            return self._json({"error": what}, 503)
-        body = (f'<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="2"><title>trex</title>'
-                f'<p>{html.escape(remote.spec)}: {html.escape(what)}</p><pre>{html.escape(remote.error)}</pre>'
-                f'<p><a href="/">back</a></p>').encode()
-        self.send(body, "text/html; charset=utf-8", 503, {"Cache-Control": "no-store"})
 
     def redirect(self, location: str, permanent: bool = True) -> None:
         """A 301, or a 302 that browsers must not cache."""
@@ -292,10 +257,8 @@ class Handler(BaseHTTPRequestHandler):
         extra = {"Content-Security-Policy": "sandbox allow-scripts"} if html else None
         ex = self.ex
         if isinstance(ex, Workspace):
-            m, path = ex.resolve(run)
-            if isinstance(m.src, Far):
-                return self._proxy(m.src.remote, f"/m/{quote(path, safe='')}/{file}")
-            ex, run = m.src, path
+            m, run = ex.resolve(run)
+            ex = m.src
         self.send_file(ex.media_path(run, file), f'"{file}"', "public, max-age=31536000, immutable", extra, compress=html)
 
     @route("GET", r"/api/info")
@@ -304,15 +267,27 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", r"/api/daemon")
     def daemon(self, q: Query) -> None:
-        """{daemon, roots: [{name, root, url, state, error}], workspaces: [{name, url, members}], history: [root],
-        install, updates}: whether this is the daemon, its directories and workspaces, the remembered directories it
-        does not serve, the trex it runs, and whether it can update."""
+        """{daemon, node, roots: [{name, root, id, url, state, error, link}], links: [{url, name, state, error}],
+        workspaces: [{name, url, members}], history: [root], install, updates}: whether this is the daemon, which node it
+        is, its directories, the trex it pulls from and its workspaces, the remembered directories and links it does not
+        serve, the trex it runs, and whether it can update."""
         roots = self.srv.roots
         if roots is None:
-            return self._json({"daemon": False, "roots": [], "workspaces": [], "history": [], "install": None,
-                               "updates": None})
-        self._json({"daemon": True, "roots": roots.served(), "workspaces": roots.workspace_list(),
-                    "history": roots.history(), "install": update.RUNNING, "updates": update.updates()})
+            return self._json({"daemon": False, "node": STANDALONE._asdict(), "roots": [], "links": [], "workspaces": [],
+                               "history": [], "install": None, "updates": None})
+        self._json({"daemon": True, "node": roots.node._asdict(), "roots": roots.served(), "links": roots.links_info(),
+                    "workspaces": roots.workspace_list(), "history": roots.history(), "install": update.RUNNING,
+                    "updates": update.updates()})
+
+    @route("GET", r"/api/holdings")
+    def holdings(self, q: Query) -> None:
+        """{node: {id, name}, dirs: [{id, via}]}: this trex, and each directory it holds with the nodes it came through,
+        from the one that crawls it to this one; another trex pulls each from /d/<id>/."""
+        roots, ex = self.srv.roots, self.srv.explorer
+        if roots is not None:
+            return self._json(roots.holdings())
+        dirs = [] if ex is None else [{"id": standalone_id(ex), "via": [STANDALONE.id]}]
+        self._json({"node": STANDALONE._asdict(), "dirs": dirs})
 
     @property
     def daemon_roots(self) -> "Roots":
@@ -329,21 +304,26 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("POST", r"/api/daemon/add")
     def daemon_add(self, q: Query) -> None:
-        """Body: {path}: absolute, ~/…, or host:path for a remote directory (which this waits to start).
-        Response: {name, url}, or 400 with {error} for a path it refuses or a remote that fails to start."""
+        """Body: {path}: absolute, ~/…, host:path for a remote directory (which this waits to start), or http://host:port
+        for a trex to pull every directory of. Response: {name, url} (the root view's for a trex), or 400 with {error}
+        for a path it refuses, a remote that fails to start or a trex that does not answer."""
         roots, path = self.daemon_roots, self.body_field("path").strip()
         try:
-            if not remote.parse(path) and not Path(path).expanduser().is_absolute():
-                raise ValueError(f"{path} is not an absolute path or host:path")
+            if not remote.parse(path) and not link_url(path) and not Path(path).expanduser().is_absolute():
+                raise ValueError(f"{path} is not an absolute path, host:path or http://host:port")
             name = roots.track(path)
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
-        self._json({"name": name, "url": root_url(name)})
+        self._json({"name": name, "url": root_url(name) if name else "/"})
 
     @route("POST", r"/api/daemon/remove")
     def daemon_remove(self, q: Query) -> None:
-        """Body: {name}. Stops serving that directory."""
-        self.daemon_roots.remove(self.body_field("name"))
+        """Body: {name}: a directory's name, or a link's url. Stops serving that directory, or pulling from that trex;
+        400 for a directory pulled from a link."""
+        try:
+            self.daemon_roots.remove(self.body_field("name"))
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
         self._json({"ok": True})
 
     @route("POST", r"/api/daemon/update")
@@ -415,6 +395,20 @@ class Handler(BaseHTTPRequestHandler):
     def rows(self, q: Query) -> None:
         self.send(self.ex.rows_json(q["path"], int(q.get("from", 0))).encode(), "application/json", compress=True)
 
+    @route("POST", r"/api/dumps")
+    def dumps(self, q: Query) -> None:
+        """Body: {runs: [{path, and unless the mirror asking holds nothing of it: uid, mseq, kept, pyramid (the rows its
+        kept buckets and compiled levels hold)}]}, at most MAX_DUMPS. Response: each run's index rows the mirror lacks
+        (`Explorer.dump`) in one body (`buckets.frame`), empty for a run this directory does not have."""
+        ex, req = self.ex, json.loads(self.body())
+        runs = req.get("runs") if isinstance(req, dict) else None
+        if not isinstance(ex, Explorer):
+            raise KeyError("a directory")
+        if not isinstance(runs, list) or not 0 < len(runs) <= MAX_DUMPS:
+            raise ValueError(f"expected {{runs: [{{path, uid?, mseq?, kept?, pyramid?}}]}} of 1 to {MAX_DUMPS}")
+        self.send(bk.frame(ex.dump_many([_held(r) for r in runs])), "application/octet-stream",
+                  headers={"Cache-Control": "no-store"})
+
     @route("POST", r"/api/buckets")
     def post_buckets(self, q: Query) -> None:
         """Body: {blocks: [{key, level, index, and runs (a list of run ids) or scope and which (all, finished or
@@ -428,8 +422,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send(body, "application/octet-stream", headers={"Cache-Control": "no-store"}, compress=not self._loopback())
 
     def _loopback(self) -> bool:
+        """Whether the client is on this machine; one on the Unix socket is a daemon reaching this trex over ssh."""
         if not isinstance(self.client_address, tuple):
-            return True
+            return False
         host = str(self.client_address[0])
         return host == "::1" or host.startswith("127.") or host.startswith("::ffff:127.")
 
@@ -499,6 +494,11 @@ def serve_unix(explorer: Explorer, path: Path) -> Server:
     return srv
 
 
+def standalone_id(ex: Explorer) -> str:
+    """The id of the directory a standalone server serves."""
+    return f"{STANDALONE.name}:{ex.root}"
+
+
 def _is_ip(name: str) -> bool:
     try:
         ipaddress.ip_address(name)
@@ -547,6 +547,16 @@ def urls(servers: Sequence[Server]) -> list[str]:
         host, port = str(s.server_address[0]), s.server_address[1]
         out.append(f"http://{f'[{host}]' if ':' in host else host}:{port}/")
     return out
+
+
+def _held(r: object) -> tuple[str, Have | None]:
+    """A run of POST /api/dumps and what the mirror asking holds of it; ValueError unless it is one."""
+    if not isinstance(r, dict) or not isinstance(path := r.get("path"), str):
+        raise ValueError(f"not a run: {r!r}")
+    if "uid" not in r:
+        return path, None
+    return path, {"uid": str(r["uid"]), "mseq": _whole(r.get("mseq", 0)), "kept_seq": _whole(r.get("kept", -1)),
+                  "pyramid_seq": _whole(r.get("pyramid", -1))}
 
 
 def _ask(b: object) -> Ask:

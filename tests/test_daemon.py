@@ -78,6 +78,8 @@ def test_colliding_names_are_told_apart_by_their_parents_until_the_collision_end
     (["/x/a/runs", "/y/a/runs"], ["runs<x/a>", "runs<y/a>"]),
     (["/data/runs", "gpu-box:~/runs", "big.lan:/scratch/runs"], ["runs<data>", "runs<gpu-box>", "runs<big>"]),
     (["/data/runs", "/data/sweeps"], ["runs", "sweeps"]),
+    (["box:/x/runs", "box:/y/runs", "/z/runs"], ["runs<x/box>", "runs<y/box>", "runs<z>"]),
+    (["box:/x/runs", "box:/y/runs"], ["runs<x>", "runs<y>"]),
 ])
 def test_names_follow_emacs_uniquify(specs, want):
     names = unique_names(specs)
@@ -114,13 +116,14 @@ def test_removing_a_directory_stops_serving_it_without_touching_its_files(roots,
     ready(roots, name)
     assert post_json(f"{http}/api/daemon/remove", {"name": name}) == (200, {"ok": True})
     assert request(f"{http}/r/{name}/api/runs")[0] == 404
-    assert json.loads((state / "roots.json").read_text()) == {"tracked": [], "workspaces": []}
+    assert json.loads((state / "roots.json").read_text()) == {"tracked": [], "links": [], "workspaces": []}
     assert sorted(p.relative_to(dirs[0]) for p in dirs[0].rglob("*")) == before
 
 
 def test_standalone_server_has_no_daemon_routes(tmp_path, dirs, http_server):
     url = http_server(server.serve(Explorer(dirs[0], tmp_path / "cache"), "127.0.0.1", 0))
-    assert get_json(f"{url}/api/daemon") == {"daemon": False, "roots": [], "workspaces": [], "history": [], "install": None, "updates": None}
+    assert get_json(f"{url}/api/daemon") == {"daemon": False, "node": server.STANDALONE._asdict(), "roots": [], "links": [],
+                                             "workspaces": [], "history": [], "install": None, "updates": None}
     assert post_json(f"{url}/api/daemon/remove", {"name": "runs"})[0] == 404
 
 

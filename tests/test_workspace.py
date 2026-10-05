@@ -210,7 +210,7 @@ def test_an_unreachable_member_leaves_the_others_working(roots, dirs, http):
     roots.add_remote("box:/no/such/runs", wait=False)
     a, far = (r["name"] for r in roots.served())
     roots.set_workspace("mixed", [a, far])
-    assert wait_for(lambda: roots.get(far).state == "unreachable")
+    assert wait_for(lambda: [r["state"] for r in roots.served() if r["name"] == far] == ["unreachable"])
     assert sorted(r["id"] for r in get_json(f"{http}/w/mixed/api/runs")["runs"]) == ["sac/r1", "sac/r2", "shared/x"]
     assert runs_with_buckets(blocks(f"{http}/w/mixed", runs=["sac/r1"])) == ["sac/r1"]
 

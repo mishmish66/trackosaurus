@@ -14,9 +14,10 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread, and a merge thread that merges small commits |
 | `trex/media.py` | PNG/MP4 encoding for logged arrays (MP4 through ffmpeg) |
 | `trex/index.py` | `Explorer`: crawl, per-run scans (inline or process pool), each run's kept buckets, finished runs' merged levels (saved, memory-mapped), blocks built from run files, block answers (`buckets_body`) and a size-bounded memo of them (`Memo`), event hub, SSE messages (`messages`) |
-| `trex/server.py` | read-only HTTP + SSE for the UI: `/api/runs`, `/api/buckets`, `/api/rows`, `/api/stream`, media |
-| `trex/daemon.py` | `trex daemon`: `Roots` (tracked directories by spec, `unique_names`, workspaces; `roots.json`, remembered ones in `history.json`), the Unix control socket, its client |
-| `trex/workspace.py` | workspaces: `Workspace` merges its members (`Member`: an `Explorer`, or `Far` for a remote one, which answers as an Explorer does) behind the Explorer interface, renaming run ids |
+| `trex/server.py` | read-only HTTP + SSE for the UI and for other trex: `/api/runs`, `/api/buckets`, `/api/rows`, `/api/stream`, media, `/api/dumps`, `/api/holdings`; a directory by name (`/r/`) or id (`/d/`) |
+| `trex/daemon.py` | `trex daemon`: `Roots` (directories by id: crawled ones by spec, pulled ones by `Link`; `Node`, `holdings`, `unique_names`, workspaces; `roots.json`, `node.json`, remembered ones in `history.json`), the Unix control socket, its client |
+| `trex/mirror.py` | `Mirror`: an Explorer of a directory another trex holds, synced through its `Upstream` (run list, dumps, media, stream) and answering from its own index |
+| `trex/workspace.py` | workspaces: `Workspace` merges its members (`Member`: an `Explorer` or `Mirror`) behind the Explorer interface, renaming run ids |
 | `trex/remote.py` | `host:path` directories: `parse`, this trex as a wheel (`build_wheel`), the ssh + `uvx` command, `Remote` (one ssh session, reconnected with backoff) |
 | `trex/compact.py` | `trex compact`: rewrites a run no process has open with its commits merged (exclusive lock, new file, verify, rename) |
 | `trex/update.py` | the daemon's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd or launchd to restart it |
@@ -97,11 +98,23 @@ them WebGL falls back to software and timings mean nothing.
   (`Explorer._memo`, a `Memo` of `MEMO_BYTES` that also holds stacks and merged levels) until those runs change (`_gens`), and `/api/runs` answers until what it holds changes
   (`_view_gen`). `/api/info` states `server.PROTOCOL`; a page of another (`data.js` PROTOCOL) says so beside the
   status.
-- **Daemon**: one server, one `Explorer` (or `Remote`) per tracked directory. A directory's URLs are its
-  standalone URLs under `/r/<name>/`, a workspace's under `/w/<name>/`, and the UI prefixes every request
-  with that (`BASE` in `data.js`); `/` is the root view, every tracked directory as a top-level folder
+- **Daemon**: one server, one `Explorer` or `Mirror` per directory. A directory's URLs are its
+  standalone URLs under `/r/<name>/` (and `/d/<id>/` for other trex), a workspace's under `/w/<name>/`, and the UI prefixes every request
+  with that (`BASE` in `data.js`); `/` is the root view, every directory as a top-level folder
   (`Roots.everything`, a nested `Workspace`), and the trex brand opens the panel that manages them. Names follow Emacs's uniquify (`runs<chush>`)
-  and change when a collision appears or ends; specs (paths, `host:path`) are the stable keys.
+  over the specs of crawled directories and the ids of pulled ones, and change when a collision appears or ends; ids are
+  the stable keys: `<node name>:<path>` for a local directory (`Node`, `node.json`, `--name`), the spec for `host:path`.
+- **Mirror** (`trex.mirror`): one directed link. It lists its upstream's runs (`/api/runs`) instead of crawling, and
+  dumps (`POST /api/dumps`, `Explorer.dump`) the index rows of each run that differs, given what it holds (uid, media,
+  kept and compiled seqs), into its own index with `Explorer.apply`, then copies the media files. The upstream's stream
+  is its stream (heartbeats aside) and tells it which runs to dump (a running one at most every `RUNNING_EVERY`). While
+  the stream is up, running runs' blocks by id, their rows and blocks its compiled levels lack come from the upstream;
+  otherwise it answers from its index. A `host:path` directory is a Mirror of the trex its `Remote` session runs.
+- **Links**: `Roots.links` are trex this one pulls every directory of (`http://host:port`). Every `PULL_EVERY` it asks
+  each for its `/api/holdings` ({node, dirs: [{id, via}]}, `via` the nodes a directory came through from the one
+  crawling it) and pulls each directory it does not crawl through the link offering it by the shortest `via` without
+  itself (`Roots._reconcile`), keeping a directory's link while that link offers it (`Mirror.retarget` otherwise). A
+  directory goes once its link answers without it; an unreachable link keeps what it offered. So links may form cycles.
 - **Workspace**: answers the Explorer interface by asking its members in parallel. A run id is the
   member's path, or `path<member>` when an earlier member holds the same path; `resolve` maps it back. It asks each
   member once per request for its part of every block, and joins the members' bucket arrays per block, run ids renamed
@@ -111,12 +124,12 @@ them WebGL falls back to software and timings mean nothing.
   added over the control socket (mode 0600) or HTTP and removed over HTTP. An update installs
   `$TREX_SOURCE` and exits with `update.RESTART_STATUS`; the systemd unit's `RestartForceExitStatus`
   or the launchd agent's `KeepAlive` restarts it, and the UI reloads once `/api/daemon` reports the new install (`update.RUNNING`, read at start).
-  A removed directory's `Explorer` is closed (`Explorer.close`). A `host:path` directory is a `Remote`:
+  A removed directory's `Explorer` is closed (`Explorer.close`). A `host:path` directory's `Remote` is
   one `ssh -L <local socket>:<remote socket> host uvx --from ~/.cache/trex/wheels/<wheel> trex serve PATH --unix
   <remote socket> --exit-on-eof`, where `<wheel>` is this trex packaged as a wheel named by a digest of its contents
-  (`remote.wheel`); a session that finds it missing says so, and the daemon writes it there over ssh and reconnects. And `Handler._proxy` passes its `/r/<name>/` requests (the stream too)
-  to the local socket; the remote server ends when the session's stdin closes. Tests use a fake `ssh`
-  and `uvx` (`tests/test_remote.py`).
+  (`remote.wheel`); a session that finds it missing says so, and the daemon writes it there over ssh and reconnects. Its
+  `Mirror` reaches the remote server through the local socket; the remote server ends when the session's stdin closes,
+  and compresses what it sends there. Tests use a fake `ssh` and `uvx` (`tests/test_remote.py`).
 - **Browser** (`data.js`): visible charts state what they show (`plan`, one demand per metric). A chart wants a coarse
   layer, blocks of one level over every step of its runs, and when zoomed a finer layer over its view (at most
   `FINE_BLOCKS` blocks): levels with buckets about `LINE_PX_PER_BUCKET` wide on screen (`DENSITY_PX_PER_BUCKET` for a
@@ -153,7 +166,7 @@ them WebGL falls back to software and timings mean nothing.
 ## Invariants (things that break silently if ignored)
 
 - **Explorer is read-only.** Nothing under a runs directory is ever created or modified by
-  `index.py`, `server.py`, `query.py` or the CLI, except `trex compact` (`compact.py`), which rewrites runs
+  `index.py`, `mirror.py`, `server.py`, `query.py` or the CLI (a Mirror writes only its cache), except `trex compact` (`compact.py`), which rewrites runs
   no other process has open: a new file, verified, then atomically renamed over `trex.sqlite`. `connect_ro` opens runs without a `-wal` file as
   `immutable` so SQLite does not create `-wal`/`-shm`; a test asserts directory contents are
   unchanged. Callers re-check the file signature after reading.
@@ -162,7 +175,9 @@ them WebGL falls back to software and timings mean nothing.
   or count mismatch.
 - **Events follow commits, in order.** `Explorer.apply` publishes after the index transaction
   commits. A run's `run` event comes after the rows and media it counts (a new run's comes
-  first); the browser treats a `run` event whose counts it has not reached as lost data.
+  first); the browser treats a `run` event whose counts it has not reached as lost data. It opens the stream before it
+  lists a scope's runs and holds the events until the list arrives (`Data.loadScope`), so no run that appears in
+  between is missed.
 - **Cache version.** Bump `CACHE_VERSION` in `index.py` whenever what the index stores, or how it
   derives it, changes. An older index is then rebuilt instead of silently misread.
 - **Shared formats across languages.** Change all of these together:

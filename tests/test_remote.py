@@ -16,6 +16,7 @@ import pytest
 from trex import buckets as bk, daemon, remote, server, update
 from trex.cli import main
 from trex.daemon import ControlServer, Roots
+from trex.mirror import Mirror
 from trex.remote import Address, Remote
 
 from helpers import post_json, request, wait_for, write_run
@@ -23,6 +24,13 @@ from helpers import post_json, request, wait_for, write_run
 
 def sessions(home):
     return [(int(pid), sock) for pid, sock in (line.split() for line in (home / "sessions").read_text().splitlines())]
+
+
+def session(roots, name):
+    """The ssh session of the remote directory `name`."""
+    entry = roots.get(name)
+    assert isinstance(entry, Mirror) and isinstance(entry.session, Remote)
+    return entry.session
 
 
 @pytest.fixture
@@ -50,7 +58,7 @@ def http(roots, http_server):
     ("box:/data/runs", Address("box", "/data/runs")),
     ("me@box.lan:~/my runs", Address("me@box.lan", "~/my runs")),
     ("[::1]:/x", Address("[::1]", "/x")),
-    ("/data/runs", None), ("~/runs", None), ("runs", None), ("box:", None), ("a/b:c", None),
+    ("/data/runs", None), ("~/runs", None), ("runs", None), ("box:", None), ("a/b:c", None), ("http://box:13898", None),
 ])
 def test_scp_style_addresses_name_remote_directories(spec, want):
     assert remote.parse(spec) == want
@@ -63,8 +71,8 @@ def test_an_existing_local_path_with_a_colon_is_local(tmp_path, monkeypatch):
 
 
 def test_remote_machines_get_this_trex_over_ssh_once(roots, runs, home):
-    entry = roots.get(roots.add_remote(f"box:{runs}"))
-    assert isinstance(entry, Remote) and entry.state == "connected"
+    entry = session(roots, roots.add_remote(f"box:{runs}"))
+    assert entry.state == "connected"
     name, data = remote.wheel()
     args = (home / "uvx.args").read_text().split("\n")
     assert args[args.index("--from") + 1] == str(home / remote.WHEELS / name)
@@ -123,8 +131,7 @@ def test_the_live_stream_passes_through(roots, runs, http):
 
 def test_removing_a_remote_directory_ends_its_remote_server(roots, runs, home):
     name = roots.add_remote(f"box:{runs}")
-    entry = roots.get(name)
-    assert isinstance(entry, Remote)
+    entry = session(roots, name)
     _, sock = sessions(home)[-1]
     assert wait_for(lambda: Path(sock).exists())
     roots.remove(name)
@@ -133,8 +140,7 @@ def test_removing_a_remote_directory_ends_its_remote_server(roots, runs, home):
 
 
 def test_a_dropped_connection_reconnects(roots, runs, home):
-    entry = roots.get(roots.add_remote(f"box:{runs}"))
-    assert isinstance(entry, Remote)
+    entry = session(roots, roots.add_remote(f"box:{runs}"))
     started = len(sessions(home))
     os.kill(sessions(home)[-1][0], signal.SIGKILL)
     assert wait_for(lambda: len(sessions(home)) == started + 1 and entry.state == "connected")
@@ -153,12 +159,15 @@ def test_adding_a_remote_without_uv_says_how_to_install_it(roots, runs, home):
         roots.add_remote(f"box:{runs}")
 
 
-def test_a_remote_that_is_not_connected_answers_with_a_page_that_reloads(roots, http):
-    roots.entries["far"] = Remote("far:/runs", Address("far", "/runs"))
-    status, headers, body = request(f"{http}/r/far/")
-    assert status == 503 and b'http-equiv="refresh"' in body and b"far:/runs" in body
-    status, _, body = request(f"{http}/r/far/api/runs")
-    assert status == 503 and "starting" in json.loads(body)["error"]
+def test_a_remote_directory_answers_from_its_copy_while_its_host_is_unreachable(roots, runs, http, home):
+    name = roots.add_remote(f"box:{runs}")
+    base = f"{http}/r/{urllib.parse.quote(name)}"
+    assert wait_for(lambda: len(json.loads(request(f"{base}/api/runs")[2])["runs"]) == 2)
+    (home / ".local" / "bin" / "uvx").unlink()
+    os.kill(sessions(home)[-1][0], signal.SIGKILL)
+    gone = lambda: [(r["state"], "uv is not installed" in r["error"]) for r in json.loads(request(f"{http}/api/daemon")[2])["roots"]]
+    assert wait_for(lambda: gone() == [("unreachable", True)] and not roots.get(name).connected)
+    assert sorted(r["id"] for r in json.loads(request(f"{base}/api/runs")[2])["runs"]) == ["a/r1", "b/r2"]
 
 
 def test_the_add_menu_takes_remote_addresses(roots, runs, http):
@@ -174,8 +183,7 @@ def test_saved_remote_directories_reconnect_after_a_restart(roots, runs, tmp_pat
     again = Roots(tmp_path / "cache2", tmp_path / "state" / "roots.json")
     try:
         again.load()
-        entry = again.get("my runs")
-        assert isinstance(entry, Remote) and wait_for(lambda: entry.state == "connected")
+        assert wait_for(lambda: session(again, "my runs").state == "connected")
     finally:
         for name in list(again.entries):
             again.entries.pop(name).close()
@@ -212,8 +220,7 @@ def test_passed_through_answers_keep_the_connection_usable(roots, runs, http):
 
 
 def test_closing_the_daemons_directories_ends_remote_sessions_and_keeps_them_saved(roots, runs, home, tmp_path):
-    entry = roots.get(roots.add_remote(f"box:{runs}"))
-    assert isinstance(entry, Remote)
+    entry = session(roots, roots.add_remote(f"box:{runs}"))
     _, sock = sessions(home)[-1]
     roots.close()
     assert not entry.local.exists() and wait_for(lambda: not Path(sock).exists()) and roots.served() == []
