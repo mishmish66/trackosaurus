@@ -182,7 +182,7 @@ class Workspace:
         rank[order] = np.arange(len(paths), dtype=np.int32)
         b = bk.concat(bs)
         b = bk.take(b.of(rank[b.run]), np.argsort(rank[b.run], kind="stable"))
-        return bk.encode(ask.level, ask.block, [paths[i] for i in order], seq[order], b)
+        return bk.encode(ask.level, ask.block, [paths[int(i)] for i in order], seq[order], b)
 
     def messages(self, prefix: str, stop: threading.Event) -> Generator[bytes, None, None]:
         """Every member's stream under `prefix`, run ids renamed, as SSE messages; until `stop`."""

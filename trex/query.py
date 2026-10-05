@@ -6,8 +6,9 @@ import os
 import re
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Final, Literal, NotRequired, TypedDict, cast
+from typing import Any, Final, Literal, cast
 
 from . import chunks
 from .format import (DB, INFO_FILE, JSONValue, MediaKind, RunState, as_dict, as_float, as_run_state, as_str, as_str_list,
@@ -21,7 +22,9 @@ type Center = Literal["median", "mean", "iqm"]
 type Reduce = Literal["last", "first", "max", "min", "mean"]
 
 
-class Record(TypedDict):
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Record:
+    """One run, flat, as the CLI's filters, sorts and tables read it (`get`)."""
 
     path: str
     name: str
@@ -40,23 +43,32 @@ class Record(TypedDict):
     info: dict[str, JSONValue]
     summary: dict[str, JSONValue]
 
+    def wire(self) -> dict[str, Any]:
+        return asdict(self)
 
-class Stats(TypedDict):
-    """All but n absent when n is 0; the CI absent when n is 1."""
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Stats:
+    """Of some values: all but n absent when n is 0; the CI absent when n is 1."""
 
     n: int
-    mean: NotRequired[float]
-    std: NotRequired[float]
-    median: NotRequired[float]
-    iqm: NotRequired[float]  # interquartile mean: the mean of the middle half
-    min: NotRequired[float]
-    max: NotRequired[float]
-    ci_lo: NotRequired[float]
-    ci_hi: NotRequired[float]
-    ci_coverage: NotRequired[float]
+    mean: float | None = None
+    std: float | None = None
+    median: float | None = None
+    iqm: float | None = None  # interquartile mean: the mean of the middle half
+    min: float | None = None
+    max: float | None = None
+    ci_lo: float | None = None
+    ci_hi: float | None = None
+    ci_coverage: float | None = None
+
+    def wire(self) -> dict[str, float]:
+        """The fields present."""
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
 
-class MediaItem(TypedDict):
+@dataclass(frozen=True, slots=True)
+class MediaItem:
     seq: int
     step: float
     key: str
@@ -64,15 +76,24 @@ class MediaItem(TypedDict):
     file: str
     size: int
 
+    def wire(self) -> dict[str, Any]:
+        return asdict(self)
 
-class KeyStats(TypedDict):
+
+@dataclass(frozen=True, slots=True)
+class KeyStats:
     points: int
     first_step: float
     last_step: float
     last: float
 
+    def wire(self) -> dict[str, Any]:
+        return asdict(self)
 
-class RunSummary(TypedDict):
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RunSummary:
+    """One run, read from its run file."""
 
     dir: str
     id: str | None
@@ -89,6 +110,9 @@ class RunSummary(TypedDict):
     summary: dict[str, JSONValue]
     keys: dict[str, KeyStats]
     media: list[MediaItem]
+
+    def wire(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 PLAIN_FIELDS: Final = ("path", "name", "parent", "state", "step", "runtime", "rows", "media", "created", "updated", "tags", "dir",
@@ -118,39 +142,32 @@ def records(view: RunsView, dirs: Mapping[str, Path]) -> list[Record]:
     media: dict[str, int] = {}
     for item in view.media:
         media[item.run] = media.get(item.run, 0) + 1
-    out: list[Record] = []
-    for m in view.runs:
-        s = m.summary
-        out.append({
-            "path": m.id, "name": m.name, "parent": m.parent, "state": m.state,
-            "step": s.get("_step"), "runtime": s.get("_runtime"), "rows": m.seq, "media": media.get(m.id, 0),
-            "created": m.created, "updated": m.updated, "tags": m.tags, "dir": str(dirs[m.id]), "visible": True,
-            "config": m.config, "info": m.info,
-            "summary": {k: v for k, v in s.items() if not k.startswith("_")},
-        })
-    return out
+    return [Record(path=m.id, name=m.name, parent=m.parent, state=m.state, step=m.summary.get("_step"),
+                   runtime=m.summary.get("_runtime"), rows=m.seq, media=media.get(m.id, 0), created=m.created,
+                   updated=m.updated, tags=m.tags, dir=str(dirs[m.id]), visible=True, config=m.config, info=m.info,
+                   summary={k: v for k, v in m.summary.items() if not k.startswith("_")}) for m in view.runs]
 
 
 def get(rec: Record, field: str) -> object:
     """A field: a plain one, config.K (c.), summary.K (s., metric., m.), info.A.B, or a bare key
     (config, then summary)."""
     if field in PLAIN_FIELDS:
-        return cast(dict[str, object], rec)[field]
+        return getattr(rec, field)
     head, _, rest = field.partition(".")
     if head in ("config", "c") and rest:
-        return rec["config"].get(rest)
+        return rec.config.get(rest)
     if head in SUMMARY_PREFIXES and rest:
-        return rec["summary"].get(rest)
+        return rec.summary.get(rest)
     if head == "info" and rest:
-        if rest in rec["info"]:
-            return rec["info"][rest]
-        v: object = rec["info"]
+        if rest in rec.info:
+            return rec.info[rest]
+        v: object = rec.info
         for part in rest.split("."):
             v = cast(dict[str, object], v).get(part) if isinstance(v, dict) else None
         return v
-    if field in rec["config"]:
-        return rec["config"][field]
-    return rec["summary"].get(field)
+    if field in rec.config:
+        return rec.config[field]
+    return rec.summary.get(field)
 
 
 # ---- sorting ----
@@ -204,22 +221,21 @@ def stats(values: Iterable[float | None], center: Center = "median") -> Stats:
     xs = sorted(v for v in values if v is not None and not math.isnan(v))
     n = len(xs)
     if not n:
-        return {"n": 0}
+        return Stats(n=0)
     mean = sum(xs) / n
     std = math.sqrt(sum((x - mean) ** 2 for x in xs) / (n - 1)) if n > 1 else 0.0
     h = (n - 1) / 2
     median = (xs[math.floor(h)] + xs[math.ceil(h)]) / 2
     iqm, iqm_se, kept = _iqm(xs)
-    out: Stats = {"n": n, "mean": mean, "std": std, "median": median, "iqm": iqm, "min": xs[0], "max": xs[-1]}
-    if n > 1:
-        if center in ("mean", "iqm"):
-            m, se, df = (mean, std / math.sqrt(n), n - 1) if center == "mean" else (iqm, iqm_se, kept - 1)
-            t = _t95(df)
-            out.update(ci_lo=m - t * se, ci_hi=m + t * se, ci_coverage=0.95)
-        else:
-            k = median_ci_rank(n)
-            out.update(ci_lo=xs[k - 1], ci_hi=xs[n - k], ci_coverage=median_ci_coverage(n))
-    return out
+    out = Stats(n=n, mean=mean, std=std, median=median, iqm=iqm, min=xs[0], max=xs[-1])
+    if n == 1:
+        return out
+    if center in ("mean", "iqm"):
+        m, se, df = (mean, std / math.sqrt(n), n - 1) if center == "mean" else (iqm, iqm_se, kept - 1)
+        t = _t95(df)
+        return replace(out, ci_lo=m - t * se, ci_hi=m + t * se, ci_coverage=0.95)
+    k = median_ci_rank(n)
+    return replace(out, ci_lo=xs[k - 1], ci_hi=xs[n - k], ci_coverage=median_ci_coverage(n))
 
 
 def _t95(df: int) -> float:
@@ -247,7 +263,7 @@ def _meta(c: sqlite3.Connection) -> dict[str, JSONValue]:
 
 def _media(c: sqlite3.Connection, run_dir: PathLike) -> list[MediaItem]:
     base = Path(run_dir).resolve()
-    return [{"seq": s, "step": st, "key": k, "kind": kind, "file": str(base / f), "size": n}
+    return [MediaItem(s, st, k, kind, str(base / f), n)
             for s, st, k, kind, f, n in c.execute("SELECT seq, step, key, kind, file, size FROM media ORDER BY seq")]
 
 
@@ -267,7 +283,7 @@ def read_rows(run_dir: PathLike, keys: Iterable[str] | None = None, start: int =
     with snapshot(run_dir) as c:
         rows = chunks.rows(c, start, chunks.row_count(c))
     if want is not None:
-        rows = [r._replace(values={k: v for k, v in r.values.items() if k in want}) for r in rows]
+        rows = [replace(r, values={k: v for k, v in r.values.items() if k in want}) for r in rows]
     return rows
 
 
@@ -282,20 +298,17 @@ def run_summary(run_dir: PathLike) -> RunSummary:
         rows = chunks.row_count(c)
         keys: dict[str, KeyStats] = {}
         for kid, name in key_names(c).items():
-            steps, values, _ = chunks.metric(c, kid, stop=rows)
-            if steps.size:
-                keys[name] = {"points": int(steps.size), "first_step": float(steps[0]), "last_step": float(steps[-1]),
-                              "last": float(values[-1])}
+            m = chunks.metric(c, kid, stop=rows)
+            if m.steps.size:
+                keys[name] = KeyStats(int(m.steps.size), float(m.steps[0]), float(m.steps[-1]), float(m.values[-1]))
         last = chunks.last_step_and_time(c, rows)
         media = _media(c, run_dir)
     step, runtime = last or (None, None)
-    return {
-        "dir": str(Path(run_dir).resolve()), "id": as_str(meta.get("id")), "name": as_str(meta.get("name")),
-        "state": as_run_state(meta.get("state")), "created": as_float(meta.get("created")),
-        "heartbeat": as_float(meta.get("heartbeat")), "rows": rows, "step": step, "runtime": runtime,
-        "tags": as_str_list(meta.get("tags")), "config": as_dict(meta.get("config")), "info": as_dict(meta.get("info")),
-        "summary": as_dict(meta.get("summary")), "keys": dict(sorted(keys.items())), "media": media,
-    }
+    return RunSummary(dir=str(Path(run_dir).resolve()), id=as_str(meta.get("id")), name=as_str(meta.get("name")),
+                      state=as_run_state(meta.get("state")), created=as_float(meta.get("created")),
+                      heartbeat=as_float(meta.get("heartbeat")), rows=rows, step=step, runtime=runtime,
+                      tags=as_str_list(meta.get("tags")), config=as_dict(meta.get("config")), info=as_dict(meta.get("info")),
+                      summary=as_dict(meta.get("summary")), keys=dict(sorted(keys.items())), media=media)
 
 
 def folder_infos(path: PathLike, root: PathLike | None = None) -> list[tuple[str, JSONValue]]:
@@ -328,7 +341,7 @@ def twema(xs: Sequence[float], ys: Sequence[float | None], alpha: float, scale: 
     out: list[float | None] = []
     acc, deb, last = 0.0, 0.0, None
     for x, y in zip(xs, ys):
-        if y is None or not math.isfinite(y) or x is None:
+        if y is None or not math.isfinite(y):
             out.append(y)
             continue
         w = 0.0 if last is None else alpha ** (max(x - last, 0.0) / scale)
@@ -344,8 +357,8 @@ def series(run_dir: PathLike, wanted: Callable[[str], bool], x: Literal["step", 
         stop = chunks.row_count(c)
         for kid, name in key_names(c).items():
             if wanted(name):
-                steps, values, times = chunks.metric(c, kid, stop=stop)
-                out[name] = ((steps if x == "step" else times).tolist(), values.tolist())
+                m = chunks.metric(c, kid, stop=stop)
+                out[name] = ((m.steps if x == "step" else m.times).tolist(), m.values.tolist())
     return out
 
 

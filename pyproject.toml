@@ -41,6 +41,7 @@ dev = [
     "pytest-cov",
     "pdoc>=16.0.0",
     "pytest-xdist>=3.8.0",
+    "playwright>=1.63.0",
 ]
 
 [build-system]
@@ -71,7 +72,6 @@ exclude_also = ['if __name__ == "__main__":', "if TYPE_CHECKING:", 'if sys.byteo
 
 [tool.pyright]
 include = ["trex", "tests", "examples", "docs"]
-exclude = ["tests/browser_smoke.py"]  # needs playwright: `uv run --with playwright`
 pythonVersion = "3.12"
-typeCheckingMode = "standard"
-strict = ["trex/writer.py", "trex/media.py", "trex/format.py", "trex/chunks.py", "trex/buckets.py", "trex/journal.py"]
+typeCheckingMode = "strict"
+executionEnvironments = [{ root = "tests", reportPrivateUsage = false }, { root = "." }]

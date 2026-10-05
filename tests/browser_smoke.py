@@ -3,31 +3,35 @@
 Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, panels of
 hidden runs, the x range of hidden runs, the filter box, console errors, UI line coverage (at least UI_COVERAGE of the modules' code lines run),
 and that a client dropping every 5th stream event still converges to the run files: every row and media item, and columns whose
-points' counts add up to each metric's finite values. Then, under a throwaway `trex daemon`: adding
-a directory with `trex serve -y`, the root view of both, making a workspace of them in the panel the trex
-brand opens, and from that panel removing a directory and re-adding it from the remembered ones.
+points' counts add up to each metric's finite values. Then a trex pulling another's runs through a link added in its panel,
+and, as this machine's trex (with a private TREX_DAEMON_DIR): adding a directory with `trex serve -y`, the root view of
+both, making a workspace of them in the panel the trex brand opens, and from that panel removing a directory and
+re-adding it from the remembered ones.
 
-    uv run --with playwright python tests/browser_smoke.py [screenshot_dir]
+    uv run playwright install chromium   # once
+    uv run python tests/browser_smoke.py [screenshot_dir]
 """
 
 import functools
+import json
+import math
+import os
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter
-from pathlib import Path
-
-import json
-import math
-import statistics
-import os
 import urllib.request
+from collections import Counter
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Protocol
 
 import numpy as np
-from playwright.sync_api import sync_playwright
+import numpy.typing as npt
+from playwright.sync_api import ConsoleMessage, Page, sync_playwright
 
 from trex import chunks
 from trex.format import connect_ro
@@ -105,10 +109,21 @@ RECORD_DRAWS = """() => {
 }"""
 
 
-def flicker_faults(draws):
+type Draw = dict[str, Any]  # a chart draw RECORD_DRAWS records: key, paced, y0, y1, lines ([id, points, end])
+type At = Callable[[float, float], tuple[float, float]]  # a point of a chart's plot area by its fractions of it
+
+
+def first_line(proc: subprocess.Popen[str]) -> str:
+    """The first line `proc` prints on its piped stdout."""
+    assert proc.stdout is not None
+    return proc.stdout.readline()
+
+
+def flicker_faults(draws: list[Draw]) -> list[str]:
     """What a viewer would see flicker between consecutive draws of a chart: a line with fewer points or its end
     further back, a line gone for a draw, and a streamed redraw shrinking the y axis."""
-    faults, by = [], {}
+    faults: list[str] = []
+    by: dict[str, list[Draw]] = {}
     for d in draws:
         by.setdefault(d["key"], []).append(d)
     for key, ds in by.items():
@@ -125,12 +140,12 @@ def flicker_faults(draws):
     return faults
 
 
-def flicker_smoke(page, url, runs):
+def flicker_smoke(page: Page, url: str, runs: Path) -> bool:
     """Whether charts drawing runs that stream, line by line and grouped, never show a line shrink, its end move back
     or vanish for a draw, nor a streamed redraw shrink the y axis."""
     writer = subprocess.Popen([sys.executable, "-c", FLICKER_WRITER, str(runs)], stdout=subprocess.PIPE, text=True)
     try:
-        writer.stdout.readline()
+        first_line(writer)
         page.goto(f"{url}/?flicker#path=flicker&group=run")
         page.wait_for_function("window.app && app.data.runs.size === 6 && [...app.charts.values()].some((c) => c.view)", timeout=30000)
         page.evaluate(RECORD_DRAWS)
@@ -147,21 +162,21 @@ def flicker_smoke(page, url, runs):
     return len(lines) > 4 and len(groups) > 4 and not faults
 
 
-def many_value(group, i, step):
+def many_value(group: str, i: int, step: int) -> float:
     """What MANY_WRITER logs."""
     return math.exp(-step / 50) + (i % 7) * 0.01 + (0.1 if group == "b" else 0) + 0.02 * math.sin(step * (i + 1))
 
 
-def group_medians(group, g0, dx, bins):
+def group_medians(group: str, g0: float, dx: float, bins: int) -> list[float | None]:
     """Per bin of a grid, the median over a MANY_WRITER group's runs of each run's mean of its rows in the bin."""
-    out = []
+    out: list[float | None] = []
     for k in range(bins):
         steps = [s for s in range(200) if g0 + k * dx <= s < g0 + (k + 1) * dx]
         out.append(statistics.median(statistics.fmean(many_value(group, i, s) for s in steps) for i in range(160)) if steps else None)
     return out
 
 
-def hidden_extent_smoke(page, url, runs):
+def hidden_extent_smoke(page: Page, url: str, runs: Path) -> bool:
     """Whether hiding a run takes its steps out of a chart's x range, and showing it again puts them back."""
     subprocess.run([sys.executable, "-c", EXTENT_WRITER, str(runs)], check=True)
     page.goto(f"{url}/?extent#path=extent&group=run")
@@ -169,7 +184,7 @@ def hidden_extent_smoke(page, url, runs):
     page.wait_for_function(SETTLED + " && app.charts.get('loss')?.view", timeout=60000)
     end = "(() => { const v = app.charts.get('loss').view; return [v.lines.length, Math.round(v.ex1)]; })()"
 
-    def toggle_long():
+    def toggle_long() -> list[int]:
         page.click("tr:has-text('long') input[type=checkbox]")
         page.wait_for_timeout(300)
         page.wait_for_function(SETTLED, timeout=60000)
@@ -190,12 +205,12 @@ LINE_PIXELS = """(key) => {
 }"""
 
 
-def line_pixels_smoke(page, url):
+def line_pixels_smoke(page: Page, url: str) -> bool:
     """Whether charts put their lines on their canvases: grouped, one per run in a folder, and grouped again after
     going back, drawn as at first whatever the folder's lines drew before."""
     chart = "app.charts.get('train/loss')"
 
-    def drawn():
+    def drawn() -> int:
         page.wait_for_function(f"{chart}?.el.isConnected", timeout=60000)
         page.evaluate(f"{chart}.el.scrollIntoView()")
         page.wait_for_function(f"{SETTLED} && {chart}.view?.lines.length", timeout=60000)
@@ -215,13 +230,13 @@ def line_pixels_smoke(page, url):
     return grouped > 300 and lines > 300 and abs(again - grouped) <= 0.02 * grouped
 
 
-def binned_smoke(page, url, runs):
+def binned_smoke(page: Page, url: str, runs: Path) -> bool:
     """Whether a zoom of more runs than a chart draws one by one draws them from bins of their buckets, as group
     statistics (each group's median per bin of its runs' means of their rows) from the chart's worker, and as a
     heatmap; and whether a server of another protocol is stated."""
     subprocess.run([sys.executable, "-c", MANY_WRITER, str(runs)], check=True)
 
-    def zoomed(query, hash_):
+    def zoomed(query: str, hash_: str) -> None:
         page.goto(f"{url}/?binned&{query}#path=many&{hash_}")
         page.wait_for_function("window.app && app.data.runs.size === 320", timeout=60000)
         page.wait_for_function(SETTLED, timeout=60000)
@@ -241,30 +256,47 @@ def binned_smoke(page, url, runs):
     print(f"binned: a zoom of 320 runs drew bins of their buckets {binned} on its worker {worker}, groups {groups} of "
           f"{len(lines[0][3]) if lines else 0} bins, at most {max(off, default=1):.2g} off their exact medians; heatmap {heat}; "
           f"protocol 1 stated {stated}")
-    return (binned is True and worker and groups == ["a", "b"] and off and max(off) < 1e-5 and heat == [True, True, 320]
+    return (binned is True and worker and groups == ["a", "b"] and bool(off) and max(off) < 1e-5 and heat == [True, True, 320]
             and stated[0] and "the server 1" in stated[1])
+
+
+class Cdp(Protocol):
+    """The part of a Chrome DevTools Protocol session the coverage uses."""
+
+    def send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]: ...
+
+
+def cdp_session(page: Page) -> Cdp:
+    """A DevTools Protocol session of `page`."""
+    return page.context.new_cdp_session(page)
 
 
 class JsCoverage:
     """Which lines of the UI's modules ran, from Chromium's V8 coverage and the node tests'. A page load discards the previous page's
     counts, so `take` runs before every navigation (`watch` makes the page do so) and takes are merged per file."""
 
-    def __init__(self, page):
-        self.cdp = page.context.new_cdp_session(page)
+    def __init__(self, page: Page) -> None:
+        self.cdp = cdp_session(page)
         self.cdp.send("Profiler.enable")
         self.cdp.send("Profiler.startPreciseCoverage", {"callCount": True, "detailed": True})
-        self.ran = {}  # module -> per UTF-16 unit: whether it ran
+        self.ran: dict[str, npt.NDArray[np.bool_]] = {}  # module -> per UTF-16 unit: whether it ran
 
-    def watch(self, page):
+    def watch(self, page: Page) -> None:
         for name in ("goto", "go_back", "go_forward", "reload", "click"):
-            step = getattr(page, name)
-            setattr(page, name, lambda *a, step=step, **kw: (self.take(), step(*a, **kw))[1])
+            setattr(page, name, self._taking_first(getattr(page, name)))
 
-    def take(self):
+    def _taking_first[**P, R](self, step: Callable[P, R]) -> Callable[P, R]:
+        """`step`, taking the coverage first."""
+        def taking(*a: P.args, **kw: P.kwargs) -> R:
+            self.take()
+            return step(*a, **kw)
+        return taking
+
+    def take(self) -> None:
         for script in self.cdp.send("Profiler.takePreciseCoverage")["result"]:
             self.merge(script)
 
-    def add_node_tests(self):
+    def add_node_tests(self) -> None:
         """Merge in the node tests' coverage of the same modules (V8's, through NODE_V8_COVERAGE)."""
         with tempfile.TemporaryDirectory() as d:
             subprocess.run(["node", "--test", *map(str, sorted((REPO / "tests").glob("*.test.mjs")))], cwd=REPO, check=True,
@@ -273,7 +305,7 @@ class JsCoverage:
                 for script in json.loads(f.read_text())["result"]:
                     self.merge(script)
 
-    def merge(self, script):
+    def merge(self, script: dict[str, Any]) -> None:
         """Add one script's V8 coverage, if it is a UI module."""
         url = script["url"].split("?")[0]
         name = url.rsplit("/", 1)[-1]
@@ -285,10 +317,10 @@ class JsCoverage:
             ran[r["startOffset"]:r["endOffset"]] = r["count"] > 0
         self.ran[name] = self.ran.get(name, ran) | ran
 
-    def report(self):
+    def report(self) -> dict[str, tuple[int, int, list[int]]]:
         """{module: (covered lines, lines with code, uncovered line numbers)}; a line is covered when any
         non-blank character on it ran."""
-        out = {}
+        out: dict[str, tuple[int, int, list[int]]] = {}
         for name, ran in sorted(self.ran.items()):
             line, blank = units(name).T
             code = ~blank.astype(bool)
@@ -303,28 +335,28 @@ UI_COVERAGE = 0.92  # share of the UI modules' code lines the smoke test must ru
 
 
 @functools.cache
-def units(name):
+def units(name: str) -> npt.NDArray[np.int64]:
     """(line, is blank) per UTF-16 code unit of a UI module, the unit V8 counts offsets in."""
-    out = []
+    out: list[tuple[int, bool]] = []
     for i, text in enumerate((STATIC / name).read_text().split("\n")):
         for ch in text + "\n":
             out.extend([(i, ch.isspace())] * (2 if ord(ch) > 0xFFFF else 1))
     return np.array(out[:-1] if out else [(0, True)], np.int64)
 
 
-def free_port():
+def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-def file_columns(run_dir):
+def file_columns(run_dir: Path) -> tuple[int, dict[str, int], int]:
     """(rows, {key: finite values}, media items) of a run file."""
     c = connect_ro(run_dir)
     rows = chunks.rows(c)
-    mseq = c.execute("SELECT count(*) FROM media").fetchone()[0]
+    mseq: int = c.execute("SELECT count(*) FROM media").fetchone()[0]
     c.close()
-    finite = Counter(k for _, _, _, d in rows for k, v in d.items() if math.isfinite(v))
+    finite = Counter(k for r in rows for k, v in r.values.items() if math.isfinite(v))
     return len(rows), dict(finite), mseq
 
 
@@ -333,12 +365,12 @@ READY = ("window.app && app.data.runs.size > 0 && app.charts.size > 0 && !app.da
 SETTLED = READY + " && !app.data.busy && !app.round && !app.raf && !app.planTimer"
 
 
-def group_levels_smoke(page, url):
+def group_levels_smoke(page: Page, url: str) -> bool:
     """Whether opening a group narrows the view to its runs, drawn as lines, a group nested inside it opens a deeper
     level, and the path bar and back button return to each level, the group-by staying as set."""
     state = """() => [app.opts.focus.length, app.opts.group, app.grouped, app.runList.filter((r) => r.shown).length,
         [...document.querySelectorAll('#crumbPath .crumb')].map((e) => e.textContent)]"""
-    def ends(text):
+    def ends(text: str) -> None:
         page.wait_for_function(f"[...document.querySelectorAll('#crumbPath .crumb')].at(-1)?.textContent === {json.dumps(text)}")
 
     page.goto(f"{url}/?levels#path=sweep&group=lr")
@@ -369,21 +401,23 @@ def group_levels_smoke(page, url):
             and up[:3] == [1, "lr / seed", True] and back == [2, "lr / seed"] and home == [0, "lr / seed", True])
 
 
-def interactions_smoke(page, url):
+def interactions_smoke(page: Page, url: str) -> bool:
     """Whether charts carry no legend and the chart controls do what they say: hover and Shift-pinned tooltips
     (which the wheel scrolls, and whose rows reveal and open runs), x and box zooms and their reset, the chart
     settings (smoothing, axes, outliers, density, reset), the sort box (type, pick, Enter, Escape), sidebar hiding,
     group-by search, keyboard scrolling, the media slider, and back/forward (back to the grouping the folder had)."""
-    key, checks = "train/loss", {}
+    key = "train/loss"
+    checks: dict[str, object] = {}
     sel = f".panel:has(.pname:text-is('{key}'))"
     chart = f"app.charts.get({key!r})"
 
-    def plot():
+    def plot() -> At:
         page.locator(f"{sel} canvas").nth(1).scroll_into_view_if_needed()
         b = page.locator(f"{sel} canvas").nth(1).bounding_box()
+        assert b is not None
         return lambda fx, fy: (b["x"] + b["width"] * fx, b["y"] + b["height"] * fy)
 
-    def soon(js, timeout=3000):
+    def soon(js: str, timeout: float = 3000) -> bool:
         """Whether `js` becomes true within `timeout` ms."""
         try:
             page.wait_for_function(js, timeout=timeout)
@@ -391,7 +425,7 @@ def interactions_smoke(page, url):
         except Exception:
             return False
 
-    def hover(at):
+    def hover(at: At) -> None:
         page.mouse.move(*at(0.5, 0.5))
         page.mouse.move(*at(0.55, 0.45))
         page.wait_for_function("!document.querySelector('#tip').hidden", timeout=5000)
@@ -414,14 +448,17 @@ def interactions_smoke(page, url):
     checks["reset zoom clears both"] = page.evaluate(f"!app.xrange && !{chart}.yzoom")
 
     page.click(f"{sel} .gear")
-    row = lambda label: f"#menu .srow:has(> label:text-is('{label}'))"
+
+    def row(label: str) -> str:
+        return f"#menu .srow:has(> label:text-is('{label}'))"
+
     page.check(f"{row('smoothing')} input[type=checkbox]")
     page.locator(f"{row('smoothing')} input[type=range]").fill("0.9")
     page.select_option(f"{row('y scale')} select", "true")
     page.select_option(f"{row('x axis')} select >> nth=0", '"runtime"')
     page.select_option(f"{row('ignore outliers')} select", "0.01")
     page.fill(f"{row('x range')} input >> nth=0", "0")
-    page.dispatch_event(f"{row('x range')} input >> nth=0", "change")
+    page.locator(f"{row('x range')} input >> nth=0").evaluate("(e) => e.dispatchEvent(new Event('change', { bubbles: true }))")
     page.wait_for_timeout(600)
     cfg = page.evaluate(f"app.panelCfg[{key!r}] || {{}}")
     checks["settings are saved for the chart"] = {"smooth", "logy", "x", "outliers", "xmin"} <= set(cfg)
@@ -509,6 +546,7 @@ def interactions_smoke(page, url):
 
     width = "document.querySelector('aside').offsetWidth"
     w0, g = page.evaluate(width), page.locator("#sideGrip").bounding_box()
+    assert g is not None
     page.mouse.move(g["x"] + g["width"] / 2, g["y"] + 300)
     page.mouse.down()
     page.mouse.move(g["x"] + g["width"] / 2 + 120, g["y"] + 300, steps=8)
@@ -536,24 +574,24 @@ def interactions_smoke(page, url):
     return not failed
 
 
-def dir_pages(url):
+def dir_pages(url: str) -> dict[str, str]:
     """{name: page path} of every directory the trex at `url` serves."""
     with urllib.request.urlopen(f"{url}/api/node") as r:
         return {x["name"]: x["url"] for x in json.loads(r.read())["dirs"]}
 
 
-def daemon_smoke(page, runs, tmp, env, out, errors):
-    """Whether the daemon's root shows every tracked directory (a folder in it as `/ name`), a workspace made in the panel (opened from the trex
+def node_smoke(page: Page, runs: Path, tmp: Path, env: dict[str, str], out: Path, errors: list[str]) -> bool:
+    """Whether this machine's trex's root shows every tracked directory (a folder in it as `/ name`), a workspace made in the panel (opened from the trex
     brand) merges them and opens though its URL was visited before it existed, and the panel removes, adds and
     forgets directories. The refused add's 400 is taken out
     of `errors`."""
     port = free_port()
     url = f"http://127.0.0.1:{port}"
-    daemon = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs / "sweep"), "--port", str(port),
-                               "--cache", str(tmp / "cache")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    node = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs / "sweep"), "--port", str(port),
+                             "--cache", str(tmp / "cache")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     row = "#menu .mrow:has(.ml:text-is('{}'))"
     try:
-        daemon.stdout.readline()
+        first_line(node)
         subprocess.run([sys.executable, "-m", "trex", "serve", str(runs / "live"), "-y"], check=True, env=env)
         page_of = dir_pages(url)
         with urllib.request.urlopen(f"{url}{page_of['sweep']}api/runs") as r1, urllib.request.urlopen(f"{url}{page_of['live']}api/runs") as r2:
@@ -603,33 +641,34 @@ def daemon_smoke(page, runs, tmp, env, out, errors):
         page.wait_for_function(READY, timeout=30000)
         page.click(".brand")
         page.wait_for_selector("#menu .mrow")
-        page.screenshot(path=str(out / "daemon_menu.png"))
+        page.screenshot(path=str(out / "node_menu.png"))
         recent_left = page.query_selector("#menu .mrecent") is not None
         panel_text = page.inner_text("#menu")
         tidy = "null" not in panel_text.split() and "unknown" not in panel_text
         with urllib.request.urlopen(f"{url}/api/node") as r:
             d = json.loads(r.read())
         left, workspaces = [x["name"] for x in d["dirs"]], [(w["name"], w["members"]) for w in d["workspaces"]]
-        print(f"daemon: root shows {root[0]}/{total} runs in {root[2]} as {root[1]!r}, a folder in it as {crumbs}; workspace of both shows "
+        print(f"node: root shows {root[0]}/{total} runs in {root[2]} as {root[1]!r}, a folder in it as {crumbs}; workspace of both shows "
               f"{merged[0]}/{total}, dir field {merged[1]}; removed live, re-added it from history; tracking {left}, "
               f"workspaces {workspaces}, history {d['history']}, panel tidy {tidy}")
         return (root == [total, "/", ["live", "sweep"]] and crumbs == ["/", "sweep"] and merged == [total, True] and sorted(left) == ["live", "sweep"]
                 and workspaces == [("both", ["sweep"])] and not d["history"] and not recent_left and tidy)
     finally:
-        daemon.terminate()
-        daemon.wait()
+        node.terminate()
+        node.wait()
 
-def link_smoke(page, tmp, env, out, upstream):
-    """Whether a daemon tracking nothing, given another trex's http://host:port in its panel, pulls and shows every run
+
+def link_smoke(page: Page, tmp: Path, env: dict[str, str], out: Path, upstream: str) -> bool:
+    """Whether this machine's trex tracking nothing, given another trex's http://host:port in its panel, pulls and shows every run
     that trex holds, lists the link under "pulled from" with no way to remove the pulled directory alone, and lets go
     of that directory with the link."""
     port = free_port()
     url = f"http://127.0.0.1:{port}"
-    daemon = subprocess.Popen([sys.executable, "-m", "trex", "serve", "--port", str(port), "--cache", str(tmp / "cache-links"),
-                               "--name", "laptop"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              env={**env, "TREX_DAEMON_DIR": str(tmp / "daemon-links")})
+    node = subprocess.Popen([sys.executable, "-m", "trex", "serve", "--port", str(port), "--cache", str(tmp / "cache-links"),
+                             "--name", "laptop"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            env={**env, "TREX_DAEMON_DIR": str(tmp / "daemon-links")})
     try:
-        daemon.stdout.readline()
+        first_line(node)
         with urllib.request.urlopen(f"{upstream}/api/runs") as r:
             want = len(json.loads(r.read())["runs"])
         page.goto(f"{url}/")
@@ -649,8 +688,8 @@ def link_smoke(page, tmp, env, out, upstream):
         print(f"links: pulled {want} runs from {upstream}; panel rows {rows}; after removing the link: directories {d['dirs']}, links {d['links']}")
         return want > 0 and len(rows) == 2 and rows[0] == ["runs", False] and rows[1][1] and d["dirs"] == [] == d["links"]
     finally:
-        daemon.terminate()
-        daemon.wait()
+        node.terminate()
+        node.wait()
 
 
 NESTED_WRITER = """
@@ -663,7 +702,7 @@ r.finish()
 """
 
 
-def filter_smoke(page, url):
+def filter_smoke(page: Page, url: str) -> bool:
     """Whether the filter box keeps the runs a WHERE clause or a name search selects, marks a clause that does not
     parse while filtering nothing, and completes fields, a field's values (with counts) and and / or from the keyboard."""
     page.goto(f"{url}/?filter#path=sweep")
@@ -671,7 +710,7 @@ def filter_smoke(page, url):
     shown = "app.runList.filter((r) => r.shown).map((r) => r.id).sort()"
     every = page.evaluate(shown)
     want = page.evaluate("app.runList.filter((r) => r.meta.config.lr === 0.001 && r.meta.config.seed === 1).map((r) => r.id).sort()")
-    results = {}
+    results: dict[str, list[Any]] = {}
     for text in ["lr = 0.001 and seed = 1", "lr = 0.00", "seed1", "lr ="]:
         page.fill("#runFilter", text)
         page.wait_for_timeout(600)
@@ -705,7 +744,7 @@ def filter_smoke(page, url):
             and results["seed1"][0] == [r for r in every if "seed1" in r] and results["lr ="] == [every, True])
 
 
-def sections_smoke(page, url):
+def sections_smoke(page: Page, url: str) -> bool:
     """Whether chart sections nest by key path and fold one at a time, and a pinned chart shows in the pinned section
     while staying in its own."""
     tree = """() => { const walk = (d) => [d.querySelector(':scope > summary .stitle').textContent, d.open,
@@ -745,16 +784,16 @@ def sections_smoke(page, url):
             and unpinned == ["charts (1)", 1])
 
 
-def hidden_panels_smoke(page, url):
+def hidden_panels_smoke(page: Page, url: str) -> bool:
     """Whether a hidden panel leaves its section for a link in the section's header that shows it again, the section
     menu checks shown panels and open subsections and toggles them, and hidden panels stay hidden on reload."""
     head = "#panels details.section:has(> summary .stitle:text-is('{}')) > summary"
     shown = "[...document.querySelectorAll('#panels .panel .ptitle > span:first-child')].map((e) => e.textContent).sort()"
 
-    def links(title):
+    def links(title: str) -> list[str]:
         return page.locator(f"{head.format(title)} .sublinks .hiddenlink").all_inner_texts()
 
-    def menu_items():
+    def menu_items() -> list[list[str]]:
         return page.evaluate("[...document.querySelectorAll('#menu .mitem')].map((b) => [b.querySelector('.micon').textContent, "
                              "b.querySelector('.ml').textContent])")
 
@@ -790,14 +829,14 @@ def hidden_panels_smoke(page, url):
             and persisted == [["eval/return/mean", "eval/return/std", "eval/video/frame", "loss"], ["len"]])
 
 
-def grouping_modes_smoke(page, url):
+def grouping_modes_smoke(page: Page, url: str) -> bool:
     """Whether runs group by their directory by default, one line per directory of several runs with a state dot;
     `run~2 / run~1` nests directories, each named within its parent, and opening one opens that directory; `run`
     lists the runs flat; and `visible = true` leaves out unchecked runs."""
     heads = "[...document.querySelectorAll('#runTable tr.grp .gname')].map((e) => e.firstChild.textContent)"
     runs = "document.querySelectorAll('#runTable tr:has(td.name a)').length"
 
-    def group_by(text):
+    def group_by(text: str) -> None:
         page.fill("#groupBy", text)
         page.keyboard.press("Escape")
         page.keyboard.press("Escape")
@@ -837,14 +876,14 @@ def grouping_modes_smoke(page, url):
             and flat[0] == [] and flat[1] > 10 and flat[2] is False and filtered == [flat[1] - 1, flat[1] - 1])
 
 
-def hidden_runs_smoke(page, url):
+def hidden_runs_smoke(page: Page, url: str) -> bool:
     """Whether panels follow the shown runs: hiding the only run that logs some keys removes their panels, showing it
     brings them back, and hiding every run leaves no panels, as in a folder without runs."""
     panels = "[...document.querySelectorAll('#panels .panel > .ptitle > span:first-child')].map((e) => e.textContent).sort()"
     only = ["eval/len", "eval/return/mean", "eval/return/std", "eval/video/frame", "loss"]
     box = "#runTable tr:has(td.name[title='nested/r0']) input[type=checkbox]"
 
-    def settle(want):
+    def settle(want: list[str]) -> list[str]:
         try:
             page.wait_for_function(f"JSON.stringify({panels}) === {json.dumps(json.dumps(want))}", timeout=5000)
         except Exception:
@@ -871,7 +910,7 @@ def hidden_runs_smoke(page, url):
             and count == "0 sections · 0 panels" and back == before)
 
 
-def main():
+def main() -> None:
     out = Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="trex-shots-"))
     out.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="trex-smoke-"))
@@ -883,23 +922,29 @@ def main():
     server = subprocess.Popen([sys.executable, "-m", "trex", "serve", str(runs), "--temporary", "--port", str(port),
                                "--cache", str(tmp / "cache")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     url = f"http://127.0.0.1:{port}"
-    ok, failed = True, []
+    ok = True
+    failed: list[str] = []
 
-    def check(name, passed):
+    def check(name: str, passed: object) -> bool:
         if not passed:
             failed.append(name)
         return bool(passed)
 
     try:
-        server.stdout.readline()
+        first_line(server)
         with sync_playwright() as p:
             exe = next(Path.home().glob(".cache/ms-playwright/chromium-*/chrome-linux64/chrome"), None)
             browser = p.chromium.launch(executable_path=str(exe) if exe else None)
             page = browser.new_page(viewport={"width": 1500, "height": 950})
             coverage = JsCoverage(page)
             coverage.watch(page)
-            errors = []
-            page.on("console", lambda m: m.type == "error" and errors.append(f"{m.type}: {m.text}"))
+            errors: list[str] = []
+
+            def console(m: ConsoleMessage) -> None:
+                if m.type == "error":
+                    errors.append(f"{m.type}: {m.text}")
+
+            page.on("console", console)
             page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
             ready = READY
             for label, h in [("cold", "#path=sweep"), ("warm", "#path=sweep"), ("grouped", "#path=sweep&group=lr")]:
@@ -962,11 +1007,11 @@ def main():
             print(f"dropped {client['dropped']} rows events; client {'converged' if ok else 'DIVERGED'}")
             ok &= check("link_smoke", link_smoke(page, tmp, env, out, url))
             server.terminate()
-            ok &= check("daemon_smoke", daemon_smoke(page, runs, tmp, env, out, errors))
+            ok &= check("node_smoke", node_smoke(page, runs, tmp, env, out, errors))
             coverage.take()
             coverage.add_node_tests()
             lines = coverage.report()
-            covered, total = (sum(v[i] for v in lines.values()) for i in (0, 1))
+            covered, total = sum(c for c, _, _ in lines.values()), sum(n for _, n, _ in lines.values())
             (out / "ui_coverage.txt").write_text("".join(f"{k}: uncovered lines {miss}\n" for k, (_, _, miss) in lines.items()))
             print("UI line coverage: " + ", ".join(f"{k} {c / n:.0%}" for k, (c, n, _) in lines.items())
                   + f"; all {covered / total:.1%} (floor {UI_COVERAGE:.0%}; uncovered lines in ui_coverage.txt)")

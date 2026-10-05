@@ -23,6 +23,7 @@ from typing import Any, Final, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import buckets as bk, remote, update
+from .format import JSONValue, as_str_list
 from .index import Ask, Explorer, Have, Which, dumps
 from .node import Node, dir_base, link_url, resolve_root, workspace_url
 from .workspace import Workspace
@@ -266,8 +267,8 @@ class Handler(BaseHTTPRequestHandler):
         node = self.srv.node
         self._json({"node": node.identity.wire(), "saves": node.saves, "home": node.home,
                     "dirs": [d.wire() for d in node.served()], "links": [link.wire() for link in node.links_info()],
-                    "workspaces": node.workspace_list(), "history": node.history(), "install": update.RUNNING,
-                    "updates": update.updates()})
+                    "workspaces": node.workspace_list(), "history": node.history(), "install": update.RUNNING.wire(),
+                    "updates": update.updates().wire()})
 
     @route("GET", r"/api/holdings")
     def holdings(self, q: Query) -> None:
@@ -275,12 +276,16 @@ class Handler(BaseHTTPRequestHandler):
         from the one crawling it to this one; another trex pulls each from /d/<id>/."""
         self._json(self.srv.node.holdings().wire())
 
-    def body_json(self) -> dict[str, Any]:
+    def _parsed(self) -> JSONValue:
+        """The JSON of the body."""
+        return json.loads(self.body())
+
+    def body_json(self) -> dict[str, JSONValue]:
         """The JSON object of the body; ValueError for anything else."""
-        req = json.loads(self.body())
+        req = self._parsed()
         if not isinstance(req, dict):
             raise ValueError("expected a JSON object")
-        return cast(dict[str, Any], req)
+        return req
 
     def body_field(self, field: str) -> str:
         """String `field` of the JSON body."""
@@ -326,19 +331,19 @@ class Handler(BaseHTTPRequestHandler):
         if restart is None:
             raise KeyError("a daemon")
         can = update.updates()
-        if not can["available"] or can["source"] is None:
-            return self._json({"error": f"updates are unavailable: {can['reason']}"}, 400)
+        if not can.available or can.source is None:
+            return self._json({"error": f"updates are unavailable: {can.reason}"}, 400)
         if not self.srv.updating.acquire(blocking=False):
             return self._json({"error": "an update is already running"}, 409)
         try:
             before = update.installed()
-            output = update.install(can["source"])
+            output = update.install(can.source)
             after = update.installed()
         except update.UpdateError as e:
             self.srv.updating.release()
             return self._json({"error": str(e)[-4000:]}, 502)
         changed = after != before
-        self._json({"updated": changed, "from": before, "to": after, "output": output[-4000:]})
+        self._json({"updated": changed, "from": before.wire(), "to": after.wire(), "output": output[-4000:]})
         if changed:
             threading.Timer(RESTART_DELAY, restart).start()
         else:
@@ -348,10 +353,10 @@ class Handler(BaseHTTPRequestHandler):
     def node_workspace(self, q: Query) -> None:
         """Body: {name, members: [directory names], old?: name being renamed}. Response {url}, or 400."""
         req = self.body_json()
-        if not isinstance(req.get("members"), list):
+        if not isinstance(members := req.get("members"), list):
             raise ValueError("expected {name, members, old?}")
         try:
-            self.srv.node.set_workspace(str(req.get("name", "")), [str(m) for m in req["members"]],
+            self.srv.node.set_workspace(str(req.get("name", "")), [str(m) for m in members],
                                         str(req["old"]) if req.get("old") else None)
         except (ValueError, KeyError) as e:
             return self._json({"error": str(e)}, 400)
@@ -391,7 +396,7 @@ class Handler(BaseHTTPRequestHandler):
         """Body: {runs: [{path, and unless the mirror asking holds nothing of it: uid, mseq, compiled, rebuilt (the rows
         its levels hold and their rebuild)}]}, at most MAX_DUMPS. Response: each run's index rows the mirror lacks
         (`Explorer.dump`) in one body (`buckets.frame`), empty for a run this directory does not have."""
-        ex, req = self.ex, json.loads(self.body())
+        ex, req = self.ex, self._parsed()
         runs = req.get("runs") if isinstance(req, dict) else None
         if not isinstance(ex, Explorer):
             raise KeyError("a directory")
@@ -405,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
         """Body: {blocks: [{key, level, index, and runs (a list of run ids) or scope and which (all, finished or
         running)}]}, at most MAX_ASKS. Response: those blocks of those runs as bucket arrays (`Explorer.buckets_body`) in
         one body (`buckets.frame`)."""
-        req = json.loads(self.body())
+        req = self._parsed()
         blocks = req.get("blocks") if isinstance(req, dict) else None
         if not isinstance(blocks, list) or not 0 < len(blocks) <= MAX_ASKS:
             raise ValueError(f"expected {{blocks: [{{key, level, index, scope | runs, which}}]}} of 1 to {MAX_ASKS}")
@@ -413,15 +418,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send(body, "application/octet-stream", headers={"Cache-Control": "no-store"}, compress=not self._loopback())
 
     def _loopback(self) -> bool:
-        """Whether the client is on this machine; one on the Unix socket is a daemon reaching this trex over ssh."""
-        if not isinstance(self.client_address, tuple):
-            return False
-        host = str(self.client_address[0])
+        """Whether the client is on this machine; one on the Unix socket is a trex reaching this one over ssh."""
+        host = str(self.client_address[0]) if self.client_address else ""
         return host == "::1" or host.startswith("127.") or host.startswith("::ffff:127.")
 
     @route("GET", r"/api/stream")
     def stream(self, q: Query) -> None:
-        """SSE for runs under `path`: rows not yet in kept buckets, then live events and heartbeats."""
+        """SSE for runs under `path`: running runs' rows beyond their levels, then live events and heartbeats."""
         stop = threading.Event()
         try:
             self._event_stream_headers()
@@ -552,27 +555,26 @@ def urls(servers: Sequence[Server]) -> list[str]:
     return out
 
 
-def _held(r: object) -> tuple[str, Have | None]:
+def _held(r: JSONValue) -> tuple[str, Have | None]:
     """A run of POST /api/dumps and what the mirror asking holds of it; ValueError unless it is one."""
     if not isinstance(r, dict) or not isinstance(path := r.get("path"), str):
         raise ValueError(f"not a run: {r!r}")
     return path, Have.read(r) if "uid" in r else None
 
 
-def _ask(b: object) -> Ask:
+def _ask(d: JSONValue) -> Ask:
     """A block request of POST /api/buckets; ValueError unless it is one."""
-    if not isinstance(b, dict) or not isinstance(key := cast(dict[str, object], b).get("key"), str):
+    if not isinstance(d, dict) or not isinstance(key := d.get("key"), str):
         raise ValueError("a block: {key, level, index, scope | runs, which}")
-    d = cast(dict[str, object], b)
     runs, which = d.get("runs"), WHICH.get(str(d.get("which", "all")))
-    if runs is not None and (not isinstance(runs, list) or not all(isinstance(r, str) for r in cast(list[object], runs))):
+    if runs is not None and (not isinstance(runs, list) or not all(isinstance(r, str) for r in runs)):
         raise ValueError("runs: a list of run ids")
     if which is None:
         raise ValueError("which: all, finished or running")
     level = _whole(d.get("level"))
     if not bk.MIN_LEVEL <= level <= bk.MAX_LEVEL:
         raise ValueError(f"level {level} out of range")
-    return Ask(key, level, _whole(d.get("index")), str(d.get("scope", "")), cast(list[str] | None, runs), which)
+    return Ask(key, level, _whole(d.get("index")), str(d.get("scope", "")), None if runs is None else as_str_list(runs), which)
 
 
 def _whole(v: object) -> int:

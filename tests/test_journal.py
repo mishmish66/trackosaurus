@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import time
+from pathlib import Path
+from typing import Any, NoReturn
 
 import numpy as np
 import pytest
@@ -15,12 +17,12 @@ from helpers import committed_rows, readback, wait_for
 
 
 @pytest.fixture(autouse=True)
-def journaled(tmp_path, monkeypatch):
+def journaled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TREX_JOURNAL", "1")
     monkeypatch.setenv("TREX_REPLICAS", str(tmp_path / "replicas"))
 
 
-def replica_of(d):
+def replica_of(d: Path) -> dict[str, Any]:
     c = sqlite3.connect(journal.sync(d, SCHEMA))
     try:
         return readback(c)
@@ -28,7 +30,7 @@ def replica_of(d):
         c.close()
 
 
-def stored(d):
+def stored(d: Path) -> dict[str, Any]:
     c = sqlite3.connect(d / DB)
     try:
         return readback(c)
@@ -36,12 +38,12 @@ def stored(d):
         c.close()
 
 
-def log_some(run, n, start=0):
+def log_some(run: trex.Run, n: int, start: int = 0) -> None:
     for i in range(start, start + n):
         run.log({"loss": 1.0 / (i + 1), "odd": float("nan")} if i % 2 else {"loss": 1.0 / (i + 1)}, step=i)
 
 
-def test_replaying_the_journal_rebuilds_the_runs_rows_meta_and_media(tmp_path):
+def test_replaying_the_journal_rebuilds_the_runs_rows_meta_and_media(tmp_path: Path) -> None:
     d = tmp_path / "r"
     run = trex.init(d, config={"lr": 0.1}, commit_interval=0.02)
     log_some(run, 70_000)
@@ -51,7 +53,7 @@ def test_replaying_the_journal_rebuilds_the_runs_rows_meta_and_media(tmp_path):
     assert (d / journal.JOURNAL).exists() and replica_of(d) == stored(d)
 
 
-def test_a_merged_run_and_its_replica_hold_the_same_rows(tmp_path):
+def test_a_merged_run_and_its_replica_hold_the_same_rows(tmp_path: Path) -> None:
     d = tmp_path / "r"
     run = trex.init(d, commit_interval=0.001)
     for i in range(120):
@@ -64,7 +66,7 @@ def test_a_merged_run_and_its_replica_hold_the_same_rows(tmp_path):
     assert commits < 20 and replica_of(d) == stored(d) and len(stored(d)["rows"]) == 120
 
 
-def test_a_live_journaled_run_is_read_from_its_replica(tmp_path):
+def test_a_live_journaled_run_is_read_from_its_replica(tmp_path: Path) -> None:
     d = tmp_path / "r"
     run = trex.init(d, commit_interval=0.02)
     log_some(run, 10)
@@ -91,7 +93,7 @@ def test_a_live_journaled_run_is_read_from_its_replica(tmp_path):
         c.close()
 
 
-def test_a_partly_written_record_is_not_read_and_the_writer_drops_it_on_reopening(tmp_path):
+def test_a_partly_written_record_is_not_read_and_the_writer_drops_it_on_reopening(tmp_path: Path) -> None:
     d = tmp_path / "r"
     run = trex.init(d)
     log_some(run, 3)
@@ -108,7 +110,7 @@ def test_a_partly_written_record_is_not_read_and_the_writer_drops_it_on_reopenin
     assert [r.payload.get("session") for r in recs if "session" in r.payload] == [journal.host()]
 
 
-def test_a_run_reopened_without_its_journal_is_journaled_from_a_snapshot(tmp_path, monkeypatch):
+def test_a_run_reopened_without_its_journal_is_journaled_from_a_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     d = tmp_path / "r"
     monkeypatch.setenv("TREX_JOURNAL", "0")
     run = trex.init(d)
@@ -122,7 +124,7 @@ def test_a_run_reopened_without_its_journal_is_journaled_from_a_snapshot(tmp_pat
     assert replica_of(d) == stored(d) and [r[0] for r in stored(d)["rows"]] == list(range(7))
 
 
-def test_a_rewritten_journal_rebuilds_the_replica(tmp_path):
+def test_a_rewritten_journal_rebuilds_the_replica(tmp_path: Path) -> None:
     d = tmp_path / "r"
     run = trex.init(d)
     log_some(run, 4)
@@ -135,11 +137,12 @@ def test_a_rewritten_journal_rebuilds_the_replica(tmp_path):
     assert replica_of(d) == stored(d) and [r[0] for r in stored(d)["rows"]] == [0, 1]
 
 
-def test_a_failing_journal_stops_journaling_but_not_the_run(tmp_path, monkeypatch, capsys):
+def test_a_failing_journal_stops_journaling_but_not_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                             capsys: pytest.CaptureFixture[str]) -> None:
     d = tmp_path / "r"
     run = trex.init(d, commit_interval=0.02)
 
-    def full(*a):
+    def full(ops: list[journal.Op], seq: int, mseq: int) -> NoReturn:
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(run._journal, "append", full)
@@ -153,7 +156,7 @@ def test_a_failing_journal_stops_journaling_but_not_the_run(tmp_path, monkeypatc
     assert "journal" in capsys.readouterr().err
 
 
-def test_runs_off_network_filesystems_are_not_journaled_unless_asked(tmp_path, monkeypatch):
+def test_runs_off_network_filesystems_are_not_journaled_unless_asked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TREX_JOURNAL")
     trex.init(tmp_path / "local").finish()
     assert not (tmp_path / "local" / journal.JOURNAL).exists()
@@ -169,11 +172,11 @@ MOUNTINFO = """\
 
 @pytest.mark.parametrize("path,want", [("/scratch/me/runs", True), ("/scratch/local disk/runs", False), ("/home/me", True),
                                        ("/tmp/runs", False), ("/scratchy", False)])
-def test_network_filesystems_are_told_by_their_mount(path, want):
-    assert journal.on_network_fs(path, MOUNTINFO) is want
+def test_network_filesystems_are_told_by_their_mount(path: str, want: bool) -> None:
+    assert journal.on_network_fs(Path(path), MOUNTINFO) is want
 
 
-def test_the_explorer_follows_a_live_journaled_run(tmp_path):
+def test_the_explorer_follows_a_live_journaled_run(tmp_path: Path) -> None:
     root = tmp_path / "runs"
     run = trex.init(root / "r", commit_interval=0.02)
     log_some(run, 50)

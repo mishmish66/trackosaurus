@@ -12,8 +12,11 @@ import urllib.parse
 import urllib.request
 import uuid
 import zlib
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple
+from typing import Any, NoReturn, cast
 
 import numpy as np
 import pytest
@@ -22,25 +25,25 @@ import trex
 from trex import buckets as bk, chunks, crawl, server
 from trex import index as trex_index
 from trex.crawl import Crawl
-from trex.format import FORMAT, connect_ro, connect_rw
-from trex.index import Explorer
+from trex.format import FORMAT, JSONValue, RunState, connect_ro, connect_rw
+from trex.index import Event, Explorer, RunRecord, Sig, Update, Which
 from trex.node import Node, resolve_root
-from trex.server import bind, serve
+from trex.server import Server, bind, serve
 from trex.server import urls as server_urls
 
 import helpers
 from helpers import committed_rows, get_json, request, wait_for, write_commit
 
 
-def loss_and_odd(i):
+def loss_and_odd(i: int) -> dict[str, float]:
     return {"loss": 1.0 / (i + 1), "odd": i} if i % 2 else {"loss": 1.0 / (i + 1)}
 
 
 write_run = functools.partial(helpers.write_run, metrics=loss_and_odd)
 
 
-def drain(sub):
-    out = []
+def drain(sub: trex_index.Subscriber) -> list[tuple[str, Any]]:
+    out: list[tuple[str, Any]] = []
     while not sub.q.empty():
         msg = sub.q.get_nowait().decode()
         ev = msg.split("\n")[0][len("event: "):]
@@ -49,26 +52,28 @@ def drain(sub):
 
 
 @pytest.fixture
-def root(tmp_path):
+def root(tmp_path: Path) -> Path:
     r = tmp_path / "runs"
     r.mkdir()
     return r
 
 
-def explorer(root, tmp_path, workers=None, cache="cache"):
+def explorer(root: Path, tmp_path: Path, workers: int | None = None, cache: str = "cache") -> Explorer:
     ex = Explorer(Crawl(root, workers), tmp_path / cache)
     ex.sync()
     return ex
 
 
-def write_chunked(d, commits, state="finished", created=1000.0):
+def write_chunked(d: Path, commits: Sequence[Sequence[chunks.CommitRow]], state: RunState = "finished",
+                  created: float = 1000.0) -> None:
     """Closed run whose commits are exactly the given lists of rows [(step, t, {key: value})]."""
     d.mkdir(parents=True)
     (d / "media").mkdir()
     c = connect_rw(d)
-    meta = {"id": uuid.uuid4().hex, "created": created, "format": FORMAT, "name": d.name, "state": state,
-            "heartbeat": time.time(), "config": {}, "tags": [], "summary": {}, "info": {}}
-    ids, seq = {}, 0
+    meta: dict[str, JSONValue] = {"id": uuid.uuid4().hex, "created": created, "format": FORMAT, "name": d.name, "state": state,
+                                  "heartbeat": time.time(), "config": {}, "tags": [], "summary": {}, "info": {}}
+    ids: dict[str, int] = {}
+    seq = 0
     c.execute("BEGIN")
     c.executemany("INSERT INTO meta VALUES (?, ?)", [(k, json.dumps(v)) for k, v in meta.items()])
     for rows in commits:
@@ -77,9 +82,9 @@ def write_chunked(d, commits, state="finished", created=1000.0):
     c.close()
 
 
-def mixed_rows(n, seed=0):
+def mixed_rows(n: int, seed: int = 0) -> list[chunks.CommitRow]:
     """Rows of three shapes; `loss` is in two of them, `x` is sometimes NaN."""
-    out = []
+    out: list[chunks.CommitRow] = []
     for i in range(n):
         if i % 7 == 3:
             d = {"eval/r": float(i + seed), "loss": 0.5 * i}
@@ -91,8 +96,9 @@ def mixed_rows(n, seed=0):
     return out
 
 
-def chunked(rows, sizes):
-    out, i = [], 0
+def chunked(rows: Sequence[chunks.CommitRow], sizes: Sequence[int]) -> list[Sequence[chunks.CommitRow]]:
+    out: list[Sequence[chunks.CommitRow]] = []
+    i = 0
     for n in sizes:
         out.append(rows[i: i + n])
         i += n
@@ -100,7 +106,7 @@ def chunked(rows, sizes):
     return out
 
 
-def expected(rows, key, level, index=None):
+def expected(rows: Sequence[chunks.CommitRow], key: str, level: int, index: int | None = None) -> bk.Buckets:
     """The buckets of `key` in `rows` at `level` (in block `index` when given)."""
     pts = [(s, d[key], t) for s, t, d in rows if key in d]
     s, v, t = (np.array(x, dtype=float) for x in zip(*pts))
@@ -108,7 +114,7 @@ def expected(rows, key, level, index=None):
     return b if index is None else bk.cut(b, index * bk.BLOCK, (index + 1) * bk.BLOCK)
 
 
-def run_points(root, path, key):
+def run_points(root: Path, path: str, key: str) -> chunks.Series:
     c = connect_ro(root / path)
     try:
         kid = {n: i for i, n in chunks.key_names(c).items()}[key]
@@ -117,7 +123,7 @@ def run_points(root, path, key):
         c.close()
 
 
-def index_dump(ex):
+def index_dump(ex: Explorer) -> dict[str, list[Any]]:
     """Everything the index stores, without compile times."""
     c = sqlite3.connect(ex.db_path)
     out = {t: sorted(c.execute(f"SELECT * FROM {t}").fetchall()) for t in ("runs", "media", "metrics", "levels")}
@@ -126,12 +132,13 @@ def index_dump(ex):
     return out
 
 
-class Top(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class Top:
     level: int
     buckets: bk.Buckets
 
 
-def top_of(ex, path, key):
+def top_of(ex: Explorer, path: str, key: str) -> Top:
     """Run `path`'s top level of `key`, and its buckets there."""
     c = sqlite3.connect(ex.db_path)
     try:
@@ -142,11 +149,11 @@ def top_of(ex, path, key):
     return Top(top, bk.concat([trex_index.unpack(d) for (d,) in blobs]))
 
 
-def top_n(ex, path, key):
+def top_n(ex: Explorer, path: str, key: str) -> int:
     return int(top_of(ex, path, key).buckets.n.sum())
 
 
-def stored_blocks(ex, path, key):
+def stored_blocks(ex: Explorer, path: str, key: str) -> dict[tuple[int, int], int]:
     """{(level, block): since} of the blocks the index stores of a run's metric."""
     c = sqlite3.connect(ex.db_path)
     try:
@@ -156,22 +163,23 @@ def stored_blocks(ex, path, key):
         c.close()
 
 
-def block(ex, key, level, index, scope="", runs=None, which="all"):
+def block(ex: Explorer, key: str, level: int, index: int, scope: str = "", runs: Sequence[str] | None = None,
+          which: Which = "all") -> bk.BucketArray:
     return bk.decode(ex.buckets_body(key, level, index, scope, runs, which))
 
 
-def of_run(a, path):
+def of_run(a: bk.BucketArray, path: str) -> bk.Buckets:
     """The buckets of run `path` of decoded array `a`, as one run's."""
     b = bk.select(a.buckets, a.buckets.run == a.paths.index(path))
     return b.of(np.zeros(b.run.size, np.int32))
 
 
-def same(a, b):
+def same(a: bk.Buckets, b: bk.Buckets) -> bool:
     """Whether two runs' buckets are equal (NaN equal to NaN)."""
     return all(np.array_equal(x, y, equal_nan=x.dtype.kind == "f") for x, y in zip(a.columns[1:], b.columns[1:], strict=True))
 
 
-def close(a, b, level):
+def close(a: bk.Buckets, b: bk.Buckets, level: int) -> bool:
     """Whether two runs' buckets of `level` hold the same buckets and counts, with means, steps and runtimes equal to
     float32 rounding (merged from finer buckets, as against bucketized from rows)."""
     return (np.array_equal(a.bucket, b.bucket) and np.array_equal(a.n, b.n)
@@ -179,7 +187,7 @@ def close(a, b, level):
             and np.allclose(a.step(level), b.step(level), atol=2.0 ** level * 4 / bk.SOFF_SCALE))
 
 
-def test_a_finished_runs_levels_hold_every_finite_point_of_each_metric_from_its_finest_level_to_its_top(root, tmp_path):
+def test_a_finished_runs_levels_hold_every_finite_point_of_each_metric_from_its_finest_level_to_its_top(root: Path, tmp_path: Path) -> None:
     rows = mixed_rows(7053)
     write_chunked(root / "r", chunked(rows, [700, 1, 2000, 323, 1024, 5, 3000]))
     ex = explorer(root, tmp_path)
@@ -196,7 +204,7 @@ def test_a_finished_runs_levels_hold_every_finite_point_of_each_metric_from_its_
         assert levels == list(range(levels[0], a.level + 1)) and set(stored_blocks(ex, "r", key).values()) == {7053}
 
 
-def test_a_block_of_a_level_above_a_runs_top_merges_its_top_level(root, tmp_path):
+def test_a_block_of_a_level_above_a_runs_top_merges_its_top_level(root: Path, tmp_path: Path) -> None:
     rows = mixed_rows(7053)
     write_chunked(root / "r", chunked(rows, [700, 1, 2000, 323, 1024, 5, 3000]))
     ex = explorer(root, tmp_path)
@@ -210,7 +218,7 @@ def test_a_block_of_a_level_above_a_runs_top_merges_its_top_level(root, tmp_path
                 assert same(of_run(a, "r"), want)
 
 
-def test_a_scope_block_holds_every_run_under_it_that_logs_the_metric(root, tmp_path):
+def test_a_scope_block_holds_every_run_under_it_that_logs_the_metric(root: Path, tmp_path: Path) -> None:
     for name in ("a/r1", "a/r2", "b/r3"):
         write_run(root / name, 600)
     write_run(root / "a" / "short", 1)
@@ -223,7 +231,7 @@ def test_a_scope_block_holds_every_run_under_it_that_logs_the_metric(root, tmp_p
     assert block(ex, "odd", level, 0, runs=["a/r2", "nope", "a/short", "a/r2"]).paths == ["a/r2"]
 
 
-def test_a_scopes_finished_blocks_are_kept_until_its_finished_runs_change(root, tmp_path):
+def test_a_scopes_finished_blocks_are_kept_until_its_finished_runs_change(root: Path, tmp_path: Path) -> None:
     write_run(root / "a" / "r1", 600)
     ex = explorer(root, tmp_path)
     level = top_of(ex, "a/r1", "odd").level
@@ -237,15 +245,16 @@ def test_a_scopes_finished_blocks_are_kept_until_its_finished_runs_change(root, 
     assert bk.decode(body()).paths == ["a/r2"]
 
 
-def test_a_memo_builds_a_value_once_while_others_wait_and_drops_the_least_recently_used():
-    memo, built, gate = trex_index.Memo(limit=10), [], threading.Event()
+def test_a_memo_builds_a_value_once_while_others_wait_and_drops_the_least_recently_used() -> None:
+    memo, gate = trex_index.Memo(limit=10), threading.Event()
+    built: list[str] = []
 
-    def build(v, nbytes=4):
+    def build(v: str, nbytes: int = 4) -> tuple[str, int]:
         gate.wait(5)
         built.append(v)
         return v, nbytes
 
-    got = []
+    got: list[str] = []
     threads = [threading.Thread(target=lambda: got.append(memo.get(("a",), 0, lambda: build("a")))) for _ in range(4)]
     for th in threads:
         th.start()
@@ -260,7 +269,7 @@ def test_a_memo_builds_a_value_once_while_others_wait_and_drops_the_least_recent
     assert memo.get(("a",), 1, lambda: build("a2")) == "a1" and memo.get(("b",), 0, lambda: build("b2")) == "b2"
 
 
-def test_the_runs_body_follows_runs_added_and_folder_notes(root, tmp_path):
+def test_the_runs_body_follows_runs_added_and_folder_notes(root: Path, tmp_path: Path) -> None:
     write_run(root / "a" / "r1", 5)
     ex = explorer(root, tmp_path)
     body = lambda: json.loads(ex.runs_body("a"))
@@ -271,11 +280,10 @@ def test_the_runs_body_follows_runs_added_and_folder_notes(root, tmp_path):
     assert [m["id"] for m in body()["runs"]] == ["a/r1", "a/r2"] and body()["folders"]["a"] == {"note": "x"}
 
 
-def test_requests_on_a_kept_alive_connection_answer_without_waiting_for_delayed_acks(http):
+def test_requests_on_a_kept_alive_connection_answer_without_waiting_for_delayed_acks(http: tuple[Explorer, str]) -> None:
     _, url = http
-    u = urllib.parse.urlsplit(url)
-    c = http_client.HTTPConnection(u.hostname, u.port, timeout=5)
-    times = []
+    c = http_client.HTTPConnection(urllib.parse.urlsplit(url).netloc, timeout=5)
+    times: list[float] = []
     for _ in range(6):
         t = time.perf_counter()
         c.request("GET", "/api/info")
@@ -285,7 +293,7 @@ def test_requests_on_a_kept_alive_connection_answer_without_waiting_for_delayed_
     assert sorted(times[1:])[2] < 0.02, times
 
 
-def test_a_block_holds_runs_merged_from_their_top_levels_or_as_their_levels_store_it(root, tmp_path):
+def test_a_block_holds_runs_merged_from_their_top_levels_or_as_their_levels_store_it(root: Path, tmp_path: Path) -> None:
     write_run(root / "a" / "short", 600)
     write_run(root / "a" / "long", 5000)
     live = write_run(root / "a" / "live", 600, finish=False)
@@ -295,7 +303,7 @@ def test_a_block_holds_runs_merged_from_their_top_levels_or_as_their_levels_stor
     assert top_of(ex, "a/long", "loss").level > level and top_of(ex, "a/live", "loss").level < level
     a = block(ex, "loss", level, 0, "a", which="finished")
     assert a.paths == ["a/long", "a/short"] and list(a.seq) == [5000, 600]
-    s, v, t = run_points(root, "a/long", "loss")
+    s, v, t = run_points(root, "a/long", "loss").columns
     assert close(of_run(a, "a/long"), bk.cut(bk.bucketize(s, v, t, level), 0, bk.BLOCK), level)
     assert same(of_run(a, "a/short"), bk.cut(bk.merge(top_of(ex, "a/short", "loss").buckets, 1), 0, bk.BLOCK))
     every = block(ex, "loss", level, 0, "a")
@@ -306,7 +314,7 @@ def test_a_block_holds_runs_merged_from_their_top_levels_or_as_their_levels_stor
     live.finish()
 
 
-def test_a_runs_blocks_below_its_top_level_come_from_its_stored_levels_without_its_run_file(root, tmp_path):
+def test_a_runs_blocks_below_its_top_level_come_from_its_stored_levels_without_its_run_file(root: Path, tmp_path: Path) -> None:
     rows = mixed_rows(5000)
     write_chunked(root / "r", chunked(rows, [1000] * 5))
     ex = explorer(root, tmp_path)
@@ -315,7 +323,7 @@ def test_a_runs_blocks_below_its_top_level_come_from_its_stored_levels_without_i
         assert close(of_run(block(ex, "loss", lv, i, runs=["r"]), "r"), expected(rows, "loss", lv, i), lv)
 
 
-def test_blocks_below_a_runs_finest_level_are_refined_from_it_without_the_run_file(root, tmp_path):
+def test_blocks_below_a_runs_finest_level_are_refined_from_it_without_the_run_file(root: Path, tmp_path: Path) -> None:
     rows = [(float(i), i / 2, {"loss": 1 / (i + 1)}) for i in range(3000)]  # a step apart: compiled down to level 0
     write_chunked(root / "r", chunked(rows, [1000] * 3))
     ex = explorer(root, tmp_path)
@@ -324,7 +332,7 @@ def test_blocks_below_a_runs_finest_level_are_refined_from_it_without_the_run_fi
         assert close(of_run(block(ex, "loss", lv, i, runs=["r"]), "r"), expected(rows, "loss", lv, i), lv)
 
 
-def test_a_growing_runs_blocks_hold_its_compiled_rows_and_its_run_file_gives_the_rows_after_them(root, tmp_path):
+def test_a_growing_runs_blocks_hold_its_compiled_rows_and_its_run_file_gives_the_rows_after_them(root: Path, tmp_path: Path) -> None:
     run = write_run(root / "a" / "r1", 3000, finish=False)
     assert wait_for(lambda: committed_rows(root / "a" / "r1") == 3000)
     ex = explorer(root, tmp_path)
@@ -343,7 +351,9 @@ def test_a_growing_runs_blocks_hold_its_compiled_rows_and_its_run_file_gives_the
 
 
 @pytest.mark.parametrize("workers", [1, 3])
-def test_a_long_runs_new_rows_change_only_the_blocks_they_fall_in_and_those_above_them(root, tmp_path, monkeypatch, workers):
+def test_a_long_runs_new_rows_change_only_the_blocks_they_fall_in_and_those_above_them(root: Path, tmp_path: Path,
+                                                                                       monkeypatch: pytest.MonkeyPatch,
+                                                                                       workers: int) -> None:
     monkeypatch.setattr(crawl, "REFRESH", 0.0)
     monkeypatch.setattr(crawl, "INLINE_BYTES", 0)
     runs = [trex.init(root / name, commit_interval=0.01) for name in ("a", "b")]
@@ -368,7 +378,7 @@ def test_a_long_runs_new_rows_change_only_the_blocks_they_fall_in_and_those_abov
     assert top == bk.level_for(7499.0) and set(after.values()) == {6000, 7500}
     for key in ("loss", "odd"):
         for p in ("a", "b"):
-            s, v, t = run_points(root, p, key)
+            s, v, t = run_points(root, p, key).columns
             for level, index in [(0, 23), (0, 29), (2, 5), (2, 7), (top - 1, 0), (top, 0), (-2, 100)]:
                 want = bk.cut(bk.bucketize(s, v, t, level), index * bk.BLOCK, (index + 1) * bk.BLOCK)
                 assert close(of_run(block(ex, key, level, index, runs=[p]), p), want, level)
@@ -376,7 +386,8 @@ def test_a_long_runs_new_rows_change_only_the_blocks_they_fall_in_and_those_abov
         run.finish()
 
 
-def test_a_finished_block_stays_while_running_runs_grow_and_changes_once_one_finishes(root, tmp_path, monkeypatch):
+def test_a_finished_block_stays_while_running_runs_grow_and_changes_once_one_finishes(root: Path, tmp_path: Path,
+                                                                                      monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(crawl, "REFRESH", 0.0)
     write_run(root / "a" / "done", 300)
     live = write_run(root / "a" / "live", 300, finish=False)
@@ -393,12 +404,13 @@ def test_a_finished_block_stays_while_running_runs_grow_and_changes_once_one_fin
     assert bk.decode(finished()).paths == ["a/done", "a/live"]
 
 
-def saved_levels(ex):
+def saved_levels(ex: Explorer) -> list[str]:
     d = ex.cache_dir / "levels"
     return sorted(f.name for f in d.iterdir() if not f.name.endswith(".tmp")) if d.exists() else []
 
 
-def test_a_new_explorer_cuts_blocks_from_the_levels_an_earlier_one_saved(root, tmp_path, monkeypatch):
+def test_a_new_explorer_cuts_blocks_from_the_levels_an_earlier_one_saved(root: Path, tmp_path: Path,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("a/r1", "a/r2", "b/r3"):
         write_run(root / name, 3000)
     ex = explorer(root, tmp_path)
@@ -407,14 +419,14 @@ def test_a_new_explorer_cuts_blocks_from_the_levels_an_earlier_one_saved(root, t
     assert wait_for(lambda: saved_levels(ex))
     ex.close()
 
-    def unread(*_):
+    def unread(*_: object) -> NoReturn:
         raise AssertionError("kept buckets read")
     monkeypatch.setattr(bk, "stack", unread)
     again = explorer(root, tmp_path)
     assert {k: again.buckets_body("loss", k[0], 0, k[1], None, "finished") for k in want} == want
 
 
-def test_saved_levels_are_left_unused_once_the_finished_runs_change(root, tmp_path):
+def test_saved_levels_are_left_unused_once_the_finished_runs_change(root: Path, tmp_path: Path) -> None:
     for name in ("a/r1", "a/r2"):
         write_run(root / name, 3000)
     ex = explorer(root, tmp_path)
@@ -428,7 +440,8 @@ def test_saved_levels_are_left_unused_once_the_finished_runs_change(root, tmp_pa
     assert a.paths == ["a/r1", "a/r2", "a/r3"] and np.all(of_run(a, "a/r3").mean == 5.0)
 
 
-def test_a_metric_saves_its_levels_at_most_once_every_levels_save_every(root, tmp_path, monkeypatch):
+def test_a_metric_saves_its_levels_at_most_once_every_levels_save_every(root: Path, tmp_path: Path,
+                                                                        monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(trex_index, "LEVELS_SAVE_EVERY", 3600.0)
     write_run(root / "a" / "r1", 3000)
     ex = explorer(root, tmp_path)
@@ -444,7 +457,7 @@ def test_a_metric_saves_its_levels_at_most_once_every_levels_save_every(root, tm
     assert saved_levels(ex) == [d.name] and {f.name: f.read_bytes() for f in d.iterdir()} == before
 
 
-def test_saved_levels_beyond_their_budget_go_least_recently_used_first(tmp_path):
+def test_saved_levels_beyond_their_budget_go_least_recently_used_first(tmp_path: Path) -> None:
     for i, name in enumerate(("old", "mid", "new")):
         (tmp_path / name).mkdir()
         f = tmp_path / name / "levels.npy"
@@ -456,7 +469,7 @@ def test_saved_levels_beyond_their_budget_go_least_recently_used_first(tmp_path)
     assert sorted(f.name for f in tmp_path.iterdir()) == ["mid", "new"]
 
 
-def test_a_changed_cache_version_deletes_the_saved_levels(root, tmp_path, monkeypatch):
+def test_a_changed_cache_version_deletes_the_saved_levels(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     write_run(root / "a" / "r1", 3000)
     ex = explorer(root, tmp_path)
     ex.buckets_body("loss", top_of(ex, "a/r1", "loss").level, 0, "a", None, "finished")
@@ -466,13 +479,13 @@ def test_a_changed_cache_version_deletes_the_saved_levels(root, tmp_path, monkey
     assert saved_levels(explorer(root, tmp_path)) == []
 
 
-def test_http_buckets_answers_every_block_asked_in_one_body_and_info_states_the_protocol(http, root):
+def test_http_buckets_answers_every_block_asked_in_one_body_and_info_states_the_protocol(http: tuple[Explorer, str], root: Path) -> None:
     ex, url = http
     for name in ("x/r1", "x/r2"):
         write_run(root / name, 300)
     ex.sync()
 
-    def post(*blocks):
+    def post(*blocks: Mapping[str, object]) -> list[bytes]:
         body = json.dumps({"blocks": list(blocks)}).encode()
         return bk.unframe(urllib.request.urlopen(urllib.request.Request(f"{url}/api/buckets", data=body)).read())
 
@@ -494,7 +507,7 @@ def test_http_buckets_answers_every_block_asked_in_one_body_and_info_states_the_
         assert json.loads(r.read())["protocol"] == server.PROTOCOL
 
 
-def test_blocks_finer_than_a_run_keeps_hold_its_rows_at_that_level(root, tmp_path):
+def test_blocks_finer_than_a_run_keeps_hold_its_rows_at_that_level(root: Path, tmp_path: Path) -> None:
     rows = mixed_rows(5000)
     write_chunked(root / "r", chunked(rows, [1000] * 5))
     ex = explorer(root, tmp_path)
@@ -506,7 +519,8 @@ def test_blocks_finer_than_a_run_keeps_hold_its_rows_at_that_level(root, tmp_pat
         ex.buckets_body("loss", bk.MAX_LEVEL + 1, 0, runs=["r"])
 
 
-def test_a_running_runs_blocks_hold_its_newest_rows_once_it_is_compiled_again(root, tmp_path, monkeypatch):
+def test_a_running_runs_blocks_hold_its_newest_rows_once_it_is_compiled_again(root: Path, tmp_path: Path,
+                                                                              monkeypatch: pytest.MonkeyPatch) -> None:
     run = trex.init(root / "r", commit_interval=0.01)
     for i in range(3000):
         run.log({"loss": float(i)}, step=i)
@@ -519,12 +533,12 @@ def test_a_running_runs_blocks_hold_its_newest_rows_once_it_is_compiled_again(ro
     monkeypatch.setattr(crawl, "REFRESH", 0.0)
     ex.sync()
     a = block(ex, "loss", 0, 11, runs=["r"])
-    s, v, t = run_points(root, "r", "loss")
+    s, v, t = run_points(root, "r", "loss").columns
     assert close(of_run(a, "r"), bk.cut(bk.bucketize(s, v, t, 0), 11 * bk.BLOCK, 12 * bk.BLOCK), 0) and list(a.seq) == [3500]
     run.finish()
 
 
-def test_live_run_streams_contiguous_rows_and_is_compiled_whole_once_it_finishes(root, tmp_path):
+def test_live_run_streams_contiguous_rows_and_is_compiled_whole_once_it_finishes(root: Path, tmp_path: Path) -> None:
     run = trex.init(root / "live", commit_interval=0.05)
     run.log({"x": 0})
     assert wait_for(lambda: committed_rows(root / "live") == 1)
@@ -550,7 +564,8 @@ def test_live_run_streams_contiguous_rows_and_is_compiled_whole_once_it_finishes
     assert top_n(ex, "live", "x") == 30
 
 
-def test_a_growing_runs_levels_are_compiled_again_after_the_refresh_interval(root, tmp_path, monkeypatch):
+def test_a_growing_runs_levels_are_compiled_again_after_the_refresh_interval(root: Path, tmp_path: Path,
+                                                                             monkeypatch: pytest.MonkeyPatch) -> None:
     run = trex.init(root / "r", commit_interval=0.01)
     run.log({"x": 0.0}, step=0)
     assert wait_for(lambda: committed_rows(root / "r") == 1)
@@ -566,7 +581,7 @@ def test_a_growing_runs_levels_are_compiled_again_after_the_refresh_interval(roo
     run.finish()
 
 
-def test_a_silent_running_run_becomes_crashed_with_every_row_compiled(root, tmp_path, monkeypatch):
+def test_a_silent_running_run_becomes_crashed_with_every_row_compiled(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run = write_run(root / "r", 10, finish=False)
     assert wait_for(lambda: committed_rows(root / "r") == 10)
     ex = explorer(root, tmp_path)
@@ -582,7 +597,7 @@ def test_a_silent_running_run_becomes_crashed_with_every_row_compiled(root, tmp_
     run.finish()
 
 
-def test_pool_and_inline_indexing_produce_identical_index(root, tmp_path, monkeypatch):
+def test_pool_and_inline_indexing_produce_identical_index(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for i in range(6):
         rows = mixed_rows(1500 + 977 * i, seed=i)
         sizes = [333] * (len(rows) // 333) + [len(rows) % 333]
@@ -599,9 +614,14 @@ def test_pool_and_inline_indexing_produce_identical_index(root, tmp_path, monkey
     before = {p: sorted(x.name for x in p.iterdir()) for p in root.glob("sweep/*")}
     inline = explorer(root, tmp_path, workers=1, cache="inline")
     monkeypatch.setattr(crawl, "INLINE_BYTES", 0)
-    pooled = []
+    pooled: list[int] = []
     real = Crawl._sync_pool
-    monkeypatch.setattr(Crawl, "_sync_pool", lambda self, ex, todo: (pooled.append(len(todo)), real(self, ex, todo)))
+
+    def counted(self: Crawl, ex: Explorer, todo: Sequence[tuple[str, Path, Sig]]) -> None:
+        pooled.append(len(todo))
+        real(self, ex, todo)
+
+    monkeypatch.setattr(Crawl, "_sync_pool", counted)
     pool = explorer(root, tmp_path, workers=4, cache="pool")
     assert pooled == [12]
     assert len(inline.records) == 12
@@ -614,7 +634,7 @@ def test_pool_and_inline_indexing_produce_identical_index(root, tmp_path, monkey
         assert {k for p, k, *_ in a["metrics"] if p == path} == set(st["keys"]) == {k for k, _, _, p, *_ in a["levels"] if p == path}
 
 
-def test_live_rows_are_contiguous_while_the_writer_commits(root, tmp_path):
+def test_live_rows_are_contiguous_while_the_writer_commits(root: Path, tmp_path: Path) -> None:
     run = trex.init(root / "live", commit_interval=0.01)
     run.log({"x": 0.0}, step=0)
     assert wait_for(lambda: committed_rows(root / "live") == 1)
@@ -623,7 +643,7 @@ def test_live_rows_are_contiguous_while_the_writer_commits(root, tmp_path):
     seen = ex.run_meta("live").seq
     n = 3000
 
-    def produce():
+    def produce() -> None:
         for i in range(1, n):
             run.log({"x": float(i), "y": -float(i)} if i % 3 else {"x": float(i)}, step=i)
             if i % 50 == 0:
@@ -640,7 +660,7 @@ def test_live_rows_are_contiguous_while_the_writer_commits(root, tmp_path):
     ex.sync()
     rows = [d for e, d in drain(sub) if e == "rows"]
     assert polls > 3 and len(rows) > 3
-    got = []
+    got: list[list[Any]] = []
     for d in rows:
         assert d["seq0"] == seen + len(got)
         got += d["rows"]
@@ -649,7 +669,7 @@ def test_live_rows_are_contiguous_while_the_writer_commits(root, tmp_path):
     assert all(("y" in r[2]) == (int(r[0]) % 3 != 0) for r in got)
 
 
-def test_run_whose_row_count_shrank_under_the_same_id_is_dropped_and_reindexed(root, tmp_path):
+def test_run_whose_row_count_shrank_under_the_same_id_is_dropped_and_reindexed(root: Path, tmp_path: Path) -> None:
     write_run(root / "r", 20)
     old = tmp_path / "old.sqlite"
     shutil.copy(root / "r" / "trex.sqlite", old)
@@ -671,7 +691,7 @@ def test_run_whose_row_count_shrank_under_the_same_id_is_dropped_and_reindexed(r
     assert top_n(ex, "r", "loss") == 20 and of_run(block(ex, "loss", 0, 0, runs=["r"]), "r").n.sum() == 20
 
 
-def test_http_stream_sends_rows_beyond_the_compiled_levels_then_live_rows(http, root):
+def test_http_stream_sends_rows_beyond_the_compiled_levels_then_live_rows(http: tuple[Explorer, str], root: Path) -> None:
     ex, url = http
     run = trex.init(root / "s" / "r", commit_interval=0.05)
     run.log({"x": 0})
@@ -681,9 +701,9 @@ def test_http_stream_sends_rows_beyond_the_compiled_levels_then_live_rows(http, 
         run.log({"x": i})
     assert wait_for(lambda: committed_rows(root / "s" / "r") == 3)
     ex.sync()
-    r = urllib.request.urlopen(f"{url}/api/stream?path=s", timeout=5)
+    r: http_client.HTTPResponse = urllib.request.urlopen(f"{url}/api/stream?path=s", timeout=5)
 
-    def next_event():
+    def next_event() -> tuple[str | None, Any]:
         ev = None
         while True:
             line = r.readline().decode().rstrip("\n")
@@ -705,7 +725,7 @@ def test_http_stream_sends_rows_beyond_the_compiled_levels_then_live_rows(http, 
     r.close()
 
 
-def test_walk_finds_nested_runs_and_skips_hidden_env_and_run_internals(root, tmp_path):
+def test_walk_finds_nested_runs_and_skips_hidden_env_and_run_internals(root: Path, tmp_path: Path) -> None:
     write_run(root / "a" / "r1", 3)
     write_run(root / "a" / "b" / "r2", 3)
     write_run(root / ".hidden" / "r3", 3)
@@ -718,7 +738,7 @@ def test_walk_finds_nested_runs_and_skips_hidden_env_and_run_internals(root, tmp
     assert [r.id for r in ex.runs("a/b/r").runs] == []
 
 
-def test_rewritten_run_is_dropped_and_reindexed(root, tmp_path):
+def test_rewritten_run_is_dropped_and_reindexed(root: Path, tmp_path: Path) -> None:
     write_run(root / "r", 50)
     ex = explorer(root, tmp_path)
     uid = ex.run_meta("r").uid
@@ -732,7 +752,7 @@ def test_rewritten_run_is_dropped_and_reindexed(root, tmp_path):
     assert meta.uid != uid and meta.seq == 5
 
 
-def test_an_index_is_held_by_one_explorer_at_a_time_and_a_later_one_reuses_it_without_rereading_runs(root, tmp_path):
+def test_an_index_is_held_by_one_explorer_at_a_time_and_a_later_one_reuses_it_without_rereading_runs(root: Path, tmp_path: Path) -> None:
     write_run(root / "r", 1500)
     ex = explorer(root, tmp_path)
     before = ex.run_meta("r")
@@ -743,7 +763,7 @@ def test_an_index_is_held_by_one_explorer_at_a_time_and_a_later_one_reuses_it_wi
     assert ex2.cache_dir == ex.cache_dir and ex2.sync() == [] and ex2.run_meta("r") == before
 
 
-def test_refuses_to_crawl_home_or_filesystem_root():
+def test_refuses_to_crawl_home_or_filesystem_root() -> None:
     with pytest.raises(ValueError, match="refusing"):
         resolve_root("~", force=False)
     with pytest.raises(ValueError, match="refusing"):
@@ -751,12 +771,12 @@ def test_refuses_to_crawl_home_or_filesystem_root():
 
 
 @pytest.fixture
-def http(root, tmp_path, http_server):
+def http(root: Path, tmp_path: Path, http_server: Callable[[Server], str]) -> tuple[Explorer, str]:
     ex = Explorer(Crawl(root), tmp_path / "cache")
     return ex, http_server(serve(helpers.node_of(ex), "127.0.0.1", 0))
 
 
-def test_http_scopes_runs_by_folder_and_serves_media_with_ranges(http, root):
+def test_http_scopes_runs_by_folder_and_serves_media_with_ranges(http: tuple[Explorer, str], root: Path) -> None:
     ex, url = http
     write_run(root / "a" / "r1", 5)
     run = trex.init(root / "b" / "r2")
@@ -774,7 +794,7 @@ def test_http_scopes_runs_by_folder_and_serves_media_with_ranges(http, root):
     assert [p for p, _ in get_json(f"{url}/api/tree")] == ["a/r1", "b/r2"]
 
 
-def test_indexing_never_creates_files_in_closed_run_directories(root, tmp_path):
+def test_indexing_never_creates_files_in_closed_run_directories(root: Path, tmp_path: Path) -> None:
     write_run(root / "r", 10)
     before = sorted(p.name for p in (root / "r").iterdir())
     ex = explorer(root, tmp_path)
@@ -782,7 +802,7 @@ def test_indexing_never_creates_files_in_closed_run_directories(root, tmp_path):
     assert sorted(p.name for p in (root / "r").iterdir()) == before == ["media", "trex.sqlite"]
 
 
-def test_run_and_folder_info_reach_the_api_for_the_scope_and_its_ancestors(root, tmp_path):
+def test_run_and_folder_info_reach_the_api_for_the_scope_and_its_ancestors(root: Path, tmp_path: Path) -> None:
     write_run(root / "sweep" / "a" / "r", 3, info={"notes": "hi"})
     trex.folder_info(root / "sweep", {"question": "q"})
     trex.folder_info(root / "sweep" / "a", {"arm": "a"})
@@ -797,7 +817,7 @@ def test_run_and_folder_info_reach_the_api_for_the_scope_and_its_ancestors(root,
     assert drain(sub) == [("folder", {"path": "sweep", "info": {"question": "q2"}})]
 
 
-def test_cache_from_another_version_is_rebuilt(root, tmp_path, monkeypatch):
+def test_cache_from_another_version_is_rebuilt(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     write_run(root / "r", 5)
     explorer(root, tmp_path).close()
     monkeypatch.setattr(trex_index, "CACHE_VERSION", trex_index.CACHE_VERSION + 1)
@@ -805,7 +825,7 @@ def test_cache_from_another_version_is_rebuilt(root, tmp_path, monkeypatch):
     assert ex.sync() == ["r"] and ex.run_meta("r").seq == 5
 
 
-def test_summary_is_the_last_logged_value_of_each_metric_including_non_finite(root, tmp_path):
+def test_summary_is_the_last_logged_value_of_each_metric_including_non_finite(root: Path, tmp_path: Path) -> None:
     run = trex.init(root / "r", commit_interval=0.05)
     run.log({"a": 1.0, "b": float("inf"), "early": 7}, step=0)
     run.log({"a": 2.0, "c": 3.0}, step=1)
@@ -825,7 +845,7 @@ def test_summary_is_the_last_logged_value_of_each_metric_including_non_finite(ro
     fresh = explorer(root, tmp_path, cache="cache2")
     assert fresh.run_meta("r").summary == s
 
-def test_http_static_files_revalidate_by_etag_and_compress_on_request(http):
+def test_http_static_files_revalidate_by_etag_and_compress_on_request(http: tuple[Explorer, str]) -> None:
     _, url = http
     status, headers, body = request(f"{url}/static/app.js")
     assert status == 200 and b"class App" in body and headers["Cache-Control"] == "no-cache"
@@ -836,7 +856,7 @@ def test_http_static_files_revalidate_by_etag_and_compress_on_request(http):
     assert request(f"{url}/static/missing.js")[0] == 404
 
 
-def test_http_media_ranges_cover_suffixes_open_ends_and_unsatisfiable_starts(http, root):
+def test_http_media_ranges_cover_suffixes_open_ends_and_unsatisfiable_starts(http: tuple[Explorer, str], root: Path) -> None:
     ex, url = http
     run = trex.init(root / "r")
     png = b"\x89PNG\r\n\x1a\n" + bytes(range(100))
@@ -863,7 +883,8 @@ def test_http_media_ranges_cover_suffixes_open_ends_and_unsatisfiable_starts(htt
     ("POST", "/api/buckets", b'{"key": "loss", "level": 0, "index": 0}', 400),
     ("POST", "/api/buckets", b'{"blocks": [{"key": "loss", "level": 0, "index": 0, "which": "fine"}]}', 400),
 ])
-def test_http_bad_requests_are_client_errors_with_a_json_message(http, root, method, path, body, status):
+def test_http_bad_requests_are_client_errors_with_a_json_message(http: tuple[Explorer, str], root: Path, method: str, path: str,
+                                                                 body: bytes | None, status: int) -> None:
     ex, url = http
     write_run(root / "r", 3)
     ex.sync()
@@ -871,9 +892,9 @@ def test_http_bad_requests_are_client_errors_with_a_json_message(http, root, met
     assert got == status and headers["Content-Type"] == "application/json" and "error" in json.loads(data)
 
 
-def test_post_bodies_are_consumed_so_a_kept_alive_connection_stays_in_step(http, root):
+def test_post_bodies_are_consumed_so_a_kept_alive_connection_stays_in_step(http: tuple[Explorer, str], root: Path) -> None:
     _, url = http
-    conn = http_client.HTTPConnection(*urllib.parse.urlsplit(url).netloc.split(":"))
+    conn = http_client.HTTPConnection(urllib.parse.urlsplit(url).netloc)
     try:
         conn.request("POST", "/api/nothing", body=b'{"ignored": true}')
         r = conn.getresponse()
@@ -886,7 +907,7 @@ def test_post_bodies_are_consumed_so_a_kept_alive_connection_stays_in_step(http,
         conn.close()
 
 
-def test_deleted_run_directory_is_dropped_and_announced(root, tmp_path):
+def test_deleted_run_directory_is_dropped_and_announced(root: Path, tmp_path: Path) -> None:
     write_run(root / "a", 3)
     write_run(root / "b", 3)
     ex = explorer(root, tmp_path)
@@ -899,7 +920,8 @@ def test_deleted_run_directory_is_dropped_and_announced(root, tmp_path):
         ex.run_meta("a")
 
 
-def test_removed_folder_notes_are_announced_and_unreadable_ones_keep_the_last_good_notes(root, tmp_path, capsys):
+def test_removed_folder_notes_are_announced_and_unreadable_ones_keep_the_last_good_notes(root: Path, tmp_path: Path,
+                                                                                         capsys: pytest.CaptureFixture[str]) -> None:
     write_run(root / "sweep" / "r", 3)
     trex.folder_info(root / "sweep", question="q")
     trex.folder_info(root, note="top")
@@ -914,9 +936,9 @@ def test_removed_folder_notes_are_announced_and_unreadable_ones_keep_the_last_go
     assert "trex_info.json" in capsys.readouterr().err
 
 
-def test_subscriber_that_falls_behind_is_dead_and_closing_the_hub_ends_every_subscription():
+def test_subscriber_that_falls_behind_is_dead_and_closing_the_hub_ends_every_subscription() -> None:
     slow = trex_index.Subscriber("", maxsize=2)
-    for i in range(3):
+    for _ in range(3):
         slow.put(b"x")
     assert slow.dead
     hub = trex_index.Hub()
@@ -925,7 +947,8 @@ def test_subscriber_that_falls_behind_is_dead_and_closing_the_hub_ends_every_sub
     assert all(s.dead for s in subs)
 
 
-def test_failed_index_batch_changes_nothing_and_the_next_poll_applies_it(root, tmp_path, monkeypatch):
+def test_failed_index_batch_changes_nothing_and_the_next_poll_applies_it(root: Path, tmp_path: Path,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("a", "b"):
         write_run(root / name, 3)
     ex = explorer(root, tmp_path)
@@ -933,7 +956,7 @@ def test_failed_index_batch_changes_nothing_and_the_next_poll_applies_it(root, t
         write_run(root / name, 2)
     stage = ex._stage
 
-    def fail_on_b(r, cur, now):
+    def fail_on_b(r: Update, cur: RunRecord | None, now: float) -> tuple[RunRecord, list[Event]]:
         if r.path == "b":
             raise RuntimeError("disk error")
         return stage(r, cur, now)
@@ -949,12 +972,13 @@ def test_failed_index_batch_changes_nothing_and_the_next_poll_applies_it(root, t
     assert [ex.run_meta(p).seq for p in ("a", "b")] == [5, 5]
 
 
-def test_server_urls_bracket_ipv6_hosts():
-    servers: list[Any] = [SimpleNamespace(server_address=("127.0.0.1", 13898)), SimpleNamespace(server_address=("::1", 13899, 0, 0))]
+def test_server_urls_bracket_ipv6_hosts() -> None:
+    servers = cast(list[Server], [SimpleNamespace(server_address=("127.0.0.1", 13898)),
+                                  SimpleNamespace(server_address=("::1", 13899, 0, 0))])
     assert server_urls(servers) == ["http://127.0.0.1:13898/", "http://[::1]:13899/"]
 
 
-def test_binding_an_explicit_port_in_use_is_an_error(tmp_path):
+def test_binding_an_explicit_port_in_use_is_an_error(tmp_path: Path) -> None:
     with socket.socket() as taken:
         taken.bind(("127.0.0.1", 0))
         taken.listen()
@@ -962,7 +986,7 @@ def test_binding_an_explicit_port_in_use_is_an_error(tmp_path):
             bind(Node(tmp_path / "cache"), ["127.0.0.1"], taken.getsockname()[1])
 
 
-def test_close_stops_polling_ends_subscriptions_and_closes_connections(root, tmp_path):
+def test_close_stops_polling_ends_subscriptions_and_closes_connections(root: Path, tmp_path: Path) -> None:
     write_run(root / "r", 3)
     ex = Explorer(Crawl(root), tmp_path / "cache").start()
     assert ex.ready.wait(10)
@@ -977,11 +1001,12 @@ def test_close_stops_polling_ends_subscriptions_and_closes_connections(root, tmp
         ex._writer.execute("SELECT 1")
 
 
-def slow_scans(monkeypatch, seconds):
+def slow_scans(monkeypatch: pytest.MonkeyPatch, seconds: float) -> list[str]:
     """Make every inline scan take `seconds`; the paths scanned so far."""
-    real, scanned = crawl.scan, []
+    real = crawl.scan
+    scanned: list[str] = []
 
-    def slow(job):
+    def slow(job: crawl.Job) -> Update | None:
         scanned.append(job.path)
         time.sleep(seconds)
         return real(job)
@@ -990,7 +1015,8 @@ def slow_scans(monkeypatch, seconds):
     return scanned
 
 
-def test_closing_in_the_middle_of_a_pass_stops_it_after_the_run_being_scanned(root, tmp_path, monkeypatch):
+def test_closing_in_the_middle_of_a_pass_stops_it_after_the_run_being_scanned(root: Path, tmp_path: Path,
+                                                                              monkeypatch: pytest.MonkeyPatch) -> None:
     for i in range(30):
         write_run(root / f"r{i}", 3)
     scanned = slow_scans(monkeypatch, 0.1)
@@ -1002,12 +1028,17 @@ def test_closing_in_the_middle_of_a_pass_stops_it_after_the_run_being_scanned(ro
     assert time.time() - t0 < 0.5 and len(scanned) < 6
 
 
-def test_close_returns_while_a_long_scan_finishes_and_the_scan_writes_nothing(root, tmp_path, monkeypatch, capfd):
+def test_close_returns_while_a_long_scan_finishes_and_the_scan_writes_nothing(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                              capfd: pytest.CaptureFixture[str]) -> None:
     write_run(root / "r0", 3)
     scanned = slow_scans(monkeypatch, 1.5)
     monkeypatch.setattr(trex_index, "CLOSE_WAIT", 0.2)
-    errors = []
-    monkeypatch.setattr(threading, "excepthook", lambda a: errors.append(a.exc_value))
+    errors: list[BaseException | None] = []
+
+    def record(a: threading.ExceptHookArgs) -> None:
+        errors.append(a.exc_value)
+
+    monkeypatch.setattr(threading, "excepthook", record)
     ex = Explorer(Crawl(root, 1), tmp_path / "cache").start()
     while not scanned:
         time.sleep(0.01)
@@ -1020,11 +1051,13 @@ def test_close_returns_while_a_long_scan_finishes_and_the_scan_writes_nothing(ro
     assert not runner.is_alive() and not errors and "[trex]" not in capfd.readouterr().err
 
 
-def test_a_failed_index_pass_is_logged_and_polling_continues(root, tmp_path, monkeypatch, capfd):
+def test_a_failed_index_pass_is_logged_and_polling_continues(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                             capfd: pytest.CaptureFixture[str]) -> None:
     write_run(root / "r", 3)
-    apply, calls = Explorer.apply, []
+    apply = Explorer.apply
+    calls: list[int] = []
 
-    def fail_once(self, results):
+    def fail_once(self: Explorer, results: Sequence[Update]) -> None:
         calls.append(len(results))
         if len(calls) == 1:
             raise sqlite3.OperationalError("database is locked")

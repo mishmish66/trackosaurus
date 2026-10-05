@@ -1,7 +1,10 @@
 import math
 import sqlite3
+from collections.abc import Iterator, Sequence
+from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 from trex import chunks
@@ -10,15 +13,15 @@ from helpers import merge, readback, write_commit
 
 
 @pytest.fixture
-def db(tmp_path):
+def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     c = sqlite3.connect(tmp_path / "r.sqlite", isolation_level=None)
     c.executescript(chunks.SCHEMA)
     yield c
     c.close()
 
 
-def write_commits(c, commits):
-    ids = {}
+def write_commits(c: sqlite3.Connection, commits: Sequence[Sequence[chunks.CommitRow]]) -> dict[str, int]:
+    ids: dict[str, int] = {}
     seq = 0
     for rows in commits:
         c.execute("BEGIN")
@@ -33,36 +36,36 @@ TRAIN_EVAL = [
 ]
 
 
-def test_metric_columns_follow_row_order_across_commits_and_row_shapes(db):
+def test_metric_columns_follow_row_order_across_commits_and_row_shapes(db: sqlite3.Connection) -> None:
     ids = write_commits(db, TRAIN_EVAL)
-    s, v, t = chunks.metric(db, ids["loss"])
+    s, v, t = chunks.metric(db, ids["loss"]).columns
     assert list(s) == [0.0, 0.0, 1.0, 2.0, 3.0] and list(v) == [1.0, 1.5, 0.9, 0.8, 0.7] and list(t) == [0.0, 0.5, 1.0, 2.0, 3.0]
-    s, v, _ = chunks.metric(db, ids["eval"])
+    s, v, _ = chunks.metric(db, ids["eval"]).columns
     assert list(s) == [0.0, 2.0] and list(v) == [7.0, 8.0]
-    s, v, _ = chunks.metric(db, ids["acc"])
+    s, v, _ = chunks.metric(db, ids["acc"]).columns
     assert list(s) == [0.0, 1.0, 2.0, 3.0] and math.isnan(v[2])
     assert chunks.row_count(db) == 6
 
 
-def test_metric_row_and_step_windows(db):
+def test_metric_row_and_step_windows(db: sqlite3.Connection) -> None:
     ids = write_commits(db, TRAIN_EVAL)
-    assert list(chunks.metric(db, ids["loss"], stop=4)[1]) == [1.0, 1.5, 0.9, 0.8]
-    assert list(chunks.metric(db, ids["loss"], step_lo=2.5)[0]) == [2.0, 3.0]
-    assert list(chunks.metric(db, ids["loss"], start=2)[1]) == [0.9, 0.8, 0.7]
-    assert list(chunks.metric(db, ids["loss"], stop=5, start=1)[1]) == [1.5, 0.9, 0.8]
-    assert list(chunks.metric(db, ids["eval"], start=2)[1]) == [8.0] and chunks.metric(db, ids["loss"], start=6)[0].size == 0
-    assert chunks.metric(db, 99)[0].size == 0
+    assert list(chunks.metric(db, ids["loss"], stop=4).values) == [1.0, 1.5, 0.9, 0.8]
+    assert list(chunks.metric(db, ids["loss"], step_lo=2.5).steps) == [2.0, 3.0]
+    assert list(chunks.metric(db, ids["loss"], start=2).values) == [0.9, 0.8, 0.7]
+    assert list(chunks.metric(db, ids["loss"], stop=5, start=1).values) == [1.5, 0.9, 0.8]
+    assert list(chunks.metric(db, ids["eval"], start=2).values) == [8.0] and chunks.metric(db, ids["loss"], start=6).steps.size == 0
+    assert chunks.metric(db, 99).steps.size == 0
 
 
-def test_rows_round_trip(db):
+def test_rows_round_trip(db: sqlite3.Connection) -> None:
     write_commits(db, TRAIN_EVAL)
     out = chunks.rows(db)
-    assert [r[0] for r in out] == list(range(6))
-    assert out[1][3] == {"eval": 7.0, "loss": 1.5} and out[5][3] == {"loss": 0.7, "acc": 0.4}
-    assert [r[0] for r in chunks.rows(db, start=2, stop=5)] == [2, 3, 4]
+    assert [r.seq for r in out] == list(range(6))
+    assert out[1].values == {"eval": 7.0, "loss": 1.5} and out[5].values == {"loss": 0.7, "acc": 0.4}
+    assert [r.seq for r in chunks.rows(db, start=2, stop=5)] == [2, 3, 4]
 
 
-def test_commit_size_is_bounded():
+def test_commit_size_is_bounded() -> None:
     with pytest.raises(ValueError):
         chunks.inserts(0, [(0.0, 0.0, {"a": 1})] * (chunks.MAX_ROWS + 1), {})
 
@@ -72,11 +75,11 @@ SPARSE = [[(float(i), i / 2, {"loss": 1 / (i + 1), **({"eval": float(i)} if i % 
           for start, n in ((0, 1), (1, 3), (4, 1), (5, 7), (12, 2), (14, 1), (15, 9))]
 
 
-def commits_of(c):
+def commits_of(c: sqlite3.Connection) -> list[tuple[int, int]]:
     return c.execute("SELECT seq0, n FROM rowmeta ORDER BY seq0").fetchall()
 
 
-def test_merging_commits_keeps_every_row_and_metric(db):
+def test_merging_commits_keeps_every_row_and_metric(db: sqlite3.Connection) -> None:
     write_commits(db, SPARSE)
     before = readback(db, tables=("keys",))
     for seq0, stop in ((1, 5), (5, 14), (0, 24)):
@@ -88,7 +91,7 @@ def test_merging_commits_keeps_every_row_and_metric(db):
     assert db.execute("SELECT count(*) FROM chunk").fetchone()[0] == 3
 
 
-def test_merge_refuses_ranges_that_are_not_whole_contiguous_commits(db):
+def test_merge_refuses_ranges_that_are_not_whole_contiguous_commits(db: sqlite3.Connection) -> None:
     write_commits(db, SPARSE)
     before, layout = readback(db, tables=("keys",)), commits_of(db)
     for seq0, stop in ((0, 3), (2, 5), (1, 6), (20, 30), (5, 5)):
@@ -99,12 +102,13 @@ def test_merge_refuses_ranges_that_are_not_whole_contiguous_commits(db):
     assert readback(db, tables=("keys",)) == before and commits_of(db) == layout
 
 
-def test_a_merge_that_would_change_any_value_is_refused(db, monkeypatch):
+def test_a_merge_that_would_change_any_value_is_refused(db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
     write_commits(db, SPARSE)
     before, layout = readback(db, tables=("keys",)), commits_of(db)
     good = chunks._merged
 
-    def flip_last_value(parts, seq0, n):
+    def flip_last_value(parts: Sequence[tuple[int, bytes]], seq0: int,
+                        n: int) -> tuple[bytes, npt.NDArray[np.int64], npt.NDArray[np.float64]]:
         blob, pos, vals = good(parts, seq0, n)
         return bytes(blob[:-1]) + bytes([blob[-1] ^ 1]), pos, vals
 
@@ -116,7 +120,7 @@ def test_a_merge_that_would_change_any_value_is_refused(db, monkeypatch):
     assert readback(db, tables=("keys",)) == before and commits_of(db) == layout
 
 
-def test_a_merge_is_refused_once_its_commits_changed(db):
+def test_a_merge_is_refused_once_its_commits_changed(db: sqlite3.Connection) -> None:
     write_commits(db, SPARSE)
     db.execute("BEGIN")
     m = chunks.prepare_merge(db, 5, 24)
@@ -132,8 +136,8 @@ def test_a_merge_is_refused_once_its_commits_changed(db):
     assert readback(db, tables=("keys",)) == before and commits_of(db) == layout
 
 
-def test_row_count_stops_at_the_first_gap_between_commits(db):
-    ids = {}
+def test_row_count_stops_at_the_first_gap_between_commits(db: sqlite3.Connection) -> None:
+    ids: dict[str, int] = {}
     db.execute("BEGIN")
     write_commit(db, 0, TRAIN_EVAL[0], ids)
     write_commit(db, 10, TRAIN_EVAL[1], ids)

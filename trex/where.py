@@ -15,7 +15,8 @@ import json
 import math
 import re
 from collections.abc import Callable, Sequence
-from typing import Final, NamedTuple, cast
+from dataclasses import dataclass
+from typing import Final, cast
 
 type Getter = Callable[[str], object]
 type Test = Callable[[Getter], bool]
@@ -28,12 +29,16 @@ _KEYWORDS: Final = frozenset({"and", "or", "not", "in", "like", "is", "null", "t
 _COMPARE: Final = frozenset({"=", "==", "!=", "<>", "<", "<=", ">", ">=", "~", "!~"})
 
 
-class Where(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class Where:
+    """A compiled filter: its test, and the fields it reads, in order."""
+
     test: Test
-    fields: list[str]  # fields the clause reads, in order
+    fields: list[str]
 
 
-class Token(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class Token:
     kind: str  # "str", "id", "op", "word"
     text: str
 
@@ -79,6 +84,14 @@ def _tokens(text: str) -> list[Token] | None:
 
 def _is_kw(t: Token | None, *words: str) -> bool:
     return t is not None and t.kind == "word" and t.text.lower() in words
+
+
+def _either(a: Test, b: Test) -> Test:
+    return lambda g: a(g) or b(g)
+
+
+def _both(a: Test, b: Test) -> Test:
+    return lambda g: a(g) and b(g)
 
 
 def as_number(v: object) -> float | None:
@@ -166,16 +179,14 @@ class _Parser:
         left = self.conj()
         while _is_kw(self.peek(), "or"):
             self.i += 1
-            a, b = left, self.conj()
-            left = lambda g, a=a, b=b: a(g) or b(g)  # noqa: E731
+            left = _either(left, self.conj())
         return left
 
     def conj(self) -> Test:
         left = self.unary()
         while _is_kw(self.peek(), "and"):
             self.i += 1
-            a, b = left, self.unary()
-            left = lambda g, a=a, b=b: a(g) and b(g)  # noqa: E731
+            left = _both(left, self.unary())
         return left
 
     def unary(self) -> Test:

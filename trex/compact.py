@@ -3,8 +3,9 @@ file that replaces trex.sqlite atomically once it reads back the same. A run bei
 
 import os
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, NamedTuple
+from typing import Final
 
 from . import chunks
 from .format import DB, SCHEMA
@@ -14,7 +15,8 @@ TMP: Final = DB + ".compacting"
 LOCK_TIMEOUT: Final = 1.0  # seconds to wait for other connections to the run to close
 
 
-class Compacted(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class Compacted:
     """Commits and bytes of a run before and after `compact`."""
 
     commits_before: int
@@ -146,7 +148,7 @@ def _verify(src: sqlite3.Connection, dst: sqlite3.Connection) -> None:
     if chunks.row_count(dst) != n or _steps(src) != _steps(dst):
         raise RuntimeError("the compacted rows differ")
     for (kid,) in src.execute("SELECT id FROM keys").fetchall():
-        if [a.tobytes() for a in chunks.metric(src, kid, stop=n)] != [a.tobytes() for a in chunks.metric(dst, kid, stop=n)]:
+        if [a.tobytes() for a in chunks.metric(src, kid, stop=n).columns] != [a.tobytes() for a in chunks.metric(dst, kid, stop=n).columns]:
             raise RuntimeError(f"metric {kid} differs once compacted")
 
 

@@ -1,0 +1,3 @@
+from radon.visitors import Class, Function
+
+def cc_visit(code: str, **kwargs: object) -> list[Function | Class]: ...

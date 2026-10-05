@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import Annotated, Final, Literal, NamedTuple
+from typing import Annotated, Final, Literal, cast
 
 import typer
 
@@ -45,9 +45,9 @@ def jsonable(v: object) -> object:
     if isinstance(v, float) and not math.isfinite(v):
         return str(v)
     if isinstance(v, dict):
-        return {str(k): jsonable(x) for k, x in v.items()}
+        return {str(k): jsonable(x) for k, x in cast(dict[object, object], v).items()}
     if isinstance(v, (list, tuple)):
-        return [jsonable(x) for x in v]
+        return [jsonable(x) for x in cast(Sequence[object], v)]
     return v
 
 
@@ -82,11 +82,20 @@ def fmt_cell(col: str, v: object, width: int | None) -> str:
         return fmt_dur(v)
     if isinstance(v, (int, float)):
         return fmt_num(v)
-    if isinstance(v, list) and all(isinstance(x, (int, float)) for x in v):
-        s = "[" + ", ".join(fmt_num(x) for x in v) + "]"
+    if (nums := numbers(v)) is not None:
+        s = "[" + ", ".join(map(fmt_num, nums)) + "]"
     else:
         s = v if isinstance(v, str) else json.dumps(jsonable(v), separators=(",", ":"))
     return s if width is None or len(s) <= width else s[: width - 1] + "…"
+
+
+def numbers(v: object) -> list[int | float] | None:
+    """`v` when it is a list of numbers."""
+    if not isinstance(v, list):
+        return None
+    items = cast(list[object], v)
+    nums = [x for x in items if isinstance(x, (int, float))]
+    return nums if len(nums) == len(items) else None
 
 
 def state(s: object) -> str:
@@ -164,7 +173,8 @@ class Selection:
         return Selected(recs, view, crawl.root, ex.cache_dir, prefix)
 
 
-class Selected(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class Selected:
     """Runs a command selected: their records, their folder's runs view, the root indexed, its cache directory, and
     the folder's path under the root."""
 
@@ -275,7 +285,7 @@ app = typer.Typer(name="trex", help="trackosaurus exp: explore and query directo
 def _version(show: bool) -> None:
     if show:
         inst = update.installed()
-        typer.echo(f"trex {inst['version']}" + (f" ({inst['commit'][:12]})" if inst["commit"] else ""))
+        typer.echo(f"trex {inst.version}" + (f" ({inst.commit[:12]})" if inst.commit else ""))
         raise typer.Exit()
 
 
@@ -582,13 +592,17 @@ def ls_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
     recs = Q.sort_records(recs, sort or "path")[:limit or None]
     fmt = out_format(fmt, as_json)
     if paths:
-        typer.echo("".join(r["dir"] + "\n" for r in recs), nl=False)
+        typer.echo("".join(r.dir + "\n" for r in recs), nl=False)
     elif fmt in ("json", "jsonl") and not columns:
-        emit(recs, None, fmt)
+        emit([r.wire() for r in recs], None, fmt)
     else:
-        extra = _csv(columns or [])
-        cols = DEFAULT_COLUMNS + [c for c in field_columns(where or [], sort or "") + extra if c not in DEFAULT_COLUMNS]
+        cols = list_columns(where or [], sort or "", _csv(columns or []))
         emit([{c: Q.get(r, c) for c in cols} for r in recs], cols, fmt, width=width(full))
+
+
+def list_columns(where: Iterable[str], sort: str, extra: Sequence[str]) -> list[str]:
+    """The columns `ls` shows: the default ones, then those its filters and sort read, then `extra`."""
+    return DEFAULT_COLUMNS + [c for c in [*field_columns(where, sort), *extra] if c not in DEFAULT_COLUMNS]
 
 
 @dataclass(frozen=True)
@@ -607,9 +621,9 @@ class GroupSpec:
         key = metric_key(metric)
         if self.reduce == "last" and self.at is None:
             return Q.get(rec, f"summary.{key}")
-        if rec["dir"] not in cache:
-            cache[rec["dir"]] = Q.series(rec["dir"], {metric_key(m) for m in self.metrics}.__contains__, x=self.x)
-        xs, ys = cache[rec["dir"]].get(key, ([], []))
+        if rec.dir not in cache:
+            cache[rec.dir] = Q.series(rec.dir, {metric_key(m) for m in self.metrics}.__contains__, x=self.x)
+        xs, ys = cache[rec.dir].get(key, ([], []))
         return Q.reduce(xs, ys, self.reduce, at=self.at)
 
     def rows(self, recs: Sequence[Q.Record], fields: Sequence[str], prefix: str) -> list[dict[str, object]]:
@@ -626,14 +640,14 @@ class GroupSpec:
         for m in self.metrics:
             st = Q.stats([as_number(self.value(r, m, cache)) for r in members], center=self.center)
             label = metric_key(m)
-            row[label] = st.get(self.center)
-            row[f"{label}:ci"] = [st["ci_lo"], st["ci_hi"]] if "ci_lo" in st and "ci_hi" in st else None
+            row[label] = getattr(st, self.center)
+            row[f"{label}:ci"] = [st.ci_lo, st.ci_hi] if st.ci_lo is not None and st.ci_hi is not None else None
             if self.stats:
-                row[f"{label}:stats"] = st
+                row[f"{label}:stats"] = st.wire()
             else:
-                row[f"{label}:range"] = [st["min"], st["max"]] if "min" in st and "max" in st else None
-                row[f"{label}:n"] = st["n"]
-        row["paths"] = [r["path"] for r in members]
+                row[f"{label}:range"] = [st.min, st.max] if st.min is not None and st.max is not None else None
+                row[f"{label}:n"] = st.n
+        row["paths"] = [r.path for r in members]
         return row
 
     def note(self, rows: Sequence[OutRow]) -> str:
@@ -681,9 +695,9 @@ def group_key(rec: Q.Record, field: str, prefix: str) -> object:
     """A run's value of group-by field `field`: `run` its path, `run~N` the directory N levels above it (both
     relative to the selection), anything else the field."""
     if field == "run":
-        return relative(rec["path"], prefix)
+        return relative(rec.path, prefix)
     if up := RUN_UP.fullmatch(field):
-        parts = rec["path"].split("/")
+        parts = rec.path.split("/")
         return relative("/".join(parts[:max(0, len(parts) - int(up[1]))]), prefix)
     v = Q.get(rec, field)
     return v if v is None or isinstance(v, (str, int, float, bool)) else json.dumps(v)
@@ -703,7 +717,8 @@ def groups_cmd(path: PathArg = ".",
                sort: Annotated[str | None, typer.Option("--sort", "-s", help="Columns to sort by; default the first metric, descending.")] = None,
                limit: Limit = None, fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Aggregate runs into groups with a median or mean and its 95% CI."""
-    recs, _, _, _, prefix = Selection(path, where or [], root, cache, force).records()
+    picked = Selection(path, where or [], root, cache, force).records()
+    recs, prefix = picked.recs, picked.prefix
     fmt, fields = out_format(fmt, as_json), group_by_fields(group_by, str(path), root)
     spec = GroupSpec(_csv(metric or []), reduce, at, x, center, stats=fmt in ("json", "jsonl"))
     keys = [metric_key(m) for m in spec.metrics]
@@ -724,24 +739,25 @@ def keys_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
              pattern: Annotated[str | None, typer.Option("--pattern", "-p", help="Regex on key names.")] = None,
              fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Metric and media keys across runs, with the spread of last values."""
-    recs, view = Selection(path, where or [], root, cache, force).records()[:2]
+    picked = Selection(path, where or [], root, cache, force).records()
+    recs, view = picked.recs, picked.view
     rx = re.compile(pattern) if pattern else None
     last: dict[str, list[float | None]] = {}
     for r in recs:
-        for k, v in r["summary"].items():
+        for k, v in r.summary.items():
             if not rx or rx.search(k):
                 last.setdefault(k, []).append(as_number(v))
     rows: list[dict[str, object]] = []
     for k, vals in sorted(last.items()):
         st = Q.stats(vals)
-        rows.append({"key": k, "kind": "metric", "runs": len(vals), "last_min": st.get("min"),
-                     "last_median": st.get("median"), "last_max": st.get("max")})
-    paths = {r["path"] for r in recs}
+        rows.append({"key": k, "kind": "metric", "runs": len(vals), "last_min": st.min, "last_median": st.median,
+                     "last_max": st.max})
+    paths = {r.path for r in recs}
     media: dict[tuple[str, str], list[str]] = {}
     for m in view.media:
         if m.run in paths and (not rx or rx.search(m.key)):
             media.setdefault((m.key, m.kind), []).append(m.run)
-    rows += [{"key": k, "kind": kind, "runs": len(set(rs)), "items": len(rs)} for (k, kind), rs in sorted(media.items())]
+    rows.extend({"key": k, "kind": kind, "runs": len(set(rs)), "items": len(rs)} for (k, kind), rs in sorted(media.items()))
     fmt = out_format(fmt, as_json)
     emit(rows, ["key", "kind", "runs", "last_min", "last_median", "last_max", "items"] if fmt != "json" else None, fmt, width=width(full))
 
@@ -758,7 +774,7 @@ class Folder:
         """Runs below this folder by state."""
         self.states = {}
         for r in self.runs:
-            self.states[r["state"]] = self.states.get(r["state"], 0) + 1
+            self.states[r.state] = self.states.get(r.state, 0) + 1
         for d in self.dirs.values():
             for s, n in d.count().items():
                 self.states[s] = self.states.get(s, 0) + n
@@ -769,7 +785,7 @@ def folder_tree(recs: Sequence[Q.Record], prefix: str, name: str) -> Folder:
     tree = Folder(name, prefix, [], {}, {})
     for r in recs:
         node = tree
-        for part in (r["path"][len(prefix) + 1:] if prefix else r["path"]).split("/")[:-1]:
+        for part in (r.path[len(prefix) + 1:] if prefix else r.path).split("/")[:-1]:
             node = node.dirs.setdefault(part, Folder(part, f"{node.path}/{part}" if node.path else part, [], {}, {}))
         node.runs.append(r)
     tree.count()
@@ -783,7 +799,8 @@ def tree_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
              runs: Annotated[bool, typer.Option("--runs", help="Also list runs under each shown folder.")] = False,
              fmt: Fmt = "table", as_json: Json = False) -> None:
     """Folder tree with run counts by state and folder notes."""
-    recs, view, top, _, prefix = Selection(path, where or [], root, cache, force).records()
+    picked = Selection(path, where or [], root, cache, force).records()
+    recs, view, top, prefix = picked.recs, picked.view, picked.root, picked.prefix
     tree = folder_tree(recs, prefix, prefix or top.name)
     notes = view.folders
     fmt = out_format(fmt, as_json)
@@ -793,7 +810,7 @@ def tree_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
         if level < depth:
             out["dirs"] = [folder_json(d, level + 1) for _, d in sorted(node.dirs.items())]
             if runs:
-                out["run_list"] = [{"path": r["path"], "state": r["state"], "step": r["step"]} for r in node.runs]
+                out["run_list"] = [{"path": r.path, "state": r.state, "step": r.step} for r in node.runs]
         return out
 
     if fmt in ("json", "jsonl"):
@@ -811,8 +828,8 @@ def print_tree(node: Folder, level: int, depth: int, runs: bool, notes: Mapping[
         return
     for _, d in sorted(node.dirs.items()):
         print_tree(d, level + 1, depth, runs, notes)
-    for r in sorted(node.runs, key=lambda r: r["path"]) if runs else []:
-        typer.echo(f"{'  ' * (level + 1)}{r['path'].rsplit('/', 1)[-1]}  [{state(r['state'])}] step {fmt_cell('step', r['step'], None)}")
+    for r in sorted(node.runs, key=lambda r: r.path) if runs else []:
+        typer.echo(f"{'  ' * (level + 1)}{r.path.rsplit('/', 1)[-1]}  [{state(r.state)}] step {fmt_cell('step', r.step, None)}")
 
 
 @command("show")
@@ -824,22 +841,22 @@ def show_cmd(run: RunArg, root: Annotated[str | None, typer.Option(help="Stop co
     folders = [(p, as_dict(i)) for p, i in Q.folder_infos(d.parent, root)]
     fmt = out_format(fmt, as_json)
     if fmt in ("json", "jsonl"):
-        out = jsonable({**s, "folders": [{"dir": p, "info": i} for p, i in folders]})
+        out = jsonable({**s.wire(), "folders": [{"dir": p, "info": i} for p, i in folders]})
         return typer.echo(json.dumps(out, separators=(",", ":")) if fmt == "jsonl" else json.dumps(out, indent=1))
-    typer.echo(f"{typer.style(str(s['name']), bold=True)}  [{state(s['state'])}]  {s['dir']}")
-    typer.echo(f"  id {s['id']} · {s['rows']} rows · step {fmt_cell('step', s['step'], None)} · runtime "
-               f"{fmt_dur(s['runtime'] or 0)} · created {fmt_cell('created', s['created'], None)}"
-               + (f" · tags {', '.join(s['tags'])}" if s["tags"] else ""))
-    sections = [("info", s["info"]), ("config", dict(sorted(s["config"].items()))), ("summary", dict(sorted(s["summary"].items()))),
+    typer.echo(f"{typer.style(str(s.name), bold=True)}  [{state(s.state)}]  {s.dir}")
+    typer.echo(f"  id {s.id} · {s.rows} rows · step {fmt_cell('step', s.step, None)} · runtime "
+               f"{fmt_dur(s.runtime or 0)} · created {fmt_cell('created', s.created, None)}"
+               + (f" · tags {', '.join(s.tags)}" if s.tags else ""))
+    sections = [("info", s.info), ("config", dict(sorted(s.config.items()))), ("summary", dict(sorted(s.summary.items()))),
                 *((f"folder info {p}", i) for p, i in folders)]
     for title, obj in sections:
         if obj:
             typer.echo(f"\n{typer.style(title, bold=True)}:\n" + "".join(f"  {k}: {fmt_cell(k, v, None)}\n" for k, v in obj.items()), nl=False)
     typer.echo(f"\n{typer.style('metrics', bold=True)}:")
-    emit([{"key": k, **v} for k, v in s["keys"].items()], ["key", "points", "first_step", "last_step", "last"], "table", width=width(full))
+    emit([{"key": k, **v.wire()} for k, v in s.keys.items()], ["key", "points", "first_step", "last_step", "last"], "table", width=width(full))
     steps: dict[tuple[str, str], list[float]] = {}
-    for m in s["media"]:
-        steps.setdefault((m["key"], m["kind"]), []).append(m["step"])
+    for m in s.media:
+        steps.setdefault((m.key, m.kind), []).append(m.step)
     if steps:
         typer.echo(f"\n{typer.style('media', bold=True)}:")
     for (k, kind), st in sorted(steps.items()):
@@ -957,10 +974,10 @@ def media_cmd(run: RunArg, key: Annotated[str | None, typer.Option("--key", "-k"
               fmt: Fmt = "table", as_json: Json = False) -> None:
     """A run's images, videos and HTML, with absolute file paths."""
     (d,) = run_dirs([run])
-    items = [m for m in Q.read_media(d) if (not key or re.search(key, m["key"])) and (not kind or m["kind"] == kind)]
+    items = [m for m in Q.read_media(d) if (not key or re.search(key, m.key)) and (not kind or m.kind == kind)]
     if latest:
-        items = list({m["key"]: m for m in items}.values())
-    emit(items, ["step", "key", "kind", "size", "file"], out_format(fmt, as_json), width=None)
+        items = list({m.key: m for m in items}.values())
+    emit([m.wire() for m in items], ["step", "key", "kind", "size", "file"], out_format(fmt, as_json), width=None)
 
 
 def flatten(d: Mapping[str, JSONValue], prefix: str = "") -> dict[str, JSONValue]:
@@ -1031,7 +1048,7 @@ def diff_cmd(runs: RunsArg, all_keys: Annotated[bool, typer.Option("--all", help
     metas = [Q.read_meta(d) for d in dirs]
     names = run_labels(dirs, metas)
     vals = [flatten(as_dict(m.get("info" if info else "config"))) for m in metas]
-    rows = [{"key": k, **{n: v.get(k) for n, v in zip(names, vals, strict=True)}} for k in sorted(set().union(*vals))
+    rows = [{"key": k, **{n: v.get(k) for n, v in zip(names, vals, strict=True)}} for k in sorted({k for v in vals for k in v})
             if all_keys or len({json.dumps(v.get(k), sort_keys=True) for v in vals}) > 1]
     emit(rows, ["key", *names], out_format(fmt, as_json), width=width(full))
 
@@ -1041,10 +1058,11 @@ def index_cmd(path: PathArg = ".", root: Root = None, cache: Cache = None, force
               fmt: Fmt = "table", as_json: Json = False) -> None:
     """Build or refresh the cache for a runs directory and report counts."""
     t0 = time.time()
-    recs, _, top, cached, prefix = Selection(path, [], root, cache, force).records()
+    picked = Selection(path, [], root, cache, force).records()
+    recs, top, cached, prefix = picked.recs, picked.root, picked.cache, picked.prefix
     states: dict[str, int] = {}
     for r in recs:
-        states[r["state"]] = states.get(r["state"], 0) + 1
+        states[r.state] = states.get(r.state, 0) + 1
     out = {"root": str(top), "path": prefix, "runs": len(recs), "states": states,
            "cache": str(cached.resolve()), "seconds": round(time.time() - t0, 3)}
     fmt = out_format(fmt, as_json)

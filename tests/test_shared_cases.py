@@ -10,8 +10,11 @@ import os
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 
 from trex import buckets as bk, query
+
+type Floats = npt.NDArray[np.float64]
 
 CASES = Path(__file__).with_name("shared_cases.json")
 
@@ -21,11 +24,11 @@ def plain(v: float | None) -> float | str | None:
     return None if v is None else float(v) if math.isfinite(v) else str(float(v))
 
 
-def plains(a: np.ndarray) -> list[float | str | None]:
+def plains(a: npt.NDArray[np.floating]) -> list[float | str | None]:
     return [plain(v) for v in a.tolist()]
 
 
-def spread(n: int, k: int, m: int) -> np.ndarray:
+def spread(n: int, k: int, m: int) -> Floats:
     """n values in [0, 1), the same on every platform."""
     return (np.arange(n) * k % m) / m
 
@@ -34,7 +37,7 @@ def b64(blob: bytes) -> str:
     return base64.b64encode(blob).decode()
 
 
-def run_rows(n: int, seed: int, level: int, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def run_rows(n: int, seed: int, level: int, index: int) -> tuple[Floats, Floats, Floats]:
     """n rows spread over block `index` of `level` and a little beyond, with NaN gaps and runs of infinities."""
     lo, hi = bk.block_range(level, index)
     steps = np.sort(lo - 10 + spread(n, 7919 + seed, 100003) * (hi - lo + 20))
@@ -49,7 +52,7 @@ def array_cases() -> list[dict[str, object]]:
     """Bucket arrays of a few runs: each field as Python wrote it, and each bucket's mean step."""
     out: list[dict[str, object]] = []
     for level, index, sizes in [(0, 0, [300, 0, 120]), (-3, 2, [200]), (5, 1, [1500, 700]), (2, 7, [])]:
-        parts = []
+        parts: list[bk.Buckets] = []
         for i, n in enumerate(sizes):
             if n:
                 b = bk.cut(bk.bucketize(*run_rows(n, i, level, index), level), index * bk.BLOCK, (index + 1) * bk.BLOCK)
@@ -75,11 +78,11 @@ def tail_cases() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     level, index, n, k = 2, 1, 700, 532  # row k falls inside a bucket at every level below
     lo, hi = bk.block_range(level, index)
-    steps: np.ndarray = lo + np.arange(n) * ((hi - lo) / n)
+    steps = lo + np.arange(n, dtype=np.float64) * ((hi - lo) / n)
     values = spread(n, 104729, 2003) * 20 - 10
     values[::19] = np.nan
     values[600:640:7] = np.inf
-    times: np.ndarray = steps * 0.5 + spread(n, 5, 13)
+    times = steps * 0.5 + spread(n, 5, 13)
     for up in (0, 2):
         lv, ix = level + up, index >> up
         before = bk.bucketize(steps[:k], values[:k], times[:k], lv)
@@ -93,10 +96,10 @@ def layer_cases() -> list[dict[str, object]]:
     """A run's buckets at a coarse level over everything and a finer level over two blocks: its column takes the finer
     buckets inside those blocks and the coarse ones whose mean step lies outside them, in step order."""
     level, n = 1, 4000
-    steps: np.ndarray = np.arange(n) * 0.75
+    steps = np.arange(n, dtype=np.float64) * 0.75
     values = spread(n, 104729, 2003) * 20 - 10
     values[::13] = np.nan
-    times: np.ndarray = steps * 2.0
+    times = steps * 2.0
     coarse_level, fine_blocks = level + 3, (2, 3)
     coarse = bk.bucketize(steps, values, times, coarse_level)
     fine = bk.bucketize(steps, values, times, level)
@@ -114,10 +117,11 @@ def bin_cases() -> list[dict[str, object]]:
     """A block of runs a level above their rows, and each run's mean per bin over its rows, for bins one and two
     buckets wide: the mean of the finite values, infinite only without any."""
     rng = np.random.default_rng(7)
-    parts, rows = [], []
+    parts: list[bk.Buckets] = []
+    rows: list[tuple[Floats, Floats]] = []
     level = 3
     for i, n in enumerate([900, 1300, 700]):
-        steps: np.ndarray = np.arange(n) * 1.0 + i
+        steps = np.arange(n, dtype=np.float64) + i
         values = rng.normal(size=n)
         values[::11] = np.nan
         if i == 1:
@@ -170,11 +174,12 @@ def stats_cases() -> list[dict[str, object]]:
     for values in groups:
         s = query.stats(values)
         xs = sorted(v for v in values if not math.isnan(v))
-        case: dict[str, object] = {"values": [plain(v) for v in values], "n": s["n"]}
+        case: dict[str, object] = {"values": [plain(v) for v in values], "n": s.n}
         if xs:
             iqm, se, kept = query._iqm(xs)
-            case.update({k: plain(s.get(k)) for k in ("mean", "std", "median", "min", "max")}, iqm=plain(iqm), iqm_se=plain(se),
-                        iqm_kept=kept, median_ci=[plain(s.get("ci_lo", xs[0])), plain(s.get("ci_hi", xs[-1]))])
+            case.update(mean=plain(s.mean), std=plain(s.std), median=plain(s.median), min=plain(s.min), max=plain(s.max),
+                        iqm=plain(iqm), iqm_se=plain(se), iqm_kept=kept,
+                        median_ci=[plain(xs[0] if s.ci_lo is None else s.ci_lo), plain(xs[-1] if s.ci_hi is None else s.ci_hi)])
         out.append(case)
     return out
 
@@ -192,7 +197,7 @@ def build_cases() -> dict[str, object]:
             "smoothing": smoothing_cases(), "stats": stats_cases()}
 
 
-def test_shared_cases_match_the_python_implementations():
+def test_shared_cases_match_the_python_implementations() -> None:
     cases = json.loads(json.dumps(build_cases()))
     if os.environ.get("TREX_WRITE_CASES") == "1":
         CASES.write_text(json.dumps(cases, indent=None, separators=(",", ":")) + "\n")

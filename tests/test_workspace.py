@@ -2,17 +2,20 @@ import functools
 import json
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, cast
+from collections.abc import Callable, Generator, Iterator
+from pathlib import Path
+from typing import cast
 
 import pytest
 
 import trex
 from trex import buckets as bk, server
+from trex.format import RunState
 from trex.node import Node, dir_base
 from trex.index import Explorer
+from trex.server import Server
 from trex.workspace import Member, Workspace
 
 import helpers
@@ -22,7 +25,7 @@ write_run = functools.partial(helpers.write_run, n=6, config={"lr": 0.1}, commit
 
 
 @pytest.fixture
-def dirs(tmp_path):
+def dirs(tmp_path: Path) -> tuple[Path, Path]:
     """a/runs: sac/r1, sac/r2, shared/x (with an image); b/runs: sac/r3, shared/x."""
     a, b = tmp_path / "a" / "runs", tmp_path / "b" / "runs"
     for d in (a / "sac" / "r1", a / "sac" / "r2", b / "sac" / "r3", b / "shared" / "x"):
@@ -32,33 +35,33 @@ def dirs(tmp_path):
 
 
 @pytest.fixture
-def node(tmp_path, home):
+def node(tmp_path: Path, home: Path) -> Iterator[Node]:
     n = Node(tmp_path / "cache", tmp_path / "state" / "roots.json")
     yield n
     n.close()
 
 
 @pytest.fixture
-def http(node, http_server):
+def http(node: Node, http_server: Callable[[Server], str]) -> str:
     return http_server(server.serve(node, "127.0.0.1", 0))
 
 
-def blocks(base, **body):
+def blocks(base: str, **body: str | list[str]) -> bk.BucketArray:
     """The bucket array answering a request for every step of `loss` at base/api/buckets."""
     return bk.decode(bk.unframe(post_bytes(f"{base}/api/buckets", {"blocks": [{"key": "loss", "level": 20, "index": 0, **body}]}))[0])
 
 
-def runs_with_buckets(a):
+def runs_with_buckets(a: bk.BucketArray) -> list[str]:
     return [p for i, p in enumerate(a.paths) if (a.buckets.run == i).any()]
 
 
-def tracked(node, *paths):
+def tracked(node: Node, *paths: Path) -> list[str]:
     for p in paths:
         assert node.by_id(node.add(p)).ready.wait(10)
     return [d.name for d in node.served()]
 
 
-def test_a_workspace_merges_its_members_folders_and_tells_apart_runs_at_one_path(node, dirs, http):
+def test_a_workspace_merges_its_members_folders_and_tells_apart_runs_at_one_path(node: Node, dirs: tuple[Path, Path], http: str) -> None:
     a, b = tracked(node, *dirs)
     assert (a, b) == ("runs<a>", "runs<b>")
     assert post_json(f"{http}/api/node/workspace", {"name": "both", "members": [a, b]}) == (200, {"url": "/w/both/"})
@@ -72,7 +75,7 @@ def test_a_workspace_merges_its_members_folders_and_tells_apart_runs_at_one_path
     assert get_json(f"{http}/w/both/api/info")["root"] == "workspace:both"
 
 
-def test_workspace_buckets_rows_and_media_come_from_the_member_holding_the_run(node, dirs, http):
+def test_workspace_buckets_rows_and_media_come_from_the_member_holding_the_run(node: Node, dirs: tuple[Path, Path], http: str) -> None:
     a, b = tracked(node, *dirs)
     node.set_workspace("both", [a, b])
     got = blocks(f"{http}/w/both", runs=["sac/r3", "shared/x", "shared/x<runs<b>>", "missing"])
@@ -91,14 +94,14 @@ def test_workspace_buckets_rows_and_media_come_from_the_member_holding_the_run(n
     assert request(f"{http}/w/both/m/{urllib.parse.quote('shared/x', safe='')}/{media[5]}")[2] == PNG
 
 
-def test_a_workspace_block_holds_every_members_runs_under_its_scope(node, dirs, http):
+def test_a_workspace_block_holds_every_members_runs_under_its_scope(node: Node, dirs: tuple[Path, Path], http: str) -> None:
     a, b = tracked(node, *dirs)
     node.set_workspace("both", [a, b])
     got = blocks(f"{http}/w/both", scope="sac")
     assert got.paths == ["sac/r1", "sac/r2", "sac/r3"] and runs_with_buckets(got) == got.paths
 
 
-def test_a_workspace_answers_a_batch_as_each_block_alone(node, dirs, http):
+def test_a_workspace_answers_a_batch_as_each_block_alone(node: Node, dirs: tuple[Path, Path], http: str) -> None:
     a, b = tracked(node, *dirs)
     node.set_workspace("both", [a, b])
     asks = [{"key": "loss", "level": 20, "index": 0, "scope": "sac"}, {"key": "loss", "level": 3, "index": 0, "runs": ["sac/r3", "shared/x"]},
@@ -108,15 +111,15 @@ def test_a_workspace_answers_a_batch_as_each_block_alone(node, dirs, http):
     assert together == [bk.unframe(x)[0] for x in alone]
 
 
-def test_a_workspace_streams_live_rows_of_every_member(node, dirs, http):
+def test_a_workspace_streams_live_rows_of_every_member(node: Node, dirs: tuple[Path, Path], http: str) -> None:
     a, b = tracked(node, *dirs)
     node.set_workspace("both", [a, b])
     run = trex.init(dirs[1] / "sac" / "live", commit_interval=0.05)
     run.log({"loss": 1.0}, step=0)
     assert wait_for(lambda: committed_rows(dirs[1] / "sac" / "live") == 1)
-    got = []
+    got: list[tuple[str, str, str | None]] = []
 
-    def read():
+    def read() -> None:
         with urllib.request.urlopen(f"{http}/w/both/api/stream?path=sac", timeout=20) as r:
             kind = None
             for line in r:
@@ -143,7 +146,7 @@ def test_a_workspace_streams_live_rows_of_every_member(node, dirs, http):
     assert ("rows", "sac/live", None) in got
 
 
-def test_a_remote_member_merges_like_a_local_one(node, dirs, http, tmp_path):
+def test_a_remote_member_merges_like_a_local_one(node: Node, dirs: tuple[Path, Path], http: str, tmp_path: Path) -> None:
     remote_runs = tmp_path / "far" / "runs"
     write_run(remote_runs / "sac" / "r9", image=True)
     tracked(node, dirs[0])
@@ -152,7 +155,7 @@ def test_a_remote_member_merges_like_a_local_one(node, dirs, http, tmp_path):
     assert (local, far) == ("runs<a>", "runs<box>")
     node.set_workspace("mixed", [local, far])
 
-    def ids():
+    def ids() -> list[tuple[str, str]]:
         return sorted((r["id"], r["dir"]) for r in get_json(f"{http}/w/mixed/api/runs?path=sac")["runs"])
 
     assert wait_for(lambda: ids() == [("sac/r1", local), ("sac/r2", local), ("sac/r9", far)])
@@ -166,7 +169,7 @@ def test_a_remote_member_merges_like_a_local_one(node, dirs, http, tmp_path):
     assert set(blocks(f"{http}/w/mixed", scope="", which="finished").paths) >= {"sac/r1", "sac/r9"}
 
 
-def test_a_remote_members_live_rows_reach_the_workspace_stream(node, dirs, http, tmp_path):
+def test_a_remote_members_live_rows_reach_the_workspace_stream(node: Node, dirs: tuple[Path, Path], http: str, tmp_path: Path) -> None:
     remote_runs = tmp_path / "far" / "runs"
     run = trex.init(remote_runs / "live", commit_interval=0.05)
     run.log({"loss": 1.0}, step=0)
@@ -174,9 +177,10 @@ def test_a_remote_members_live_rows_reach_the_workspace_stream(node, dirs, http,
     node.add_remote(f"box:{remote_runs}")
     node.set_workspace("mixed", [d.name for d in node.served()])
     assert wait_for(lambda: "live" in [r["id"] for r in get_json(f"{http}/w/mixed/api/runs")["runs"]])
-    got, opened = [], threading.Event()
+    got: list[str] = []
+    opened = threading.Event()
 
-    def read():
+    def read() -> None:
         with urllib.request.urlopen(f"{http}/w/mixed/api/stream", timeout=20) as r:
             kind = None
             for line in r:
@@ -200,7 +204,7 @@ def test_a_remote_members_live_rows_reach_the_workspace_stream(node, dirs, http,
     assert got == ["live"]
 
 
-def test_an_unreachable_member_leaves_the_others_working(node, dirs, http):
+def test_an_unreachable_member_leaves_the_others_working(node: Node, dirs: tuple[Path, Path], http: str) -> None:
     tracked(node, dirs[0])
     node.add_remote("box:/no/such/runs", wait=False)
     a, far = (d.name for d in node.served())
@@ -210,7 +214,7 @@ def test_an_unreachable_member_leaves_the_others_working(node, dirs, http):
     assert runs_with_buckets(blocks(f"{http}/w/mixed", runs=["sac/r1"])) == ["sac/r1"]
 
 
-def test_workspaces_are_saved_and_lose_members_that_stop_being_tracked(node, dirs, http, tmp_path):
+def test_workspaces_are_saved_and_lose_members_that_stop_being_tracked(node: Node, dirs: tuple[Path, Path], http: str, tmp_path: Path) -> None:
     a, b = tracked(node, *dirs)
     node.set_workspace("both", [a, b])
     node.set_workspace("just-a", [a])
@@ -226,7 +230,7 @@ def test_workspaces_are_saved_and_lose_members_that_stop_being_tracked(node, dir
     assert [w["name"] for w in get_json(f"{http}/api/node")["workspaces"]] == ["both"]
 
 
-def test_a_workspace_can_be_renamed_and_names_are_checked(node, dirs, http):
+def test_a_workspace_can_be_renamed_and_names_are_checked(node: Node, dirs: tuple[Path, Path], http: str) -> None:
     a, b = tracked(node, *dirs)
     node.set_workspace("one", [a])
     assert post_json(f"{http}/api/node/workspace", {"name": "two", "members": [a, b], "old": "one"})[0] == 200
@@ -237,13 +241,13 @@ def test_a_workspace_can_be_renamed_and_names_are_checked(node, dirs, http):
     assert post_json(f"{http}/api/node/workspace", {"name": "three", "members": [a], "old": "two"})[0] == 400
 
 
-def test_a_nodes_root_serves_the_page(node, dirs, http):
+def test_a_nodes_root_serves_the_page(node: Node, dirs: tuple[Path, Path], http: str) -> None:
     tracked(node, *dirs)
     assert b'/static/app.js' in request(f"{http}/")[2]
     assert request(f"{http}/w/nope/")[2] == request(f"{http}/")[2]
 
 
-def test_a_nodes_root_shows_every_directory_as_a_top_level_folder(node, tmp_path, http):
+def test_a_nodes_root_shows_every_directory_as_a_top_level_folder(node: Node, tmp_path: Path, http: str) -> None:
     a, b = tmp_path / "x" / "a" / "runs", tmp_path / "y" / "a" / "runs"
     write_run(a / "sac" / "r1", image=True)
     write_run(b / "sac" / "r1")
@@ -261,21 +265,21 @@ def test_a_nodes_root_shows_every_directory_as_a_top_level_folder(node, tmp_path
     assert get_json(f"{http}/api/info")["root"] == "daemon:/"
 
 
-def test_an_empty_nodes_root_has_no_runs(node, http):
+def test_an_empty_nodes_root_has_no_runs(node: Node, http: str) -> None:
     assert get_json(f"{http}/api/runs") == {"runs": [], "media": [], "folders": {}}
 
 
 class Endless:
     """A directory whose stream sends heartbeats as fast as they are taken; `ended` once the stream is closed."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.sent = 0
         self.ended = threading.Event()
 
-    def tree(self):
+    def tree(self) -> list[tuple[str, RunState]]:
         return []
 
-    def messages(self, prefix, stop):
+    def messages(self, prefix: str, stop: threading.Event) -> Generator[bytes, None, None]:
         try:
             while True:
                 self.sent += 1
@@ -284,9 +288,9 @@ class Endless:
             self.ended.set()
 
 
-def test_a_workspace_stream_ends_its_member_pumps_when_the_client_leaves():
+def test_a_workspace_stream_ends_its_member_pumps_when_the_client_leaves() -> None:
     fake, stop = Endless(), threading.Event()
-    ws = Workspace("w", [Member("m", cast(Any, fake))])
+    ws = Workspace("w", [Member("m", cast(Explorer, fake))])
     gen = ws.messages("", stop)
     next(gen)
     assert wait_for(lambda: fake.sent > 20_001)

@@ -1,6 +1,8 @@
 import sys
 import threading
 from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -47,24 +49,23 @@ exec {python} -m trex "$@"
 
 
 @pytest.fixture(autouse=True)
-def close_explorers(monkeypatch):
+def close_explorers(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Close every Explorer a test opens."""
-    opened = []
+    opened: list[index.Explorer] = []
     init = index.Explorer.__init__
 
-    def tracked(self, *a, **kw):
+    def tracked(self: index.Explorer, *a: Any, **kw: Any) -> None:
         init(self, *a, **kw)
         opened.append(self)
 
     monkeypatch.setattr(index.Explorer, "__init__", tracked)
     yield
     for ex in opened:
-        if not ex._closed:
-            ex.close()
+        ex.close()
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The fake remote machine's home, reached by host names through a fake ssh, with uv installed."""
     h = tmp_path / "remote-home"
     (h / ".local" / "bin").mkdir(parents=True)

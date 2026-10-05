@@ -25,7 +25,8 @@ def loss(i: int) -> dict[str, float]:
 def write_run(d: Path, n: int = 5, *, finish: bool = True, image: bool = False,
               metrics: Callable[[int], Mapping[str, float]] = loss, **init: Any) -> trex.Run:
     """A run of `n` rows (`metrics(step)` at steps 0..n-1), with an image at the last step when `image`."""
-    run = trex.init(d, **{"commit_interval": 0.05, **init})
+    init.setdefault("commit_interval", 0.05)
+    run = trex.init(d, **init)
     for i in range(n):
         run.log(dict(metrics(i)), step=i)
     if image:
@@ -80,7 +81,7 @@ def readback(c: sqlite3.Connection, tables: Sequence[str] = ("meta", "keys", "me
     out: dict[str, Any] = {t: sorted(c.execute(f"SELECT * FROM {t}").fetchall()) for t in tables}
     out["row_count"] = chunks.row_count(c)
     out["rows"] = [(r.seq, r.step, r.t, sorted((k, repr(v)) for k, v in r.values.items())) for r in chunks.rows(c)]
-    out["points"] = {name: [a.tobytes() for a in chunks.metric(c, kid)] for kid, name in chunks.key_names(c).items()}
+    out["points"] = {name: [a.tobytes() for a in chunks.metric(c, kid).columns] for kid, name in chunks.key_names(c).items()}
     return out
 
 

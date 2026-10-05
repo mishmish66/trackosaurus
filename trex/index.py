@@ -9,6 +9,7 @@ live stream, and the dumps other trex pull.
 import contextlib
 import fcntl
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -23,7 +24,6 @@ from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-import itertools
 from itertools import batched
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol, Self, TextIO, cast
@@ -1050,7 +1050,7 @@ class Explorer:
             return bk.merge(part, level - st.level[part.run].astype(np.int64))
 
         with ThreadPoolExecutor(max_workers=MERGE_THREADS) as pool:
-            parts = list(pool.map(lambda ab: one(*ab), zip(bounds, bounds[1:])))
+            parts = list(pool.map(one, bounds, bounds[1:]))
         return bk.concat(parts)
 
     def _stack(self, key: str) -> Stack:

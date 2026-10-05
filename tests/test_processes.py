@@ -7,30 +7,33 @@ import signal
 import socket
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from helpers import get_json, post_json, write_run
 
+type Forge = tuple[str, Callable[[], str]]
 
-def free_port():
+
+def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path: Path) -> dict[str, str]:
     return {**os.environ, "TREX_DAEMON_DIR": str(tmp_path / "state"), "TREX_CACHE": str(tmp_path / "cache"),
             "PYTHON_COLORS": "0", "NO_COLOR": "1"}
 
 
-def trex_cmd(*argv):
+def trex_cmd(*argv: str | int | Path) -> list[str]:
     return [sys.executable, "-m", "trex", *map(str, argv)]
 
 
-def start(env, *argv):
+def start(env: dict[str, str], *argv: str | int | Path) -> subprocess.Popen[str]:
     """A trex server process, once it has printed its address."""
     p = subprocess.Popen(trex_cmd(*argv), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     assert p.stdout and p.stderr
@@ -39,13 +42,13 @@ def start(env, *argv):
     return p
 
 
-def interrupt(p, sig=signal.SIGINT):
+def interrupt(p: subprocess.Popen[str], sig: signal.Signals = signal.SIGINT) -> int:
     """Exit code after `sig`."""
     p.send_signal(sig)
     return p.wait(timeout=20)
 
 
-def test_a_temporary_trex_answers_until_interrupted(tmp_path, env):
+def test_a_temporary_trex_answers_until_interrupted(tmp_path: Path, env: dict[str, str]) -> None:
     write_run(tmp_path / "runs" / "r")
     port = free_port()
     p = start(env, "serve", tmp_path / "runs", "--temporary", "--port", port)
@@ -55,7 +58,7 @@ def test_a_temporary_trex_answers_until_interrupted(tmp_path, env):
         assert interrupt(p) == 0
 
 
-def test_the_machines_trex_takes_directories_from_serve_and_removes_its_socket_on_exit(tmp_path, env):
+def test_the_machines_trex_takes_directories_from_serve_and_removes_its_socket_on_exit(tmp_path: Path, env: dict[str, str]) -> None:
     a, b = tmp_path / "a" / "runs", tmp_path / "b" / "logs"
     write_run(a / "r")
     write_run(b / "r")
@@ -74,7 +77,7 @@ def test_the_machines_trex_takes_directories_from_serve_and_removes_its_socket_o
     assert json.loads((tmp_path / "state" / "roots.json").read_text())["tracked"] == [str(a), str(b)]
 
 
-def test_a_restarted_trex_serves_the_directories_it_had(tmp_path, env):
+def test_a_restarted_trex_serves_the_directories_it_had(tmp_path: Path, env: dict[str, str]) -> None:
     write_run(tmp_path / "runs" / "r")
     port = free_port()
     assert interrupt(start(env, "serve", tmp_path / "runs", "--port", port)) == 0
@@ -85,7 +88,7 @@ def test_a_restarted_trex_serves_the_directories_it_had(tmp_path, env):
         assert interrupt(p) == 0
 
 
-def test_output_to_a_closed_pipe_ends_without_a_traceback(tmp_path, env):
+def test_output_to_a_closed_pipe_ends_without_a_traceback(tmp_path: Path, env: dict[str, str]) -> None:
     write_run(tmp_path / "r", 20000, metrics=lambda i: {"x": float(i)})
     p = subprocess.Popen(trex_cmd("series", tmp_path / "r", "-k", "x"), env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True)
@@ -96,7 +99,7 @@ def test_output_to_a_closed_pipe_ends_without_a_traceback(tmp_path, env):
     p.wait(timeout=20)
 
 
-def test_a_terminated_trex_exits_cleanly_and_removes_its_socket(tmp_path, env):
+def test_a_terminated_trex_exits_cleanly_and_removes_its_socket(tmp_path: Path, env: dict[str, str]) -> None:
     p = start(env, "serve", "--port", free_port())
     assert (tmp_path / "state" / "daemon.sock").exists()
     assert interrupt(p, signal.SIGTERM) == 0
@@ -107,7 +110,7 @@ GIT = ["git", "-c", "user.name=trex", "-c", "user.email=trex@localhost", "-c", "
 
 
 @pytest.fixture
-def forge(tmp_path):
+def forge(tmp_path: Path) -> Forge:
     """(source, push) of a git forge holding this checkout's files; `push()` adds a commit and returns its id."""
     repo = Path(__file__).resolve().parents[1]
     files = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"], cwd=repo, capture_output=True, text=True,
@@ -119,7 +122,7 @@ def forge(tmp_path):
             shutil.copy2(repo / f, work / f)
     subprocess.run([*GIT, "init", "-q", "--bare", str(bare)], check=True)
 
-    def push():
+    def push() -> str:
         subprocess.run([*GIT, "init", "-q"], cwd=work, check=True)
         subprocess.run([*GIT, "add", "-A"], cwd=work, check=True)
         subprocess.run([*GIT, "commit", "-q", "--allow-empty", "-m", "release"], cwd=work, check=True)
@@ -131,7 +134,7 @@ def forge(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv")
-def test_update_installs_the_newest_commit_and_the_restarted_trex_runs_it(tmp_path, env, forge):
+def test_update_installs_the_newest_commit_and_the_restarted_trex_runs_it(tmp_path: Path, env: dict[str, str], forge: Forge) -> None:
     source, push = forge
     env = {**env, "UV_TOOL_DIR": str(tmp_path / "tools"), "UV_TOOL_BIN_DIR": str(tmp_path / "bin"),
            "TREX_SOURCE": source, "INVOCATION_ID": "systemd"}
@@ -139,7 +142,7 @@ def test_update_installs_the_newest_commit_and_the_restarted_trex_runs_it(tmp_pa
     daemon = [str(tmp_path / "tools" / "trex" / "bin" / "python"), "-m", "trex", "serve", "--port", str(free_port())]
     api = f"http://127.0.0.1:{daemon[-1]}/api/node"
 
-    def start_daemon():
+    def start_daemon() -> subprocess.Popen[str]:
         p = subprocess.Popen(daemon, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         assert p.stdout and "http://" in p.stdout.readline()
         return p

@@ -13,9 +13,10 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import IO, Final, Literal, NamedTuple, Protocol, Self, cast, runtime_checkable
+from typing import IO, Final, Literal, Protocol, Self, cast, runtime_checkable
 
 from numpy.typing import ArrayLike
 
@@ -81,7 +82,8 @@ def sealed(rows: int, values: int) -> bool:
     return values >= SEALED or 2 * rows > chunks.MAX_ROWS
 
 
-class _Tail(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class _Tail:
     """A commit this session may merge."""
 
     seq0: int
@@ -90,13 +92,15 @@ class _Tail(NamedTuple):
     first_id: int  # its chunks have rowids from here on
 
 
-class _Row(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class _Row:
     step: float
     time: float
     values: dict[str, float]
 
 
-class _Media(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class _Media:
     key: str
     step: float
     time: float

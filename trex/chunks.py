@@ -12,7 +12,8 @@ import struct
 import sys
 from array import array
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Final, NamedTuple
+from dataclasses import dataclass
+from typing import Final
 
 import numpy as np
 import numpy.typing as npt
@@ -29,7 +30,8 @@ type KeyChunk = tuple[int, bytes]
 """(key id, chunk)"""
 
 
-class Row(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class Row:
     """One logged row read back."""
 
     seq: int
@@ -38,12 +40,17 @@ class Row(NamedTuple):
     values: dict[str, float]
 
 
-class Series(NamedTuple):
+@dataclass(frozen=True, slots=True, eq=False)
+class Series:
     """One metric's points in row order."""
 
     steps: Floats
     values: Floats
     times: Floats
+
+    @property
+    def columns(self) -> tuple[Floats, Floats, Floats]:
+        return self.steps, self.values, self.times
 
 
 MAX_ROWS: Final = 65535
@@ -165,9 +172,10 @@ def rows(c: sqlite3.Connection, start: int = 0, stop: int | None = None) -> list
     names = key_names(c)
     q = "SELECT seq0, n, data FROM rowmeta WHERE seq0 + n > ?" + (" AND seq0 < ?" if stop is not None else "") + " ORDER BY seq0"
     out: list[Row] = []
-    for seq0, n, meta in c.execute(q, (start,) if stop is None else (start, stop)):
+    for r in c.execute(q, (start,) if stop is None else (start, stop)):
+        seq0, n, meta = int(r[0]), int(r[1]), bytes(r[2])
         mv = memoryview(meta).cast("d")
-        part = [Row(seq0 + i, mv[i], mv[n + i], {}) for i in range(n)]
+        part = [Row(seq0 + i, float(mv[i]), float(mv[n + i]), {}) for i in range(n)]
         for kid, blob in c.execute("SELECT key_id, data FROM chunk WHERE seq0 = ?", (seq0,)):
             pos, v = decode(blob)
             name = names[kid]
@@ -204,7 +212,8 @@ def last_step_and_time(c: sqlite3.Connection, rows: int) -> tuple[float, float] 
     return mv[n - 1], mv[2 * n - 1]
 
 
-class Merge(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class Merge:
     """Commits holding exactly rows [seq0, stop), read and rebuilt as one commit by `prepare_merge`."""
 
     seq0: int

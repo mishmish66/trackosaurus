@@ -25,8 +25,9 @@ import tempfile
 import uuid
 import zlib
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, NamedTuple, cast
+from typing import Final, cast
 
 JOURNAL: Final = "trex.journal"
 NETWORK_FS: Final = frozenset({"nfs", "nfs4", "cifs", "smb3", "smbfs", "lustre", "gpfs", "ceph", "beegfs", "glusterfs",
@@ -44,8 +45,11 @@ type Value = None | int | float | str | bytes
 type Op = tuple[str, Sequence[Value]]
 
 
-class Record(NamedTuple):
-    end: int  # offset just past the record in the journal
+@dataclass(frozen=True, slots=True)
+class Record:
+    """A record of a journal: its payload, and the offset just past it."""
+
+    end: int
     payload: dict[str, object]
 
 

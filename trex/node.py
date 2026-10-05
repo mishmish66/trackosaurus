@@ -63,6 +63,7 @@ from typing import Any, Final, Self
 from urllib.parse import quote, urlsplit
 
 from . import remote
+from .format import JSONValue, as_dict, as_str_list
 from .crawl import Crawl
 from .index import Explorer
 from .mirror import Connect, Pull, Unreachable, Upstream
@@ -116,6 +117,31 @@ class Pulled:
 
     link: str
     via: list[str]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Saved:
+    """What a node keeps across restarts (`roots.json`): the directories it tracks, its links (ssh sessions aside),
+    the directories it pulls, and its workspaces' members."""
+
+    tracked: list[str]
+    links: list[str]
+    pulled: dict[str, Pulled]
+    workspaces: dict[str, list[str]]
+
+    def wire(self) -> dict[str, Any]:
+        return {"tracked": self.tracked, "links": self.links,
+                "pulled": {d: [p.link, p.via] for d, p in self.pulled.items()},
+                "workspaces": [{"name": w, "members": m} for w, m in self.workspaces.items()]}
+
+    @classmethod
+    def read(cls, v: JSONValue) -> Self:
+        d = as_dict(v)
+        pulled = {k: p for k, p in as_dict(d.get("pulled")).items() if isinstance(p, list) and len(p) == 2}
+        workspaces = [as_dict(w) for w in ws] if isinstance(ws := d.get("workspaces"), list) else []
+        return cls(tracked=as_str_list(d.get("tracked")), links=as_str_list(d.get("links")),
+                   pulled={k: Pulled(str(p[0]), as_str_list(p[1])) for k, p in pulled.items()},
+                   workspaces={str(w.get("name")): as_str_list(w.get("members")) for w in workspaces})
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -328,8 +354,7 @@ class Node:
         self._history: list[str] = []
         if state is not None:
             with contextlib.suppress(FileNotFoundError, ValueError):
-                saved = json.loads(state.with_name("history.json").read_text())
-                self._history = [str(r) for r in saved] if isinstance(saved, list) else []
+                self._history = as_str_list(json.loads(state.with_name("history.json").read_text()))
 
     @property
     def saves(self) -> bool:
@@ -339,21 +364,21 @@ class Node:
         """Track the directories and links saved in `state`, skipping directories that no longer exist; open the
         directories it pulled, from the cache, so they answer before their links do; keep its workspaces."""
         try:
-            saved = json.loads(self.state.read_text()) if self.state else {}
+            saved = Saved.read(json.loads(self.state.read_text()) if self.state else None)
         except FileNotFoundError:
             return
-        for spec in map(str, [*saved.get("tracked", []), *saved.get("links", [])]):
+        for spec in [*saved.tracked, *saved.links]:
             try:
                 self.track(spec, force=True, wait=False)
             except ValueError as e:
                 print(f"[trex] skipping saved directory {spec}: {e}", file=sys.stderr, flush=True)
         with self.lock:
-            for d, (key, via) in saved.get("pulled", {}).items():
-                if key in self.links and d not in self.entries:
-                    self.entries[d] = Explorer(Pull(self.links[key].upstream(d), d), self.cache).start()
-                    self.pulled[d] = Pulled(key, via)
-            for w in saved.get("workspaces", []):
-                self.workspaces[str(w.get("name"))] = [self._id(m) for m in map(str, w.get("members", []))]
+            for d, p in saved.pulled.items():
+                if p.link in self.links and d not in self.entries:
+                    self.entries[d] = Explorer(Pull(self.links[p.link].upstream(d), d), self.cache).start()
+                    self.pulled[d] = p
+            for w, members in saved.workspaces.items():
+                self.workspaces[w] = [self._id(m) for m in members]
             self._views = {}
 
     def _id(self, spec: str) -> str:
@@ -695,9 +720,8 @@ class Node:
         if spec is not None:
             self._history = [spec, *(r for r in self._history if r != spec)][:HISTORY_MAX]
             write_json(self.state.with_name("history.json"), self._history)
-        write_json(self.state, {"tracked": self.tracked(), "links": [k for k, link in self.links.items() if link.session is None],
-                                "pulled": {d: [p.link, p.via] for d, p in self.pulled.items()},
-                                "workspaces": [{"name": w, "members": m} for w, m in self.workspaces.items()]})
+        write_json(self.state, Saved(tracked=self.tracked(), links=[k for k, link in self.links.items() if link.session is None],
+                                     pulled=dict(self.pulled), workspaces=dict(self.workspaces)).wire())
 
     def close(self) -> None:
         """Stop serving every directory and pulling from every link (a daemon's stay saved)."""

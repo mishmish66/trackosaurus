@@ -20,8 +20,8 @@ import time
 import zlib
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from itertools import batched
+from pathlib import Path
 from typing import Any, Final, Protocol
 from urllib.parse import quote, urlsplit
 
@@ -243,8 +243,9 @@ class Pull:
         try:
             for paths in batched(todo, DUMPS_AT_ONCE):
                 updates = self._dumped(ex, paths)
+                media = [m for r in updates for m in r.media]
                 with ThreadPoolExecutor(FETCH_THREADS) as pool:
-                    list(pool.map(lambda m: self._media_file(m.run, m.file), [m for r in updates for m in r.media]))
+                    list(pool.map(self._media_file, [m.run for m in media], [m.file for m in media]))
                 ex.apply(updates)
                 left -= set(paths)
                 self._trim(ex, paths)

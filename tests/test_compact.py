@@ -4,6 +4,9 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -16,11 +19,14 @@ from helpers import commit_count, readback_run
 
 
 @pytest.fixture
-def unmerged(monkeypatch):
-    monkeypatch.setattr(trex.writer, "merge_plan", lambda tail: None)
+def unmerged(monkeypatch: pytest.MonkeyPatch) -> None:
+    def merge_plan(tail: Sequence[tuple[int, int]]) -> int | None:
+        return None
+
+    monkeypatch.setattr(trex.writer, "merge_plan", merge_plan)
 
 
-def small_commit_run(d, n=200):
+def small_commit_run(d: Path, n: int = 200) -> None:
     run = trex.init(d, config={"lr": 0.1}, commit_interval=0.001)
     for i in range(n):
         run.log({"loss": i + 0.5, "nan": float("nan"), **({"eval": -float(i)} if i % 7 == 0 else {})}, step=i)
@@ -31,7 +37,7 @@ def small_commit_run(d, n=200):
     run.finish()
 
 
-def test_compacting_a_finished_run_keeps_everything_readers_see_in_few_commits(tmp_path, unmerged):
+def test_compacting_a_finished_run_keeps_everything_readers_see_in_few_commits(tmp_path: Path, unmerged: None) -> None:
     d = tmp_path / "r"
     small_commit_run(d)
     before, many = readback_run(d), commit_count(d)
@@ -40,7 +46,7 @@ def test_compacting_a_finished_run_keeps_everything_readers_see_in_few_commits(t
     assert r.bytes_after < r.bytes_before and sorted(p.name for p in d.iterdir()) == ["media", DB]
 
 
-def test_a_run_another_process_has_open_is_refused_and_left_as_it_was(tmp_path, unmerged):
+def test_a_run_another_process_has_open_is_refused_and_left_as_it_was(tmp_path: Path, unmerged: None) -> None:
     d = tmp_path / "r"
     small_commit_run(d, 30)
     before, many = readback_run(d), commit_count(d)
@@ -62,7 +68,7 @@ def test_a_run_another_process_has_open_is_refused_and_left_as_it_was(tmp_path, 
     assert readback_run(d) == before and commit_count(d) == many and not (d / compact.TMP).exists()
 
 
-def test_a_killed_writers_run_is_compacted_with_the_rows_in_its_wal(tmp_path):
+def test_a_killed_writers_run_is_compacted_with_the_rows_in_its_wal(tmp_path: Path) -> None:
     d = tmp_path / "r"
     code = textwrap.dedent(f"""
         import os, signal, time, trex
@@ -82,14 +88,15 @@ def test_a_killed_writers_run_is_compacted_with_the_rows_in_its_wal(tmp_path):
     assert commit_count(d) == 1 and not (d / (DB + "-wal")).exists()
 
 
-def test_a_compaction_that_fails_partway_leaves_the_run_as_it_was(tmp_path, unmerged, monkeypatch):
+def test_a_compaction_that_fails_partway_leaves_the_run_as_it_was(tmp_path: Path, unmerged: None,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
     d = tmp_path / "r"
     small_commit_run(d, 60)
     before, many, size = readback_run(d), commit_count(d), (d / DB).stat().st_size
     calls = [0]
     merge = chunks.merge_chunks
 
-    def fail_on_the_second_metric(*args):
+    def fail_on_the_second_metric(*args: Any) -> bytes:
         calls[0] += 1
         if calls[0] == 2:
             raise OSError("disk full")
@@ -102,7 +109,7 @@ def test_a_compaction_that_fails_partway_leaves_the_run_as_it_was(tmp_path, unme
     assert not (d / compact.TMP).exists()
 
 
-def test_a_compacted_run_takes_new_rows_and_merges_them(tmp_path, unmerged, monkeypatch):
+def test_a_compacted_run_takes_new_rows_and_merges_them(tmp_path: Path, unmerged: None, monkeypatch: pytest.MonkeyPatch) -> None:
     d = tmp_path / "r"
     small_commit_run(d, 40)
     compact.compact(d)
@@ -116,7 +123,8 @@ def test_a_compacted_run_takes_new_rows_and_merges_them(tmp_path, unmerged, monk
     assert [r[0] for r in rows] == list(range(140)) and commit_count(d) < 20
 
 
-def test_compact_command_reports_each_run_and_skips_open_ones(tmp_path, unmerged, capsys):
+def test_compact_command_reports_each_run_and_skips_open_ones(tmp_path: Path, unmerged: None,
+                                                              capsys: pytest.CaptureFixture[str]) -> None:
     for name in ("a", "b/c"):
         small_commit_run(tmp_path / "runs" / name, 30)
     held = connect_rw(tmp_path / "runs" / "b" / "c")

@@ -69,7 +69,7 @@ def main() -> None:
     ap.add_argument("--live", action="store_true", help="a few slow runs that keep streaming")
     ap.add_argument("--hours", type=float, default=12.0)
     args = ap.parse_args()
-    jobs = []
+    jobs: list[tuple[Path, float, int, int, float, int, int]] = []
     if args.live:
         steps = int(args.hours * 3600 / 1.0)
         for lr in (0.001, 0.003):

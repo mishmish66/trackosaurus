@@ -8,23 +8,38 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, TypedDict
+from typing import Any, Final
+
+from .format import as_dict, as_str
 
 DEFAULT_SOURCE: Final = "git+https://github.com/mishmish66/trackosaurus"
 INSTALL_TIMEOUT: Final = 600.0  # seconds
 RESTART_STATUS: Final = 75  # exit status asking the service manager to start the daemon again (systemd's RestartForceExitStatus)
 
 
-class Install(TypedDict):
+@dataclass(frozen=True, slots=True)
+class Install:
+    """A trex installed: its version, and the git commit for a git source."""
+
     version: str
-    commit: str | None  # git commit installed, for a git source
+    commit: str | None
+
+    def wire(self) -> dict[str, str | None]:
+        return {"version": self.version, "commit": self.commit}
 
 
-class Updates(TypedDict):
-    source: str | None  # $TREX_SOURCE
+@dataclass(frozen=True, slots=True)
+class Updates:
+    """Whether this process can update itself, from $TREX_SOURCE (`source`), and why not when it cannot."""
+
+    source: str | None
     available: bool
-    reason: str  # why not, when unavailable
+    reason: str
+
+    def wire(self) -> dict[str, Any]:
+        return {"source": self.source, "available": self.available, "reason": self.reason}
 
 
 class UpdateError(Exception):
@@ -39,15 +54,15 @@ def installed(prefix: Path | None = None) -> Install:
         try:
             dist = importlib.metadata.distribution("trex")
         except importlib.metadata.PackageNotFoundError:
-            return {"version": "unknown", "commit": None}
+            return Install("unknown", None)
         version, direct = dist.version, dist.read_text("direct_url.json")
     elif found is None:
-        return {"version": "unknown", "commit": None}
+        return Install("unknown", None)
     else:
         version = found.name.removeprefix("trex-").removesuffix(".dist-info")
         direct = (found / "direct_url.json").read_text() if (found / "direct_url.json").is_file() else None
-    commit = (json.loads(direct).get("vcs_info") or {}).get("commit_id") if direct else None
-    return {"version": version, "commit": commit}
+    vcs = as_dict(as_dict(json.loads(direct)).get("vcs_info")) if direct else {}
+    return Install(version, as_str(vcs.get("commit_id")))
 
 
 RUNNING: Final = installed()  # the trex this process runs, as installed when it started
@@ -81,7 +96,7 @@ def updates(env: Mapping[str, str] = os.environ, prefix: Path | None = None) -> 
         reason = f"this trex ({prefix}) is not the uv tool install ({tool_env()})"
     else:
         reason = ""
-    return {"source": source, "available": not reason, "reason": reason}
+    return Updates(source, not reason, reason)
 
 
 def service(env: Mapping[str, str]) -> bool:

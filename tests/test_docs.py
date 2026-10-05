@@ -9,7 +9,7 @@ import trex
 BUILD = Path(__file__).resolve().parents[1] / "docs" / "build.py"
 
 
-def test_docs_have_a_page_for_every_module_and_their_links_resolve(tmp_path):
+def test_docs_have_a_page_for_every_module_and_their_links_resolve(tmp_path: Path) -> None:
     subprocess.run([sys.executable, str(BUILD), str(tmp_path)], check=True, capture_output=True)
     names = {m.name for m in pkgutil.iter_modules(trex.__path__)} - {"__main__"}
     assert {p.stem for p in (tmp_path / "trex").glob("*.html")} == names

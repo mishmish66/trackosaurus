@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Final, cast
 
+from .format import JSONValue
 from .node import Node, dir_base
 
 TIMEOUT: Final = 60.0  # seconds a client waits for the reply
@@ -32,7 +33,7 @@ class _Control(socketserver.StreamRequestHandler):
 
     def handle(self) -> None:
         try:
-            req = json.loads(self.rfile.readline())
+            req: JSONValue = json.loads(self.rfile.readline())
             reply = cast(ControlServer, self.server).answer(req if isinstance(req, dict) else {})
         except (ValueError, OSError) as e:
             reply = {"error": str(e)}
@@ -58,7 +59,7 @@ class ControlServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             os.umask(old)
         self.path = path
 
-    def answer(self, req: dict[str, Any]) -> dict[str, Any]:
+    def answer(self, req: dict[str, JSONValue]) -> dict[str, Any]:
         match req.get("op"):
             case "status":
                 return {"urls": self.urls, "dirs": [d.wire() for d in self.node.served()]}
@@ -74,7 +75,7 @@ class ControlServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.path.unlink(missing_ok=True)
 
 
-def request(req: dict[str, Any], path: Path | None = None) -> dict[str, Any] | None:
+def request(req: dict[str, JSONValue], path: Path | None = None) -> dict[str, JSONValue] | None:
     """The reply of this machine's trex, or None when none listens on the socket."""
     with socket.socket(socket.AF_UNIX) as s:
         s.settimeout(TIMEOUT)
@@ -83,5 +84,5 @@ def request(req: dict[str, Any], path: Path | None = None) -> dict[str, Any] | N
         except (FileNotFoundError, ConnectionRefusedError):
             return None
         s.sendall(json.dumps(req).encode() + b"\n")
-        reply = json.loads(s.makefile("rb").readline() or b"null")
-    return cast(dict[str, Any], reply) if isinstance(reply, dict) else None
+        reply: JSONValue = json.loads(s.makefile("rb").readline() or b"null")
+    return reply if isinstance(reply, dict) else None

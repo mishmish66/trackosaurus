@@ -1,3 +1,4 @@
+import http.client as http_client
 import json
 import shutil
 import sqlite3
@@ -9,7 +10,7 @@ from typing import Any
 import pytest
 
 import trex
-from trex import buckets as bk, crawl, index, mirror, server
+from trex import buckets as bk, crawl, mirror, server
 from trex.crawl import Crawl
 from trex.index import Dump, Explorer
 from trex.mirror import Pull, Unreachable, Upstream
@@ -233,11 +234,16 @@ def test_an_upstream_that_refuses_or_is_not_http_is_said_so(source: Source) -> N
 def test_requests_to_an_upstream_share_connections_and_survive_one_that_went_stale(source: Source, monkeypatch: pytest.MonkeyPatch) -> None:
     _, _, url = source
     up = Upstream.at(url)
-    opened: list[object] = []
+    opened: list[http_client.HTTPConnection] = []
     connect = up.connect
-    monkeypatch.setattr(up, "connect", lambda timeout: (opened.append(c := connect(timeout)), c)[1])
+
+    def recorded(timeout: float) -> http_client.HTTPConnection:
+        opened.append(c := connect(timeout))
+        return c
+
+    monkeypatch.setattr(up, "connect", recorded)
     for _ in range(5):
         assert json.loads(up.request("GET", "/api/info"))["protocol"] == server.PROTOCOL
     assert len(opened) == 1
-    opened[0].sock.close()  # type: ignore[attr-defined]
+    opened[0].sock.close()
     assert json.loads(up.request("GET", "/api/info"))["protocol"] == server.PROTOCOL and len(opened) == 2

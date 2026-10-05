@@ -1,12 +1,15 @@
 import json
 import math
 import os
+import sqlite3
 import subprocess
 import sys
 import textwrap
 import time
-from typing import Any, cast
+from pathlib import Path
+from typing import IO, Any, NoReturn, cast
 
+import numpy as np
 import pytest
 
 import trex
@@ -16,23 +19,24 @@ from trex.format import connect_ro, key_names, row_count
 from helpers import commit_count, wait_for
 
 
-def rows_of(d):
+def rows_of(d: Path) -> list[tuple[int, float, dict[str, float]]]:
     c = connect_ro(d)
-    out = [(seq, step, vals) for seq, step, _, vals in chunks.rows(c)]
+    out = [(r.seq, r.step, r.values) for r in chunks.rows(c)]
     c.close()
     return out
 
 
-def meta_of(d):
+def meta_of(d: Path) -> dict[str, Any]:
     c = connect_ro(d)
     m = {k: json.loads(v) for k, v in c.execute("SELECT key, value FROM meta")}
     c.close()
     return m
 
 
-def test_logs_contiguous_rows_with_flattened_scalars_and_nonfinite(tmp_path):
+def test_logs_contiguous_rows_with_flattened_scalars_and_nonfinite(tmp_path: Path) -> None:
     run = trex.init(tmp_path / "r", name="n", config={"opt": {"lr": 1e-3}}, tags=["a"])
-    run.log({"a": {"b": 1.5}, "nan": float("nan"), "flag": True, "text": "skip"})  # pyright: ignore[reportArgumentType]  # non-numbers are skipped
+    untyped: Any = {"text": "skip"}
+    run.log({"a": {"b": 1.5}, "nan": float("nan"), "flag": True, **untyped})
     run.log({"x": 2}, step=10)
     run.log({"x": 3})
     run.finish()
@@ -44,7 +48,7 @@ def test_logs_contiguous_rows_with_flattened_scalars_and_nonfinite(tmp_path):
     assert (m["name"], m["state"], m["config"], m["tags"]) == ("n", "finished", {"opt/lr": 1e-3}, ["a"])
 
 
-def test_rows_become_visible_to_readers_within_the_commit_interval(tmp_path):
+def test_rows_become_visible_to_readers_within_the_commit_interval(tmp_path: Path) -> None:
     run = trex.init(tmp_path / "r", commit_interval=0.2)
     run.log({"x": 1})
     assert wait_for(lambda: rows_of(tmp_path / "r"), timeout=2)
@@ -53,7 +57,7 @@ def test_rows_become_visible_to_readers_within_the_commit_interval(tmp_path):
     run.finish()
 
 
-def test_reopening_a_run_resumes_its_sequence_and_step(tmp_path):
+def test_reopening_a_run_resumes_its_sequence_and_step(tmp_path: Path) -> None:
     a = trex.init(tmp_path / "r")
     a.log({"x": 1}, step=5)
     a.finish()
@@ -65,7 +69,7 @@ def test_reopening_a_run_resumes_its_sequence_and_step(tmp_path):
     assert meta_of(tmp_path / "r")["id"] == uid
 
 
-def test_killed_writer_leaves_a_readable_consistent_run(tmp_path):
+def test_killed_writer_leaves_a_readable_consistent_run(tmp_path: Path) -> None:
     code = textwrap.dedent(f"""
         import os, signal, time, trex
         run = trex.init({str(tmp_path / "r")!r}, commit_interval=0.05)
@@ -86,7 +90,7 @@ def test_killed_writer_leaves_a_readable_consistent_run(tmp_path):
     assert meta_of(tmp_path / "r")["state"] == "running"
 
 
-def test_merge_plan_merges_fan_in_commits_of_a_value_tier_newest_first():
+def test_merge_plan_merges_fan_in_commits_of_a_value_tier_newest_first() -> None:
     F, plan = trex.writer.FAN_IN, trex.writer.merge_plan
     ones = [(1, 1)] * F
     assert plan(ones[:-1]) is None
@@ -101,20 +105,25 @@ def test_merge_plan_merges_fan_in_commits_of_a_value_tier_newest_first():
     assert trex.writer.sealed(1, trex.writer.SEALED) and trex.writer.sealed(40_000, 40_000) and not trex.writer.sealed(10, 10)
 
 
-def log_one_row_per_commit(run, n, start=0):
+def log_one_row_per_commit(run: trex.Run, n: int, start: int = 0) -> None:
     for i in range(start, start + n):
         run.log({"loss": i + 0.5, **({"eval": -float(i)} if i % 7 == 0 else {})}, step=i)
         time.sleep(0.003)
 
 
-def expected_rows(n):
+def expected_rows(n: int) -> list[tuple[int, float, dict[str, float]]]:
     return [(i, float(i), {"loss": i + 0.5, **({"eval": -float(i)} if i % 7 == 0 else {})}) for i in range(n)]
 
 
-def test_small_commits_are_merged_as_the_run_goes(tmp_path, monkeypatch):
-    merges = []
+def test_small_commits_are_merged_as_the_run_goes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    merges: list[list[tuple[int, int]]] = []
     apply = chunks.apply_merge
-    monkeypatch.setattr(chunks, "apply_merge", lambda c, m: merges.append(m.commits) or apply(c, m))
+
+    def recording(c: sqlite3.Connection, m: chunks.Merge) -> int:
+        merges.append(m.commits)
+        return apply(c, m)
+
+    monkeypatch.setattr(chunks, "apply_merge", recording)
     run = trex.init(tmp_path / "r", commit_interval=0.001)
     log_one_row_per_commit(run, 300)
     run.finish()
@@ -122,8 +131,9 @@ def test_small_commits_are_merged_as_the_run_goes(tmp_path, monkeypatch):
     assert len(merges) >= 10 and commit_count(tmp_path / "r") < 3 * trex.writer.FAN_IN
 
 
-def test_a_failing_merge_stops_merging_and_leaves_every_row(tmp_path, monkeypatch, capsys):
-    def broken(c, m):
+def test_a_failing_merge_stops_merging_and_leaves_every_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            capsys: pytest.CaptureFixture[str]) -> None:
+    def broken(c: sqlite3.Connection, m: chunks.Merge) -> NoReturn:
         c.execute("DELETE FROM rowmeta WHERE seq0 >= ? AND seq0 < ?", (m.seq0, m.stop))
         raise OSError("disk full")
 
@@ -135,7 +145,7 @@ def test_a_failing_merge_stops_merging_and_leaves_every_row(tmp_path, monkeypatc
     assert "merging of" in capsys.readouterr().err
 
 
-def check_killed_run(d):
+def check_killed_run(d: Path) -> None:
     """Every committed row of a run whose writer was killed is there, in commits without gaps or overlaps, and the
     run resumes."""
     c = connect_ro(d)
@@ -161,7 +171,7 @@ LOGGER = """
 
 @pytest.mark.parametrize("where", ["halfway through a swap", "before a swap commits"])
 @pytest.mark.parametrize("nth", [2, 9])
-def test_a_writer_killed_while_merging_keeps_every_committed_row(tmp_path, where, nth):
+def test_a_writer_killed_while_merging_keeps_every_committed_row(tmp_path: Path, where: str, nth: int) -> None:
     d = tmp_path / "r"
     kill = ("c.execute('DELETE FROM chunk WHERE id >= ? AND seq0 >= ? AND seq0 < ?', (m.first_id, m.seq0, m.stop))"
             if where == "halfway through a swap" else "real(c, m)")
@@ -182,7 +192,7 @@ def test_a_writer_killed_while_merging_keeps_every_committed_row(tmp_path, where
 
 
 @pytest.mark.parametrize("after", [0.15, 0.4, 0.75, 1.3])
-def test_a_writer_killed_at_any_moment_keeps_every_committed_row(tmp_path, after):
+def test_a_writer_killed_at_any_moment_keeps_every_committed_row(tmp_path: Path, after: float) -> None:
     d = tmp_path / "r"
     code = textwrap.dedent(f"""
         import os, signal, threading, time, trex
@@ -192,7 +202,7 @@ def test_a_writer_killed_at_any_moment_keeps_every_committed_row(tmp_path, after
     check_killed_run(d)
 
 
-def test_media_files_are_written_before_their_rows(tmp_path):
+def test_media_files_are_written_before_their_rows(tmp_path: Path) -> None:
     run = trex.init(tmp_path / "r")
     png = b"\x89PNG\r\n\x1a\n" + bytes(100)
     run.log_image("img", png, step=3)
@@ -206,7 +216,7 @@ def test_media_files_are_written_before_their_rows(tmp_path):
     assert (tmp_path / "r" / media[1][4]).stat().st_size == media[1][5]
 
 
-def test_exception_inside_context_marks_run_failed(tmp_path):
+def test_exception_inside_context_marks_run_failed(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         with trex.init(tmp_path / "r") as run:
             run.log({"x": 1})
@@ -214,7 +224,7 @@ def test_exception_inside_context_marks_run_failed(tmp_path):
     assert meta_of(tmp_path / "r")["state"] == "failed"
 
 
-def test_info_dict_keeps_nesting_and_merges_updates(tmp_path):
+def test_info_dict_keeps_nesting_and_merges_updates(tmp_path: Path) -> None:
     run = trex.init(tmp_path / "r", info={"git": {"sha": "abc", "dirty": False}, "notes": "first try"})
     run.info(notes="second try", host={"name": "gpu-box", "gpus": [0, 1]}, bad=float("nan"))
     run.finish()
@@ -222,13 +232,13 @@ def test_info_dict_keeps_nesting_and_merges_updates(tmp_path):
                                                "host": {"name": "gpu-box", "gpus": [0, 1]}, "bad": "nan"}
 
 
-def test_folder_info_merges_into_a_json_file(tmp_path):
+def test_folder_info_merges_into_a_json_file(tmp_path: Path) -> None:
     trex.folder_info(tmp_path / "sweep", {"question": "does width help?"})
     trex.folder_info(tmp_path / "sweep", owner="me")
     assert json.loads((tmp_path / "sweep" / "trex_info.json").read_text()) == {"question": "does width help?", "owner": "me"}
 
 
-def test_rows_are_stored_as_one_commit_with_one_chunk_per_metric_and_names_once(tmp_path):
+def test_rows_are_stored_as_one_commit_with_one_chunk_per_metric_and_names_once(tmp_path: Path) -> None:
     run = trex.init(tmp_path / "r", commit_interval=60)
     for i in range(10):
         run.log({"train/loss": 1 / (i + 1), "lr": 0.1})
@@ -245,16 +255,16 @@ def test_rows_are_stored_as_one_commit_with_one_chunk_per_metric_and_names_once(
     assert rows[5] == (5, 4.0, {"eval/score": 4})
 
 
-def test_row_times_are_seconds_since_creation(tmp_path):
+def test_row_times_are_seconds_since_creation(tmp_path: Path) -> None:
     run = trex.init(tmp_path / "r")
     run.log({"x": 1}, timestamp=run.created + 12.5)
     run.finish()
     c = connect_ro(tmp_path / "r")
-    assert chunks.rows(c)[0][2] == 12.5
+    assert chunks.rows(c)[0].t == 12.5
     c.close()
 
 
-def media_of(d):
+def media_of(d: Path) -> list[tuple[str, str, bytes]]:
     c = connect_ro(d)
     out = c.execute("SELECT key, kind, file FROM media ORDER BY seq").fetchall()
     c.close()
@@ -262,13 +272,12 @@ def media_of(d):
 
 
 class FakePIL:
-    def save(self, fp, format):
+    def save(self, fp: IO[bytes], format: str) -> None:
         assert format == "PNG"
         fp.write(b"\x89PNG\r\n\x1a\nfake")
 
 
-def test_images_are_logged_from_arrays_paths_bytes_and_pil_images(tmp_path):
-    np = pytest.importorskip("numpy")
+def test_images_are_logged_from_arrays_paths_bytes_and_pil_images(tmp_path: Path) -> None:
     jpg = tmp_path / "photo.JPEG"
     jpg.write_bytes(b"\xff\xd8\xff\xe0jpeg")
     run = trex.init(tmp_path / "r")
@@ -285,7 +294,7 @@ def test_images_are_logged_from_arrays_paths_bytes_and_pil_images(tmp_path):
     c.close()
 
 
-def test_videos_and_html_are_logged_from_bytes_and_paths(tmp_path):
+def test_videos_and_html_are_logged_from_bytes_and_paths(tmp_path: Path) -> None:
     mp4, page = tmp_path / "clip.mp4", tmp_path / "page.html"
     mp4.write_bytes(b"\0\0\0\x18ftypisom")
     page.write_text("<i>report</i>")
@@ -298,8 +307,7 @@ def test_videos_and_html_are_logged_from_bytes_and_paths(tmp_path):
                                         ("page", "html", b"<i>report</i>")]
 
 
-def test_metric_values_unwrap_scalars_count_bools_and_drop_non_numbers(tmp_path):
-    np = pytest.importorskip("numpy")
+def test_metric_values_unwrap_scalars_count_bools_and_drop_non_numbers(tmp_path: Path) -> None:
     run = trex.init(tmp_path / "r")
     untyped: Any = {"vec": np.array([1, 2]), "name": "x", "none": None}
     run.log({"f32": np.float32(1.5), "i64": np.int64(3), "flag": True, **untyped})
@@ -309,8 +317,9 @@ def test_metric_values_unwrap_scalars_count_bools_and_drop_non_numbers(tmp_path)
     assert rows_of(tmp_path / "r") == [(0, 0.0, {"f32": 1.5, "i64": 3.0, "flag": 1.0}), (1, 1.0, {"zero_d": 2.0})]
 
 
-def test_writer_errors_are_raised_by_finish_and_never_by_log(tmp_path, monkeypatch, capsys):
-    def broken(self, c, final_state=None):
+def test_writer_errors_are_raised_by_finish_and_never_by_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                             capsys: pytest.CaptureFixture[str]) -> None:
+    def broken(self: trex.Run, c: sqlite3.Connection, final_state: trex.FinalState | None = None) -> NoReturn:
         raise OSError("disk full")
 
     monkeypatch.setattr(trex.writer.Run, "_commit", broken)
@@ -323,7 +332,7 @@ def test_writer_errors_are_raised_by_finish_and_never_by_log(tmp_path, monkeypat
     assert "disk full" in capsys.readouterr().err
 
 
-def test_uncaught_exception_marks_the_run_failed_and_still_reports_the_error(tmp_path):
+def test_uncaught_exception_marks_the_run_failed_and_still_reports_the_error(tmp_path: Path) -> None:
     code = textwrap.dedent(f"""
         import trex
         run = trex.init({str(tmp_path / "r")!r})
@@ -335,7 +344,7 @@ def test_uncaught_exception_marks_the_run_failed_and_still_reports_the_error(tmp
     assert meta_of(tmp_path / "r")["state"] == "failed" and rows_of(tmp_path / "r") == [(0, 0.0, {"x": 1.0})]
 
 
-def test_summary_and_info_values_that_are_not_json_become_text(tmp_path):
+def test_summary_and_info_values_that_are_not_json_become_text(tmp_path: Path) -> None:
     run = trex.init(tmp_path / "r")
     run.summary(path=tmp_path / "ckpt", best=float("inf"), pair=(1, 2))
     run.finish()
