@@ -188,7 +188,7 @@ def test_series_returns_each_keys_points_in_row_order_across_commits_of_mixed_ro
         want = [(s, d[key]) for s, d in expected if key in d]
         assert [(r["step"], r["value"]) for r in rows if r["key"] == key] == want
     assert not [r for r in rows if r["key"] == "absent"]
-    xs, ys = Q.series(path, ["loss"], x="runtime")["loss"]
+    xs, ys = Q.series(path, {"loss"}.__contains__, x="runtime")["loss"]
     assert list(xs) == pytest.approx([s for s, d in expected])
     assert list(ys) == [d["loss"] for _, d in expected]
 
@@ -359,8 +359,15 @@ def test_fields_resolve_config_first_then_summary_with_prefixes_and_nested_info(
     assert Q.get(RECORD, field) == want
 
 
-def test_summary_markers_are_numbers():
-    assert str(Q.get(RECORD, "loss")) == "nan" and Q.num("-inf") == -math.inf and Q.num("abc") is None and Q.num(True) == 1.0
+def test_summary_markers_sort_as_numbers_and_nan_as_missing():
+    recs = [{**RECORD, "summary": {"loss": v}} for v in ("inf", "nan", 1.0, "-inf")]
+    assert [r["summary"]["loss"] for r in Q.sort_records(recs, "summary.loss")] == ["-inf", 1.0, "inf", "nan"]
+
+
+@pytest.mark.parametrize("clause", ["summary.note = best", "note = best", "done = true", "summary.done = true"])
+def test_text_and_boolean_summaries_filter_as_in_the_ui(clause):
+    rec = cast(Q.Record, {**RECORD, "summary": {"note": "best", "done": True}})
+    assert where_test(clause)(lambda f: Q.get(rec, f))
 
 
 @pytest.mark.parametrize("clause,want", [("name > q", True), ("name < q", False), ("name >= r", True), ("config.both < d", True)])

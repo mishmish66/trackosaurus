@@ -24,7 +24,7 @@ import struct
 import tempfile
 import uuid
 import zlib
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Final, NamedTuple, cast
 
@@ -45,8 +45,7 @@ type Op = tuple[str, Sequence[Value]]
 
 
 class Record(NamedTuple):
-    start: int  # offset of the record in the journal
-    end: int  # offset just past it
+    end: int  # offset just past the record in the journal
     payload: dict[str, object]
 
 
@@ -104,16 +103,16 @@ def records(data: bytes, offset: int = 0) -> Iterator[Record]:
         body = data[offset + 4: offset + 4 + n]
         if end > len(data) or zlib.crc32(body) != _HEAD.unpack_from(data, offset + 4 + n)[0]:
             return
-        yield Record(offset, end, json.loads(body))
+        yield Record(end, json.loads(body))
         offset = end
 
 
 class Writer:
     """Appends a run's commits to its journal, fsync'ing each."""
 
-    def __init__(self, run_dir: Path, run_id: str, seq: int, mseq: int, snapshot: Callable[[], list[Op]]) -> None:
+    def __init__(self, run_dir: Path, run_id: str, seq: int, mseq: int, c: sqlite3.Connection) -> None:
         """Continue the journal if it holds this run up to `seq` rows and `mseq` media, else start a new one
-        from `snapshot` (every op that rebuilds the run)."""
+        from the inserts that rebuild the run in `c`."""
         self.path = run_dir / JOURNAL
         data = self.path.read_bytes() if self.path.exists() else b""
         recs = list(records(data))
@@ -128,7 +127,7 @@ class Writer:
         tmp = self.path.with_name(f".{JOURNAL}.{os.getpid()}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         os.write(fd, _encode({"journal": uuid.uuid4().hex, "run": run_id, "host": host()}))
-        os.write(fd, _encode({"ops": snapshot(), "seq": seq, "mseq": mseq}))
+        os.write(fd, _encode({"ops": snapshot(c), "seq": seq, "mseq": mseq}))
         os.fsync(fd)
         os.close(fd)
         os.replace(tmp, self.path)
@@ -144,6 +143,14 @@ class Writer:
 
     def close(self) -> None:
         os.close(self.fd)
+
+
+def snapshot(c: sqlite3.Connection) -> list[Op]:
+    """Inserts that rebuild the run in `c`."""
+    ops: list[Op] = []
+    for table, cols in TABLES.items():
+        ops += [(table, tuple(row)) for row in c.execute(f"SELECT {', '.join(cols)} FROM {table}")]
+    return ops
 
 
 def replay(c: sqlite3.Connection, ops: Sequence[Sequence[object]]) -> None:

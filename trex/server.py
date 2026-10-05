@@ -1,12 +1,12 @@
 """HTTP server for the explorer UI (started by `trex serve`; see cli.py)."""
 
+import contextlib
 import errno
 import gzip
 import html
 import ipaddress
 import json
 import os
-import queue
 import re
 import socket
 import socketserver
@@ -19,10 +19,10 @@ from typing import TYPE_CHECKING, Any, Final, cast
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import remote, update
-from .daemon import resolve_root, root_url, workspace_url
+from .daemon import root_url, workspace_url
 from .remote import Remote
-from .workspace import HEARTBEAT, Far, Workspace
-from .index import Explorer, Which, dumps, sse
+from .workspace import Far, Workspace
+from .index import Explorer, Which, dumps
 
 if TYPE_CHECKING:
     from .daemon import Roots
@@ -300,9 +300,9 @@ class Handler(BaseHTTPRequestHandler):
         ex = self.ex
         if isinstance(ex, Workspace):
             m, path = ex.resolve(run)
-            if isinstance(m, Far):
-                return self._proxy(m.remote, f"/m/{quote(path, safe='')}/{file}")
-            ex, run = m.ex, path
+            if isinstance(m.src, Far):
+                return self._proxy(m.src.remote, f"/m/{quote(path, safe='')}/{file}")
+            ex, run = m.src, path
         self.send_file(ex.media_path(run, file), f'"{file}"', "public, max-age=31536000, immutable", extra, compress=html)
 
     @route("GET", r"/api/info")
@@ -447,28 +447,17 @@ class Handler(BaseHTTPRequestHandler):
     @route("GET", r"/api/stream")
     def stream(self, q: Query) -> None:
         """SSE for runs under `path`: rows not yet in kept buckets, then live events and heartbeats."""
-        prefix = q.get("path", "")
-        if isinstance(self.ex, Workspace):
-            return self._workspace_stream(self.ex, prefix)
-        ex = self.ex
-        sub = ex.hub.subscribe(prefix)
+        stop = threading.Event()
         try:
             self._event_stream_headers()
-            self.wfile.write(b"retry: 2000\n\n" + b"".join(ex.backfill(prefix)))
-            while not sub.dead:
-                msgs = []
-                try:
-                    msgs.append(sub.q.get(timeout=HEARTBEAT))
-                    while len(msgs) < 2000:
-                        msgs.append(sub.q.get_nowait())
-                except queue.Empty:
-                    if not msgs:
-                        msgs.append(sse("hb", ex.live_seqs(prefix)))
-                self.wfile.write(b"".join(msgs))
+            self.wfile.write(b"retry: 2000\n\n")
+            with contextlib.closing(self.ex.messages(q.get("path", ""), stop)) as msgs:
+                for msg in msgs:
+                    self.wfile.write(msg)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
-            ex.hub.unsubscribe(sub)
+            stop.set()
 
     def _event_stream_headers(self) -> None:
         self.send_response(200)
@@ -478,19 +467,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
-
-    def _workspace_stream(self, ws: Workspace, prefix: str) -> None:
-        """The merged streams of a workspace's members, until the client goes away."""
-        stop = threading.Event()
-        try:
-            self._event_stream_headers()
-            self.wfile.write(b"retry: 2000\n\n")
-            for msg in ws.events(prefix, stop):
-                self.wfile.write(msg)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-        finally:
-            stop.set()
 
 
 class Server(ThreadingHTTPServer):
@@ -582,14 +558,6 @@ def urls(servers: Sequence[Server]) -> list[str]:
         host, port = str(s.server_address[0]), s.server_address[1]
         out.append(f"http://{f'[{host}]' if ':' in host else host}:{port}/")
     return out
-
-
-def check_root(root: str | os.PathLike[str], force: bool) -> Path:
-    """`resolve_root`, exiting with its error."""
-    try:
-        return resolve_root(root, force)
-    except ValueError as e:
-        sys.exit(f"trex: {e}")
 
 
 def _whole(v: object) -> int:

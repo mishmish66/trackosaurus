@@ -256,10 +256,11 @@ export function pointBuffer(buf, n) {
 }
 
 /** Line table: per line (point offset, point count, color). */
+/** Lines' (offset, count, color), in whole rows of the table texture. */
 export class Table {
   constructor(n) {
     this.n = 0;
-    this.a = new Int32Array(4 * Math.max(1, n));
+    this.a = new Int32Array(4 * MW * Math.max(1, Math.ceil(n / MW)));
   }
   clear() {
     this.n = 0;
@@ -300,7 +301,6 @@ class Renderer {
     this.canvas.addEventListener("webglcontextrestored", () => {
       this.init();
       this.lost = false;
-      this.onRestore?.();
     });
     this.init();
   }
@@ -352,8 +352,8 @@ class Renderer {
     }
   }
 
-  /** Whether density rendering is available. */
-  get density() {
+  /** Whether this GPU draws density heatmaps (float render targets). */
+  get heatmaps() {
     return this.densFormat !== null;
   }
 
@@ -433,12 +433,7 @@ class Renderer {
     gl.bindTexture(gl.TEXTURE_2D, pts.tex);
     gl.uniform1i(u.u_pos, 0);
     gl.activeTexture(gl.TEXTURE1);
-    const rows = Math.max(1, Math.ceil(table.n / MW)), need = 4 * MW * rows;
-    if (table.a.length < need) {
-      const b = new Int32Array(need);
-      b.set(table.a);
-      table.a = b;
-    }
+    const rows = Math.max(1, Math.ceil(table.n / MW));
     if (this.metaAt + rows > this.metaRows) {
       if (this.metaTex) gl.deleteTexture(this.metaTex);
       this.metaRows = Math.max(META_ROWS, rows);

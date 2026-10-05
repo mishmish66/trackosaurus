@@ -161,8 +161,7 @@ class Remote:
         """One ssh session, after sending this trex's wheel when the remote lacks it (if `send`); whether it
         connected."""
         sock = f"/tmp/trex-{uuid.uuid4().hex[:16]}.sock"
-        ssh, name = os.environ.get("TREX_SSH", "ssh"), wheel()[0]
-        cmd = [ssh, *SSH_OPTIONS, "-L", f"{self.local}:{sock}", self.addr.host, remote_command(self.addr, sock, name)]
+        cmd = [*ssh(), "-L", f"{self.local}:{sock}", self.addr.host, remote_command(self.addr, sock, wheel()[0])]
         self.state, self.error = "starting", ""
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -197,16 +196,20 @@ class Remote:
             self.error = "\n".join(errors) or f"ssh exited with status {proc.returncode}"
         return connected
 
-
     def _send(self) -> str | None:
         """Copy this trex's wheel to the remote's WHEELS over ssh; None when it arrived, else why not."""
         name, data = wheel()
-        cmd = [os.environ.get("TREX_SSH", "ssh"), *SSH_OPTIONS, self.addr.host, upload_command(name)]
+        cmd = [*ssh(), self.addr.host, upload_command(name)]
         try:
             done = subprocess.run(cmd, input=data, capture_output=True, timeout=ADD_TIMEOUT)
         except (OSError, subprocess.TimeoutExpired) as e:
             return f"sending trex: {e}"
         return None if done.returncode == 0 else f"sending trex: {done.stderr.decode(errors='replace').strip() or done.returncode}"
+
+
+def ssh() -> list[str]:
+    """The ssh command ($TREX_SSH, else ssh) and its options."""
+    return [os.environ.get("TREX_SSH", "ssh"), *SSH_OPTIONS]
 
 
 def _end(proc: subprocess.Popen[str]) -> None:

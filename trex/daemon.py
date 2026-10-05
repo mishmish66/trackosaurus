@@ -41,7 +41,7 @@ from urllib.parse import quote
 from . import remote
 from .index import Explorer
 from .remote import Remote
-from .workspace import Far, Local, Workspace
+from .workspace import Far, Member, Workspace
 
 TIMEOUT: Final = 60.0  # seconds a client waits for the daemon's reply
 HISTORY_MAX: Final = 50  # directories remembered for re-adding
@@ -143,13 +143,12 @@ class Roots:
             saved = json.loads(self.state.read_text())
         except FileNotFoundError:
             return
-        tracked = saved.get("tracked", []) if isinstance(saved, dict) else [e.get("root", "") for e in saved]
-        for spec in map(str, tracked):
+        for spec in map(str, saved.get("tracked", [])):
             try:
                 self.track(spec, force=True, wait=False)
             except ValueError as e:
                 print(f"[trex] skipping saved directory {spec}: {e}", file=sys.stderr, flush=True)
-        for w in saved.get("workspaces", []) if isinstance(saved, dict) else []:
+        for w in saved.get("workspaces", []):
             members = [m for m in map(str, w.get("members", [])) if m in self.entries]
             with self.lock:
                 self.workspaces[str(w.get("name"))] = members
@@ -272,9 +271,9 @@ class Roots:
                 view = self._views[""] = Workspace("/", self._members(list(self.entries)), nested=True)
             return view
 
-    def _members(self, specs: Sequence[str]) -> list[Local | Far]:
+    def _members(self, specs: Sequence[str]) -> list[Member]:
         names = self.names()
-        return [Far(names[s], e) if isinstance(e := self.entries[s], Remote) else Local(names[s], e) for s in specs]
+        return [Member(names[s], Far(e) if isinstance(e := self.entries[s], Remote) else e) for s in specs]
 
     def workspace_list(self) -> list[dict[str, object]]:
         with self.lock:

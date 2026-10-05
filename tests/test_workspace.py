@@ -12,7 +12,7 @@ import pytest
 import trex
 from trex import buckets as bk, server
 from trex.daemon import Roots
-from trex.workspace import Workspace
+from trex.workspace import Member, Workspace
 
 import helpers
 from helpers import PNG, committed_rows, get_json, post_bytes, post_json, request, wait_for
@@ -256,10 +256,8 @@ def test_an_empty_daemon_root_has_no_runs(roots, http):
     assert get_json(f"{http}/api/runs") == {"runs": [], "media": [], "folders": {}}
 
 
-class EndlessMember:
-    """A member whose stream sends heartbeats as fast as they are taken; `ended` once the stream is closed."""
-
-    name = "m"
+class Endless:
+    """A directory whose stream sends heartbeats as fast as they are taken; `ended` once the stream is closed."""
 
     def __init__(self):
         self.sent = 0
@@ -268,20 +266,20 @@ class EndlessMember:
     def tree(self):
         return []
 
-    def events(self, prefix, stop):
+    def messages(self, prefix, stop):
         try:
             while True:
                 self.sent += 1
-                yield "hb", "{}"
+                yield b"event: hb\ndata: {}\n\n"
         finally:
             self.ended.set()
 
 
 def test_a_workspace_stream_ends_its_member_pumps_when_the_client_leaves():
-    fake, stop = EndlessMember(), threading.Event()
-    ws = Workspace("w", [cast(Any, fake)])
+    fake, stop = Endless(), threading.Event()
+    ws = Workspace("w", [Member("m", cast(Any, fake))])
     try:
-        gen = ws.events("", stop)
+        gen = ws.messages("", stop)
         next(gen)
         assert wait_for(lambda: fake.sent > 20_001)
         stop.set()

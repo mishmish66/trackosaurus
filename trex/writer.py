@@ -231,7 +231,7 @@ class Run:
         if not journal.wanted(self.dir):
             return
         try:
-            self._journal = journal.Writer(self.dir, self.id, self._seq, self._mseq, lambda: _snapshot(c))
+            self._journal = journal.Writer(self.dir, self.id, self._seq, self._mseq, c)
             self._journal.append(self._meta_ops(meta), self._seq, self._mseq)
         except OSError as e:
             self._journal_failed(e)
@@ -465,14 +465,6 @@ class Run:
             c.close()
             if self._journal is not None:
                 self._journal.close()
-
-
-def _snapshot(c: sqlite3.Connection) -> list[journal.Op]:
-    """Inserts that rebuild the run in `c`."""
-    ops: list[journal.Op] = []
-    for table, cols in journal.TABLES.items():
-        ops += [(table, tuple(row)) for row in c.execute(f"SELECT {', '.join(cols)} FROM {table}")]
-    return ops
 
 
 def init(dir: str | os.PathLike[str], *, name: str | None = None, config: Mapping[str, object] | None = None,

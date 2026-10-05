@@ -4,36 +4,35 @@ import csv
 import json
 import math
 import os
+import plistlib
 import re
+import shlex
 import signal
+import sqlite3
 import sys
 import threading
 import time
-from array import array
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Final, Literal, TextIO
+from typing import Annotated, Final, Literal
 
 import typer
 
-from . import query as Q
-from .format import JSONValue, as_dict, as_str
-from .server import DEFAULT_PORT
-from .where import compile_where
-
-if TYPE_CHECKING:
-    from .daemon import Roots
-    from .index import Explorer
-    from .server import Server
+from . import daemon, query as Q, remote, update
+from .compact import InUse, compact
+from .daemon import Roots, resolve_root
+from .format import DB, JSONValue, as_dict, as_str
+from .index import Explorer, RunsView
+from .server import DEFAULT_PORT, Server, bind, serve_unix, urls
+from .where import as_number, compile_where
 
 type OutRow = Mapping[str, object]
 type Format = Literal["table", "json", "jsonl", "csv", "tsv"]
-type Series = dict[str, tuple[array[float], array[float]]]
+type Series = dict[str, tuple[list[float], list[float]]]
 
-OPEN: "list[Explorer]" = []  # indexes a command opened, closed when it ends
 DEFAULT_COLUMNS: Final = ["path", "state", "step", "runtime"]
 STATE_COLORS: Final = {"running": "green", "failed": "red", "crashed": "red", "finished": "bright_black"}
 
@@ -82,7 +81,10 @@ def fmt_cell(col: str, v: object, width: int | None) -> str:
         return fmt_dur(v)
     if isinstance(v, (int, float)):
         return fmt_num(v)
-    s = v if isinstance(v, str) else json.dumps(jsonable(v), separators=(",", ":"))
+    if isinstance(v, list) and all(isinstance(x, (int, float)) for x in v):
+        s = "[" + ", ".join(fmt_num(x) for x in v) + "]"
+    else:
+        s = v if isinstance(v, str) else json.dumps(jsonable(v), separators=(",", ":"))
     return s if width is None or len(s) <= width else s[: width - 1] + "…"
 
 
@@ -91,10 +93,9 @@ def state(s: object) -> str:
     return typer.style(str(s), fg=STATE_COLORS.get(str(s)))
 
 
-def emit(rows: Sequence[OutRow], cols: Sequence[str] | None, fmt: Format, out: TextIO | None = None,
-         width: int | None = 48) -> None:
+def emit(rows: Sequence[OutRow], cols: Sequence[str] | None, fmt: Format, width: int | None = 48) -> None:
     """Print rows in `fmt`, restricted to `cols` (None: every key)."""
-    stream = out if out is not None else sys.stdout
+    stream = sys.stdout
     if fmt in ("json", "jsonl"):
         data = [jsonable(r if cols is None else {c: r.get(c) for c in cols}) for r in rows]
         stream.write(json.dumps(data, indent=1) + "\n" if fmt == "json" else "".join(json.dumps(d, separators=(",", ":")) + "\n" for d in data))
@@ -104,10 +105,10 @@ def emit(rows: Sequence[OutRow], cols: Sequence[str] | None, fmt: Format, out: T
         w = csv.writer(stream, delimiter="," if fmt == "csv" else "\t", lineterminator="\n")
         w.writerows([cols, *([fmt_cell(c, r.get(c), None) for c in cols] for r in rows)])
         return
-    _table(rows, cols, width, stream)
+    _table(rows, cols, width)
 
 
-def _table(rows: Sequence[OutRow], cols: Sequence[str], width: int | None, stream: TextIO) -> None:
+def _table(rows: Sequence[OutRow], cols: Sequence[str], width: int | None) -> None:
     """Aligned columns, numeric ones right-aligned; on a terminal the header is bold and states colored."""
     cells = [[fmt_cell(c, r.get(c), width) for c in cols] for r in rows]
     widths = [max([len(c)] + [len(row[i]) for row in cells]) for i, c in enumerate(cols)]
@@ -119,9 +120,9 @@ def _table(rows: Sequence[OutRow], cols: Sequence[str], width: int | None, strea
             padded = [p.replace(v, state(v), 1) if c == "state" and v else p for c, v, p in zip(cols, vals, padded, strict=True)]
         return "  ".join(padded).rstrip()
 
-    typer.echo(typer.style(line(cols, False), bold=True), file=stream)
+    typer.echo(typer.style(line(cols, False), bold=True))
     for row in cells:
-        typer.echo(line(row, True), file=stream)
+        typer.echo(line(row, True))
 
 
 # ---- selecting runs ----
@@ -138,36 +139,27 @@ class Selection:
 
     def scope(self) -> tuple[Path, str]:
         """(index root, folder prefix)."""
-        from .server import check_root
-
         p = Path(self.path).expanduser().resolve()
         if not p.exists():
-            sys.exit(f"trex: {self.path} does not exist")
+            raise ValueError(f"{self.path} does not exist")
         if self.root:
-            root = check_root(self.root, self.force)
+            root = resolve_root(self.root, self.force)
             if not p.is_relative_to(root):
-                sys.exit(f"trex: {p} is not under --root {root}")
+                raise ValueError(f"{p} is not under --root {root}")
             prefix = p.relative_to(root).as_posix()
             return root, "" if prefix == "." else prefix
         if Q.is_run(p):
-            return check_root(p.parent, self.force), p.name
-        return check_root(p, self.force), ""
+            return resolve_root(p.parent, self.force), p.name
+        return resolve_root(p, self.force), ""
 
-    def index(self) -> tuple[Q.Explorer, Path, str]:
-        """(index brought up to date, root, prefix)."""
+    def records(self) -> tuple[list[Q.Record], RunsView, Explorer, str]:
+        """(selected records, the folder's runs view, its index (closed), prefix)."""
         root, prefix = self.scope()
-        ex = Q.open_index(root, cache_dir(self.cache))
-        OPEN.append(ex)
-        return ex, root, prefix
-
-    def records(self) -> tuple[list[Q.Record], Q.Explorer, str]:
-        """(selected records, index, prefix)."""
-        ex, _, prefix = self.index()
-        return self.select(Q.records(ex, prefix)), ex, prefix
-
-    def select(self, recs: Iterable[Q.Record]) -> list[Q.Record]:
+        with Q.open_index(root, cache_dir(self.cache)) as ex:
+            view = ex.runs(prefix)
         tests = [where_test(w) for w in self.where]
-        return [r for r in recs if all(t(lambda f, r=r: Q.get(r, f)) for t in tests)]
+        recs = [r for r in Q.records(view, ex.dirs) if all(t(lambda f, r=r: Q.get(r, f)) for t in tests)]
+        return recs, view, ex, prefix
 
 
 def cache_dir(cache: str | None) -> str:
@@ -179,7 +171,7 @@ def run_dirs(args: Iterable[str]) -> list[Path]:
     paths = [line.strip() for a in args for line in (sys.stdin if a == "-" else [a]) if line.strip()]
     for p in paths:
         if not Q.is_run(Path(p).expanduser()):
-            sys.exit(f"trex: {p} is not a run directory (no trex.sqlite)")
+            raise ValueError(f"{p} is not a run directory (no trex.sqlite)")
     return [Path(p).expanduser() for p in paths]
 
 
@@ -269,9 +261,7 @@ app = typer.Typer(name="trex", help="trackosaurus exp: explore and query directo
 
 def _version(show: bool) -> None:
     if show:
-        from .update import installed
-
-        inst = installed()
+        inst = update.installed()
         typer.echo(f"trex {inst['version']}" + (f" ({inst['commit'][:12]})" if inst["commit"] else ""))
         raise typer.Exit()
 
@@ -293,9 +283,6 @@ def command[**P](name: str, *aliases: str) -> Callable[[Callable[P, None]], Call
             except (ValueError, re.error) as e:
                 typer.echo(f"trex {name}: {e}", err=True)
                 raise typer.Exit(2) from e
-            finally:
-                while OPEN:
-                    OPEN.pop().close()
 
         app.command(name)(run)
         for alias in aliases:
@@ -318,22 +305,21 @@ ServiceSource = Annotated[str | None, typer.Option(envvar="TREX_SOURCE", show_en
                                "git+https://github.com/mishmish66/trackosaurus; '' for no update button).")]
 
 
-def listen(explorer: "Explorer | None", hosts: list[str] | None, port: int | None, allow: list[str] | None,
-           roots: "Roots | None" = None) -> list["Server"]:
-    """`server.bind`, exiting with a message when an address is unavailable."""
-    from .server import bind
-
+def listen(explorer: Explorer | None, hosts: list[str] | None, port: int | None, allow: list[str] | None,
+           roots: Roots | None = None) -> list[Server]:
+    """`server.bind`; ValueError when an address is unavailable."""
     try:
         return bind(explorer, hosts or ["127.0.0.1"], port, roots, allow or [])
     except OSError as e:
-        sys.exit(f"trex: cannot listen on {', '.join(hosts or ['127.0.0.1'])} port {port or f'from {DEFAULT_PORT}'}: {e.strerror or e}")
+        where = f"{', '.join(hosts or ['127.0.0.1'])} port {port or f'from {DEFAULT_PORT}'}"
+        raise ValueError(f"cannot listen on {where}: {e.strerror or e}") from e
 
 
 def _interrupt(signum: int, frame: object) -> None:
     raise KeyboardInterrupt
 
 
-def run_servers(servers: Sequence["Server"], banner: Sequence[str]) -> None:
+def run_servers(servers: Sequence[Server], banner: Sequence[str]) -> None:
     """Print `banner`, then serve until SIGINT or SIGTERM."""
     signal.signal(signal.SIGTERM, _interrupt)
     try:
@@ -351,8 +337,6 @@ def run_servers(servers: Sequence["Server"], banner: Sequence[str]) -> None:
 
 def add_to_daemon(root: str, force: bool, yes: bool) -> bool:
     """Offer to add `root` (a path or host:path) to a running daemon; whether it was added."""
-    from . import daemon
-
     status = daemon.request({"op": "status"})
     if status is None:
         return False
@@ -361,7 +345,7 @@ def add_to_daemon(root: str, force: bool, yes: bool) -> bool:
         return False
     reply = daemon.request({"op": "add", "path": root, "force": force}) or {"error": "the daemon stopped"}
     if "error" in reply:
-        sys.exit(f"trex serve: {reply['error']}")
+        raise ValueError(reply["error"])
     typer.echo(f"trex daemon serving {typer.style(root, bold=True)} at {reply['url']}")
     return True
 
@@ -375,15 +359,11 @@ def serve_cmd(runs_dir: PathArg, host: Hosts = None, port: Port = None, allow_ho
               exit_on_eof: Annotated[bool, typer.Option("--exit-on-eof", hidden=True)] = False) -> None:
     """Crawl a runs directory and serve the web UI, or add it to a running `trex daemon` (which also serves
     host:path directories over ssh)."""
-    from . import remote
-    from .index import Explorer
-    from .server import check_root, serve_unix, urls
-
     if remote.parse(runs_dir):
         if not add_to_daemon(runs_dir, force, yes=True):
-            sys.exit("trex serve: host:path directories are served by `trex daemon`; start one first")
+            raise ValueError("host:path directories are served by `trex daemon`; start one first")
         return
-    root = check_root(runs_dir, force)
+    root = resolve_root(runs_dir, force)
     if not standalone and add_to_daemon(str(root), force, yes):
         return
     ex = Explorer(root, cache_dir(cache)).start()
@@ -408,9 +388,6 @@ def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]..
                cache: Annotated[str | None, typer.Option(help="Cache directory (default $TREX_CACHE or ~/.cache/trex).")] = None,
                force: Force = False) -> None:
     """Serve several runs directories from one server; `trex serve DIR` offers to add to it."""
-    from . import daemon, update
-    from .server import urls
-
     roots = daemon.Roots(Path(cache).expanduser() if cache else daemon.default_cache(), daemon.state_dir() / "roots.json")
     servers = listen(None, host, port, allow_host, roots)
     try:
@@ -429,10 +406,7 @@ def daemon_cmd(dirs: Annotated[list[str] | None, typer.Argument(metavar="[DIR]..
     threading.Thread(target=control.serve_forever, name="trex-control", daemon=True).start()
     roots.load()
     for d in dirs or []:
-        try:
-            roots.track(d, force, wait=False)
-        except ValueError as e:
-            sys.exit(f"trex: {e}")
+        roots.track(d, force, wait=False)
     banner = [f"trex daemon on {'  '.join(urls(servers))}  socket={control.path}  cache={roots.cache}",
               *(f"  {r['name']}  {r['root']}" for r in roots.served())]
     try:
@@ -482,8 +456,6 @@ def daemon_args(hosts: list[str], allow: list[str]) -> list[str]:
 
 def service_source(source: str | None) -> str | None:
     """The default repository when not given; None for ''."""
-    from . import update
-
     return update.DEFAULT_SOURCE if source is None else source or None
 
 
@@ -495,18 +467,12 @@ def service_env(cache: str | None, source: str | None) -> dict[str, str]:
 
 def service_path(*extra: str) -> str:
     """A service's PATH: uv's directory, this Python's, `extra`, then the system's."""
-    from . import update
-
     path = [str(Path(update.uv()).parent), str(Path(sys.executable).parent), *extra, "/usr/local/bin", "/usr/bin", "/bin"]
     return ":".join(dict.fromkeys(path))
 
 
 def systemd_unit(hosts: list[str], port: int, allow: list[str], cache: str | None, source: str | None) -> str:
     """The unit for `trex systemd-unit`."""
-    import shlex
-
-    from . import update
-
     host_args = daemon_args(hosts, allow)
     options = [*(["--port", str(port)] if port != DEFAULT_PORT else []), *(["--cache", cache] if cache else []),
                *(["--source", source] if source else [])]
@@ -526,14 +492,11 @@ def systemd_unit_cmd(host: Hosts = None, port: ServicePort = DEFAULT_PORT, allow
 
 def warn_not_tool_install(command: str, source: str | None) -> None:
     """Say on stderr that the update button will not show when this trex is not the uv tool install."""
-    from . import update
-
     if source and update.tool_env() != Path(sys.prefix).resolve():
         typer.echo(f"trex {command}: this trex ({sys.prefix}) is not the uv tool install, so the update button will "
                    f"not show; run the service from `uv tool install {source}`", err=True)
 
 
-LAUNCHD_LABEL: Final = "trex"
 PLIST_HEAD: Final = """\
 <!-- trex daemon as a launchd agent, running while you are logged in:
        trex launchd-plist > ~/Library/LaunchAgents/trex.plist
@@ -548,14 +511,10 @@ PLIST_HEAD: Final = """\
 
 def launchd_plist(hosts: list[str], port: int, allow: list[str], cache: str | None, source: str | None) -> str:
     """The agent for `trex launchd-plist`."""
-    import plistlib
-
-    from . import update
-
     env = {"PATH": service_path("/opt/homebrew/bin"), "PYTHONUNBUFFERED": "1", "NO_COLOR": "1", "TREX_SERVICE": "launchd",
            **service_env(cache, source)}
     log = str(Path.home() / "Library" / "Logs" / "trex.log")
-    agent = {"Label": LAUNCHD_LABEL,
+    agent = {"Label": "trex",
              "ProgramArguments": [sys.executable, "-m", "trex", "daemon", *daemon_args(hosts, allow), "--port", str(port)],
              "EnvironmentVariables": env, "RunAtLoad": True,
              "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 2, "ExitTimeOut": 30,
@@ -582,7 +541,7 @@ def ls_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
            paths: Annotated[bool, typer.Option("--paths", help="Print only absolute run directories (to pipe into series/diff -).")] = False,
            fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """List runs, with filters, sorting and chosen columns."""
-    recs, _, _ = Selection(path, where or [], root, cache, force).records()
+    recs = Selection(path, where or [], root, cache, force).records()[0]
     recs = Q.sort_records(recs, sort or "path")[:limit or None]
     fmt = out_format(fmt, as_json)
     if paths:
@@ -612,8 +571,8 @@ class GroupSpec:
         if self.reduce == "last" and self.at is None:
             return Q.get(rec, f"summary.{key}")
         if rec["dir"] not in cache:
-            cache[rec["dir"]] = Q.series(rec["dir"], [metric_key(m) for m in self.metrics], x=self.x)
-        xs, ys = cache[rec["dir"]].get(key, (array("d"), array("d")))
+            cache[rec["dir"]] = Q.series(rec["dir"], {metric_key(m) for m in self.metrics}.__contains__, x=self.x)
+        xs, ys = cache[rec["dir"]].get(key, ([], []))
         return Q.reduce(xs, ys, self.reduce, at=self.at)
 
     def rows(self, recs: Sequence[Q.Record], fields: Sequence[str], prefix: str) -> list[dict[str, object]]:
@@ -628,7 +587,7 @@ class GroupSpec:
         """A group's row: its fields, run count, and per metric the center, CI, and range and n (or full stats)."""
         row["runs"] = len(members)
         for m in self.metrics:
-            st = Q.stats([Q.num(self.value(r, m, cache)) for r in members], center=self.center)
+            st = Q.stats([as_number(self.value(r, m, cache)) for r in members], center=self.center)
             label = metric_key(m)
             row[label] = st.get(self.center)
             row[f"{label}:ci"] = [st["ci_lo"], st["ci_hi"]] if "ci_lo" in st and "ci_hi" in st else None
@@ -663,12 +622,10 @@ def group_fields(exprs: Iterable[str]) -> list[str]:
 
 
 def group_by_fields(given: Sequence[str] | None, path: str, root: str | None) -> list[str]:
-    """Fields of the given group-by, else of the one declared for `path`."""
-    return group_fields(given) if given else declared_group_by(path, root)
-
-
-def declared_group_by(path: str, root: str | None) -> list[str]:
-    """The group-by the nearest trex_info.json at or above `path` declares, else run~1."""
+    """Fields of the given group-by, else of the one the nearest trex_info.json at or above `path` declares, else
+    run~1."""
+    if given:
+        return group_fields(given)
     for _, info in reversed(Q.folder_infos(path, root)):
         g = as_dict(as_dict(info).get("trex")).get("group_by")
         if isinstance(g, str) or isinstance(g, list):
@@ -695,10 +652,6 @@ def group_key(rec: Q.Record, field: str, prefix: str) -> object:
     return v if v is None or isinstance(v, (str, int, float, bool)) else json.dumps(v)
 
 
-def _bracketed(v: object) -> object:
-    return "[" + ", ".join(fmt_num(x) for x in v) + "]" if isinstance(v, list) else v
-
-
 @command("groups", "compare")
 def groups_cmd(path: PathArg = ".",
                group_by: Annotated[list[str] | None, typer.Option("--group-by", "-g", show_default=False,
@@ -713,7 +666,7 @@ def groups_cmd(path: PathArg = ".",
                sort: Annotated[str | None, typer.Option("--sort", "-s", help="Columns to sort by; default the first metric, descending.")] = None,
                limit: Limit = None, fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Aggregate runs into groups with a median or mean and its 95% CI."""
-    recs, _, prefix = Selection(path, where or [], root, cache, force).records()
+    recs, _, _, prefix = Selection(path, where or [], root, cache, force).records()
     fmt, fields = out_format(fmt, as_json), group_by_fields(group_by, str(path), root)
     spec = GroupSpec(_csv(metric or []), reduce, at, x, center, stats=fmt in ("json", "jsonl"))
     keys = [metric_key(m) for m in spec.metrics]
@@ -722,7 +675,7 @@ def groups_cmd(path: PathArg = ".",
     if spec.stats:
         return emit(rows, None, fmt)
     cols = fields + ["runs"] + [f"{k}{part}" for k in keys for part in ("", ":ci", ":range", ":n")]
-    emit([{k: _bracketed(v) if k.endswith((":ci", ":range")) else v for k, v in r.items()} for r in rows], cols, fmt, width=width(full))
+    emit(rows, cols, fmt, width=width(full))
     if keys and fmt == "table":
         sys.stdout.flush()
         typer.echo(spec.note(rows), err=True)
@@ -734,13 +687,13 @@ def keys_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
              pattern: Annotated[str | None, typer.Option("--pattern", "-p", help="Regex on key names.")] = None,
              fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Metric and media keys across runs, with the spread of last values."""
-    recs, ex, prefix = Selection(path, where or [], root, cache, force).records()
+    recs, view = Selection(path, where or [], root, cache, force).records()[:2]
     rx = re.compile(pattern) if pattern else None
     last: dict[str, list[float | None]] = {}
     for r in recs:
         for k, v in r["summary"].items():
             if not rx or rx.search(k):
-                last.setdefault(k, []).append(Q.num(v))
+                last.setdefault(k, []).append(as_number(v))
     rows: list[dict[str, object]] = []
     for k, vals in sorted(last.items()):
         st = Q.stats(vals)
@@ -748,7 +701,7 @@ def keys_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
                      "last_median": st.get("median"), "last_max": st.get("max")})
     paths = {r["path"] for r in recs}
     media: dict[tuple[str, str], list[str]] = {}
-    for m in ex.runs(prefix)["media"]:
+    for m in view["media"]:
         if m.run in paths and (not rx or rx.search(m.key)):
             media.setdefault((m.key, m.kind), []).append(m.run)
     rows += [{"key": k, "kind": kind, "runs": len(set(rs)), "items": len(rs)} for (k, kind), rs in sorted(media.items())]
@@ -793,10 +746,9 @@ def tree_cmd(path: PathArg = ".", where: Where = None, root: Root = None,
              runs: Annotated[bool, typer.Option("--runs", help="Also list runs under each shown folder.")] = False,
              fmt: Fmt = "table", as_json: Json = False) -> None:
     """Folder tree with run counts by state and folder notes."""
-    sel = Selection(path, where or [], root, cache, force)
-    ex, index_root, prefix = sel.index()
-    tree = folder_tree(sel.select(Q.records(ex, prefix)), prefix, prefix or index_root.name)
-    notes = {p: v[1] for p, v in ex.folders.items()}
+    recs, view, ex, prefix = Selection(path, where or [], root, cache, force).records()
+    tree = folder_tree(recs, prefix, prefix or ex.root.name)
+    notes = view["folders"]
     fmt = out_format(fmt, as_json)
 
     def folder_json(node: Folder, level: int) -> dict[str, object]:
@@ -883,19 +835,14 @@ class SeriesSpec:
     smooth: float | None
     paths: bool
 
-    def keys(self, d: Path) -> list[str]:
-        """--key keys, plus the run's keys matching --pattern."""
-        keys = set(self.key)
-        if self.pattern:
-            keys |= {k for k in Q.read_keys(d) if re.search(self.pattern, k)}
-        if not keys:
-            sys.exit("trex series: give --key KEY (repeatable) or --pattern REGEX")
-        return sorted(keys)
+    def wanted(self, key: str) -> bool:
+        """Whether --key names `key` or --pattern matches it."""
+        return key in self.key or bool(self.pattern and re.search(self.pattern, key))
 
     def rows(self, d: Path) -> list[dict[str, object]]:
         name = str(d) if self.paths else as_str(Q.read_meta(d).get("name")) or d.name
         rows: list[dict[str, object]] = []
-        for k, (xs, ys) in Q.series(d, self.keys(d), x=self.x).items():
+        for k, (xs, ys) in sorted(Q.series(d, self.wanted, x=self.x).items()):
             pts = [(a, b) for a, b in zip(xs, ys, strict=True) if (self.since is None or a >= self.since) and (self.until is None or a <= self.until)]
             sx, sy = [a for a, _ in pts], [b for _, b in pts]
             sm = Q.twema(sx, sy, self.smooth, Q.smooth_scale(max(xs) - min(xs) if xs else 0)) if self.smooth else None
@@ -917,6 +864,8 @@ def series_cmd(runs: RunsArg,
                paths: Annotated[bool, typer.Option("--paths", help="Label rows by run directory instead of name.")] = False,
                fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Metric series of one or more runs, in long format."""
+    if not key and not pattern:
+        raise ValueError("give --key KEY (repeatable) or --pattern REGEX")
     spec = SeriesSpec(key or [], pattern, x, since, until, last, every, points, smooth, paths)
     rows = [row for d in run_dirs(runs) for row in spec.rows(d)]
     emit(rows, ["run", "key", x, "value"] + (["smoothed"] if smooth else []), out_format(fmt, as_json), width=width(full))
@@ -932,8 +881,8 @@ def tail_cmd(run: RunArg,
              fmt: Fmt = "table", as_json: Json = False, full: Full = False) -> None:
     """Last rows of a run; --follow streams new ones until it ends."""
     (d,) = run_dirs([run])
-    keys, fmt = key or None, out_format(fmt, as_json)
-    first = max(0, Q.row_count(d) - lines) if lines > 0 else Q.row_count(d)
+    keys, fmt, n = key or None, out_format(fmt, as_json), Q.row_count(d)
+    first = max(0, n - lines) if lines > 0 else n
     rows = Q.read_rows(d, keys, start=first)
     cols: list[str] = []
     show_rows(rows[-lines:] if lines else [], keys, cols, fmt, width(full), first=True)
@@ -1001,11 +950,6 @@ def compact_cmd(paths: Annotated[list[str], typer.Argument(metavar="PATH...", he
                                                            show_default=False)]) -> None:
     """Rewrite runs with their commits merged, which shrinks runs logged a few rows per commit; the one command that
     writes run files. A run another process has open, such as one still being written, is skipped."""
-    import sqlite3
-
-    from .compact import InUse, compact
-    from .format import DB
-
     found: list[Path] = []
     for a in paths:
         p = Path(a).expanduser()
@@ -1014,7 +958,7 @@ def compact_cmd(paths: Annotated[list[str], typer.Argument(metavar="PATH...", he
         elif p.is_dir():
             found += sorted(d.parent for d in p.rglob(DB))
         else:
-            sys.exit(f"trex compact: {a} is not a run or a directory")
+            raise ValueError(f"{a} is not a run or a directory")
     before = after = done = skipped = failed = 0
 
     def mb(b: int) -> str:
@@ -1046,7 +990,7 @@ def diff_cmd(runs: RunsArg, all_keys: Annotated[bool, typer.Option("--all", help
     """Config (or info) differences between runs."""
     dirs = run_dirs(runs)
     if len(dirs) < 2:
-        sys.exit("trex diff: give at least two runs")
+        raise ValueError("give at least two runs")
     metas = [Q.read_meta(d) for d in dirs]
     names = run_labels(dirs, metas)
     vals = [flatten(as_dict(m.get("info" if info else "config"))) for m in metas]
@@ -1060,12 +1004,11 @@ def index_cmd(path: PathArg = ".", root: Root = None, cache: Cache = None, force
               fmt: Fmt = "table", as_json: Json = False) -> None:
     """Build or refresh the cache for a runs directory and report counts."""
     t0 = time.time()
-    ex, index_root, prefix = Selection(path, [], root, cache, force).index()
-    recs = Q.records(ex, prefix)
+    recs, _, ex, prefix = Selection(path, [], root, cache, force).records()
     states: dict[str, int] = {}
     for r in recs:
         states[r["state"]] = states.get(r["state"], 0) + 1
-    out = {"root": str(index_root), "path": prefix, "runs": len(recs), "states": states,
+    out = {"root": str(ex.root), "path": prefix, "runs": len(recs), "states": states,
            "cache": str(ex.cache_dir.resolve()), "seconds": round(time.time() - t0, 3)}
     fmt = out_format(fmt, as_json)
     emit([out], None if fmt in ("json", "jsonl") else list(out), fmt, width=None)

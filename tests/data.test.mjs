@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Data } from "../trex/static/data.js";
 
-const UI = { status() {}, data() {}, runs() {}, keys() {}, media() {}, idle() {}, replan() {}, conn() {}, protocol() {} };
+const UI = { status() {}, data() {}, runs() {}, keys() {}, media() {}, idle() {}, conn() {}, protocol() {} };
 
 /** A bucket array of no buckets naming runs `paths`, holding rows `seqs` of them (buckets.encode). */
 function emptyArray(level, index, paths, seqs) {

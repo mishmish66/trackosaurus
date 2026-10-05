@@ -46,7 +46,7 @@ def test_metric_columns_follow_row_order_across_commits_and_row_shapes(db):
 
 def test_metric_row_and_step_windows(db):
     ids = write_commits(db, TRAIN_EVAL)
-    assert list(chunks.metric(db, ids["loss"], start=2, stop=4)[1]) == [0.9, 0.8]
+    assert list(chunks.metric(db, ids["loss"], stop=4)[1]) == [1.0, 1.5, 0.9, 0.8]
     assert list(chunks.metric(db, ids["loss"], step_lo=2.5)[0]) == [2.0, 3.0]
     assert chunks.metric(db, 99)[0].size == 0
 
@@ -61,7 +61,7 @@ def test_rows_round_trip(db):
 
 def test_commit_size_is_bounded():
     with pytest.raises(ValueError):
-        chunks.encode([(0.0, 0.0, {"a": 1})] * (chunks.MAX_ROWS + 1), {})
+        chunks.inserts(0, [(0.0, 0.0, {"a": 1})] * (chunks.MAX_ROWS + 1), {})
 
 
 SPARSE = [[(float(i), i / 2, {"loss": 1 / (i + 1), **({"eval": float(i)} if i % 3 == 0 else {}),

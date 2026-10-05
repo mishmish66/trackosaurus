@@ -23,7 +23,8 @@ from trex import buckets as bk, chunks, server
 from trex import index as trex_index
 from trex.format import FORMAT, connect_ro, connect_rw
 from trex.index import Explorer
-from trex.server import bind, check_root, serve
+from trex.daemon import resolve_root
+from trex.server import bind, serve
 from trex.server import urls as server_urls
 
 import helpers
@@ -667,10 +668,10 @@ def test_restart_reuses_cache_without_rereading_unchanged_runs(root, tmp_path, m
 
 
 def test_refuses_to_crawl_home_or_filesystem_root():
-    with pytest.raises(SystemExit):
-        check_root("~", force=False)
-    with pytest.raises(SystemExit):
-        check_root("/", force=False)
+    with pytest.raises(ValueError, match="refusing"):
+        resolve_root("~", force=False)
+    with pytest.raises(ValueError, match="refusing"):
+        resolve_root("/", force=False)
 
 
 @pytest.fixture

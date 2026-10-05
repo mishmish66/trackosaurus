@@ -57,16 +57,18 @@ function search(text) {
   return { test: (g) => ["name", "path"].some((f) => g(f) != null && rx.test(textOf(g(f)))), fields: ["name", "path"] };
 }
 
+/** Tokens of `text`, {kind, text (quotes unescaped), start, end}; null where it does not tokenize (an open quote, a
+ * stray character). */
 function tokens(text) {
   const out = [];
   TOKEN.lastIndex = 0;
   while (TOKEN.lastIndex < text.length && text.slice(TOKEN.lastIndex).trim()) {
     const m = TOKEN.exec(text);
     if (!m || m[5] !== undefined) return null;
-    if (m[1] !== undefined) out.push({ kind: "str", text: m[1].slice(1, -1).replaceAll("''", "'") });
-    else if (m[2] !== undefined) out.push({ kind: "id", text: m[2].slice(1, -1).replaceAll('""', '"') });
-    else if (m[3] !== undefined) out.push({ kind: "op", text: m[3] });
-    else out.push({ kind: "word", text: m[4] });
+    const start = m.index + m[0].length - m[0].trimStart().length, end = m.index + m[0].length;
+    if (m[1] !== undefined) out.push({ kind: "str", text: m[1].slice(1, -1).replaceAll("''", "'"), start, end });
+    else if (m[2] !== undefined) out.push({ kind: "id", text: m[2].slice(1, -1).replaceAll('""', '"'), start, end });
+    else out.push({ kind: m[3] !== undefined ? "op" : "word", text: m[3] ?? m[4], start, end });
   }
   return out;
 }
@@ -78,7 +80,7 @@ const VALUE_AFTER = new Set([...COMPARE, "("]);
 /** What the word at `caret` in a filter is, for completion: {kind: "field" | "operator" | "value" | "joiner" | null,
  * field (for a value), from, to (the span the completion replaces), prefix (its text so far)}. */
 export function completionContext(text, caret) {
-  const toks = spans(text.slice(0, caret));
+  const toks = tokens(text.slice(0, caret));
   if (!toks) return { kind: null, from: caret, to: caret, prefix: "" };
   const last = toks.at(-1), partial = last && last.end === caret && (last.kind === "word" || last.kind === "id") ? last : null;
   const prev = partial ? toks.slice(0, -1) : toks;
@@ -120,20 +122,6 @@ function fieldBefore(toks) {
   let j = i - 1;
   if (isKw(toks[j], "not")) j--;
   return toks[j] && (toks[j].kind === "word" || toks[j].kind === "id") ? toks[j].text : null;
-}
-
-/** Tokens of `text` with their spans; null where it does not tokenize (an open quote, a stray character). */
-function spans(text) {
-  const out = [];
-  TOKEN.lastIndex = 0;
-  while (TOKEN.lastIndex < text.length && text.slice(TOKEN.lastIndex).trim()) {
-    const m = TOKEN.exec(text);
-    if (!m || m[5] !== undefined) return null;
-    const lead = m[0].length - m[0].trimStart().length, start = m.index + lead, end = m.index + m[0].length;
-    const kind = m[1] !== undefined ? "str" : m[2] !== undefined ? "id" : m[3] !== undefined ? "op" : "word";
-    out.push({ kind, text: kind === "str" || kind === "id" ? text.slice(start + 1, end - 1) : text.slice(start, end), start, end });
-  }
-  return out;
 }
 
 /** A value as filter text: numbers and plain words bare, anything else in single quotes. */

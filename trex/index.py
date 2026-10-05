@@ -1,10 +1,10 @@
 """Explorer index of a runs directory, in <cache_root>/<hash of root>/index.sqlite: run metadata, last
-values, each run's kept buckets of every metric (`trex.buckets`), a bounded cache of finer blocks built from run files,
-and media; beside it, in levels/, the finished runs' buckets merged per level. A run is its path relative to the root.
+values, each run's kept buckets of every metric (`trex.buckets`) and media; beside it, in levels/, the finished runs' buckets merged per level. A run is its path relative to the root.
 Runs are scanned inline or in worker processes; the main process commits, then publishes events in
 order per run.
 """
 
+import contextlib
 import hashlib
 import json
 import math
@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing.context import BaseContext
@@ -190,6 +190,9 @@ MERGE_THREADS: Final = min(8, os.cpu_count() or 1)  # threads merging one level
 PAGE_SIZE: Final = 16384
 READ_ERRORS: Final = (sqlite3.Error, OSError, ValueError, KeyError, struct.error)
 ROWS_EVENT_MAX: Final = 20_000  # larger catch-ups reach browsers through new kept buckets instead of rows
+HEARTBEAT: Final = 10.0  # seconds of stream silence after which a heartbeat is sent
+STREAM_BATCH: Final = 2000  # events sent together at most
+STOP_POLL: Final = 0.5  # seconds between a stream's checks of its stop event
 NO_BUCKETS: Final = bk.encode(bk.MIN_LEVEL, 0, [""], [0], bk.empty())  # a run's bucket array where it has none
 
 TABLES: Final = {
@@ -304,9 +307,9 @@ def _last_values(c: sqlite3.Connection, names: Mapping[int, str]) -> dict[str, f
     for kid, name in names.items():
         r = c.execute("SELECT data FROM chunk WHERE key_id = ? ORDER BY seq0 DESC LIMIT 1", (kid,)).fetchone()
         if r:
-            vals = chunks.decode(r[0]).values
+            vals = chunks.decode(r[0])[1]
             if len(vals):
-                out[name] = vals[-1]
+                out[name] = float(vals[-1])
     return out
 
 
@@ -951,6 +954,28 @@ class Explorer:
             if rows:
                 out.append(sse_text("rows", _rows_event(p, start, rows)))
         return out
+
+    def messages(self, prefix: str, stop: threading.Event) -> Generator[bytes, None, None]:
+        """SSE for runs under `prefix`: rows beyond their kept buckets, then live events and a heartbeat after each
+        quiet HEARTBEAT, until the subscription overflows or `stop` is set."""
+        sub = self.hub.subscribe(prefix)
+        try:
+            yield b"".join(self.backfill(prefix))
+            quiet = time.monotonic()
+            while not sub.dead and not stop.is_set():
+                try:
+                    msgs = [sub.q.get(timeout=STOP_POLL)]
+                except queue.Empty:
+                    if time.monotonic() - quiet < HEARTBEAT:
+                        continue
+                    msgs = [sse("hb", self.live_seqs(prefix))]
+                with contextlib.suppress(queue.Empty):
+                    while len(msgs) < STREAM_BATCH:
+                        msgs.append(sub.q.get_nowait())
+                quiet = time.monotonic()
+                yield b"".join(msgs)
+        finally:
+            self.hub.unsubscribe(sub)
 
     def live_seqs(self, prefix: str) -> dict[str, tuple[int, int]]:
         """{path: (rows, media)} of running runs."""

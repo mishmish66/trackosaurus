@@ -92,8 +92,7 @@ async function fetchArrayHere(url, body) {
 
 export class Data {
   constructor(ui) {
-    this.ui = ui; // {runs(), data(keys, run|null, streamed), keys(), media(key), status(text), conn(live), replan(), idle(), ahead(),
-    //   protocol(server's)}
+    this.ui = ui; // {runs(), data(keys, streamed), keys(), media(key), status(text), conn(live), idle(), ahead(), protocol(server's)}
     this.info = null; // /api/info of what the page shows
     this.gen = 0; // bumped by `close`; work begun under an older generation is dropped
     this.version = 0; // bumped whenever runs, their metadata, blocks or rows change
@@ -613,7 +612,7 @@ export class Data {
     const keys = this.touched;
     this.touched = new Set();
     this.flushKeys();
-    this.ui.data(keys, null, streamed);
+    this.ui.data(keys, streamed);
   }
 
   /** Discard a run's rows and reload it from its current server state. */
@@ -643,7 +642,7 @@ export class Data {
       r.pending = [];
       for (const [kind, ev] of pending) this.dispatch(kind, ev);
       this.ui.runs();
-      this.ui.data(new Set(r.cols.keys()), null, true);
+      this.ui.data(new Set(r.cols.keys()), true);
     } catch (e) {
       console.warn(`resync ${r.id} failed`, e);
       r.resyncInFlight = false;
@@ -745,7 +744,7 @@ export class Data {
       const summary = r.meta.summary;
       const before = r.meta.kept_seq;
       this.setMeta(r, { ...meta, summary: { ...meta.summary, ...summary } });
-      if (meta.kept_seq !== before) this.ui.data(new Set(r.cols.keys()), null, true); // its blocks are due again
+      if (meta.kept_seq !== before) this.ui.data(new Set(r.cols.keys()), true); // its blocks are due again
       // The stream is ordered, so every row and media item this meta counts has already been delivered.
       if (!r.holding && (r.seq < meta.seq || r.mseq < meta.mseq)) {
         console.warn(`run ${r.id}: meta says ${meta.seq},${meta.mseq}, have ${r.seq},${r.mseq}`);

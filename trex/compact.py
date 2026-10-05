@@ -43,9 +43,7 @@ def compact(run_dir: Path) -> Compacted:
         try:
             _build(src, dst, groups)
             _verify(src, dst)
-            dst.execute("PRAGMA locking_mode=EXCLUSIVE")
-            dst.execute("BEGIN EXCLUSIVE")
-            dst.execute("COMMIT")
+            _lock(dst)
             _fsync(tmp)
             os.replace(tmp, db)
             _fsync(run_dir)
@@ -63,13 +61,18 @@ def compact(run_dir: Path) -> Compacted:
 def _exclusive(db: Path) -> sqlite3.Connection:
     c = sqlite3.connect(db, isolation_level=None, timeout=LOCK_TIMEOUT)
     try:
-        c.execute("PRAGMA locking_mode=EXCLUSIVE")
-        c.execute("BEGIN EXCLUSIVE")
-        c.execute("COMMIT")
+        _lock(c)
     except sqlite3.OperationalError as e:
         c.close()
         raise InUse(f"{db.parent} is open in another process (a live writer?)") from e
     return c
+
+
+def _lock(c: sqlite3.Connection) -> None:
+    """Hold an exclusive lock on c's database until c closes."""
+    c.execute("PRAGMA locking_mode=EXCLUSIVE")
+    c.execute("BEGIN EXCLUSIVE")
+    c.execute("COMMIT")
 
 
 def _groups(c: sqlite3.Connection) -> tuple[list[list[tuple[int, int]]], int]:

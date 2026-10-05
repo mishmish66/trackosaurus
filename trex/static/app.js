@@ -208,17 +208,22 @@ function sectionControls(sec, subs, show) {
     d.open = true;
     requestAnimationFrame(() => d.scrollIntoView({ block: "start" }));
   };
-  const all = (e) => {
-    const inner = [...e.currentTarget.closest("details").querySelectorAll("details.section")];
-    const fold = inner.some((d) => d.open);
-    for (const d of inner) d.open = !fold;
-  };
+  const all = (e) => foldAll(e.currentTarget.closest("details"));
   const links = [...sec.children.map((x, i) => h("button", { className: "linkish", title: `open ${x.id}`, textContent: `${x.title} (${x.n})`,
                    onclick: stop(() => open(subs[i])) })),
                  ...sec.hidden.map(([key]) => h("button", { className: "linkish hiddenlink", title: `show ${key} (hidden)`,
                    textContent: shortName(key, sec), onclick: stop(() => show(key)) }))];
   return [links.length ? h("span", { className: "sublinks" }, ...links) : null,
           subs.length ? h("button", { className: "subfold", onclick: stop(all) }) : null].filter(Boolean);
+}
+
+/** Whether any section inside `el` is open. */
+const anyOpen = (el) => [...el.querySelectorAll("details.section")].some((d) => d.open);
+
+/** Fold every section inside `el` while any is open, else unfold them all. */
+function foldAll(el) {
+  const fold = anyOpen(el);
+  for (const d of el.querySelectorAll("details.section")) d.open = !fold;
 }
 
 /** Sorted copy of a section and its subsections: panels by name, subsections by sectionCmp. */
@@ -235,27 +240,29 @@ function sectionCmp(a, b) {
   return a.media - b.media || cmpNames(a.title, b.title);
 }
 
+/** POST `body` (as JSON) to daemon `path`: [whether it succeeded, its JSON answer]. */
+async function post(path, body = {}) {
+  const r = await fetch(path, { method: "POST", body: JSON.stringify(body) });
+  return [r.ok, await r.json()];
+}
+
 /** Open page `url` after refetching it past the browser's HTTP cache, so a cached redirect cannot divert it. */
 function openPage(url) {
   fetch(url, { cache: "reload" }).catch(() => null).finally(() => (location.href = url));
 }
 
+/** Page options the URL hash holds when they differ from these (group and focus aside). */
+const OPT_DEFAULTS = { path: "", filter: "", chart: "", center: "median", band: "ci", keys: "", sort: "created", dir: "desc" };
+
 /** Page options from the URL hash. */
 function hashOpts(q) {
-  return {
-    path: q.get("path") || "",
-    filter: q.get("filter") || "",
-    group: q.get("group") ?? "",
-    focus: focusOpt(q),
-    chart: q.get("chart") || "",
-    center: ["mean", "iqm"].includes(q.get("center")) ? q.get("center") : "median",
-    band: q.get("band") || "ci",
-    keys: q.get("keys") || "",
-    sort: q.get("sort") || "created",
-    dir: q.get("dir") || "desc",
-  };
+  const o = Object.fromEntries(Object.entries(OPT_DEFAULTS).map(([k, d]) => [k, q.get(k) || d]));
+  if (!["median", "mean", "iqm"].includes(o.center)) o.center = "median";
+  return { ...o, group: q.get("group") ?? "", focus: focusOpt(q) };
 }
 const NAV_OPTS = ["path", "focus", "chart", "group"]; // changed by navigation, restored by back/forward
+/** A chart's options it does not override (center and band come from the toolbar). */
+const PANEL_DEFAULTS = { smooth: 0, logx: false, logy: false, xmin: null, xmax: null, ymin: null, ymax: null, outliers: 0, render: "auto" };
 
 /** Opened groups, outermost first: [[fields of a group-by level, their values], …] from `focus` (JSON). */
 function focusOpt(q) {
@@ -268,13 +275,21 @@ function focusOpt(q) {
 }
 
 const cmpNames = (a, b) => a.localeCompare(b, undefined, { numeric: true });
-const fieldTexts = new WeakMap(); // run metadata -> Map(group-by field -> its text)
 /** Whether shown run r may be drawn for `key` without a column: a finished run logging it, from its buckets. */
 const fromBlocks = (r, key) => r.shown && r.meta.state !== "running" && hasKey(r, key);
 
+const fieldTexts = new WeakMap(); // run metadata -> Map(field -> its text)
 let runNums = 0;
 /** A number of its own for run r. */
 const runNum = (r) => (r.num ||= ++runNums);
+
+/** [the shown runs of `runs` in order, a hash of their set]. */
+function shownOf(runs) {
+  const shown = runs.filter((r) => r.shown);
+  let a = shown.length, b = 0;
+  for (const r of shown) (a = (a + Math.imul(runNum(r), 0x9e3779b1)) | 0), (b ^= Math.imul(runNum(r), 0x85ebca6b));
+  return [shown, `${a}.${b}`];
+}
 
 function hashStr(s) {
   let x = 2166136261;
@@ -307,7 +322,18 @@ const store = {
       localStorage.setItem(k, JSON.stringify(v));
     } catch {}
   },
+  /** Merge `part` into the object stored under k (default d). */
+  patch(k, d, part) {
+    this.set(k, { ...this.get(k, d), ...part });
+  },
 };
+const INFO_OPEN = { info: true, folder: true, varies: true }; // the info panel's sections open by default
+
+/** A menu row ({label, sub, icon}): its icon when set, label, and `sub` beside it when set; class "mitem" + cls. */
+function mitem(it, cls, attrs) {
+  return h("button", { className: "mitem" + cls, ...attrs }, it.icon != null ? h("span", { className: "micon", textContent: it.icon }) : null,
+    h("span", { className: "ml", textContent: it.label }), it.sub != null && it.sub !== "" ? h("span", { className: "ms", textContent: it.sub }) : null);
+}
 
 /** Floating popover anchored under a button; closes on outside click or Escape. */
 const menu = {
@@ -328,17 +354,13 @@ const menu = {
     if (this.el) this.el.hidden = true;
     this.anchor = null;
   },
-  /** items: [{label, sub, color, icon, active, onpick}] */
+  /** items: [{label, sub, icon, active, onpick}] */
   list(anchor, { title, items, search }) {
     const ul = h("div", { className: "mlist" });
     const render = (q) => {
       const ql = q.toLowerCase();
       ul.replaceChildren(...items.filter((it) => !ql || it.label.toLowerCase().includes(ql)).slice(0, 500).map((it) =>
-        h("button", { className: "mitem" + (it.active ? " active" : ""), onclick: () => it.onpick() },
-          it.icon ? h("span", { className: "micon", textContent: it.icon })
-            : h("span", { className: "sw", style: `background:${it.color || "transparent"}` }),
-          h("span", { className: "ml", textContent: it.label }),
-          it.sub != null ? h("span", { className: "ms", textContent: it.sub }) : null)));
+        mitem(it, it.active ? " active" : "", { onclick: () => it.onpick() })));
     };
     render("");
     this.open(anchor, h("div", {},
@@ -389,13 +411,13 @@ class App {
     this.opts = hashOpts(q);
     this.panelCfg = {};
     this.groupFromHash = q.has("group");
+    this.panelsSoon = throttle(() => this.renderPanels(), 300);
     this.data = new Data({
       runs: throttle(() => this.onRuns(), 300),
-      data: (keys, r, streamed) => this.onData(keys, r, streamed),
-      keys: throttle(() => this.renderPanels(), 300),
+      data: (keys, streamed) => this.onData(keys, streamed),
+      keys: () => this.panelsSoon(),
       media: (k) => this.onMedia(k),
       status: (t) => ($("#status").textContent = t),
-      replan: () => this.replan(true),
       idle: () => this.nextFrame(),
       ahead: () => this.aheadOf(),
       protocol: (n) => this.showProtocol(n),
@@ -404,7 +426,6 @@ class App {
         $("#conn").title = live ? "streaming" : "stream disconnected, retrying";
       },
     });
-    this.dirtyMedia = new Set();
     this.mediaThrottle = throttle(() => this.renderMedia(), 500);
     this.io = new IntersectionObserver(
       (es) => {
@@ -415,7 +436,7 @@ class App {
             if (!e.isIntersecting && !c.full) c.releaseCanvases();
           }
           c.visible = e.isIntersecting;
-          if (c.visible && c.dirty) this.schedule(true);
+          if (c.visible && c.dirty) e.target._chart ? this.schedule(true) : c.render();
         }
       },
       { root: $("#panels"), rootMargin: "300px" },
@@ -427,29 +448,15 @@ class App {
     return this.isGrouped && !this.scopeIsRun;
   }
 
-  /** Whether the path opened is a run, by the tree last fetched. */
+  /** Whether the path opened is a run: then the runs loaded are that run alone. */
   get scopeIsRun() {
-    if (this.runPathsOf !== this.tree) (this.runPathsOf = this.tree), (this.runPaths = new Set(this.tree.map(([p]) => p)));
-    return this.runPaths.has(this.opts.path);
+    return this.data.runs.has(this.opts.path);
   }
 
   /** Effective display options for one chart: its overrides on top of the toolbar. */
   panelOpts(key) {
-    const o = this.opts, p = this.panelCfg[key] || {};
-    return {
-      smooth: p.smooth ?? 0,
-      xmode: p.x === "runtime" ? X_RUNTIME : X_STEP,
-      logx: p.logx ?? false,
-      logy: p.logy ?? false,
-      xmin: p.xmin ?? null,
-      xmax: p.xmax ?? null,
-      ymin: p.ymin ?? null,
-      ymax: p.ymax ?? null,
-      outliers: p.outliers ?? 0,
-      center: p.center ?? o.center,
-      band: p.band ?? o.band,
-      render: p.render ?? "auto",
-    };
+    const p = this.panelCfg[key] || {};
+    return { ...PANEL_DEFAULTS, center: this.opts.center, band: this.opts.band, ...p, xmode: p.x === "runtime" ? X_RUNTIME : X_STEP };
   }
 
   hasPanelOverrides(key) {
@@ -458,7 +465,7 @@ class App {
 
   async start() {
     startWorkers();
-    preload(["/api/daemon", `${BASE}/api/info`, `${BASE}/api/tree`, `${BASE}/api/runs?path=${encodeURIComponent(this.opts.path)}`]);
+    preload(["/api/daemon", `${BASE}/api/info`, `${BASE}/api/runs?path=${encodeURIComponent(this.opts.path)}`]);
     if (!(await this.enterDaemon())) return;
     await this.data.init();
     const root = this.data.rootKey;
@@ -468,9 +475,7 @@ class App {
     this.pins = store.get(`pins:${root}`, []);
     this.hiddenPanels = new Set(store.get(`hiddenPanels:${root}`, []));
     this.bindControls();
-    await this.refreshTree();
     await this.loadScope();
-    setInterval(() => this.refreshTree().then(() => this.renderCrumbs()), 15000);
     if (USE_GL) (window.requestIdleCallback ?? setTimeout)(() => renderer()); // its setup blocks, so it runs while blocks load
   }
 
@@ -523,7 +528,8 @@ class App {
         h("span", { className: "ml", textContent: w.name }), h("span", { className: "ms", textContent: w.members.join(" · ") || "empty" })),
       h("button", { className: "chev", textContent: "✎", title: "edit this workspace", onclick: () => edit(w) }),
       h("button", { className: "chev", textContent: "×", title: "delete this workspace (its directories stay tracked)",
-        onclick: () => this.deleteWorkspace(w, refresh) })));
+        onclick: () => this.forget(`Delete workspace ${w.name}? Its directories stay tracked.`, "/api/daemon/workspace/delete",
+          { name: w.name }, w.url, refresh) })));
   }
 
   /** Name and members of a new workspace, or of `ws`; `done` returns to the panel. */
@@ -532,10 +538,8 @@ class App {
     const name = h("input", { type: "text", placeholder: "workspace name", value: ws?.name || "", spellcheck: false });
     const boxes = d.roots.map((r) => h("input", { type: "checkbox", checked: !!ws?.members.includes(r.name), value: r.name }));
     const save = async () => {
-      const body = { name: name.value, members: boxes.filter((b) => b.checked).map((b) => b.value), old: ws?.name };
-      const r = await fetch("/api/daemon/workspace", { method: "POST", body: JSON.stringify(body) });
-      const j = await r.json();
-      if (r.ok) openPage(j.url);
+      const [ok, j] = await post("/api/daemon/workspace", { name: name.value, members: boxes.filter((b) => b.checked).map((b) => b.value), old: ws?.name });
+      if (ok) openPage(j.url);
       else err.textContent = j.error;
     };
     return h("div", {}, h("div", { className: "mtitle", textContent: ws ? `edit ${ws.name}` : "new workspace" }),
@@ -545,10 +549,12 @@ class App {
       err, h("div", { className: "mfoot" }, h("button", { textContent: "cancel", onclick: done }), h("button", { textContent: "save", onclick: save })));
   }
 
-  async deleteWorkspace(w, refresh) {
-    if (!confirm(`Delete workspace ${w.name}? Its directories stay tracked.`)) return;
-    await fetch("/api/daemon/workspace/delete", { method: "POST", body: JSON.stringify({ name: w.name }) });
-    if (w.url === `${BASE}/`) openPage("/");
+  /** After `question` is confirmed, POST body to daemon `path`; then leave the page for "/" if it showed `url`, else
+   * refresh the panel. */
+  async forget(question, path, body, url, refresh) {
+    if (!confirm(question)) return;
+    await post(path, body);
+    if (url === `${BASE}/`) openPage("/");
     else refresh();
   }
 
@@ -558,10 +564,9 @@ class App {
     const add = async (path) => {
       const host = REMOTE.exec(path.trim())?.[1];
       [err.textContent, note.textContent] = ["", host ? `starting trex on ${host}…` : ""];
-      const r = await fetch("/api/daemon/add", { method: "POST", body: JSON.stringify({ path: path.trim() }) });
-      const j = await r.json();
+      const [ok, j] = await post("/api/daemon/add", { path: path.trim() });
       note.textContent = "";
-      if (r.ok) openPage(j.url);
+      if (ok) openPage(j.url);
       else err.textContent = j.error;
     };
     const input = h("input", { type: "text", placeholder: "/path/to/runs, ~/runs or host:path", spellcheck: false,
@@ -571,11 +576,11 @@ class App {
         h("span", { className: "ml", textContent: r.name }),
         h("span", { className: "ms", textContent: tailOf(r.root, 36) + (r.state === "local" || r.state === "connected" ? "" : ` · ${r.state}`) })),
       h("button", { className: "chev", textContent: "×", title: "stop tracking this directory (its files are kept)",
-        onclick: () => this.removeRoot(r, refresh) })));
+        onclick: () => this.forget(`Stop serving ${r.root}? Its run files are kept.`, "/api/daemon/remove", { name: r.name }, r.url, refresh) })));
     const recent = d.history.map((path) => h("button", { className: "mitem", title: `track ${path}`, onclick: () => add(path) },
       h("span", { className: "micon", textContent: "+" }), h("span", { className: "ml", textContent: tailOf(path, 56) })));
     const clear = async () => {
-      await fetch("/api/daemon/history/clear", { method: "POST", body: "{}" });
+      await post("/api/daemon/history/clear");
       refresh();
     };
     return [served.length ? h("div", { className: "mlist" }, ...served) : h("div", { className: "mhint", textContent: "none tracked" }),
@@ -599,12 +604,11 @@ class App {
     btn.disabled = true;
     btn.textContent = "updating…";
     err.textContent = "";
-    const r = await fetch("/api/daemon/update", { method: "POST", body: "{}" });
-    const j = await r.json();
-    if (!r.ok || !j.updated) {
+    const [ok, j] = await post("/api/daemon/update");
+    if (!ok || !j.updated) {
       btn.disabled = false;
       btn.textContent = "update";
-      err.textContent = r.ok ? "already the newest trex" : j.error;
+      err.textContent = ok ? "already the newest trex" : j.error;
       return;
     }
     btn.textContent = "restarting…";
@@ -614,13 +618,6 @@ class App {
       if (d?.install && JSON.stringify(d.install) === JSON.stringify(j.to)) break;
     }
     location.reload();
-  }
-
-  async removeRoot(r, refresh) {
-    if (!confirm(`Stop serving ${r.root}? Its run files are kept.`)) return;
-    await fetch("/api/daemon/remove", { method: "POST", body: JSON.stringify({ name: r.name }) });
-    if (r.url === `${BASE}/`) openPage("/");
-    else refresh();
   }
 
   async refreshTree() {
@@ -675,10 +672,9 @@ class App {
   /** Write the options to the URL hash: a new history entry when `push` (navigation), else in place. */
   saveHash(push = false) {
     const q = new URLSearchParams();
-    const defaults = { center: "median", band: "ci", sort: "created", dir: "desc" };
     for (const [k, v] of Object.entries(this.opts)) {
-      const s = k === "focus" ? (v.length ? JSON.stringify(v) : "") : Array.isArray(v) ? v.join(",") : v === true ? "1" : v;
-      if (k === "group" ? this.groupInHash() : s && defaults[k] !== s) q.set(k, s);
+      const s = k === "focus" ? (v.length ? JSON.stringify(v) : "") : v;
+      if (k === "group" ? this.groupInHash() : s && OPT_DEFAULTS[k] !== s) q.set(k, s);
     }
     const url = "#" + q.toString();
     if (push && url !== location.hash) history.pushState(null, "", url);
@@ -757,20 +753,19 @@ class App {
     $("aside").addEventListener("scroll", () => (sideRaf ||= requestAnimationFrame(side)));
     new ResizeObserver(() => (sideRaf ||= requestAnimationFrame(side))).observe($("aside"));
     const o = this.opts;
-    const bind = (sel, key, ev, get, after) => {
+    const bind = (sel, key, ev, after) => {
       const el = $(sel);
-      if (el.type === "checkbox") el.checked = o[key];
-      else el.value = o[key];
+      el.value = o[key];
       el.addEventListener(ev, () => {
-        this.setOpt(key, get(el));
+        this.setOpt(key, el.value);
         after();
       });
     };
-    bind("#runFilter", "filter", "input", (e) => e.value, throttle(() => this.onRuns(), 150));
+    bind("#runFilter", "filter", "input", throttle(() => this.onRuns(), 150));
     this.bindFilterBox();
-    bind("#center", "center", "change", (e) => e.value, () => this.redrawAll());
-    bind("#band", "band", "change", (e) => e.value, () => this.redrawAll());
-    bind("#keyFilter", "keys", "input", (e) => e.value, throttle(() => this.renderPanels(), 150));
+    bind("#center", "center", "change", () => this.redrawAll());
+    bind("#band", "band", "change", () => this.redrawAll());
+    bind("#keyFilter", "keys", "input", throttle(() => this.renderPanels(), 150));
     $("#resetZoom").addEventListener("click", () => this.resetZoom());
     this.bindGroupBox();
     this.bindSortBox();
@@ -798,9 +793,11 @@ class App {
     return [...out.values()].sort((a, b) => (a.run - b.run) || cmpNames(a.name, b.name));
   }
 
-  childMenu(anchor, prefix, title) {
+  /** The folders and runs directly under `prefix`, to open one, by the tree as it now is. */
+  async childMenu(anchor, prefix) {
+    await this.refreshTree();
     menu.list(anchor, {
-      title, search: true,
+      title: prefix || this.data.info.name, search: true,
       items: this.children(prefix).map((e) => ({
         label: e.name, icon: e.run ? "▪" : "▸", sub: e.run ? e.state : `${e.count} runs`, active: e.path === this.opts.path,
         onpick: () => this.setPath(e.path),
@@ -827,11 +824,7 @@ class App {
       const s = h("span", { className: "seg" + (current ? " current" : "") + (cls ? ` ${cls}` : "") },
         h("button", { className: "crumb", title: target || "/", onclick: current ? null : open }, text));
       if (siblingsOf != null) s.append(h("button", { className: "chev", textContent: "▾", title: "switch to a sibling",
-        onclick: async (e) => {
-          const a = e.currentTarget;
-          await this.refreshTree();
-          this.childMenu(a, siblingsOf, siblingsOf || this.data.info.name);
-        } }));
+        onclick: (e) => this.childMenu(e.currentTarget, siblingsOf) }));
       sep();
       path.push(s);
     };
@@ -853,13 +846,9 @@ class App {
           h("button", { className: "chev", textContent: "×", title: "back to all charts (Esc)", onclick: () => this.showChartAlone("") })));
     } else if (depth) {
       // an opened group has no children to open
-    } else if (!this.scopeIsRun && this.children(o.path).length) {
+    } else if (!this.scopeIsRun && this.data.runs.size) {
       path.push(h("button", { className: "chev drill", textContent: "›", title: "open a child folder or run",
-        onclick: async (e) => {
-          const a = e.currentTarget;
-          await this.refreshTree();
-          this.childMenu(a, o.path, o.path || this.data.info.name);
-        } }));
+        onclick: (e) => this.childMenu(e.currentTarget, o.path) }));
     }
     $("#crumbPath").replaceChildren(...path);
     this.renderInfo();
@@ -869,12 +858,9 @@ class App {
   renderInfo() {
     const run = this.scopeIsRun && this.data.runs.get(this.opts.path);
     const [header, sections] = run ? this.runInfo(run) : this.scopeInfo();
-    const open = store.get("infoOpen", { info: true, folder: true, varies: true });
-    const section = ([kind, title, obj, sort]) => h("details", { className: "infosec", open: !!open[kind], ontoggle: (e) => {
-      const s = store.get("infoOpen", { info: true, folder: true, varies: true });
-      s[kind] = e.target.open;
-      store.set("infoOpen", s);
-    } }, h("summary", {}, title, h("span", { className: "gcount", textContent: ` ${Object.keys(obj).length}` })), kvTree(obj, sort));
+    const open = store.get("infoOpen", INFO_OPEN);
+    const section = ([kind, title, obj, sort]) => h("details", { className: "infosec", open: !!open[kind],
+      ontoggle: (e) => store.patch("infoOpen", INFO_OPEN, { [kind]: e.target.open }) }, h("summary", {}, title, h("span", { className: "gcount", textContent: ` ${Object.keys(obj).length}` })), kvTree(obj, sort));
     $("#infoPanel").replaceChildren(h("div", { className: "infohead" }, ...header),
       ...sections.filter(([, , obj]) => obj && Object.keys(obj).length).map(section));
     $("#infoPanel").hidden = false;
@@ -894,7 +880,7 @@ class App {
 
   /** [header, sections] of a folder's or group's page: notes of the folders on its path, and its config spread. */
   scopeInfo() {
-    const o = this.opts, members = this.runList.filter((r) => r.match && r.inFocus);
+    const o = this.opts, members = this.runList.filter((r) => r.inFocus);
     const where = o.path || this.data.info?.name || "root";
     const outer = [where, ...o.focus.slice(0, -1).map((l) => this.focusLabel(l))].join(" / ");
     const header = [h("b", { textContent: o.focus.length ? this.focusLabel(o.focus.at(-1)) : where }),
@@ -956,7 +942,7 @@ class App {
 
   /** A run's value of group-by field f, as text: `run` its id, `run~n` its directory n levels up (relative to the
    * view), anything else the field as filters name it. */
-  fieldText(r, f) {
+  valueText(r, f) {
     if (f === "run") return r.id;
     const up = RUN_UP.exec(f);
     if (up) return this.rel(r.id.split("/").slice(0, -Number(up[1])).join("/"));
@@ -965,7 +951,7 @@ class App {
     let t = known.get(f);
     if (t === undefined) {
       const v = runField(r, f);
-      known.set(f, (t = v == null ? "∅" : typeof v === "object" ? JSON.stringify(v) : String(v)));
+      known.set(f, (t = v == null ? "∅" : textOf(v)));
     }
     return t;
   }
@@ -974,7 +960,7 @@ class App {
    * above them, then dir, state and the config keys whose value varies. */
   groupFieldItems() {
     if (this.groupItemsFor === this.runList) return this.groupItems;
-    const runs = this.runList.filter((r) => r.match), count = (f) => new Set(runs.map((r) => this.fieldText(r, f))).size;
+    const runs = this.runList.filter((r) => r.match), count = (f) => new Set(runs.map((r) => this.valueText(r, f))).size;
     const depth = Math.max(0, ...runs.map((r) => this.rel(r.id).split("/").length - 1));
     const cfg = new Set();
     for (const r of runs) for (const k of Object.keys(r.meta.config || {})) cfg.add(k);
@@ -1012,10 +998,10 @@ class App {
    * groups (this.groups), one line each, colored in label order. */
   buildGroupTree(runs) {
     const levels = parseGroupBy(this.opts.group);
-    const vals = runs.map((r) => levels.map((fields) => fields.map((f) => this.fieldText(r, f))));
+    const vals = runs.map((r) => levels.map((fields) => fields.map((f) => this.valueText(r, f))));
     const multi = levels.map((_, i) => new Set(vals.map((v) => v[i].join("\u0001"))).size > 1);
     const shown = levels.flatMap((l, i) => (multi[i] && !l.includes("run") ? [i] : []));
-    const root = { key: "[]", label: "", fields: [], values: [], runs: [], children: [], parent: null };
+    const root = { key: "[]", label: "", name: "", fields: [], values: [], runs: [], children: [], parent: null };
     this.nodes = new Map([[root.key, root]]);
     const childOf = new Map(); // node -> Map(its level's values joined -> child)
     runs.forEach((r, j) => {
@@ -1029,7 +1015,9 @@ class App {
         let next = kids.get(at);
         if (!next) {
           const key = JSON.stringify([...JSON.parse(node.key), ...vals[j][i]]);
-          next = { key, label: nodeLabel(levels[i], vals[j][i], node), fields: levels[i], values: vals[j][i], runs: [], children: [], parent: node };
+          const label = nodeLabel(levels[i], vals[j][i], node);
+          next = { key, label, name: node.name ? `${node.name} / ${label}` : label, fields: levels[i], values: vals[j][i], runs: [], children: [],
+                   parent: node };
           node.children.push(next);
           kids.set(at, next);
           this.nodes.set(key, next);
@@ -1052,15 +1040,7 @@ class App {
     this.groupTree = root;
     this.isGrouped = !levels.some((l, i) => multi[i] && l.includes("run")) && leaves.length > 1 && leaves.some((n) => n.runs.length > 1);
     this.groups = new Map(this.isGrouped ? leaves.map((n) => [n.key, n]) : []);
-    [...this.groups.values()].map((n) => [n, this.nodeName(n)]).sort((a, b) => cmpNames(a[1], b[1]))
-      .forEach(([n, name], i) => Object.assign(n, { name, color: PALETTE[i % PALETTE.length] }));
-  }
-
-  /** A node's labels from the top of the tree, " / " between levels. */
-  nodeName(node) {
-    const out = [];
-    for (let n = node; n?.parent; n = n.parent) out.unshift(n.label);
-    return out.join(" / ");
+    [...this.groups.values()].sort((a, b) => cmpNames(a.name, b.name)).forEach((n, i) => (n.color = PALETTE[i % PALETTE.length]));
   }
 
   // ---- runs ----
@@ -1085,18 +1065,19 @@ class App {
     for (const r of runs) {
       r.visible = !this.hidden.has(r.id);
       r.match = match(r);
-      r.focused = o.focus.every(([fields, values]) => fields.every((f, i) => this.fieldText(r, f) === values[i]));
+      r.focused = o.focus.every(([fields, values]) => fields.every((f, i) => this.valueText(r, f) === values[i]));
     }
     if (o.focus.length && runs.length && !runs.some((r) => r.focused)) o.focus = [];
     const isRun = this.scopeIsRun;
     for (const r of runs) {
       r.inFocus = r.match && r.focused;
-      r.shown = r.inFocus && (!this.hidden.has(r.id) || isRun);
+      r.shown = r.inFocus && (r.visible || isRun);
     }
     runs.sort((a, b) => this.compare(this.sortValue(a), this.sortValue(b)) || (b.meta.created || 0) - (a.meta.created || 0));
     this.buildGroupTree(runs.filter((r) => r.inFocus));
     this.assignColors(runs);
     this.runList = runs;
+    [this.shown, this.shownSig] = shownOf(runs);
   }
 
   /** A run's color: its group's, else the next palette color among shown runs (hidden ones by id). */
@@ -1111,7 +1092,7 @@ class App {
   /** Metric and media keys of the shown runs (null: every key, when all runs are shown); true when that set
    * changed. */
   updateScopeKeys() {
-    const runs = this.runList.filter((r) => r.shown);
+    const runs = this.shown;
     let keys = null;
     if (runs.length < this.runList.length) {
       keys = new Set();
@@ -1179,7 +1160,7 @@ class App {
       () => this.renderGroupBox(),
       () => this.renderRunTable(),
       () => {
-        for (const k of this.mediaPanels.keys()) this.dirtyMedia.add(k);
+        for (const m of this.mediaPanels.values()) m.dirty = true;
         this.mediaThrottle();
       },
     ]);
@@ -1285,48 +1266,41 @@ class App {
    * choose, Tab or Enter take one, Escape closes them); Enter without completions, or leaving, shows the expression in
    * use in its canonical form. */
   bindGroupBox() {
-    const box = $("#groupBy"), st = { hl: 0, items: [], ctx: null, context: groupContext, candidates: () => this.groupFieldItems() };
-    const apply = throttle(() => document.activeElement === box && this.setGroup(box.value), 150);
-    const show = () => this.filterList(box, st);
+    const box = $("#groupBy"), apply = throttle(() => document.activeElement === box && this.setGroup(box.value), 150);
+    this.bindCompletions(box, { context: groupContext, candidates: () => this.groupFieldItems() }, {
+      input: apply,
+      key: (e) => (e.key === "Enter" || e.key === "Escape") && (box.blur(), true),
+      blur: () => (this.setGroup(box.value), (box.value = this.opts.group)),
+    });
+  }
+
+  /** The filter box's completions: field names, operators, a field's values (with run counts) or and / or, as the
+   * text before the caret calls for. */
+  bindFilterBox() {
+    this.bindCompletions($("#runFilter"), {});
+  }
+
+  /** Completions in box (`filterList`, with its st options): shown on focus, click and input; ↑/↓ choose, Tab or Enter
+   * take one, Escape closes them. `on.input` runs after input, `on.key` takes other keys (true when it handled one),
+   * `on.blur` runs on leaving the box. */
+  bindCompletions(box, opts, on = {}) {
+    const st = { hl: 0, items: [], ctx: null, ...opts }, show = () => this.filterList(box, st);
     box.addEventListener("focus", show);
     box.addEventListener("click", show);
-    box.addEventListener("input", () => ((st.hl = 0), show(), apply()));
+    box.addEventListener("input", () => ((st.hl = 0), show(), on.input?.()));
     box.addEventListener("keydown", (e) => {
       const listed = menu.anchor === box && st.items.length, step = listed && { ArrowDown: 1, ArrowUp: -1 }[e.key];
       if (step) (st.hl = (st.hl + step + st.items.length) % st.items.length), this.filterList(box, st, false);
       else if (listed && (e.key === "Tab" || e.key === "Enter")) this.takeCompletion(box, st, st.items[st.hl]);
-      else if (e.key === "Escape" && listed) menu.close();
-      else if (e.key === "Enter" || e.key === "Escape") box.blur();
-      else return;
+      else if (listed && e.key === "Escape") menu.close();
+      else if (!on.key?.(e)) return;
       e.preventDefault();
       e.stopPropagation();
     });
     box.addEventListener("blur", () => {
       if (menu.anchor === box) menu.close();
-      this.setGroup(box.value);
-      box.value = this.opts.group;
+      on.blur?.();
     });
-  }
-
-  /** The filter box's completions: field names, operators, a field's values (with run counts) or and / or, as the
-   * text before the caret calls for; ↑/↓ choose, Tab or Enter take one, Escape closes them. */
-  bindFilterBox() {
-    const box = $("#runFilter"), st = { hl: 0, items: [], ctx: null };
-    const show = () => this.filterList(box, st);
-    box.addEventListener("focus", show);
-    box.addEventListener("click", show);
-    box.addEventListener("input", () => ((st.hl = 0), show()));
-    box.addEventListener("keydown", (e) => {
-      if (menu.anchor !== box || !st.items.length) return;
-      const step = { ArrowDown: 1, ArrowUp: -1 }[e.key];
-      if (step) (st.hl = (st.hl + step + st.items.length) % st.items.length), this.filterList(box, st, false);
-      else if (e.key === "Tab" || e.key === "Enter") this.takeCompletion(box, st, st.items[st.hl]);
-      else if (e.key === "Escape") menu.close();
-      else return;
-      e.preventDefault();
-      e.stopPropagation();
-    });
-    box.addEventListener("blur", () => menu.anchor === box && menu.close());
   }
 
   /** Show a box's completions for the word at the caret (recomputed unless `fresh` is false), or close them when there
@@ -1342,8 +1316,7 @@ class App {
     }
     if (!st.items.length) return menu.anchor === box && menu.close();
     const list = h("div", { className: "mlist" }, ...st.items.map((it, i) =>
-      h("button", { className: "mitem" + (i === st.hl ? " hl" : ""), onmousedown: (e) => e.preventDefault(), onclick: () => this.takeCompletion(box, st, it) },
-        h("span", { className: "ml", textContent: it.label }), it.sub ? h("span", { className: "ms", textContent: it.sub }) : null)));
+      mitem(it, i === st.hl ? " hl" : "", { onmousedown: (e) => e.preventDefault(), onclick: () => this.takeCompletion(box, st, it) })));
     menu.open(box, list);
     list.querySelector(".hl")?.scrollIntoView({ block: "nearest" });
   }
@@ -1406,8 +1379,8 @@ class App {
     const items = [];
     st.shown.forEach((f, i) => {
       if (f.metric && !st.shown[i - 1]?.metric) items.push(h("div", { className: "mtitle", textContent: "metric (last value)" }));
-      items.push(h("button", { className: "mitem" + (f.value === this.opts.sort ? " active" : "") + (i === st.hl ? " hl" : ""),
-        onmousedown: (e) => e.preventDefault(), onclick: () => pick(f) }, h("span", { className: "ml", textContent: f.label })));
+      items.push(mitem(f, (f.value === this.opts.sort ? " active" : "") + (i === st.hl ? " hl" : ""),
+        { onmousedown: (e) => e.preventDefault(), onclick: () => pick(f) }));
     });
     const list = h("div", { className: "mlist" }, ...(items.length ? items : [h("div", { className: "mhint", textContent: "no matching field" })]));
     menu.open(box, list);
@@ -1418,7 +1391,7 @@ class App {
     this.renderSortOptions();
     const rows = []; // row factories in display order
     const metric = this.opts.sort.startsWith(METRIC_SORT) ? this.opts.sort.slice(METRIC_SORT.length) : null;
-    const fmtVal = (v) => (v == null ? "" : typeof v === "number" ? fmt(v) : String(v));
+    const fmtVal = (v) => (v == null ? "" : fmtAny(v));
     const saveHidden = () => store.set(`hidden:${this.data.rootKey}`, [...this.hidden]);
     const setHidden = (runs, hide) => {
       for (const r of runs) hide ? this.hidden.add(r.id) : this.hidden.delete(r.id);
@@ -1434,7 +1407,7 @@ class App {
       const s = r.meta.summary || {};
       return h("tr", { className: (r.match ? "" : "nomatch") + (this.sideMark === r.id ? " mark" : "") },
         h("td", { className: "tw" }),
-        h("td", {}, h("input", { type: "checkbox", checked: !this.hidden.has(r.id), onchange: (e) => setHidden([r], !e.target.checked) })),
+        h("td", {}, h("input", { type: "checkbox", checked: r.visible, onchange: (e) => setHidden([r], !e.target.checked) })),
         h("td", {}, h("span", { className: "sw", style: `background:${r.color}` })),
         h("td", { className: "name", title: r.id, style: `padding-left:${4 + depth * 14}px` },
           h("a", { href: "#", textContent: r.meta.name ?? "", onclick: (e) => {
@@ -1449,7 +1422,7 @@ class App {
     };
     /** A collapsible header row for a node of the group tree; a group (one line) shows its color. */
     const headRow = ({ key, label, members, color, depth, open, openTitle, onOpen }) => {
-      const vis = members.filter((r) => !this.hidden.has(r.id)).length;
+      const vis = members.filter((r) => r.visible).length;
       return h("tr", { className: "grp" + (open ? " open" : "") + (this.sideMark === key ? " mark" : ""), title: open ? "click to collapse" : "click to expand",
         onclick: (e) => !e.target.closest("input, button") && toggle(key) },
         h("td", { className: "tw" }, h("span", { className: "caret", textContent: "▸" })),
@@ -1462,7 +1435,7 @@ class App {
         h("td", { className: "num val", textContent: metric ? fmtVal(this.groupSortValue(members, label)) : "" }),
         h("td", { className: "num" }, h("button", { className: "gfocus", textContent: "open ›", title: openTitle, onclick: onOpen })));
     };
-    const inScope = this.runList.filter((r) => r.match && r.inFocus);
+    const inScope = this.runList.filter((r) => r.inFocus);
     const heads = [];
     const walk = (node, depth) => {
       for (const c of node.children) {
@@ -1477,7 +1450,7 @@ class App {
     walk(this.groupTree, 0);
     this.sideRows = rows;
     this.renderSideWindow();
-    const shown = this.runList.filter((r) => r.shown).length;
+    const shown = this.shown.length;
     $("#runCount").textContent = `${shown} shown · ${this.runList.length} in ${this.opts.path || this.data.info?.name || "root"}`;
     const ca = $("#collapseAll");
     ca.hidden = !heads.length;
@@ -1488,7 +1461,7 @@ class App {
       this.saveCollapsed();
       this.renderRunTable();
     };
-    const anyVisible = inScope.some((r) => !this.hidden.has(r.id));
+    const anyVisible = inScope.some((r) => r.visible);
     const ha = $("#hideAll");
     ha.textContent = anyVisible ? "hide all" : "show all";
     ha.onclick = () => setHidden(inScope, anyVisible);
@@ -1602,10 +1575,7 @@ class App {
     this.renderPanelCount();
     const els = [$("#infoPanel"), h("div", { className: "panelbar" }, sectionBtn, this.panelCount)];
     els.push(...sections.map((x) => this.sectionEl(x, closed)));
-    sectionBtn.addEventListener("click", () => {
-      const open = [...root.querySelectorAll("details.section")].some((d) => d.open);
-      for (const d of root.querySelectorAll("details.section")) d.open = !open;
-    });
+    sectionBtn.addEventListener("click", () => foldAll(root));
     root.replaceChildren(...els);
     if (this.opts.chart && this.data.keys.has(this.opts.chart)) this.panelEl(this.opts.chart, "metric");
     const alone = this.opts.chart && this.charts.get(this.opts.chart);
@@ -1627,9 +1597,7 @@ class App {
     const subs = sec.children.map((x) => this.sectionEl(x, closed, depth + 1));
     const head = h("summary", {});
     const el = h("details", { className: "section", style: `--depth:${depth}`, open: !closed[sec.id], ontoggle: (e) => {
-      const c = store.get("closedSections", {});
-      c[sec.id] = !e.target.open;
-      store.set("closedSections", c);
+      store.patch("closedSections", {}, { [sec.id]: !e.target.open });
       this.updateSectionsToggle();
     } }, head, ...[grid, ...subs].filter(Boolean));
     const s = { sec, subs, el, head, grid };
@@ -1770,11 +1738,10 @@ class App {
   updateSectionsToggle() {
     const btn = $("#panels .sectionsToggle");
     if (!btn) return;
-    const secs = [...document.querySelectorAll("#panels details.section")];
-    btn.textContent = secs.some((d) => d.open) ? "collapse all sections" : "expand all sections";
-    btn.hidden = !secs.length;
+    btn.textContent = anyOpen($("#panels")) ? "collapse all sections" : "expand all sections";
+    btn.hidden = !$("#panels details.section");
     for (const b of document.querySelectorAll("#panels .subfold")) {
-      const open = [...b.closest("details").querySelectorAll("details.section")].some((d) => d.open);
+      const open = anyOpen(b.closest("details"));
       b.textContent = open ? "fold inside" : "unfold inside";
       b.title = open ? "fold every subsection of this section" : "unfold every subsection of this section";
     }
@@ -1782,9 +1749,8 @@ class App {
 
   /** Mark the charts of `keys` dirty: drawn at once for work the view asked for, once it is all done; paced when
    * `streamed`. */
-  onData(keys, r, streamed = false) {
+  onData(keys, streamed = false) {
     if (!keys || !this.runList) return this.redrawAll();
-    if (r && !r.shown) return;
     const first = this.markDirty(keys); // a chart still showing nothing draws on the next frame
     if (!streamed) this.urgent = true;
     if (!streamed && !this.data.busy) this.schedule(true);
@@ -1842,9 +1808,8 @@ class App {
     if (n < 0) return this.nextFrame();
     if (this.round.some((c) => c.waiting)) return; // the round draws together once the workers answer
     if (n && performance.now() - t0 > FRAME_BUDGET_MS / 2) return this.nextFrame(); // drawing gets a frame of its own
-    const drew = this.round.length > 0, t1 = performance.now();
+    const drew = this.round.length > 0;
     for (const c of this.round) c.draw();
-    this.presentMs = performance.now() - t1;
     this.round = null;
     if (drew || this.planSoon) this.replan(this.planSoon), (this.planSoon = false);
     if ([...this.charts.values()].some((c) => (c.visible || c.full) && c.dirty)) this.schedule(this.urgent && !this.data.busy);
@@ -1878,7 +1843,6 @@ class App {
   /** What to fetch ahead (`Data.nextAhead`): each chart's demand over the shown runs, visible charts first. */
   aheadOf() {
     if (!this.runList) return [];
-    if (this.shownFor !== this.runList) this.replanShown();
     const charts = [...this.charts.values()].sort((a, b) => (b.visible || b.full) - (a.visible || a.full)), seen = new Set();
     return charts.filter((c) => !seen.has(c.key) && seen.add(c.key)).map((c) => this.demand(c, this.shown));
   }
@@ -1909,7 +1873,6 @@ class App {
       this.planTimer = null;
       this.plannedAt = performance.now();
       if (!this.runList) return;
-      if (this.shownFor !== this.runList) this.replanShown();
       const demands = new Map(); // one per metric, from its widest visible chart
       for (const c of this.charts.values()) {
         if (!(c.visible || c.full)) continue;
@@ -1918,14 +1881,6 @@ class App {
       }
       this.data.plan([...demands.values()]);
     }, due - performance.now());
-  }
-
-  /** The shown runs of the run list, and a hash of their set. */
-  replanShown() {
-    (this.shownFor = this.runList), (this.shown = this.runList.filter((r) => r.shown));
-    let a = this.shown.length, b = 0;
-    for (const r of this.shown) (a = (a + Math.imul(runNum(r), 0x9e3779b1)) | 0), (b ^= Math.imul(runNum(r), 0x85ebca6b));
-    this.shownSig = `${a}.${b}`;
   }
 
   /** Shared x zoom [x0, x1, xmode], or null. */
@@ -2066,14 +2021,13 @@ class App {
   // ---- media ----
 
   onMedia(key) {
-    if (!this.mediaPanels.has(key)) this.data.ui.keys();
-    this.dirtyMedia.add(key);
+    const m = this.mediaPanels.get(key);
+    if (m) m.dirty = true;
+    else this.panelsSoon();
     this.mediaThrottle();
   }
 
   renderMedia() {
-    for (const k of this.dirtyMedia) this.mediaPanels.get(k)?.markDirty();
-    this.dirtyMedia.clear();
     for (const m of this.mediaPanels.values()) if (m.visible && m.dirty) m.render();
   }
 }
@@ -2096,7 +2050,7 @@ class MediaPanel {
     this.app = app;
     this.key = key;
     this.dirty = true;
-    this._visible = false;
+    this.visible = false;
     this.follow = true;
     this.figs = new Map();
     this.slider = h("input", { type: "range", min: 0, max: 0, value: 0, oninput: () => {
@@ -2111,22 +2065,10 @@ class MediaPanel {
     this.el._media = this;
   }
 
-  get visible() {
-    return this._visible;
-  }
-  set visible(v) {
-    this._visible = v;
-    if (v && this.dirty) this.render();
-  }
-
-  markDirty() {
-    this.dirty = true;
-  }
-
   render() {
     this.dirty = false;
     const m = this.app.data.media.get(this.key) || new Map();
-    const runs = (this.app.runList || []).filter((r) => r.shown && m.has(r.id)).slice(0, MAX_MEDIA_RUNS);
+    const runs = (this.app.shown || []).filter((r) => m.has(r.id)).slice(0, MAX_MEDIA_RUNS);
     const steps = [...new Set(runs.flatMap((r) => m.get(r.id).map((x) => x.step)))].sort((a, b) => a - b);
     this.slider.max = Math.max(0, steps.length - 1);
     if (this.follow) this.slider.value = this.slider.max;

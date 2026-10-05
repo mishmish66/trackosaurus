@@ -307,20 +307,15 @@ class LineSet {
     this.key = null;
     this.win = null; // [w0, w1] transformed x when decimated
     this.table = new Table(64);
-    this.uploadMs = 0;
   }
 
   /** Bring every column up to date. p: {xmode, logx, logy, alpha, scale, ex0, ex1, vx0, vx1, pw}.
    * False when the GPU cannot hold the set. */
   sync(cols, p) {
-    const t0 = performance.now();
     const alpha = this.raw ? 0 : p.alpha;
     const key = `${p.xmode}|${p.logx}|${p.logy}|${alpha}|${alpha > 0 ? p.scale : 0}`;
     const fresh = this.pts.live && key === this.key && this.inWindow(p) && this.updateStale(cols, p, alpha);
-    const ok = fresh || this.build(cols, p, alpha, key);
-    const dt = performance.now() - t0;
-    this.uploadMs = dt > 0.05 ? dt : 0;
-    return ok;
+    return fresh || this.build(cols, p, alpha, key);
   }
 
   /** Whether the view stays inside the decimation window (if any) at enough resolution. */
@@ -535,7 +530,7 @@ export class Chart {
     const rows = !app.grouped && binned ? this.binnedRows(groups, v) : null;
     if (rows === WAITING) return WAITING;
     const runLines = rows || groups.filter((ln) => ln.cols[0]);
-    const gl = !app.grouped && r ? this.linesGL(r, runLines, v, o, yr) : null;
+    const gl = !app.grouped && r ? this.linesGL(r, runLines, v, yr) : null;
     const lines = gl ? gl.lines : app.grouped ? this.linesGrouped(groups, allCols, v, o, yr, binned) : this.linesCanvas(runLines, v, yr);
     if (lines === WAITING) return WAITING;
     const y = this.yView(o, yr, allCols, v);
@@ -557,14 +552,13 @@ export class Chart {
   }
 
   /** Lines drawn from the GPU line sets ({lines, density}), or null when the GPU cannot hold them. */
-  linesGL(r, groups, v, o, yr) {
+  linesGL(r, groups, v, yr) {
     const faint = v.alpha > 0;
-    const density = r.density && (o.render === "density" || (o.render === "auto" && groups.length > DENSITY_AUTO));
+    const density = this.binned && r.heatmaps;
     const p = { ...v, pw: this.pw, vx0: v.x0, vx1: v.x1 };
     const g = this.glLines(r);
     const cols = groups.map((ln) => ln.cols[0]);
     const ok = g.main.sync(cols, p) && (!faint || density || g.faint.sync(cols, p));
-    this.uploadMs = g.main.uploadMs + (faint && !density ? g.faint.uploadMs : 0);
     if (!ok) return null;
     for (const c of cols) for (const raw of faint ? [false, true] : [false]) growVisible(c, v, raw, yr);
     return { lines: groups.map((ln) => ({ ...ln })), density };
@@ -821,7 +815,6 @@ export class Chart {
   /** Compute what the chart shows next (the costly part), for `draw` to present. */
   prepare() {
     this.dirty = false;
-    this.uploadMs = 0;
     const next = this.w ? this.compute() : null;
     this.waiting = next === WAITING; // a worker computes what it shows; it is prepared again once that is done
     if (this.waiting) return;

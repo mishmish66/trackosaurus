@@ -192,9 +192,10 @@ def test_serve_hands_remote_addresses_to_the_daemon(roots, runs, capsys):
         control.server_close()
 
 
-def test_serving_a_remote_address_needs_a_daemon(home):
-    with pytest.raises(SystemExit, match="trex daemon"):
+def test_serving_a_remote_address_needs_a_daemon(home, capsys):
+    with pytest.raises(SystemExit) as e:
         main(["serve", "box:/runs"])
+    assert e.value.code == 2 and "trex daemon" in capsys.readouterr().err
 
 
 def test_passed_through_answers_keep_the_connection_usable(roots, runs, http):

@@ -12,11 +12,11 @@ explorer. To *use* trex to explore runs, read `trex --help` and `trex COMMAND --
 | `trex/chunks.py` | per-metric chunk codec: each commit is one `rowmeta` row (steps, times) plus one `chunk` per metric present; `prepare_merge` / `apply_merge` rewrite adjacent commits as one |
 | `trex/buckets.py` | bucket arrays, the one form metric data takes between run files and charts: the `TKB1` format (`encode`, `decode`), `bucketize`, `merge`, `cut`, `union`, and `Stack` (many runs' buckets, each at its own level) |
 | `trex/writer.py` | `trex.init` / `Run` / `folder_info`: logging API, background commit thread, and a merge thread that merges small commits |
-| `trex/media.py` | PNG/MP4 encoding for logged arrays (numpy and ffmpeg imported lazily) |
-| `trex/index.py` | `Explorer`: crawl, per-run scans (inline or process pool), each run's kept buckets, finished runs' merged levels (saved, memory-mapped), blocks built from run files with a size-bounded cache, block answers (`buckets_body`), event hub |
+| `trex/media.py` | PNG/MP4 encoding for logged arrays (MP4 through ffmpeg) |
+| `trex/index.py` | `Explorer`: crawl, per-run scans (inline or process pool), each run's kept buckets, finished runs' merged levels (saved, memory-mapped), blocks built from run files, block answers (`buckets_body`) and a size-bounded memo of them (`Memo`), event hub, SSE messages (`messages`) |
 | `trex/server.py` | read-only HTTP + SSE for the UI: `/api/runs`, `/api/buckets`, `/api/rows`, `/api/stream`, media |
 | `trex/daemon.py` | `trex daemon`: `Roots` (tracked directories by spec, `unique_names`, workspaces; `roots.json`, remembered ones in `history.json`), the Unix control socket, its client |
-| `trex/workspace.py` | workspaces: `Workspace` merges member directories (`Local`, `Far`) behind the Explorer interface, renaming run ids |
+| `trex/workspace.py` | workspaces: `Workspace` merges its members (`Member`: an `Explorer`, or `Far` for a remote one, which answers as an Explorer does) behind the Explorer interface, renaming run ids |
 | `trex/remote.py` | `host:path` directories: `parse`, this trex as a wheel (`build_wheel`), the ssh + `uvx` command, `Remote` (one ssh session, reconnected with backoff) |
 | `trex/compact.py` | `trex compact`: rewrites a run no process has open with its commits merged (exclusive lock, new file, verify, rename) |
 | `trex/update.py` | the daemon's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd or launchd to restart it |

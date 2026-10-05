@@ -86,8 +86,7 @@ def test_names_follow_emacs_uniquify(specs, want):
 
 def test_saved_directories_that_no_longer_exist_are_skipped(roots, dirs, tmp_path, state):
     roots.add(dirs[0])
-    (state / "roots.json").write_text(json.dumps([{"name": "gone", "root": str(tmp_path / "gone")},
-                                                  {"name": "runs", "root": str(dirs[0])}]))
+    (state / "roots.json").write_text(json.dumps({"tracked": [str(tmp_path / "gone"), str(dirs[0])], "workspaces": []}))
     again = Roots(tmp_path / "cache", state / "roots.json")
     again.load()
     assert [r["name"] for r in again.served()] == ["runs"]

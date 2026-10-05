@@ -5,15 +5,15 @@ import math
 import os
 import re
 import sqlite3
-from array import array
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Final, Literal, NotRequired, TypedDict, cast
 
 from . import chunks
 from .format import (DB, INFO_FILE, JSONValue, MediaKind, RunState, as_dict, as_float, as_run_state, as_str, as_str_list,
                      key_names, snapshot)
-from .index import Explorer
+from .index import Explorer, RunsView
+from .where import as_number, text_of
 
 type PathLike = str | os.PathLike[str]
 type Center = Literal["median", "mean", "iqm"]
@@ -102,18 +102,6 @@ def is_run(path: PathLike) -> bool:
     return (Path(path) / DB).is_file()
 
 
-def num(v: object) -> float | None:
-    """Metric value as float; the wire markers "nan"/"inf"/"-inf" become floats."""
-    if isinstance(v, (int, float)):
-        return float(v)
-    if isinstance(v, str):
-        try:
-            return float(v)
-        except ValueError:
-            return None
-    return None
-
-
 # ---- run sets (through the explorer index) ----
 
 def open_index(root: PathLike, cache: PathLike) -> Explorer:
@@ -124,19 +112,18 @@ def open_index(root: PathLike, cache: PathLike) -> Explorer:
     return ex
 
 
-def records(ex: Explorer, prefix: str = "") -> list[Record]:
-    """One flat record per run under folder `prefix` (relative to the index root)."""
-    body = ex.runs(prefix)
+def records(view: RunsView, dirs: Mapping[str, Path]) -> list[Record]:
+    """One flat record per run of an Explorer's runs view; `dirs`: the run directory of each run."""
     media: dict[str, int] = {}
-    for m in body["media"]:
+    for m in view["media"]:
         media[m.run] = media.get(m.run, 0) + 1
     out: list[Record] = []
-    for m in body["runs"]:
+    for m in view["runs"]:
         s = m["summary"]
         out.append({
             "path": m["id"], "name": m["name"], "parent": m["parent"], "state": m["state"],
             "step": s.get("_step"), "runtime": s.get("_runtime"), "rows": m["seq"], "media": media.get(m["id"], 0),
-            "created": m["created"], "updated": m["updated"], "tags": m["tags"], "dir": str(ex.dirs[m["id"]]), "visible": True,
+            "created": m["created"], "updated": m["updated"], "tags": m["tags"], "dir": str(dirs[m["id"]]), "visible": True,
             "config": m["config"], "info": m["info"],
             "summary": {k: v for k, v in s.items() if not k.startswith("_")},
         })
@@ -152,8 +139,7 @@ def get(rec: Record, field: str) -> object:
     if head in ("config", "c") and rest:
         return rec["config"].get(rest)
     if head in SUMMARY_PREFIXES and rest:
-        v = rec["summary"].get(rest)
-        return num(v) if v is not None else None
+        return rec["summary"].get(rest)
     if head == "info" and rest:
         if rest in rec["info"]:
             return rec["info"][rest]
@@ -163,13 +149,7 @@ def get(rec: Record, field: str) -> object:
         return v
     if field in rec["config"]:
         return rec["config"][field]
-    if field in rec["summary"]:
-        return num(rec["summary"][field])
-    return None
-
-
-def _text(v: object) -> str:
-    return v if isinstance(v, str) else json.dumps(v)
+    return rec["summary"].get(field)
 
 
 # ---- sorting ----
@@ -190,10 +170,10 @@ def sort_records[R](recs: Sequence[R], spec: str, getter: Callable[[R, str], obj
 def _sortable(v: object) -> tuple[int, float, str] | None:
     if v is None:
         return None
-    n = num(v) if not isinstance(v, str) else None
+    n = as_number(v)
     if n is not None:
         return None if math.isnan(n) else (0, n, "")
-    return (1, 0.0, _text(v))
+    return (1, 0.0, text_of(v))
 
 
 # ---- statistics (same definitions as the browser's group bands) ----
@@ -273,11 +253,6 @@ def _media(c: sqlite3.Connection, run_dir: PathLike) -> list[MediaItem]:
 def read_meta(run_dir: PathLike) -> dict[str, JSONValue]:
     with snapshot(run_dir) as c:
         return _meta(c)
-
-
-def read_keys(run_dir: PathLike) -> list[str]:
-    with snapshot(run_dir) as c:
-        return sorted(key_names(c).values())
 
 
 def row_count(run_dir: PathLike) -> int:
@@ -361,15 +336,15 @@ def twema(xs: Sequence[float], ys: Sequence[float | None], alpha: float, scale: 
     return out
 
 
-def series(run_dir: PathLike, keys: Iterable[str], x: Literal["step", "runtime"] = "step") -> dict[str, tuple[array[float], array[float]]]:
-    """{key: (xs, ys)} in row order."""
-    out = {k: (array("d"), array("d")) for k in keys}
+def series(run_dir: PathLike, wanted: Callable[[str], bool], x: Literal["step", "runtime"] = "step") -> dict[str, tuple[list[float], list[float]]]:
+    """{key: (xs, ys)} in row order, of the metrics `wanted` takes."""
+    out: dict[str, tuple[list[float], list[float]]] = {}
     with snapshot(run_dir) as c:
         stop = chunks.row_count(c)
         for kid, name in key_names(c).items():
-            if name in out:
+            if wanted(name):
                 steps, values, times = chunks.metric(c, kid, stop=stop)
-                out[name] = (array("d", (steps if x == "step" else times).tobytes()), array("d", values.tobytes()))
+                out[name] = ((steps if x == "step" else times).tolist(), values.tolist())
     return out
 
 
