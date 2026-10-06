@@ -47,7 +47,8 @@ run.finish()                                    # also at exit; an uncaught exce
 - On a cluster, use a data-transfer node (`xfer:/scratch/me/runs`); jobs on any node stream live.
 - Add `http://host:port` to pull everything another trex holds, kept on this machine to browse offline: a laptop
   pulling a lab workstation's trex reads every machine the workstation crawls without reaching them itself.
-- `trex systemd-unit` or `trex launchd-plist` (macOS) gives a service with an update button in the `trex` panel.
+- `trex systemd-unit`, `trex launchd-plist` (macOS) or `trex runit-service` (runit, as on Void) gives a service with
+  an update button in the `trex` panel.
 - `trex compact DIR` merges the commits of runs logged a few rows per commit (written before the writer merged them); rows are unchanged.
 
 ## Limits

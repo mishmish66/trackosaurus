@@ -1,6 +1,7 @@
 """The `trex` command; `trex --help` documents it."""
 
 import csv
+import getpass
 import json
 import math
 import os
@@ -518,11 +519,16 @@ def service_path(*extra: str) -> str:
     return ":".join(dict.fromkeys(path))
 
 
+def service_options(port: int, cache: str | None, source: str | None) -> list[str]:
+    """The options besides the hosts that a service file's header repeats, to make it again."""
+    return [*(["--port", str(port)] if port != DEFAULT_PORT else []), *(["--cache", cache] if cache else []),
+            *(["--source", source] if source else [])]
+
+
 def systemd_unit(hosts: list[str], port: int, allow: list[str], cache: str | None, source: str | None) -> str:
     """The unit for `trex systemd-unit`."""
     host_args = service_args(hosts, allow)
-    options = [*(["--port", str(port)] if port != DEFAULT_PORT else []), *(["--cache", cache] if cache else []),
-               *(["--source", source] if source else [])]
+    options = service_options(port, cache, source)
     return UNIT.format(args="".join(f" {shlex.quote(a)}" for a in host_args + options), status=update.RESTART_STATUS,
                        env="".join(f"Environment={k}={v}\n" for k, v in service_env(cache, source).items()), path=service_path(),
                        exec_start=shlex.join([sys.executable, "-m", "trex", "serve", *host_args, "--port", str(port)]))
@@ -577,6 +583,46 @@ def launchd_plist_cmd(host: Hosts = None, port: ServicePort = DEFAULT_PORT, allo
     source = service_source(source)
     typer.echo(launchd_plist(host or [], port, allow_host or [], cache, source), nl=False)
     warn_not_tool_install("launchd-plist", source)
+
+
+RUNIT_AS_USER: Final = 'chpst -u "$USER:$(id -Gn "$USER" | tr \' \' :)"'  # the user and all their groups, from root
+
+RUNIT_RUN: Final = """\
+#!/bin/sh
+# trex as a runit service, started by the system's runsvdir and run as {user}:
+#   sudo mkdir -p /etc/sv/trex/log
+#   trex runit-service{args} | sudo tee /etc/sv/trex/run >/dev/null && sudo chmod +x /etc/sv/trex/run
+#   sudo ln -s /usr/bin/vlogger /etc/sv/trex/log/run  # its log: syslog, tagged trex (socklog: svlogtail daemon)
+#   sudo ln -s /etc/sv/trex /var/service/
+#   sudo sv status trex  # also sv restart, sv down, sv up
+# runsv starts it again whenever it exits: after a failed start (an address that is not up yet), and after an update,
+# when trex exits with {status}, on the new trex.
+exec 2>&1
+ulimit -n 524288  # the open-file limit systemd gives services
+export HOME={home} USER={user} LOGNAME={user} PATH={path}
+export PYTHONUNBUFFERED=1 NO_COLOR=1 TREX_SERVICE=runit{env}
+exec {as_user} {exec_start}
+"""
+
+
+def runit_run(hosts: list[str], port: int, allow: list[str], cache: str | None, source: str | None) -> str:
+    """The run script for `trex runit-service`."""
+    host_args, q = service_args(hosts, allow), shlex.quote
+    return RUNIT_RUN.format(args="".join(f" {q(a)}" for a in host_args + service_options(port, cache, source)),
+                            status=update.RESTART_STATUS, home=q(str(Path.home())), user=q(getpass.getuser()),
+                            path=q(service_path()), env="".join(f" {k}={q(v)}" for k, v in service_env(cache, source).items()),
+                            as_user=RUNIT_AS_USER,
+                            exec_start=shlex.join([sys.executable, "-m", "trex", "serve", *host_args, "--port", str(port)]))
+
+
+@command("runit-service")
+def runit_service_cmd(host: Hosts = None, port: ServicePort = DEFAULT_PORT, allow_host: AllowHosts = None,
+                      cache: ServiceCache = None, source: ServiceSource = None) -> None:
+    """Print a runit run script with which the system's runsvdir runs `trex serve` on this trex as you; its header
+    says how to install it."""
+    source = service_source(source)
+    typer.echo(runit_run(host or [], port, allow_host or [], cache, source), nl=False)
+    warn_not_tool_install("runit-service", source)
 
 
 @command("ls", "find")

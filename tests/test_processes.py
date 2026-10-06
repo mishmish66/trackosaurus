@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from trex.cli import RUNIT_AS_USER
+
 from helpers import get_json, post_json, wait_for, write_run
 
 type Forge = tuple[str, Callable[[], str]]
@@ -75,6 +77,20 @@ def test_the_machines_trex_takes_directories_from_serve_and_removes_its_socket_o
         assert interrupt(p) == 0
     assert not (tmp_path / "state" / "daemon.sock").exists()
     assert json.loads((tmp_path / "state" / "roots.json").read_text())["tracked"] == [str(a), str(b)]
+
+
+def test_a_runit_run_script_starts_this_machines_trex_as_a_service(tmp_path: Path, env: dict[str, str]) -> None:
+    port = free_port()
+    script = subprocess.run(trex_cmd("runit-service", "--port", port, "--source", "git+https://x"), env=env, capture_output=True,
+                            text=True, check=True).stdout
+    (tmp_path / "run").write_text(script.replace(f"exec {RUNIT_AS_USER} ", "exec "))  # changing the user takes root
+    p = subprocess.Popen(["sh", str(tmp_path / "run")], env=env, stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout and any("http://" in line for line in p.stdout)
+        updates = get_json(f"http://127.0.0.1:{port}/api/node")["updates"]
+        assert updates["source"] == "git+https://x" and "not running as a service" not in updates["reason"]
+    finally:
+        assert interrupt(p) == 0
 
 
 def test_a_restarted_trex_serves_the_directories_it_had(tmp_path: Path, env: dict[str, str]) -> None:

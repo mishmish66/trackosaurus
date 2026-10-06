@@ -1,4 +1,5 @@
-"""Updating the daemon's trex from $TREX_SOURCE: `uv tool install $TREX_SOURCE`, then systemd or launchd restarts it."""
+"""Updating the daemon's trex from $TREX_SOURCE: `uv tool install $TREX_SOURCE`, then systemd, launchd or runit
+restarts it."""
 
 import functools
 import importlib.metadata
@@ -84,14 +85,14 @@ def tool_env() -> Path | None:
 
 
 def updates(env: Mapping[str, str] = os.environ, prefix: Path | None = None) -> Updates:
-    """Whether this process can update itself: it needs $TREX_SOURCE, systemd or launchd to restart it, and to run
-    the trex that `uv tool install` replaces."""
+    """Whether this process can update itself: it needs $TREX_SOURCE, systemd, launchd or runit to restart it, and to
+    run the trex that `uv tool install` replaces."""
     source = env.get("TREX_SOURCE") or None
     prefix = (prefix or Path(sys.prefix)).resolve()
     if source is None:
         reason = "TREX_SOURCE is not set"
     elif not service(env):
-        reason = "not running as a service (see `trex systemd-unit`, `trex launchd-plist`)"
+        reason = "not running as a service (see `trex systemd-unit`, `trex launchd-plist`, `trex runit-service`)"
     elif tool_env() != prefix:
         reason = f"this trex ({prefix}) is not the uv tool install ({tool_env()})"
     else:
@@ -100,8 +101,8 @@ def updates(env: Mapping[str, str] = os.environ, prefix: Path | None = None) -> 
 
 
 def service(env: Mapping[str, str]) -> bool:
-    """Whether systemd or launchd (`trex launchd-plist`) runs this process."""
-    return "INVOCATION_ID" in env or env.get("TREX_SERVICE") == "launchd"
+    """Whether systemd, launchd (`trex launchd-plist`) or runit (`trex runit-service`) runs this process."""
+    return "INVOCATION_ID" in env or env.get("TREX_SERVICE") in ("launchd", "runit")
 
 
 def install(source: str) -> str:

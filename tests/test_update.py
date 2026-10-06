@@ -41,8 +41,9 @@ def test_updates_need_a_source_a_service_manager_and_the_uv_tool_install(tmp_pat
     assert "TREX_SOURCE" in update.updates({"INVOCATION_ID": "1"}, tool).reason
     assert "systemd" in update.updates({"TREX_SOURCE": "git+https://x"}, tool).reason
     assert "not the uv tool install" in update.updates(systemd, tmp_path).reason
-    launchd = {"TREX_SOURCE": "git+https://x", "TREX_SERVICE": "launchd"}
-    assert update.updates(launchd, tool) == update.Updates(source="git+https://x", available=True, reason="")
+    for manager in ("launchd", "runit"):
+        env = {"TREX_SOURCE": "git+https://x", "TREX_SERVICE": manager}
+        assert update.updates(env, tool) == update.Updates(source="git+https://x", available=True, reason="")
 
 
 def test_install_failure_carries_uvs_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

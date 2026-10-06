@@ -25,8 +25,18 @@ As a launchd agent on macOS (running while you are logged in; log in ~/Library/L
     trex launchd-plist > ~/Library/LaunchAgents/trex.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/trex.plist
 
-The update button in the panel installs the newest trex from the `--source` given to `trex systemd-unit` or
-`trex launchd-plist` (default this repository), and systemd or launchd restarts it on it.
+As a runit service (Void Linux), started by the system's runsvdir and run as you (log in syslog, tagged trex; with
+socklog: `svlogtail daemon`):
+
+    uv tool install git+https://github.com/mishmish66/trackosaurus
+    sudo mkdir -p /etc/sv/trex/log
+    trex runit-service | sudo tee /etc/sv/trex/run >/dev/null && sudo chmod +x /etc/sv/trex/run
+    sudo ln -s /usr/bin/vlogger /etc/sv/trex/log/run
+    sudo ln -s /etc/sv/trex /var/service/
+
+The update button in the panel installs the newest trex from the `--source` given to `trex systemd-unit`,
+`trex launchd-plist` or `trex runit-service` (default this repository), and systemd, launchd or runit restarts it on
+it.
 
 A directory given as `host:path` is crawled on that machine over ssh: the node copies this trex there and runs it
 with uvx (`trex.remote`), one for all the directories it tracks on that host, so the machine needs only uv and an ssh

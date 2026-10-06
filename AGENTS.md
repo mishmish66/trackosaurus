@@ -23,10 +23,10 @@ docstrings (Markdown, published by `docs/build.py`); the README's "One trex, man
 | `trex/workspace.py` | `Workspace`: members (`Member`: a name and an Explorer) behind the Explorer interface, run ids renamed; merged (a named workspace) or nested (a node's home view) |
 | `trex/server.py` | HTTP + SSE for a node: the UI, `/api/node*`, `/api/holdings`, and per directory or workspace `/api/runs`, `/api/buckets`, `/api/rows`, `/api/stream`, `/api/dumps`, media |
 | `trex/compact.py` | `trex compact`: rewrites a run no process has open with its commits merged (exclusive lock, new file, verify, rename) |
-| `trex/update.py` | a node's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd or launchd to restart it |
+| `trex/update.py` | a node's update: `uv tool install $TREX_SOURCE`, then exit `RESTART_STATUS` for systemd, launchd or runit to restart it |
 | `trex/query.py` | read-side queries for the CLI: records, field access, sorting, statistics, series |
 | `trex/where.py` | run filters: a SQL WHERE clause (or a name search) compiled to a test over a field getter |
-| `trex/cli.py` | `trex` command (Typer): `serve systemd-unit launchd-plist ls groups keys tree show series tail media diff index compact`; `daemon` is a hidden alias of `serve` that service files written by older versions run |
+| `trex/cli.py` | `trex` command (Typer): `serve systemd-unit launchd-plist runit-service ls groups keys tree show series tail media diff index compact`; `daemon` is a hidden alias of `serve` that service files written by older versions run |
 | `trex/static/` | UI, plain ES modules: `app.js` (page, node panel), `data.js` (block store, planner, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (bucket arrays, columns, smoothing, decimation, group stats), `pool.js` and `worker.js` (binning on workers over copies of the columns and bucket arrays they read, fetching), `where.js` (run filters, run fields, filter completion); `index.html` |
 | `typings/` | type stubs for untyped dev dependencies (radon) |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
@@ -73,7 +73,8 @@ serves them, with the UI, to browsers and to other trex.
 - **This machine's trex** saves what it holds in `$TREX_DAEMON_DIR` (default `~/.local/state/trex`) and listens on the
   control socket there (`daemon.sock`, mode 0600). `trex serve DIR...` while it runs hands it the directories over the
   socket (asking first unless `-y` or stdin is not a tty) and exits; otherwise it becomes this machine's trex. Run as a
-  service (`trex systemd-unit`, `trex launchd-plist`), it updates itself from the panel (`trex.update`).
+  service (`trex systemd-unit`, `trex launchd-plist`, `trex runit-service`), it updates itself from the panel
+  (`trex.update`).
 - **A temporary node** (`trex serve --temporary`) saves nothing and ignores the control socket, so it runs beside this
   machine's trex. Given one local directory, `/` shows that directory alone (`Node.home`).
 - **A remote node** is a temporary node that another node starts on a host over ssh (`trex.remote`): `uvx` runs this
@@ -216,9 +217,9 @@ directories, links, workspaces, history, the trex it runs and whether it can upd
 `/workspace/delete`, `/history/clear`, and `/api/holdings`. The UI prefixes every request with its view's base
 (`BASE` in `data.js`), and the trex brand opens the panel that manages directories, links, workspaces and updates. A
 page whose `PROTOCOL` (in `data.js`) differs from the server's says so beside the status. An update installs
-`$TREX_SOURCE` and exits with `update.RESTART_STATUS`; the systemd unit's `RestartForceExitStatus` or the launchd
-agent's `KeepAlive` restarts it, and the UI reloads once `/api/node` reports the new install (`update.RUNNING`, read at
-start).
+`$TREX_SOURCE` and exits with `update.RESTART_STATUS`; the systemd unit's `RestartForceExitStatus`, the launchd
+agent's `KeepAlive` or runsv (which starts a runit service again whenever it exits) restarts it, and the UI reloads
+once `/api/node` reports the new install (`update.RUNNING`, read at start).
 
 ### Workspaces
 

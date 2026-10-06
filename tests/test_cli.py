@@ -1,6 +1,9 @@
+import getpass
+import grp
 import io
 import json
 import math
+import os
 import plistlib
 import re
 import shlex
@@ -20,7 +23,7 @@ from _pytest.capture import CaptureResult
 import trex
 from trex import query as Q
 from trex import update
-from trex.cli import field_columns, main, where_test
+from trex.cli import RUNIT_AS_USER, field_columns, main, where_test
 from trex.format import connect_ro
 
 from helpers import committed_rows, wait_for
@@ -453,6 +456,48 @@ def test_launchd_plist_with_an_empty_source_has_no_update_source(capsys: pytest.
     monkeypatch.setenv("TREX_SOURCE", "git+https://example.org/trex")
     main(["launchd-plist", "--source", ""])
     assert "TREX_SOURCE" not in plistlib.loads(capsys.readouterr().out.encode())["EnvironmentVariables"]
+
+
+def runit_env(script: str, tmp_path: Path) -> dict[str, str]:
+    """The environment runit run script `script` gives the trex it runs: the script run with its last line, the exec,
+    replaced by env."""
+    probe = tmp_path / "probe"
+    probe.write_text("".join(f"{line}\n" for line in [*script.splitlines()[:-1], "exec env"]))
+    out = subprocess.run(["sh", str(probe)], env={}, capture_output=True, text=True, check=True).stdout
+    return dict(line.split("=", 1) for line in out.splitlines() if re.match(r"[A-Za-z_]\w*=", line))
+
+
+def test_runit_service_runs_this_trex_as_you_and_runsv_starts_it_again_after_an_update(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    main(["runit-service", "--host", "127.0.0.1", "--port", "9000", "--allow-host", "box.tailnet.ts.net",
+          "--cache", str(tmp_path / "my cache"), "--source", "git+https://example.org/trex"])
+    script = capsys.readouterr().out
+    lines = script.splitlines()
+    assert lines[0] == "#!/bin/sh" and "exec 2>&1" in lines
+    assert lines[-1] == f"exec {RUNIT_AS_USER} " + shlex.join([sys.executable, "-m", "trex", "serve", "--host", "127.0.0.1",
+                                                              "--allow-host", "box.tailnet.ts.net", "--port", "9000"])
+    (tmp_path / "run").write_text(script)
+    assert subprocess.run(["sh", "-n", str(tmp_path / "run")]).returncode == 0
+    env = runit_env(script, tmp_path)
+    assert {"TREX_SOURCE": "git+https://example.org/trex", "TREX_CACHE": str((tmp_path / "my cache").resolve()),
+            "HOME": str(Path.home()), "USER": getpass.getuser()}.items() <= env.items()
+    assert update.service(env) and str(Path(sys.executable).parent) in env["PATH"].split(":")
+    as_user = subprocess.run(["sh", "-c", f"USER={getpass.getuser()}; echo {RUNIT_AS_USER.removeprefix('chpst -u ')}"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    assert as_user.split(":")[:2] == [getpass.getuser(), grp.getgrgid(os.getgid()).gr_name]
+
+
+def test_runit_service_updates_from_the_trex_repository_by_default(capsys: pytest.CaptureFixture[str], tmp_path: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TREX_SOURCE", raising=False)
+    main(["runit-service"])
+    assert runit_env(capsys.readouterr().out, tmp_path)["TREX_SOURCE"] == update.DEFAULT_SOURCE
+
+
+def test_runit_service_with_an_empty_source_has_no_update_source(capsys: pytest.CaptureFixture[str], tmp_path: Path,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TREX_SOURCE", "git+https://example.org/trex")
+    main(["runit-service", "--source", ""])
+    assert "TREX_SOURCE" not in runit_env(capsys.readouterr().out, tmp_path)
 
 
 def test_version_names_the_installed_trex(capsys: pytest.CaptureFixture[str]) -> None:
