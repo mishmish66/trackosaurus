@@ -242,3 +242,58 @@ test("a column takes each step from the finest level whose blocks hold it, in st
     }
   }
 });
+
+test("a chunk whose columns are all freed is told of, and its floats go to later columns under its next generation", () => {
+  const drops = [], whole = (loc) => K.chunkView(loc.chunk).length;
+  K.onDrops((id, gen) => drops.push([id, gen]));
+  const before = K.columnStore(1), filler = K.columnStore(whole(before.loc)); // the columns after these begin a chunk
+  const a = K.columnStore(3), b = K.columnStore(5);
+  assert.deepEqual([b.loc.chunk, b.loc.gen, b.loc.off, a.loc.size, b.loc.size], [a.loc.chunk, a.loc.gen, a.loc.off + 3, 3, 5]);
+  a.view.set([1, 2, 3]);
+  assert.deepEqual([...K.chunkView(a.loc.chunk).subarray(a.loc.off, a.loc.off + 3)], [1, 2, 3]);
+  const next = K.columnStore(whole(a.loc)); // more than the chunk has left: another takes the columns from here on
+  assert.notEqual(next.loc.chunk, a.loc.chunk);
+  K.freeStore(a.loc);
+  assert.deepEqual(drops, []);
+  K.freeStore(b.loc);
+  assert.deepEqual(drops, [[a.loc.chunk, a.loc.gen]]);
+  const again = K.columnStore(whole(a.loc));
+  assert.deepEqual(again.loc, { chunk: a.loc.chunk, gen: a.loc.gen + 1, off: 0, size: whole(a.loc) });
+  for (const x of [before, filler, next, again]) K.freeStore(x.loc);
+});
+
+test("a column bins by runtime the same in whatever order its runtimes come", () => {
+  // [runtime, value, rows it stands for]: bins of one finite mean, of infinities alone, of both signs, and empty ones
+  const points = [[5.5, 1, 2], [0.5, 4, 1], [5.6, 3, 2], [0.6, Infinity, 1], [2.5, Infinity, 1], [9.5, 7, 1], [2.6, -Infinity, 3],
+                  [3.5, Infinity, 1], [1.5, NaN, 1], [0.7, 8, 3], [9.1, 9, 1]];
+  const of = (pts) => K.Col.adopt(Float64Array.from(pts, (_, i) => i), Float64Array.from(pts, (q) => q[1]), Float64Array.from(pts, (q) => q[0]),
+                                  pts.length, Float64Array.from(pts, (q) => q[2]));
+  const p = { xmode: K.X_RUNTIME, x0: 0, x1: 10, bins: 10, flags: 0, alpha: 0, scale: 1 };
+  const resumed = of(points), inOrder = of([...points].sort((a, b) => a[0] - b[0]));
+  assert.deepEqual([resumed.sorted[K.X_RUNTIME], inOrder.sorted[K.X_RUNTIME]], [false, true]);
+  assert.deepEqual([...K.binRows([resumed], p)], [7, NaN, NaN, Infinity, Infinity, 2, 3.5, 5, 6.5, 8]);
+  assert.deepEqual([...K.binRows([resumed], p)], [...K.binRows([inOrder], p)]);
+});
+
+test("the point nearest a runtime is found in whatever order the runtimes come", () => {
+  const v = [10, 11, 12, 13, 14], t = [7, 2, 9, 4, 1], c = column([0, 1, 2, 3, 4], v, t);
+  assert.equal(c.len, 5);
+  for (const [x, i] of [[0, 4], [2.9, 1], [3.1, 3], [8.1, 2], [100, 2]]) {
+    assert.deepEqual(K.nearest(c, K.X_RUNTIME, x, 0, 1), { i, x: t[i], y: v[i], raw: v[i] }, `runtime ${x}`);
+  }
+});
+
+test("a kept binning takes the columns it is given later", () => {
+  const cols = Array.from({ length: 5 }, (_, k) => column([0.5, 1.5], [k, 2 * k]));
+  const p = { xmode: K.X_STEP, x0: 0, x1: 2, bins: 2, flags: 0, alpha: 0, scale: 1 }, cache = new K.BinCache();
+  assert.deepEqual([...K.binRows(cols.slice(0, 1), p, cache)], [0, 0]);
+  assert.deepEqual([...K.binRows(cols, p, cache)], cols.flatMap((_, k) => [k, 2 * k]));
+});
+
+test("rows streamed at steps no block shown holds are all kept, bucketed at the chart's level", () => {
+  const block = fullBlock(2, 0, (q) => q); // steps [0, 1024) in buckets of 4
+  const tail = { s: [2000, 2001, 2003, 2004, 2100], v: [1, 3, 5, 7, 9], t: [10, 20, 30, 40, 50], q: [0, 1, 2, 3, 4], n: 5 };
+  const col = K.buildColumn([block], tail, 2, false), last = (a) => [...a.subarray(col.n - 3, col.n)];
+  assert.equal(col.n, 256 + 3);
+  assert.deepEqual([last(col.s), last(col.v), last(col.t), last(col.w)], [[6004 / 3, 2004, 2100], [3, 7, 9], [20, 40, 50], [3, 1, 1]]);
+});

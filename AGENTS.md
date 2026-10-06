@@ -46,18 +46,31 @@ uv run pytest                                             # all suites, one work
 uv run pytest --cov                                       # the same with branch coverage, subprocesses included; fails below 94%
 uv run python docs/build.py                               # pdoc pages into site/
 node --test tests/*.test.mjs                              # JS kernel, shared cases, complexity and unused variables (node >= 18)
+node --test --experimental-test-coverage --test-coverage-include='trex/static/kernel.js' \
+  --test-coverage-include='trex/static/where.js' --test-coverage-lines=95 --test-coverage-branches=85 \
+  tests/*.test.mjs                                        # the same with CI's coverage floors (node >= 22.8; see below)
 uv run python tests/browser_smoke.py                      # headless UI on its own throwaway trex; fails below 92% UI line coverage
                                                           # (Chromium once: uv run playwright install chromium)
 uv run python examples/demo.py /tmp/runs && uv run trex serve /tmp/runs --temporary
 ```
 
 Run pyright and the three suites after any change that touches their area. CI (`.github/workflows/test.yml`) runs
-pyright, `pytest --cov` and the node tests with coverage of `kernel.js` and `where.js` (95% of lines, 85% of branches)
-on Python 3.12; the smoke test stays local. It measures which lines of the UI modules run (V8 coverage over every page
-it loads), fails below `UI_COVERAGE`, and writes the uncovered lines to `ui_coverage.txt` beside its screenshots. It
-starts its own trex (`trex serve --temporary`, and nodes with a private `TREX_DAEMON_DIR`) on temporary directories
-and free ports. Never point tests at a trex someone is using: tests that start this machine's trex give it a private
-`TREX_DAEMON_DIR`.
+pyright, `pytest --cov` and the node tests with their coverage floors, on Python 3.12 and Node 22; the smoke test stays
+local. It measures which lines of the UI modules run (V8 coverage over every page it loads), fails below `UI_COVERAGE`,
+and writes the uncovered lines to `ui_coverage.txt` beside its screenshots. It starts its own trex (`trex serve
+--temporary`, and nodes with a private `TREX_DAEMON_DIR`) on temporary directories and free ports. Never point tests at
+a trex someone is using: tests that start this machine's trex give it a private `TREX_DAEMON_DIR`.
+
+The node tests have coverage floors of their own, which only the second `node` command above checks: of `kernel.js`
+and `where.js` together they must run 95% of the lines and 85% of the branches, or the command exits 1 though every
+test passes. Its report ends with each file's percentages and the numbers of the lines not run. Only node tests count,
+not what the smoke test runs in a browser, so code added to either file needs a node test of what it does
+(`tests/kernel.test.mjs`; `tests/shared_cases.test.mjs` for what is shared with Python; `tests/where.test.mjs`).
+`--test-coverage-include` needs Node 22.5 and the two floors Node 22.8; no Node 18 or 20 has them (`bad option`). With
+an older `node`, a plain `node --test` passing says nothing about the floors: run the command with a Node 22 release
+unpacked from nodejs.org (`<dir>/bin/node --test ...`; the tests need nothing else of it), or run `node --test
+--experimental-test-coverage tests/*.test.mjs`, which prints the same percentages for every file it loads and never
+fails on them, and read its `kernel.js` and `where.js` rows (its `all files` row counts the test files too).
 
 Headless Chromium reaches the GPU only with
 `--headless=new --use-gl=angle --use-angle=gl-egl --ignore-gpu-blocklist --enable-gpu`; without them WebGL falls back
@@ -367,6 +380,10 @@ block input for more than about 50 ms.
 - The browser smoke test streams runs while recording every chart draw (`flicker_smoke`); `TREX_REFRESH` sets how
   often growing runs are compiled (10 s; the smoke test uses 1 s).
 - Measure before and after a change (time from the action to the next frame, plus long tasks), rather than assuming.
+  Measure each kind of chart the change touches, since they take different paths: runs drawn one by one (`group=run`)
+  come from the GPU line sets; grouped charts, which a page opens with (`DEFAULT_GROUP`, or the folder's `group_by`),
+  bin their runs' columns on workers and redraw when those answer; charts of more runs than `App.coarseAbove` bin from
+  buckets. A zoom has two times to measure: its first redraw, and the redraw with its detail.
 
 ## Conventions
 

@@ -3,7 +3,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { Col, IQM, STATS, X_STEP, aggGroups, binRows, bucketPaths, bucketStep, bucketViews, buildColumn, unframe } from "../trex/static/kernel.js";
+import { Col, IQM, STATS, X_STEP, aggGroups, binRows, bucketPaths, bucketStep, bucketViews, buildColumn, runColumn, unframe }
+  from "../trex/static/kernel.js";
 import { smoothScale } from "../trex/static/plot.js";
 import { asNumber } from "../trex/static/where.js";
 
@@ -86,6 +87,23 @@ test("runs' buckets bin to the mean of their rows per bin, as Python bins the ro
       if (!Number.isFinite(w)) return assert.ok(Object.is(got, w), `${at}: ${got} != ${w}`);
       assert.ok(Math.abs(got - w) <= 1e-5 * Math.max(1, Math.abs(w)), `${at}: ${got} != ${w}`);
     }));
+  }
+});
+
+test("a run's buckets viewed in their array are the column built from them, and bin as it does", () => {
+  for (const c of [...CASES.arrays, ...CASES.bins]) {
+    const { v } = viewsOf(c.blob);
+    for (let row = 0; row < v.runs; row++) {
+      const view = runColumn(v, row), built = buildColumn([{ v, row }], NO_TAIL, v.level, false), at = `array ${v.level}|${v.base} run ${row}`;
+      assert.deepEqual([view.len, view.sorted], [built.n, built.sorted], at);
+      for (const k of ["s", "v", "t", "w"]) assert.deepEqual([...view[k]], [...built[k].subarray(0, built.n)], `${at} ${k}`);
+      assert.equal(view.v.buffer, v.mean.buffer, `${at}: its values are the array's`);
+    }
+  }
+  for (const c of CASES.bins) {
+    const { v } = viewsOf(c.blob), p = { xmode: X_STEP, x0: c.x0, x1: c.x1, bins: c.bins, flags: 0, alpha: 0, scale: 1 };
+    const rows = (column) => [...binRows(Array.from({ length: v.runs }, (_, i) => column(i)), p)];
+    assert.deepEqual(rows((i) => runColumn(v, i)), rows((i) => buildColumn([{ v, row: i }], NO_TAIL, v.level, false)));
   }
 });
 
