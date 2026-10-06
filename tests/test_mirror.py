@@ -3,6 +3,7 @@ import json
 import shutil
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ import pytest
 import trex
 from trex import buckets as bk, crawl, mirror, server
 from trex.crawl import Crawl
-from trex.index import Dump, Explorer
+from trex.index import Dump, Explorer, Rows
 from trex.mirror import Pull, Unreachable, Upstream
 from trex.server import Server
 
@@ -188,6 +189,67 @@ def test_a_running_runs_rows_reach_the_mirrors_stream_and_stay_with_it_once_the_
     assert wait_for(lambda: not pull.connected)
     assert json.loads(m.rows_json("c/r5", 10)) == rows and m.live_seqs("c") == {"c/r5": (30, 0)}
     done.set()
+    live.finish()
+
+
+def test_a_running_runs_levels_follow_its_rows_once_its_tail_has_grown_or_its_keys_change(
+        source: Source, runs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(crawl, "REFRESH", 0.0)
+    monkeypatch.setattr(mirror, "RUNNING_EVERY", 0.0)
+    monkeypatch.setattr(mirror, "TAIL_ROWS", 20)
+    ex, _, url = source
+    ex.start()
+    m = mirror_of(url, tmp_path / "cache").start()
+    pull = m.origin
+    assert isinstance(pull, Pull)
+    live = write_run(runs / "c" / "r7", n=10, finish=False)
+    assert wait_for(lambda: "c/r7" in m.records and m.records["c/r7"].compiled == 10 and m.live_seqs("c") == {"c/r7": (10, 0)})
+    for i in range(10, 25):
+        live.log({"loss": 0.5}, step=i)
+    assert wait_for(lambda: m.live_seqs("c") == {"c/r7": (25, 0)} and ex.records["c/r7"].compiled == 25)
+    assert m.sync() == [] and m.records["c/r7"].compiled == 10
+    assert json.loads(m.rows_json("c/r7", 10))["rows"][-1][0] == 24.0
+    for i in range(25, 32):
+        live.log({"loss": 0.5}, step=i)
+    assert wait_for(lambda: m.records["c/r7"].compiled >= 30)
+    live.log({"loss": 0.5, "acc": 1.0}, step=32)
+    assert wait_for(lambda: "acc" in m.records["c/r7"].keys)
+    live.finish()
+
+
+def test_a_running_run_whose_tail_begins_past_its_levels_is_due_them_at_once(
+        source: Source, runs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mirror, "RUNNING_EVERY", 0.0)
+    ex, _, url = source
+    live = write_run(runs / "c" / "r9", n=10, finish=False)
+    assert wait_for(lambda: committed_rows(runs / "c" / "r9") == 10)
+    ex.sync()
+    m = synced(url, tmp_path / "cache")
+    pull = m.origin
+    assert isinstance(pull, Pull) and m.records["c/r9"].compiled == 10
+    due: list[bool] = []
+    for seq0 in (10, 11):  # a tail of one row: right after the levels, then past them
+        pull._tails["c/r9"] = Rows("c/r9", seq0, [[float(seq0), 0.0, {"loss": 0.5}]])
+        due.append(pull._due(m, "c/r9", time.monotonic()))
+    assert due == [False, True]
+    live.finish()
+
+
+def test_a_mirror_counts_of_a_running_run_only_the_rows_it_can_serve(
+        source: Source, runs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(crawl, "REFRESH", 1000.0)
+    ex, _, url = source
+    live = write_run(runs / "c" / "r10", n=10, finish=False)
+    assert wait_for(lambda: committed_rows(runs / "c" / "r10") == 10)
+    ex.sync()
+    for i in range(10, 20):
+        live.log({"loss": 0.5}, step=i)
+    assert wait_for(lambda: committed_rows(runs / "c" / "r10") == 20)
+    ex.sync()
+    assert (ex.records["c/r10"].seq, ex.records["c/r10"].compiled) == (20, 10)
+    m = synced(url, tmp_path / "cache")  # a mirror not following the stream: no tail beyond the levels
+    meta = m.runs("c").runs[0]
+    assert (m.records["c/r10"].seq, meta.seq, json.loads(m.rows_json("c/r10", meta.compiled))["rows"]) == (20, 10, [])
     live.finish()
 
 

@@ -2,6 +2,7 @@
 // density heatmap; the chart copies the result onto its own canvas. Points live in RG32F
 // textures (x, y relative to an origin); a line table (offset, count, color) per draw lets one
 // instanced multi-draw render every line as antialiased segment quads.
+//# allFunctionsCalledOnLoad
 
 const TW = 2048; // points per row of a point texture
 const MW = 1024; // lines per row of a line table
@@ -12,7 +13,7 @@ const MAX_BINS = 16; // texels of the density maximum
 const ext = (gl, name) => gl.getExtension(name);
 
 /** A program compiling and linking in the background (KHR_parallel_shader_compile); `linked` checks it. */
-function compile(gl, vs, fs) {
+export function compile(gl, vs, fs) {
   const p = gl.createProgram(), shaders = [];
   for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
     const s = gl.createShader(type);
@@ -26,7 +27,7 @@ function compile(gl, vs, fs) {
 }
 
 /** `prog` with its uniforms' locations, once it has linked; throws its compile errors when it failed. */
-function linked(gl, prog) {
+export function linked(gl, prog) {
   if (prog.u) return prog;
   const p = prog.p;
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
@@ -47,9 +48,9 @@ precision highp float;
 precision highp int;
 uniform highp sampler2D u_pos;
 uniform highp isampler2D u_meta;
-uniform int u_base, u_row0;
+uniform int u_base, u_row0, u_grid, u_first;
 uniform vec2 u_off, u_scale, u_org, u_size;
-vec2 fetch(int i) { return texelFetch(u_pos, ivec2(i % ${TW}, i / ${TW}), 0).xy; }
+vec2 fetch(int i) { i += u_first; return texelFetch(u_pos, ivec2(i % ${TW}, i / ${TW}), 0).xy; }
 ivec4 meta(int line) { return texelFetch(u_meta, ivec2(line % ${MW}, u_row0 + line / ${MW}), 0); }
 bool broken(vec2 p) { return abs(p.y) > 1.0e37 || abs(p.x) > 1.0e37; }
 vec2 toPx(vec2 p) { return vec2(u_org.x + (p.x - u_off.x) * u_scale.x, u_org.y - (p.y - u_off.y) * u_scale.y); }
@@ -57,16 +58,17 @@ vec4 toClip(vec2 P) { return vec4(P.x / u_size.x * 2.0 - 1.0, 1.0 - P.y / u_size
 vec4 unpack(ivec4 m) { return vec4(float((m.z >> 16) & 255), float((m.z >> 8) & 255), float(m.z & 255), float(m.w)) / 255.0; }
 `;
 
-// Segment quad: two triangles around segment i -> i+1, padded by half width plus the half pixel coverage reaches.
+// Segment quad: two triangles around segment i -> i+1, padded by half width plus the half pixel coverage reaches. Its
+// line is the draw's, or with u_grid segments a line, the instance's.
 const LINE_VS = (multi) => `${header(multi)}
 uniform float u_half, u_count;
 out vec2 v_uv;
 flat out float v_len, v_depth;
 flat out vec4 v_color;
 void main() {
-  int line = DRAW_ID + u_base;
+  int line = u_grid > 0 ? gl_InstanceID / u_grid : DRAW_ID + u_base;
   ivec4 m = meta(line);
-  int i = m.x + gl_InstanceID;
+  int i = m.x + (u_grid > 0 ? gl_InstanceID - line * u_grid : gl_InstanceID);
   vec2 a = fetch(i), b = fetch(i + 1);
   if (broken(a) || broken(b)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   vec2 A = toPx(a), B = toPx(b), d = B - A;
@@ -83,9 +85,11 @@ void main() {
   gl_Position = toClip(mix(A, B, end) + dir * s * h + nrm * side * h);
 }`;
 
-// Coverage of a round-capped segment of width 2*u_half. Depth decreases with draw order and
-// coverage, so each line blends into a pixel about once (as a stroked path would).
-const LINE_FS = `#version 300 es
+// Coverage of a round-capped segment of width 2*u_half. With `once`, depth decreases with draw order and coverage, so
+// each line blends into a pixel about once (as a stroked path would): a translucent line's joints then show no beads.
+// Writing depth for each fragment takes the GPU about half again as long, and an opaque line's joints blended twice
+// differ only in their edges' few pixels, so opaque lines are drawn without (`Renderer.lines`).
+const LINE_FS = (once) => `#version 300 es
 precision highp float;
 uniform float u_half, u_alpha, u_count;
 uniform int u_density;
@@ -98,20 +102,33 @@ void main() {
   float d = u < 0.0 ? length(vec2(u, v)) : u > v_len ? length(vec2(u - v_len, v)) : abs(v);
   float cov = clamp(u_half + 0.5 - d, 0.0, 1.0);
   if (cov <= 0.0) discard;
-  gl_FragDepth = v_depth - cov * 0.5 / (u_count + 1.0);
+  ${once ? "gl_FragDepth = v_depth - cov * 0.5 / (u_count + 1.0);" : ""}
   if (u_density == 1) { o = vec4(cov, 0.0, 0.0, 1.0); return; }
   float al = cov * u_alpha * v_color.a;
   o = vec4(v_color.rgb * al, al);
 }`;
+
+// A heatmap's counts: line gl_InstanceID as a 1 px line strip through its points (none broken but all of a line's),
+// each pixel it crosses getting one.
+const COUNT_VS = `${header(false)}
+void main() {
+  vec2 p = fetch(meta(gl_InstanceID).x + gl_VertexID);
+  gl_Position = broken(p) ? vec4(2.0, 2.0, 2.0, 1.0) : toClip(toPx(p));
+}`;
+
+const COUNT_FS = `#version 300 es
+precision highp float;
+out vec4 o;
+void main() { o = vec4(1.0, 0.0, 0.0, 1.0); }`;
 
 // Band quad between bins i and i+1: line-table entry (hi offset, bins, rgb, alpha) with the lo
 // offset in the entry after it.
 const BAND_VS = (multi) => `${header(multi)}
 flat out vec4 v_color;
 void main() {
-  int band = DRAW_ID + u_base;
+  int band = u_grid > 0 ? gl_InstanceID / u_grid : DRAW_ID + u_base;
   ivec4 m = meta(2 * band), l = meta(2 * band + 1);
-  int k = gl_InstanceID;
+  int k = u_grid > 0 ? gl_InstanceID - band * u_grid : gl_InstanceID;
   vec2 h0 = fetch(m.x + k), h1 = fetch(m.x + k + 1), l0 = fetch(l.x + k), l1 = fetch(l.x + k + 1);
   if (broken(h0) || broken(h1) || broken(l0) || broken(l1)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   int c = gl_VertexID;
@@ -127,7 +144,22 @@ flat in vec4 v_color;
 out vec4 o;
 void main() { float a = u_alpha * v_color.a; o = vec4(v_color.rgb * a, a); }`;
 
-// Maximum of the density texture over the plot rectangle, into MAX_BINS texels (MAX blending).
+// Maximum of each TILE x TILE tile of the density texture's plot rectangle u_rect.
+const TILE = 16;
+const TILE_FS = `#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D u_dens;
+uniform ivec4 u_rect;
+out vec4 o;
+void main() {
+  ivec2 t = ivec2(gl_FragCoord.xy) * ${TILE}, end = min(t + ${TILE}, u_rect.zw);
+  float m = 0.0;
+  for (int y = t.y; y < end.y; y++) for (int x = t.x; x < end.x; x++) m = max(m, texelFetch(u_dens, u_rect.xy + ivec2(x, y), 0).r);
+  o = vec4(m, 0.0, 0.0, 1.0);
+}`;
+
+// Maximum of the tiles' maxima (u_rect: their texture's), into MAX_BINS texels (MAX blending).
 const MAX_VS = `#version 300 es
 precision highp float;
 precision highp int;
@@ -157,7 +189,8 @@ void main() {
 const CMAP_FS = `#version 300 es
 precision highp float;
 uniform highp sampler2D u_dens, u_max;
-uniform int u_shift, u_dark;
+uniform ivec2 u_at;
+uniform int u_dark;
 out vec4 o;
 vec3 viridis(float t) {
   const vec3 c0 = vec3(0.2777273272234177, 0.005407344544966578, 0.3340998053353061);
@@ -170,7 +203,7 @@ vec3 viridis(float t) {
   return c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6)))));
 }
 void main() {
-  float d = texelFetch(u_dens, ivec2(gl_FragCoord.xy) - ivec2(0, u_shift), 0).r;
+  float d = texelFetch(u_dens, ivec2(gl_FragCoord.xy) - u_at, 0).r;
   if (d <= 0.004) discard;
   float mx = 0.0;
   for (int i = 0; i < ${MAX_BINS}; i++) mx = max(mx, texelFetch(u_max, ivec2(i, 0), 0).r);
@@ -260,9 +293,11 @@ export class Table {
   constructor(n) {
     this.n = 0;
     this.a = new Int32Array(4 * MW * Math.max(1, Math.ceil(n / MW)));
+    this.translucent = false; // some line's color is
   }
   clear() {
     this.n = 0;
+    this.translucent = false;
   }
   push(off, count, color) {
     if (4 * (this.n + 1) > this.a.length) {
@@ -271,6 +306,7 @@ export class Table {
       this.a = b;
     }
     const c = rgba(color), k = 4 * this.n++;
+    if (c[3] < 255) this.translucent = true;
     this.a[k] = off;
     this.a[k + 1] = count;
     this.a[k + 2] = (c[0] << 16) | (c[1] << 8) | c[2];
@@ -315,11 +351,14 @@ class Renderer {
     const floats = ext(gl, "EXT_color_buffer_float"), blend = floats && ext(gl, "EXT_float_blend");
     ext(gl, "KHR_parallel_shader_compile");
     this.maxRows = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), 32768);
+    this.most = Math.min(gl.getParameter(gl.MAX_VIEWPORT_DIMS)[0], 8192); // px the shared canvas is wide or high, at most
     this.progs = this.lineProgs(!!this.multi);
     this.densFormat = null;
     if (floats) {
       this.densFormat = blend ? gl.R32F : gl.R16F;
       this.progs.max = compile(gl, MAX_VS, MAX_FS);
+      this.progs.tile = compile(gl, QUAD_VS, TILE_FS);
+      this.progs.count = compile(gl, COUNT_VS, COUNT_FS);
       this.progs.cmap = compile(gl, QUAD_VS, CMAP_FS);
       this.maxTex = this.texture(this.densFormat, MAX_BINS, 1, gl.RED, gl.FLOAT, null);
       this.maxFbo = gl.createFramebuffer();
@@ -328,6 +367,10 @@ class Renderer {
       if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) this.densFormat = null;
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     }
+    this.wakeFbo = gl.createFramebuffer(); // one pixel, for `wake`
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.wakeFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texture(gl.RGBA8, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, null), 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     this.dens = null;
     this.metaTex = null;
     this.metaRows = this.metaAt = 0;
@@ -337,7 +380,8 @@ class Renderer {
 
   lineProgs(multi) {
     const gl = this.gl;
-    return { ...this.progs, line: compile(gl, LINE_VS(multi), LINE_FS), band: compile(gl, BAND_VS(multi), BAND_FS) };
+    return { ...this.progs, line: compile(gl, LINE_VS(multi), LINE_FS(true)), lineOpaque: compile(gl, LINE_VS(multi), LINE_FS(false)),
+             band: compile(gl, BAND_VS(multi), BAND_FS) };
   }
 
   /** Program `name`, linked; line and band programs drop multi-draw when theirs fail to link. */
@@ -345,7 +389,7 @@ class Renderer {
     try {
       return linked(this.gl, this.progs[name]);
     } catch (e) {
-      if (!this.multi || (name !== "line" && name !== "band")) throw e;
+      if (!this.multi || !["line", "lineOpaque", "band"].includes(name)) throw e;
       this.multi = null;
       this.progs = this.lineProgs(false);
       return linked(this.gl, this.progs[name]);
@@ -395,42 +439,69 @@ class Renderer {
     }
   }
 
-  /** Start a chart image of W x H device px; `clip` = [x, y, w, h] device px, y down. */
-  begin(W, H, clip) {
-    const gl = this.gl, c = this.canvas;
-    if (c.width < W || c.height < H) {
-      c.width = Math.max(c.width, W);
-      c.height = Math.max(c.height, H);
+  /** Top-left corners (device px, y down) of a region of the shared canvas for each chart image of `sizes` ([W, H]
+   * each), in rows at most `wide` px wide (or one image), the canvas grown to hold them; null for those beyond its
+   * largest size, drawn at [0, 0] after the others are copied. */
+  place(sizes, wide = Infinity) {
+    const most = this.most, end = Math.min(most, wide), out = [];
+    let x = 0, y = 0, row = 0, w = 0;
+    for (const [W, H] of sizes) {
+      if (x && x + W > end) (x = 0), (y += row), (row = 0);
+      const fits = x + W <= most && y + H <= most;
+      out.push(fits ? [x, y] : null);
+      if (!fits) continue;
+      (x += W), (row = Math.max(row, H)), (w = Math.max(w, x));
     }
+    this.fit(w, y + row);
+    return out;
+  }
+
+  /** Grow the shared canvas to at least W x H (which clears it, and waits for the GPU). */
+  fit(W, H) {
+    const c = this.canvas;
+    if (c.width < W || c.height < H) (c.width = Math.max(c.width, W)), (c.height = Math.max(c.height, H));
+  }
+
+  /** Grow the shared canvas to at least W x H, as far as its largest size allows, ahead of the images that need it. */
+  reserve(W, H) {
+    this.fit(Math.min(W, this.most), Math.min(H, this.most));
+  }
+
+  /** Start a chart image of W x H device px at `at` (its top-left corner on the shared canvas, device px, y down);
+   * `clip` = [x, y, w, h] device px, y down. */
+  begin(W, H, clip, at = [0, 0]) {
+    const gl = this.gl;
+    this.fit(at[0] + W, at[1] + H);
     this.W = W;
     this.H = H;
-    this.shift = c.height - H;
+    this.at = [at[0], this.canvas.height - at[1] - H]; // the image's bottom-left corner in GL coordinates
     const x0 = Math.round(clip[0]), y0 = Math.round(clip[1]);
     const x1 = Math.round(clip[0] + clip[2]), y1 = Math.round(clip[1] + clip[3]);
     this.clip = [x0, y0, Math.max(0, x1 - x0), Math.max(0, y1 - y0)];
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, this.shift, W, H);
+    gl.viewport(this.at[0], this.at[1], W, H);
     gl.enable(gl.SCISSOR_TEST);
-    gl.scissor(0, this.shift, W, H);
+    gl.scissor(this.at[0], this.at[1], W, H);
     gl.clearColor(0, 0, 0, 0);
     gl.clearDepth(1);
     gl.depthMask(true);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    this.scissor(this.shift);
+    this.scissor(this.at);
     gl.enable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.bindVertexArray(this.vao);
   }
 
-  scissor(shift) {
+  /** Scissor to the plot rectangle of an image whose bottom-left corner is at `base` (GL coordinates). */
+  scissor(base) {
     const [x, y, w, h] = this.clip;
-    this.gl.scissor(x, shift + this.H - y - h, w, h);
+    this.gl.scissor(base[0] + x, base[1] + this.H - y - h, w, h);
   }
 
-  /** Bind `pts`, a line table and `view` {off: data at the plot origin, scale: px per unit, org: device px}.
-   * Each table goes to rows of the table texture no earlier draw reads, so no upload changes what a queued
-   * draw sees. */
+  /** Bind `pts`, a line table and `view` {off: data at the plot origin, scale: px per unit, org: device px, first: the
+   * point the table's offsets count from (0 unless given)}. Each table goes to rows of the table texture no earlier
+   * draw reads, so no upload changes what a queued draw sees. */
   bind(prog, pts, table, view) {
     const gl = this.gl, u = prog.u;
     gl.useProgram(prog.p);
@@ -448,6 +519,7 @@ class Renderer {
     gl.bindTexture(gl.TEXTURE_2D, this.metaTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, this.metaAt, MW, rows, gl.RGBA_INTEGER, gl.INT, table.a, 0);
     gl.uniform1i(u.u_row0, this.metaAt);
+    gl.uniform1i(u.u_first, view.first || 0);
     this.metaAt += rows;
     gl.uniform1i(u.u_meta, 1);
     gl.uniform2f(u.u_off, view.off[0], view.off[1]);
@@ -456,11 +528,14 @@ class Renderer {
     gl.uniform2f(u.u_size, this.W, this.H);
   }
 
-  /** Instanced draws of 6 vertices per instance; instance counts per draw from `inst(i)`. */
-  draws(prog, n, inst) {
+  /** Instanced draws of 6 vertices per instance: `grid` instances each of n lines in one draw, or a draw per line with
+   * `inst(i)` instances. */
+  draws(prog, n, inst, grid = 0) {
     const gl = this.gl;
+    gl.uniform1i(prog.u.u_grid, grid);
     if (!n) return;
-    if (this.multi) {
+    if (grid) gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, n * grid);
+    else if (this.multi) {
       if (!this.firsts || this.firsts.length < n) {
         const m = Math.max(n, 2 * (this.firsts?.length || 0));
         this.firsts = new Int32Array(m);
@@ -480,70 +555,62 @@ class Renderer {
     }
   }
 
-  /** Every line of `table` as a `width` px (device) stroke at opacity `alpha`, in table order. */
-  lines(pts, table, view, width, alpha, density = false) {
-    const gl = this.gl, prog = this.program("line"), a = table.a;
+  /** Every line of `table` as a `width` px (device) stroke at opacity `alpha`, in table order; lines of `grid` + 1
+   * points each when grid is set. */
+  lines(pts, table, view, width, alpha, density = false, grid = 0) {
+    const gl = this.gl, once = density || alpha < 1 || table.translucent, prog = this.program(once ? "line" : "lineOpaque"), a = table.a;
     this.bind(prog, pts, table, view);
     gl.uniform1f(prog.u.u_half, width / 2);
     gl.uniform1f(prog.u.u_alpha, alpha);
     gl.uniform1f(prog.u.u_count, table.n);
     gl.uniform1i(prog.u.u_density, density ? 1 : 0);
-    gl.enable(gl.DEPTH_TEST);
-    gl.depthFunc(gl.LESS);
-    gl.clear(gl.DEPTH_BUFFER_BIT);
-    this.draws(prog, table.n, (i) => a[4 * i + 1] - 1);
+    if (once) gl.enable(gl.DEPTH_TEST), gl.depthFunc(gl.LESS), gl.clear(gl.DEPTH_BUFFER_BIT);
+    this.draws(prog, table.n, (i) => a[4 * i + 1] - 1, grid);
     gl.disable(gl.DEPTH_TEST);
   }
 
-  /** Filled bands: table entries in (hi, lo) pairs with equal counts. */
-  bands(pts, table, view, alpha) {
+  /** Filled bands: table entries in (hi, lo) pairs with equal counts (`grid` + 1 points each when grid is set). */
+  bands(pts, table, view, alpha, grid = 0) {
     const gl = this.gl, prog = this.program("band"), a = table.a;
     this.bind(prog, pts, table, view);
     gl.uniform1f(prog.u.u_alpha, alpha);
-    this.draws(prog, table.n >> 1, (i) => a[8 * i + 1] - 1);
+    this.draws(prog, table.n >> 1, (i) => a[8 * i + 1] - 1, grid);
   }
 
-  /** Heatmap of every line of `table`: per-pixel line count (each line once), log colormap. */
-  density(pts, table, view, width, dark) {
+  /** Heatmap of every line of `table`: per-pixel line count (each line once), log colormap; lines of `grid` + 1 points
+   * each, when grid is set, counted as 1 px lines. */
+  density(pts, table, view, width, dark, grid = 0) {
     const gl = this.gl, W = this.W, H = this.H;
     let d = this.dens;
     if (!d || d.w < W || d.h < H) {
-      if (d) gl.deleteTexture(d.tex), gl.deleteRenderbuffer(d.depth), gl.deleteFramebuffer(d.fbo);
+      if (d) gl.deleteTexture(d.tex), gl.deleteTexture(d.tiles), gl.deleteRenderbuffer(d.depth), gl.deleteFramebuffer(d.fbo), gl.deleteFramebuffer(d.tileFbo);
       const w = Math.max(W, d?.w || 0), h = Math.max(H, d?.h || 0);
-      d = this.dens = { w, h, tex: this.texture(this.densFormat, w, h, gl.RED, gl.FLOAT, null), depth: gl.createRenderbuffer(), fbo: gl.createFramebuffer() };
+      d = this.dens = { w, h, tex: this.texture(this.densFormat, w, h, gl.RED, gl.FLOAT, null), depth: gl.createRenderbuffer(), fbo: gl.createFramebuffer(),
+                        tiles: this.texture(this.densFormat, Math.ceil(w / TILE), Math.ceil(h / TILE), gl.RED, gl.FLOAT, null), tileFbo: gl.createFramebuffer() };
       gl.bindRenderbuffer(gl.RENDERBUFFER, d.depth);
       gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
       gl.bindFramebuffer(gl.FRAMEBUFFER, d.fbo);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, d.tex, 0);
       gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, d.depth);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, d.tileFbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, d.tiles, 0);
     }
+    const [cx, cy, cw, ch] = this.clip, rect = [cx, H - cy - ch, cw, ch]; // the plot in the density texture
     gl.bindFramebuffer(gl.FRAMEBUFFER, d.fbo);
     gl.viewport(0, 0, W, H);
-    this.scissor(0);
+    gl.scissor(...rect);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.blendFunc(gl.ONE, gl.ONE);
-    this.lines(pts, table, view, width, 1, true);
-    // maximum over the plot rectangle
-    const [cx, cy, cw, ch] = this.clip, mp = this.program("max");
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.maxFbo);
-    gl.disable(gl.SCISSOR_TEST);
-    gl.viewport(0, 0, MAX_BINS, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.blendEquation(gl.MAX);
-    gl.useProgram(mp.p);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, d.tex);
-    gl.uniform1i(mp.u.u_dens, 0);
-    gl.uniform4i(mp.u.u_rect, cx, H - cy - ch, Math.max(1, cw), ch);
-    if (cw && ch) gl.drawArrays(gl.POINTS, 0, cw * ch);
-    gl.blendEquation(gl.FUNC_ADD);
+    if (grid) this.countLines(pts, table, view, grid);
+    else this.lines(pts, table, view, width, 1, true);
+    this.densityMax(d, rect);
     // colormap onto the chart image
     const cp = this.program("cmap");
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.enable(gl.SCISSOR_TEST);
-    gl.viewport(0, this.shift, W, H);
-    this.scissor(this.shift);
+    gl.viewport(this.at[0], this.at[1], W, H);
+    this.scissor(this.at);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(cp.p);
     gl.activeTexture(gl.TEXTURE0);
@@ -552,16 +619,78 @@ class Renderer {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.maxTex);
     gl.uniform1i(cp.u.u_max, 1);
-    gl.uniform1i(cp.u.u_shift, this.shift);
+    gl.uniform2i(cp.u.u_at, this.at[0], this.at[1]);
     gl.uniform1i(cp.u.u_dark, dark ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
-  /** Copy the chart image onto a 2D context (device px, identity transform). */
-  copyTo(ctx) {
+  /** Every line of `table` (`grid` + 1 points each, broken only where all are) as a 1 px line strip, adding one to
+   * each pixel it crosses. */
+  countLines(pts, table, view, grid) {
+    const prog = this.program("count");
+    this.bind(prog, pts, table, view);
+    this.gl.drawArraysInstanced(this.gl.LINE_STRIP, 0, grid + 1, table.n);
+  }
+
+  /** The density texture's maximum over `rect` (the plot's [x, y, w, h] in it) into the maximum texels: each tile's,
+   * then theirs. */
+  densityMax(d, rect) {
+    const gl = this.gl, [, , cw, ch] = rect, tw = Math.ceil(cw / TILE), th = Math.ceil(ch / TILE), tp = this.program("tile"), mp = this.program("max");
+    gl.disable(gl.SCISSOR_TEST);
+    gl.disable(gl.BLEND);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, d.tileFbo);
+    gl.viewport(0, 0, Math.max(1, tw), Math.max(1, th));
+    gl.useProgram(tp.p);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, d.tex);
+    gl.uniform1i(tp.u.u_dens, 0);
+    gl.uniform4i(tp.u.u_rect, ...rect);
+    if (cw && ch) gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.enable(gl.BLEND);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.maxFbo);
+    gl.viewport(0, 0, MAX_BINS, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.blendEquation(gl.MAX);
+    gl.useProgram(mp.p);
+    gl.bindTexture(gl.TEXTURE_2D, d.tiles);
+    gl.uniform1i(mp.u.u_dens, 0);
+    gl.uniform4i(mp.u.u_rect, 0, 0, Math.max(1, tw), th);
+    if (tw && th) gl.drawArrays(gl.POINTS, 0, tw * th);
+    gl.blendEquation(gl.FUNC_ADD);
+  }
+
+  /** Give the GPU a command to run now. After a pause its first commands take a millisecond or two longer to be run,
+   * which whoever reads results back then waits for; an interaction's handler calls this first, so that the time
+   * passes while it does its own work. */
+  wake() {
+    if (this.lost) return;
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.wakeFbo);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.flush();
+  }
+
+  /** Call `then` once the GPU has run every command issued so far: work that reads results back then waits for its
+   * own commands only. */
+  whenDone(then) {
+    const gl = this.gl, sync = this.lost ? null : gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!sync) return void then();
+    gl.flush();
+    const poll = () => {
+      if (!this.lost && gl.clientWaitSync(sync, 0, 0) === gl.TIMEOUT_EXPIRED) return void setTimeout(poll, 4);
+      gl.deleteSync(sync);
+      then();
+    };
+    setTimeout(poll, 4);
+  }
+
+  /** Copy the W x H chart image at `at` (top-left, device px, y down) onto a 2D context (device px, identity
+   * transform). */
+  copyTo(ctx, at = [0, 0], W = this.W, H = this.H) {
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.drawImage(this.canvas, 0, 0, this.W, this.H, 0, 0, this.W, this.H);
+    ctx.drawImage(this.canvas, at[0], at[1], W, H, 0, 0, W, H);
     ctx.restore();
   }
 }

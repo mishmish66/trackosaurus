@@ -424,12 +424,14 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", r"/api/stream")
     def stream(self, q: Query) -> None:
-        """SSE for runs under `path`: running runs' rows beyond their levels, then live events and heartbeats."""
+        """SSE for runs under `path`: running runs' rows beyond their levels, then live events and heartbeats. Its headers
+        go out once it is subscribed, so a page that waits for it to open before listing runs misses no change."""
         stop = threading.Event()
         try:
-            self._event_stream_headers()
-            self.wfile.write(b"retry: 2000\n\n")
             with contextlib.closing(self.ex.messages(q.get("path", ""), stop)) as msgs:
+                first = next(msgs, b"")
+                self._event_stream_headers()
+                self.wfile.write(b"retry: 2000\n\n" + first)
                 for msg in msgs:
                     self.wfile.write(msg)
         except (BrokenPipeError, ConnectionResetError, OSError):

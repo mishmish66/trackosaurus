@@ -27,12 +27,12 @@ docstrings (Markdown, published by `docs/build.py`); the README's "One trex, man
 | `trex/query.py` | read-side queries for the CLI: records, field access, sorting, statistics, series |
 | `trex/where.py` | run filters: a SQL WHERE clause (or a name search) compiled to a test over a field getter |
 | `trex/cli.py` | `trex` command (Typer): `serve systemd-unit launchd-plist runit-service ls groups keys tree show series tail media diff index compact`; `daemon` is a hidden alias of `serve` that service files written by older versions run |
-| `trex/static/` | UI, plain ES modules: `app.js` (page, node panel), `data.js` (block store, planner, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `kernel.js` (bucket arrays, columns, smoothing, decimation, group stats), `pool.js` and `worker.js` (binning on workers over copies of the columns and bucket arrays they read, fetching), `where.js` (run filters, run fields, filter completion); `index.html` |
+| `trex/static/` | UI, plain ES modules: `app.js` (page, node panel), `data.js` (block store, planner, stream), `plot.js` (charts), `gl.js` (WebGL2 renderer), `gpustats.js` (bin means and group statistics on the GPU, a round of charts at a time), `kernel.js` (bucket arrays, columns, smoothing, decimation, group stats), `pool.js` and `worker.js` (binning on workers over copies of the columns and bucket arrays they read, fetching), `where.js` (run filters, run fields, filter completion); `index.html` |
 | `typings/` | type stubs for untyped dev dependencies (radon) |
 | `examples/demo.py` | synthetic sweeps and live runs for trying the UI |
 | `docs/build.py` | pdoc pages of every module into `site/` |
 | `docs/media/` | the docs' video tour and its poster image (left out of the sdist); the README embeds the same video, uploaded to GitHub |
-| `tests/` | pytest suites (`test_processes.py` runs real `trex` processes; `test_node.py`, `test_mesh.py`, `test_remote.py`, `test_mirror.py` cover nodes, links and ssh; shared helpers in `helpers.py` and `conftest.py`, including a fake `ssh` and `uvx`), the node tests (`*.test.mjs`), the cross-language cases (`where_cases.json`, `shared_cases.json`), and the browser smoke test |
+| `tests/` | pytest suites (`test_processes.py` runs real `trex` processes; `test_node.py`, `test_mesh.py`, `test_remote.py`, `test_mirror.py` cover nodes, links and ssh; shared helpers in `helpers.py` and `conftest.py`, including a fake `ssh` and `uvx`), the node tests (`*.test.mjs`), the cross-language cases (`where_cases.json`, `shared_cases.json`), the browser smoke test, and the interaction benchmark (`browser_bench.py`) |
 
 Runtime dependencies: Python ≥ 3.12, numpy, and Typer for the CLI (ffmpeg only to log frame arrays as video). The UI
 loads no external scripts, and the server is standard library.
@@ -51,6 +51,7 @@ node --test --experimental-test-coverage --test-coverage-include='trex/static/ke
   tests/*.test.mjs                                        # the same with CI's coverage floors (node >= 22.8; see below)
 uv run python tests/browser_smoke.py                      # headless UI on its own throwaway trex; fails below 92% UI line coverage
                                                           # (Chromium once: uv run playwright install chromium)
+uv run python tests/browser_bench.py --verify 60          # interaction latency against the 10 ms target, then the GPU's statistics against the kernel's
 uv run python examples/demo.py /tmp/runs && uv run trex serve /tmp/runs --temporary
 ```
 
@@ -75,6 +76,22 @@ fails on them, and read its `kernel.js` and `where.js` rows (its `all files` row
 Headless Chromium reaches the GPU only with
 `--headless=new --use-gl=angle --use-angle=gl-egl --ignore-gpu-blocklist --enable-gpu`; without them WebGL falls back
 to software and timings mean nothing.
+
+The benchmark (`tests/browser_bench.py`) stays local too. It replays a session's interactions (scrolls, a chart shown
+alone, hovering, zooms, filtering, regrouping, entering a run and leaving it) against a throwaway trex on generated
+runs (2048 in 256 sweeps under 4 directories, 224 metrics, some logging meanwhile; written and indexed once, kept in
+`~/.cache/trex/bench`, several GB), or against a running one (`--url`). Each is timed from its input event to the end
+of the last draw of a chart in view that shows its data as it then stands (its view's layers, every block of them for
+every run it shows, no column left to rebuild), beside the GPU time of that chart's round's draws (a timer query): the
+frame showing them needs both. It prints each one's median and worst over the rounds and exits 1 when a worst exceeds
+the target. With `--verify N` it then makes N random interactions and compares, after each, what the
+GPU binned for the grouped charts in view with `kernel.aggGroups` of the same runs (exit 1 when they differ): the check
+of a GPU and its driver that the smoke test, rendering a small folder in software, cannot make; run it after any change
+of `gpustats.js`. Another trex on the same cache makes its server index the runs anew (one Explorer per index
+directory). The browser's profile is kept beside the runs (`--profile`), as a used browser's is, for its cache of
+compiled shaders: with a new profile the browser compiles the shaders of its own drawing at their first use (a focus
+ring, a selection drawn on a 2D canvas), 10 to 30 ms on the GPU process's thread, which the page's draws and reads
+wait for; so the first run with a new profile, or after a browser or driver update, shows those first uses slow.
 
 ## Architecture
 
@@ -158,13 +175,17 @@ have)` is the other direction: what a mirror holding `have` of a run lacks.
 - **Merged levels** (`<index dir>/levels/<sha1 of metric>-<digest>/`, one `.npy` per array, memory-mapped when read):
   the finished runs' top levels of a metric merged to each level from its coarsest top to `LEVELS_AHEAD` above,
   merged ahead of requests on a thread, saved at most once a metric every `LEVELS_SAVE_EVERY` seconds and up to
-  `TREX_LEVELS_MB` (least recently used deleted). A later Explorer whose finished runs and their `compiled` and `ver`
-  are the same (`Finished.sig`) maps them instead of merging again.
-- **In memory**: `Explorer._memo` (`Memo`, `MEMO_BYTES`) holds stacks, merged levels and a folder's finished-run block
-  answers until those runs change (`_gens`), and at most `MEMO_MAPS` memory maps of saved levels; `/api/runs` answers
-  are kept until what the index holds changes. A saved level is mapped without holding its file open (`index.mapped`;
-  before Python 3.13, where each map holds a descriptor, an Explorer keeps maps of at most 1/`MAPS_PER_FILES` of the
-  open-file limit), and an Explorer raises the process's soft open-file limit to the hard one (`open_files`).
+  `TREX_LEVELS_MB` (least recently used deleted; their bytes counted at the first save and kept count of after, so a
+  save reads only the directories it adds and replaces). A later Explorer whose finished runs and their `compiled` and
+  `ver` are the same (`Finished.sig`) maps them instead of merging again; any change of a metric's finished runs (one
+  finishing, crashing or resuming) has its levels merged anew from every finished run.
+- **In memory**: `Explorer._memo` (`Memo`, `MEMO_BYTES`) holds each metric's finished runs (`Finished`) and a folder's
+  finished-run block answers until those runs change (`_gens`, bumped once the change has committed), stacks and merged
+  levels under the digest of the finished runs they were made from (`Finished.sig`), so that no answer mixes two sets of
+  them, and at most `MEMO_MAPS` memory maps of saved levels; `/api/runs` answers are kept until what the index holds
+  changes. A saved level is mapped without holding its file open (`index.mapped`; before Python 3.13, where each map
+  holds a descriptor, an Explorer keeps maps of at most 1/`MAPS_PER_FILES` of the open-file limit), and an Explorer
+  raises the process's soft open-file limit to the hard one (`open_files`).
 - **Media files**: a crawled run's are its own `media/` files; a pulled directory's are copied into `<index
   dir>/media/`, named by their contents, so one copy serves every run.
 - **Node state** (`$TREX_DAEMON_DIR`): `node.json` (`Identity`: id, name), `roots.json` (`Saved`: tracked directories,
@@ -184,7 +205,8 @@ array, all in one body (`buckets.frame`). Per run (`Explorer._block`):
   together without decoding them); below its finest level, its finest level's buckets refined (`buckets.refine`: each
   bucket placed at its mean step).
 
-Each run's `seq` in the answer is its `compiled`; the browser adds the rows beyond it from the stream.
+Top levels are read by key: each run's span gives the blocks it covers at its top level (`_top_blocks`), so no other
+level is read. Each run's `seq` in the answer is its `compiled`; the browser adds the rows beyond it from the stream.
 
 Stored blocks of more than `BLOCK_ALONE` runs are read by the **block workers** (`index.Workers`): `BLOCK_WORKERS`
 processes, each reading a slice of the runs (at most `SLICE`; rows and decompression on `READ_THREADS` threads) from
@@ -206,10 +228,13 @@ Workers end with the process that started them (`worker_init`), also when it is 
   unreachable link keeps what it offered. So links may form cycles, and each directory is held once per node.
 - **Pull** (`trex.mirror`): reads `GET /api/runs?path=` at start, after the stream reconnects and every `LIST_EVERY`
   seconds, and marks every run whose `ver` differs from its own. It dumps marked runs (`POST /api/dumps {runs: [{path,
-  uid, mseq, compiled, rebuilt}]}`, `DUMPS_AT_ONCE` a request, a running run at most every `RUNNING_EVERY` seconds),
-  copies their new media files, then applies them. A `Dump` holds the record, the media items the mirror lacks, the
-  metrics' spans, and blocks: every block (`replace`) when the mirror holds nothing, another uid or another `rebuilt`;
-  else the blocks whose `since` is beyond the mirror's `compiled`.
+  uid, mseq, compiled, rebuilt}]}`, `DUMPS_AT_ONCE` a request), copies their new media files, then applies them. A
+  running run stays live by the rows its stream brings, so it is dumped (`Pull._due`) at most every `RUNNING_EVERY`
+  seconds, and then only once its tail holds `TAIL_ROWS` rows past its levels, something its rows do not carry changed
+  (its state, keys, uid or media: `_urgent`), or no tail continues its levels (none, or one beginning past them, as one
+  fetched from an upstream whose levels are ahead does). A `Dump` holds the record, the media items the mirror lacks,
+  the metrics' spans, and blocks: every block (`replace`) when the mirror holds nothing, another uid or another
+  `rebuilt`; else the blocks whose `since` is beyond the mirror's `compiled`.
 - **The stream**: the Pull follows the upstream's `/api/stream`. A `run` event whose `ver` the index lacks, or a
   `media` event, marks the run; `delete` drops it; `folder` updates folder notes; `rows` events extend running runs'
   **tails** (rows beyond their levels, fetched once by `GET /api/rows?path=&from=<compiled>` while the stream is up)
@@ -241,55 +266,123 @@ or `path<member>` when an earlier member holds the same path (`resolve` maps it 
 top-level folder named for it. For each block it asks the members for their parts (at once, as an Explorer answers
 asks) and chains their bucket arrays as bytes, each member's runs in turn, run ids renamed
 (`Workspace.buckets_bodies`, `buckets.chain`). Its stream merges the members' streams, renaming run ids in every
-event. Every run gets a `dir` field: its member's name.
+event, and follows its members as they change (a node updates its views' members in place, `Node._update_views`): a
+member that joins is followed from then on, its runs sent first as `run` events, and one that leaves no longer is.
+Every run gets a `dir` field: its member's name.
 
 ### Browser
 
+- **Runs loaded and shown**: the page loads the runs of the folder it was opened at (`Data.scope`) and follows its
+  stream; a folder or run under it is shown from those runs without loading anything (`App.openPath`, `showPath`: the
+  runs under the path, `runsAsListed`), a path outside it by loading its runs (`loadScope`). A run has an index while
+  its scope lasts (`r.idx`, `Data.byIdx`), and each metric a mask of the runs logging it (`keyMasks`). `Data.runsWith`
+  gives one list for all the metrics the same runs log, so what is kept per list (its running runs, their last step,
+  their group lines) is shared by those metrics' charts. A metric's version (`keyVersion`) changes whenever what its
+  charts show may: its blocks, layers or columns, or a run logging it. The panels' sections keep their elements from one
+  rendering to the next, and only what differs is put into the page (`App.renderPanels`, `setChildren`), so the charts
+  that stay keep their layout. A view shown again finds what was made for it: its runs as they were computed
+  (`App.computeRuns`: marked, sorted, grouped and colored; `keepRuns`, up to `KEPT_VIEWS` views by `runsKey`: the runs
+  loaded and hidden, the path, the filter, the groups opened, the grouping and the sorting), restored while every run
+  whose metadata was set since (`Data.metaVer`, a run's `ver`) is marked, sorted and grouped as it was (`runsHold`),
+  with the lines' signature and the run table of those runs, so a run's event, clearing a filter or leaving a folder
+  computes no run anew; a view computed anew lists its runs in the order they were last sorted in when all were
+  (`App.runOrder`), so sorting them again is linear; the list of shown runs and the run table come back as the same
+  objects when their contents repeat (`keptShown`, `runTabs`), so the caches keyed by them hit; and each chart keeps its
+  last `GPU_KEPT` binnings on the GPU (`Chart.fromGpu`), so clearing a filter, resetting a zoom or leaving a folder bins
+  nothing; and the images of charts binned on the GPU are kept (`IMAGE_BYTES`, captured in idle time after an
+  interaction's draw, `Chart.imageKey`: the binning, the axes' ranges, the canvas's size, the theme, the runs' colors),
+  so such a view is copied rather than drawn. Every run object has the page's fields from its creation, in one order
+  (`RUN_FIELDS`, `Data.newRun`), so code reading them over all runs sees one shape.
 - **Planning** (`data.js`): visible charts state what they show (`plan`, one demand per metric). A chart wants a coarse
   layer, blocks of one level over every step of its runs, and when zoomed a finer layer over its view (at most
   `FINE_BLOCKS` blocks): levels with buckets about `LINE_PX_PER_BUCKET` wide on screen (`DENSITY_PX_PER_BUCKET` for a
   chart of many runs) within a point budget, rounded so they change only when a span crosses a power of two, as top
-  levels do. When many finished runs lack a block, one request asks for the folder's finished runs; other runs are
-  asked for by id, and a running run again once its `compiled` passes the rows its block holds (`Data.current`).
-  Requests go out in batches of at most `BATCH_BLOCKS` blocks, spread over the free request slots (`Data.pump`), the
-  chart last pressed first (`App.lead`).
-- **The store**: answers fill one store, `Data.blocks` (block -> run -> its row of a bucket array); a chart shows its
-  wanted layers once every block holds every run but those whose request failed, and keeps showing the previous ones
-  until then. A failed request (`Data.fail`) is asked for again once due, `RETRY_MS` after its block's first failure and
-  twice as long after each further one, up to `RETRY_MAX_MS` (`Data.need` skips it until then, `Data.retrySoon` plans
-  again when it falls due); a chart showing nothing says why (`Chart.emptyText`: loading, the server's error, or no
-  data), and the status counts the failing blocks. A run drawn as a line
-  has a column (`kernel.buildColumn`): its buckets in the shown blocks, a finer level's where its blocks lie and the
-  coarse level's elsewhere (in step order without sorting: the finer blocks, when they join into one range, replace
-  the coarse buckets inside it, `emitBuckets`), then the streamed rows those blocks do not hold, bucketed as the server
-  would, so a live run looks the same when its levels catch up. Columns are rebuilt in tasks (`Data.rebuildSome`:
-  `REBUILD_SLICE_MS` at a time, going on up to `REBUILD_WHOLE_MS` to finish a metric), only those whose blocks or
-  layers changed, and the UI is told of a metric once none of its columns awaits rebuilding, so a chart draws its runs'
-  new columns together. A chart of more runs than it draws one by one (`App.coarseAbove`: group
-  statistics, or a heatmap) bins its finished runs from their buckets in its finest shown blocks (`Data.partsOf`), its
-  running ones from their columns. Binning weights each point by the rows it stands for, so a bin's mean is the mean
-  of the rows in it. Workers fetch blocks, each array of a batch into a buffer of its own handed to the page
-  (`pool.fetchArraysOnWorker`), which keeps it (`kernel.adoptStore`, up to `ARRAY_BYTES`; blocks no chart uses go
-  first).
+  levels do. When many finished runs lack a block, one request asks for the finished runs of the folder shown
+  (`Data.view`); other runs are asked for by id, and a running run again once its `compiled` passes the rows its block
+  holds (`Data.current`). Requests go out in batches of at most `BATCH_BLOCKS` blocks, spread over the free request
+  slots (`Data.pump`), the chart last pressed first (`App.lead`). A block that holds every finished run logging its
+  metric holds those of any list (`finishedHeld`), and a chart that shows all its view wants is not planned again until
+  its metric's data, its view or the finished runs change (`planChart`; settled only by a plan that found it already
+  showing those layers, since what it wants depends on the extent of what it shows), so a plan costs little per chart.
+  Charts are planned as they come near the view and when the view or the path changes, before they draw (`App.planNow`;
+  a change of the view or the path plans the charts in view only, and the others before the rounds that draw them), and
+  the columns that plan queues for the charts in view are built then (`Data.rebuildNow`), the others' in tasks. A column
+  is rebuilt only when the layers it was built for differ, by value, from those its chart shows.
+- **The store**: answers fill one store, `Data.blocks` (block -> run -> its row of a bucket array; an array knows its
+  rows' run indices, `rowRun`); a chart shows its wanted layers once every block holds every run but those whose request
+  failed, and keeps showing the previous ones until then. A failed request (`Data.fail`) is asked for again once due,
+  `RETRY_MS` after its block's first failure and twice as long after each further one, up to `RETRY_MAX_MS` (`Data.need`
+  skips it until then, `Data.retrySoon` plans again when it falls due); a chart showing nothing says why
+  (`Chart.emptyText`: loading, the server's error, or no data), and the status counts the failing blocks. A run drawn
+  as a line has a column (`kernel.buildColumn`): its buckets in the shown blocks, a finer level's where its blocks lie
+  and the coarse level's elsewhere (in step order without sorting: the finer blocks, when they join into one range,
+  replace the coarse buckets inside it, `emitBuckets`), then the streamed rows those blocks do not hold, bucketed as the
+  server would, so a live run looks the same when its levels catch up. Columns are rebuilt in tasks
+  (`Data.rebuildSome`: `REBUILD_SLICE_MS` at a time, going on up to `REBUILD_WHOLE_MS` to finish a metric), only those
+  whose blocks or layers changed, and the UI is told of a metric once none of its columns awaits rebuilding, so a chart
+  draws its runs' new columns together. Workers fetch blocks, each array of a batch into a buffer of its own handed to
+  the page (`pool.fetchArraysOnWorker`) with its rows' step extents (`kernel.rowExtents`, found by the worker while the
+  array's bytes are at hand), which keeps it (`kernel.adoptStore`, up to `ARRAY_BYTES`; blocks no chart uses go first).
+  The x extent of a chart's runs comes from those row extents, or run by run for at most `EXTENT_BY_RUN` runs
+  (`Data.extentOf`).
+- **Binning on the GPU** (`gpustats.js`): a chart of more runs than it draws one by one (`App.coarseAbove`: group
+  statistics, or a heatmap) is binned there from the run table (`App.buildRunTable`: by run index, each shown run's
+  group and whether it is drawn from its column; the groups' members), its finished runs from their buckets in its
+  finest shown blocks (the bucket arrays copied to the GPU as they are, `arrayTextures`), its running ones from their
+  columns. Binning weights each point by the rows it stands for, so a bin's mean is the mean of the rows in it. A view
+  binned from buckets on a step axis takes no bin narrower than its finest buckets (`Chart.binFloor`, the least width of
+  `kernel.binGrid`): the planner rounds its level up (`levelFor`), and in narrower bins each bucket's point would fall
+  in one bin and the bins between it be interpolated, drawing stripes in a heatmap and kinks in group lines where runs
+  log at the same steps. The charts binned together make a round (`runGpuJobs`, `runRound`): their bins lie side by side
+  as columns of shared textures, a run a row, and each step is one pass over all of them: each run's sums per bin
+  (gathered per bin by bisection over the run's buckets on a step axis; a point a bucket for runtimes), means with empty
+  bins interpolated, each group's values in a bin put in order and summarized (inside the statistics pass for groups of
+  at most `SMALL` runs; for larger ones first by the steps of a sorting network, each a pass, `inOrder`), the points the
+  charts draw, and each chart's y range. Only the ranges are read back, once a call; tooltips read the values under the
+  pointer. A chart's means are kept (`MEANS_BYTES`) for later rounds of the same data and binning, whichever runs are
+  shown or grouped, and a round's whole texture of them for a round of the same charts (`ROUND_BYTES`), so a filter or a
+  regrouping computes statistics only. Every running run counts as drawn from its column, shown or not, so its means
+  hold whichever runs a filter shows. Values are moved between textures by fragment passes, and points are drawn only
+  where they add up (sums, counts): an integrated Radeon left about one unblended point in two million undrawn. Smoothed
+  values, outlier quantiles and a browser without float render targets are left to the workers (`Chart.fromWorker`), as
+  is everything once a round on the GPU throws (`runGpuJobs`), and a chart of few runs draws their columns' lines
+  (`LineSet`).
 - **Workers**: columns and bucket arrays live in located chunks (`kernel.columnStore`, `adoptStore`: chunk,
-  generation, offset). Each chart's binning runs on one worker of the pool (`pool.js`), which keeps that chart's
-  binnings and is sent a copy of each column and array its jobs read, once (`pool.sendCopies`), dropped when the page
-  frees the chunk; a run's buckets in one block become a column viewing the array (`kernel.runColumn`). A draw round
-  waits for its charts' workers and draws them together. Nothing needs shared memory, so plain http on any host works
-  the same.
-- **Fetching ahead**: while no plan's requests are under way, `Data.prefetch` keeps `PREFETCH_PARALLEL` batches in
-  flight (`Data.nextAhead`, each request once a page, while the blocks no chart uses hold less than `AHEAD_BYTES`):
-  every chart's wanted layers first, visible charts first and then the nearest the view (`App.aheadOf`), then the two
-  levels below the finest each shown chart shows over the steps it shows. Fetched blocks wait in the store, so a
-  scroll finds the charts' blocks already there. While a zoom is dragged, the blocks the charts would want for it are
-  fetched ahead too, for where the drag is every `AIM_MS` (`App.aimZoom`, `Data.fetchFor`), so a zoom mostly finds its
-  blocks there at release.
+  generation, offset). A chart's binning that the GPU does not do runs on one worker of the pool (`pool.js`), which
+  keeps that chart's binnings and is sent a copy of each column and array its jobs read, once (`pool.sendCopies`),
+  dropped when the page frees the chunk; a run's buckets in one block become a column viewing the array
+  (`kernel.runColumn`). A draw round waits for its charts' workers and draws them together. Nothing needs shared
+  memory, so plain http on any host works the same.
+- **Fetching ahead**: while no plan's requests are under way, `Data.prefetch` keeps `PREFETCH_PARALLEL` requests in
+  flight (`Data.nextAhead`, each request once a page, while the blocks no chart uses hold less than `AHEAD_BYTES`), each
+  of blocks of about `AHEAD_REQUEST_BYTES` in all, so that none holds up a plan's requests: every chart's wanted layers
+  first, visible charts first and then the nearest the view (`App.aheadOf`), then the two levels below the finest each
+  chart shows, or would, over the steps it shows (`finerAhead`). Fetched blocks wait in the store, so a scroll or a zoom
+  finds the charts' blocks already there. The bucket arrays a zoom into the charts nearest the view would bin are copied
+  to the GPU ahead as well, in idle tasks (`App.warmSoon`, `gpustats.warmArrays`; the GPU keeps up to its own
+  `ARRAY_BYTES` of arrays, the least recently used freed). While a zoom is dragged, the blocks the charts would want for
+  it are fetched ahead too, for where the drag is every `AIM_MS` (`App.aimZoom`, `Data.fetchFor`). Once the drag rests
+  for `AIM_REST_MS` (and again when blocks fetched for it come), the charts in view are binned on the GPU as a zoom to
+  where it rests would show them at once (`App.binAhead`, `Chart.binAhead`: the layers `Data.layersIf` says they would
+  show, the binning `gpuView` would ask for), and the binnings kept among each chart's (`keepGpu`), so a zoom released
+  there bins nothing and reads nothing back; one released elsewhere bins as before. A binning is found by what it was
+  made of (`gpuSig`), so one made for a view that never comes is only work lost. The means of binnings made ahead are
+  kept until the next ones are made (`gpustats.dropAhead`), so a drag does not push other views' means out.
 - **Rendering**: WebGL2; a browser without it gets no charts, and a lost context keeps the charts as drawn until it is
-  restored. Above 300 lines a chart draws a density heatmap. No upload overwrites GPU data a queued draw may read: each
-  draw's line table takes fresh rows of the table texture (`Renderer.bind`), and columns, which never change once
-  built, each take a slot of their own after the others (`LineSet.update`; a set whose columns are mostly new is
-  uploaded whole). Charts then never depend on how a driver orders uploads against earlier draws. A draw's instances
-  are each line's segments in view (`LineSet.tableFor`), not all of its points.
+  restored. Above 300 lines a chart draws a density heatmap: each pixel's count of the lines crossing it, a run binned
+  on the GPU as a 1 px line strip (`Renderer.countLines`). The charts of a round draw their lines into regions of the
+  one shared canvas, and then each copies its own (`plot.drawCharts`, `Renderer.place`); the canvas has room for a
+  window full of charts from the first round on (`makeRoom`, `Renderer.reserve`), since growing it waits for the GPU. No
+  upload overwrites GPU data a queued draw may read: each draw's line table takes fresh rows of the table texture
+  (`Renderer.bind`), and columns, which never change once built, each take a slot of their own after the others
+  (`LineSet.update`; a set whose columns are mostly new is uploaded whole). Charts then never depend on how a driver
+  orders uploads against earlier draws. A draw's instances are each line's segments in view (`LineSet.tableFor`), not
+  all of its points. Opaque lines are drawn without the depth test that makes a translucent line blend into a pixel once
+  (`LINE_FS`), which costs the GPU a third of their time; the line tables of GPU views are shared by the charts drawing
+  the same lines (`gpuTableSet`). A chart's canvas keeps its drawing while out of view (up to `CANVAS_BYTES` in all, the
+  least recently seen freed), and the chart shown alone lies over the grid (`#alone`), which keeps its layout, scroll
+  position and drawings underneath, unseen meanwhile.
+
 
 ## Invariants (things that break silently if ignored)
 
@@ -299,11 +392,18 @@ event. Every run gets a `dir` field: its member's name.
   `trex.sqlite`. `connect_ro` opens runs without a `-wal` file as `immutable` so SQLite does not create `-wal`/`-shm`;
   a test asserts directory contents are unchanged. Callers re-check the file signature after reading.
 - **Sequence numbers are contiguous.** Rows and media are numbered 0, 1, 2, … per run; readers stop at a gap. The
-  browser and a Pull hold the rows of each running run beyond its levels, and resync on any gap or count mismatch.
+  browser and a Pull hold the rows of each running run beyond its levels, and resync on any gap or count mismatch. A
+  browser's resync takes the rows from where the server's begin (a mirror's may begin past its levels, which catch up),
+  and one after which the events that waited for it still leave a gap is tried again later, twice as late each time
+  (`Data.resync`).
 - **Events follow commits, in order.** `Explorer.apply` publishes after the index transaction commits. A run's `run`
   event comes after the rows and media it counts (a new run's comes first); the browser treats a `run` event whose
-  counts it has not reached as lost data. It opens the stream before it lists a scope's runs and holds the events until
-  the list arrives (`Data.loadScope`), so no run that appears in between is missed.
+  counts it has not reached as lost data. A running run's counts, in `run` events and the run list, are what its origin
+  has (`Origin.live`): a Pull's, the end of its tail, which it grows and passes on to its stream under one lock
+  (`Pull._append`), so they never count rows not yet sent. The browser lists a scope's runs once the scope's stream is
+  open, and holds the events until the list arrives (`Data.loadScope`; so the page does not ask for its runs among its
+  first requests, `App.start`, and `listing_order_smoke` checks the order); a stream's headers go out once it is
+  subscribed (a workspace's to every member, `Workspace._follow`), so no run that appears in between is missed.
 - **A run's version is set where it is crawled.** `apply` bumps `ver` on every change of a crawled run (`Update.ver`
   None); a Pull copies the upstream's. Mirrors decide what to dump by comparing `ver`, so a change that leaves `ver` as
   it was never reaches them.
@@ -313,6 +413,10 @@ event. Every run gets a `dir` field: its member's name.
 - **Mirrors never forward requests.** Everything a Pull's Explorer answers comes from its index, its media copies and
   its tails; the upstream is reached only to take what changed.
 - **One Explorer per index directory** (its `lock`). Two processes of the same origin get separate indexes.
+- **Kept runs name all they were computed from.** `App.computeRuns` restores a view's runs while its `runsKey` and the
+  metadata of the runs under its path are as they were. Whatever else it, or what it calls, comes to read (another
+  option, something of a run outside its metadata) must enter the key, bump a version the key holds, or join
+  `UNCOUNTED`; else a view shown again shows stale runs. `kept_runs_smoke` covers what it reads today.
 - **Cache version.** Bump `CACHE_VERSION` in `index.py` whenever what the index stores, or how it derives it, changes.
   An older index is then rebuilt instead of silently misread. Bump `server.PROTOCOL` and `data.js` `PROTOCOL` together
   whenever what the UI and the server say to each other changes.
@@ -327,10 +431,10 @@ event. Every run gets a `dir` field: its member's name.
     `plot.js` `smoothScale`, `query.py` `twema`/`smooth_scale`;
   - group statistics (order-statistic median CI, Student-t mean CI, interquartile mean of ranks [floor(n/4), n -
     floor(n/4)) with Yuen's CI): `kernel.js` `agg` / `medianCiRank` / `iqmStats`, `plot.js` `bandOf`, `query.py`
-    `stats` / `_iqm`. NaN is no value; ±inf are values (the mean infinite or NaN, the spread NaN, order statistics and
-    the IQM finite while the infinities fall outside their ranks). A run's value in a bin is the mean of its finite
-    points there weighted by the rows each stands for, infinite only when it has none (`kernel.js` `binColumn`), as
-    with buckets;
+    `stats` / `_iqm`, and the GPU's `gpustats.js` `statsFS`. NaN is no value; ±inf are values (the mean infinite or
+    NaN, the spread NaN, order statistics and the IQM finite while the infinities fall outside their ranks). A run's
+    value in a bin is the mean of its finite points there weighted by the rows each stands for, infinite only when it
+    has none (`kernel.js` `binColumn`; on the GPU `sums` and `FILL_FS`), as with buckets;
   - non-finite numbers as text: "nan", "inf", "-inf" (`index.wire`, `cli.jsonable`, `where`'s markers, `where.js`
     `nonFiniteText`);
   - run filters and field names: `where.py` and `static/where.js` (`compileWhere`, `runField`), `query.py` `get`;
@@ -358,32 +462,68 @@ event. Every run gets a `dir` field: its member's name.
 
 ## UI performance rules
 
-The 10k-run view is the benchmark; interactions should reach the next painted frame in about 20 ms, and no task should
-block input for more than about 50 ms.
+The benchmark (`tests/browser_bench.py`) is the measure: every interaction should have redrawn the charts in view
+within 10 ms of its input, and no task should block input for more than about 50 ms.
 - Per-draw work is proportional to pixels, not points (`prep` decimates per pixel).
-- Charts draw first. Sidebar, path bar and info panel update after the frame paints (`App.afterPaint`), one task each.
-  Chart drawing stops at `FRAME_BUDGET_MS` per frame and continues on the next. Redraws for streamed data come at most
-  4 times a second, less often when the visible charts are expensive to draw, and keep the y axis while the lines fill
-  most of it (`steadyY`). Work the view asked for draws on the next frame; after a zoom, a chart that shows lines
-  waits up to `HOLD_MS` for the columns being rebuilt for it (`App.due`), so it redraws once, with all of them. Blocks
-  are planned after the charts draw, only when what the view shows or the data changed; a zoom plans before it draws
-  (`App.setXRange`).
-- Group statistics bin each column once per binning (`BinCache`, kept per chart while the column has the same points);
-  a chart's groups are summarized in one `aggGroups` call. Order statistics come from histogram selection, exact; only
-  bins of at most 64 values are sorted.
-- A chart's lines (`App.linesFor`) and their x extent are kept until the runs drawn (`linesSig`) or the data
-  (`Data.version`) change.
+- Scrolling never waits for the page: no wheel listener blocks it but the pinned tooltip's, attached only while it
+  is pinned (`App.tipWheel`).
+- Charts draw first, and at once: a change of the view draws them in a microtask when its handler returns
+  (`App.drawSoon`), not on the next frame. A round draws the charts in view (`inView`); the others within `NEAR_PX` of
+  the view follow `NEAR_ROUND` a round, the nearest first, each round once the GPU has drawn the one before
+  (`Renderer.whenDone`) and a frame has painted (`App.afterFrame`), so a scroll finds its charts drawn and the frame
+  showing an interaction carries its work alone. Sidebar, path bar and info panel update after the frame paints
+  (`App.afterPaint`), one task each, as do a box's completions of what was typed (`bindCompletions`); the info panel's
+  closed sections make their tables when first opened. Redraws for streamed data come at most 4 times a second, less
+  often when the visible charts are expensive to draw, stop preparing at `FRAME_BUDGET_MS` per frame, and keep the y
+  axis while the lines fill most of it (`steadyY`). After a zoom, a chart that shows lines waits up to `HOLD_MS` for the
+  columns being rebuilt for it (`App.due`), so it redraws once, with all of them. A change of the view or the path plans
+  before it draws (`App.setXRange`, `showPath`); otherwise blocks are planned after the charts draw. The URL hash is
+  written at the end of the handler's task, after its charts drew (`App.saveHash`, `writeHash`).
+- Reading results back from the GPU waits for everything issued before it, and for whatever else the GPU process's
+  thread is doing: the browser draws the page there too (its raster of a frame, its swap). A round reads once (its
+  charts' y ranges), and a round that follows another waits for the GPU first; nothing else on an interaction's path
+  reads back. After a pause the GPU runs its first commands a millisecond or two late, so a handler whose charts will
+  read back gives it one before its own work (`Renderer.wake`, from `App.onRuns`, `setPath`, `setXRange`,
+  `showChartAlone`).
+- An interaction computes on the GPU only what it changes: bin means are kept across filters and regroupings
+  (`gpustats.meansOf`), bucket arrays are copied there ahead of the zoom that needs them (`warmSoon`), and textures
+  come from a pool.
+- Nothing on an interaction's path is proportional to runs × charts: what depends on the runs alone is computed once a
+  change (`computeRuns`, the run table) or kept per run list (`Data.runsWith` and the caches keyed by its lists), and a
+  chart's own work is proportional to its bucket arrays, its running runs and its groups. Bookkeeping over the store
+  is per block or per array, never per block entry (`Data.blockBytes`).
+- What only the first use of something costs is paid when the page loads, or off the page's thread: every UI module has
+  V8 compile its functions as it loads (`//# allFunctionsCalledOnLoad` before its first statement; after an `import` it
+  does nothing), so none is compiled at its first call, formatters (`Intl`) are made with their module, the page's text
+  styles and symbols are laid out with the page (`#fonts`, `warmFonts`: the first text in a font, size and weight, or a
+  symbol the font lacks, takes the browser milliseconds to find the font for), a canvas's font is set when it is resized
+  rather than at each draw, a filter is tested over the runs once after they load (`warmFilter`), so that the first one
+  typed runs compiled code, the shared canvas has its size before an interaction needs it, and a bucket array's row
+  extents come from the worker that fetched it (the first pass over an array's memory costs about as much as fetching it
+  from RAM).
+- Layout and style are not read where they were just changed: the theme's colors are read once (`plot.theme`), what is
+  in view comes from an observer (`inView`), and only a change of the path looks at once where its charts lie
+  (`App.lookNow`, which reads the place of each chart only in the grids that reach near the view). Panels change only
+  when their metrics do (`updateScopeKeys`), and then only the sections that differ.
+- A chart's lines (`App.linesFor`) and their x extent are kept until the runs drawn (`linesSig`) or its metric's data
+  (`Data.keyVersion`) change.
 - Work over all runs is sliced (`Data.rebuildSoon`) or indexed (`ConfigIndex`); nothing that touches every run × every
   key runs on an interaction.
-- The sidebar builds only the rows near its scroll position. Off-screen panels skip layout (`content-visibility`) and
-  hold no canvas backing store.
+- The sidebar builds only the rows near its scroll position. Off-screen panels skip layout (`content-visibility`).
 - The browser smoke test streams runs while recording every chart draw (`flicker_smoke`); `TREX_REFRESH` sets how
   often growing runs are compiled (10 s; the smoke test uses 1 s).
-- Measure before and after a change (time from the action to the next frame, plus long tasks), rather than assuming.
-  Measure each kind of chart the change touches, since they take different paths: runs drawn one by one (`group=run`)
-  come from the GPU line sets; grouped charts, which a page opens with (`DEFAULT_GROUP`, or the folder's `group_by`),
-  bin their runs' columns on workers and redraw when those answer; charts of more runs than `App.coarseAbove` bin from
-  buckets. A zoom has two times to measure: its first redraw, and the redraw with its detail.
+- Measure before and after a change, with the benchmark, rather than assuming, and each kind of chart the change
+  touches, since they take different paths: runs drawn one by one (`group=run`, few runs) come from the GPU line sets;
+  grouped charts, which a page opens with (`DEFAULT_GROUP`, or the folder's `group_by`), and heatmaps of many runs are
+  binned on the GPU; smoothed ones on workers. What a draw costs the GPU does not show in the page's own timings: a
+  timer query around its draws does (`EXT_disjoint_timer_query_webgl2`), per round rather than per pass, since a query
+  adds to a small pass. Known costs on an integrated GPU (a Radeon 760M): it idles at 800 MHz of 2599 and raises its
+  clock only after some 30 ms of continuous load (40% of the time busy does not), so an interaction's GPU work all runs
+  at the idle clock, and takes time in inverse proportion to the clock. At 800 MHz: pixels written through thin
+  primitives go at about 1.4e9 a second whatever the blending, the format or the primitive (a render backend writes one
+  2×2 block a clock, of which a 1 px line fills one pixel), so the 15 heatmaps of 2048 runs in view take 12.6 ms
+  (writing 7.6, shading 3, geometry 2); 15 grouped charts of 256 groups take 7 ms (filling the bands 3.2, the lines
+  2.8); binning a zoom of them 3.5 ms; and a texture upload moves about 2 GB/s.
 
 ## Conventions
 

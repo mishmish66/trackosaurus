@@ -7,6 +7,7 @@ as an Explorer (`runs`, `buckets_bodies`, ...), from its members' Explorers.
 """
 
 import contextlib
+import itertools
 import json
 import queue
 import threading
@@ -180,22 +181,52 @@ class Workspace:
         return bk.chain([body for _, body in parts], [self.ws_id(m, p) for m, body in parts for p in bk.names(body)])
 
     def messages(self, prefix: str, stop: threading.Event) -> Generator[bytes, None, None]:
-        """Every member's stream under `prefix`, run ids renamed, as SSE messages; until `stop`."""
-        self._refresh()
+        """Every member's stream under `prefix`, run ids renamed, as SSE messages, its first (empty) once every member's
+        is subscribed; until `stop`. Members are followed as they change: one that joins is followed from then on, its
+        runs sent first (a page listed them without it), and one that leaves no longer is."""
         q: queue.Queue[bytes] = queue.Queue(maxsize=20000)
+        pumps: dict[tuple[str, int], threading.Event] = {}  # (member name, id of its Explorer) -> set to stop following it
+        try:
+            self._follow(prefix, q, pumps, late=False)
+            yield b""
+            while not stop.is_set():
+                with contextlib.suppress(queue.Empty):
+                    yield q.get(timeout=0.5)
+                self._follow(prefix, q, pumps, late=True)
+        finally:
+            for ended in pumps.values():
+                ended.set()
 
-        def pump(m: Member, mp: str) -> None:
-            with contextlib.suppress(OSError), contextlib.closing(m.src.messages(mp, stop)) as msgs:
-                for msg in msgs:
-                    for kind, data in parse_sse(msg.decode()):
-                        if not _put(q, sse_text(kind, self._rename_event(m, kind, data)), stop):
-                            return
+    def _follow(self, prefix: str, q: queue.Queue[bytes], pumps: dict[tuple[str, int], threading.Event], late: bool) -> None:
+        """Follow the members `prefix` covers that are not followed yet, each subscribed before this returns, and stop
+        following those it no longer covers."""
+        scope = {(m.name, id(m.src)): (m, mp) for m, mp in self._scope(prefix)}
+        if scope.keys() == pumps.keys():
+            return
+        self._refresh()
+        for k in pumps.keys() - scope.keys():
+            pumps.pop(k).set()
+        for k in scope.keys() - pumps.keys():
+            m, mp = scope[k]
+            pumps[k] = ended = threading.Event()
+            msgs = m.src.messages(mp, ended)
+            with contextlib.suppress(OSError, StopIteration):
+                first = next(msgs)  # subscribed: whatever changes from here on reaches the stream
+                threading.Thread(target=self._pump, args=(m, mp, msgs, first, q, ended, late), daemon=True).start()
 
-        for mp in self._scope(prefix):
-            threading.Thread(target=pump, args=mp, daemon=True).start()
-        while not stop.is_set():
-            with contextlib.suppress(queue.Empty):
-                yield q.get(timeout=0.5)
+    def _pump(self, m: Member, mp: str, msgs: Generator[bytes, None, None], first: bytes, q: queue.Queue[bytes],
+              ended: threading.Event, late: bool) -> None:
+        """Pass member m's stream under `mp` (subscribed, `first` its first message) on to `q`, run ids renamed, until
+        `ended`; when `late`, its runs first."""
+        with contextlib.suppress(OSError), contextlib.closing(msgs):
+            if late:
+                for meta in m.src.runs(mp).runs:
+                    if not _put(q, sse_text("run", dumps(self._rename(m, meta).wire())), ended):
+                        return
+            for msg in itertools.chain([first], msgs):
+                for kind, data in parse_sse(msg.decode()):
+                    if not _put(q, sse_text(kind, self._rename_event(m, kind, data)), ended):
+                        return
 
     def _rename_event(self, m: Member, kind: str, data: str) -> str:
         """An event's JSON with its run (or folder) as the workspace names it."""

@@ -15,6 +15,22 @@ function emptyArray(level, index, paths, seqs) {
   return { buf, bytes: buf.byteLength, paths, ext: null };
 }
 
+/** A bucket array of block `index` naming runs `paths`, each with the buckets `rows` gives it ([offset in the block,
+ * value] each, one row a bucket), holding rows `seqs` of them (buckets.encode). */
+function bucketArray(level, index, paths, seqs, rows) {
+  const names = new TextEncoder().encode(paths.join("\0")), pad = (n) => Math.ceil(n / 8) * 8, runs = paths.length, all = rows.flat(), count = all.length;
+  const first = 32 + pad(names.length), seq = first + pad(4 * (runs + 1)), offset = seq + pad(4 * runs), mean = offset + 2 * pad(2 * count);
+  const buf = new ArrayBuffer(mean + 12 * count);
+  new Uint32Array(buf, 0, 8).set([0x31424b54, level >>> 0, index, 0, runs, count, names.length, 0]);
+  new Uint8Array(buf, 32, names.length).set(names);
+  new Uint32Array(buf, first, runs + 1).set(rows.reduce((f, r) => [...f, f.at(-1) + r.length], [0]));
+  new Uint32Array(buf, seq, runs).set(seqs);
+  new Uint16Array(buf, offset, count).set(all.map((q) => q[0]));
+  new Float32Array(buf, mean, count).set(all.map((q) => q[1]));
+  new Uint32Array(buf, mean + 8 * count, count).fill(1);
+  return { buf, bytes: buf.byteLength, paths, ext: null };
+}
+
 function withRuns(n, running = 0) {
   const d = new Data(UI);
   d.fetchMany = async (xs) => xs.map(() => null); // no server
@@ -49,6 +65,83 @@ test("a chart shows the layers it wants only once every block holds every one of
   assert.equal(ch.ready, ch.want);
 });
 
+test("a folder shown from the runs loaded asks for its own finished runs' blocks; a request on its way covers only that folder's", () => {
+  const d = new Data(UI), queue = [], again = [], other = [];
+  d.fetchMany = async (xs) => xs.map(() => null);
+  const runs = ["a", "b"].flatMap((dir) => Array.from({ length: 100 }, (_, i) => d.newRun({ id: `${dir}/r${i}`, seq: 10, mseq: 0, compiled: 10, keys: ["loss"],
+                                                                                       summary: {}, state: "finished" })));
+  d.view = "a";
+  d.need("loss", 2, 0, runs.slice(0, 100), queue);
+  assert.deepEqual(queue.map((x) => [x.runs, x.scope]), [[null, "a"]]);
+  assert.ok(d.asking(queue[0]), "asked");
+  d.need("loss", 2, 0, runs.slice(0, 100), again);
+  assert.deepEqual(again, [], "on its way");
+  d.view = "b";
+  d.need("loss", 2, 0, runs.slice(100), other);
+  assert.deepEqual(other.map((x) => [x.runs, x.scope]), [[null, "b"]], "the other folder's runs are not");
+});
+
+test("metrics the same runs log share one list of them, which a chart's plan is kept for", () => {
+  const d = new Data(UI);
+  d.fetchMany = async (xs) => xs.map(() => null);
+  const runs = Array.from({ length: 4 }, (_, i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, compiled: 10, keys: i < 3 ? ["loss", "acc", "lr"] : ["lr"],
+                                                               summary: { _step: 1000 }, state: "finished" }));
+  assert.equal(d.runsWith(runs, "loss"), d.runsWith(runs, "acc"));
+  assert.deepEqual(d.runsWith(runs, "loss").map((r) => r.id), ["r0", "r1", "r2"]);
+  assert.equal(d.runsWith(runs, "lr"), runs, "every run logs it: the list itself");
+  assert.ok(d.someLog(runs.slice(3), "lr") && !d.someLog(runs.slice(3), "loss"));
+});
+
+test("a chart that shows all its view wants is not planned again until its data or its view changes", () => {
+  const { d, runs } = withRuns(3), demand = (pw) => ({ key: "loss", runs, runsSig: "a", xmode: 0, zoomed: false, x0: -Infinity, x1: Infinity, pw, many: false });
+  let asked = 0;
+  const need = d.need.bind(d);
+  d.need = (...a) => (asked++, need(...a));
+  d.planChart(demand(600), []);
+  const ch = d.charts.get("loss"), { level, indices } = ch.want.coarse;
+  for (const index of indices) d.addArray({ key: "loss", level, index }, emptyArray(level, index, ["r0", "r1", "r2"], [10, 10, 10]));
+  d.planChart(demand(600), []);
+  d.rebuildNow();
+  d.planChart(demand(600), []);
+  const settled = asked;
+  d.planChart(demand(600), []);
+  assert.equal(asked, settled, "nothing changed: no block is looked at");
+  d.planChart(demand(2400), []);
+  assert.ok(asked > settled, "a wider chart is planned anew");
+  const wide = asked;
+  d.setMeta(runs[0], { ...runs[0].meta, compiled: 11 });
+  d.planChart(demand(2400), []);
+  assert.ok(asked > wide, "a run's levels grew: its blocks are looked at again");
+});
+
+test("the x extent of a chart's runs spans their buckets in the blocks it shows, found run by run or from their arrays' rows", () => {
+  const { d, runs } = withRuns(40);
+  d.plan([{ key: "loss", runs, runsSig: "a", xmode: 0, zoomed: false, x0: -Infinity, x1: Infinity, pw: 600, many: false }]);
+  const ch = d.charts.get("loss"), { level, indices } = ch.want.coarse, ids = runs.map((r) => r.id), seqs = runs.map(() => 10);
+  assert.equal(d.extentOf(runs, "loss"), null, "before it shows any block");
+  // run i has two buckets in the first block, i and i + 2 buckets in: the first runs' lie inside the others'
+  d.addArray({ key: "loss", level, index: indices[0] }, bucketArray(level, indices[0], ids, seqs, runs.map((_, i) => [[i, 1], [i + 2, 2]])));
+  for (const index of indices.slice(1)) d.addArray({ key: "loss", level, index }, emptyArray(level, index, ids, seqs));
+  d.settleChart("loss", ch);
+  const step = (offset) => (indices[0] * 256 + offset + 0.5 / 65536) * 2 ** level;
+  assert.deepEqual(d.extentOf(runs, "loss"), [step(0), step(41)], "of many runs");
+  assert.deepEqual(d.extentOf(runs.slice(3, 6), "loss"), [step(3), step(7)], "of a few");
+  assert.deepEqual(d.extentOf(runs.slice(3, 38), "loss"), [step(3), step(39)], "of many of them");
+});
+
+test("the queued columns of the metrics asked for are rebuilt at once, the others' in a task", async () => {
+  const d = new Data(UI), keys = ["acc", "loss"];
+  const runs = [0, 1].map((i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, compiled: 10, keys, summary: { _step: 1000 }, state: "finished" }));
+  d.fetchMany = async (xs) => xs.map((x) => emptyArray(x.level, x.index, ["r0", "r1"], [10, 10]));
+  d.plan(keys.map((key) => ({ ...demandOf(runs), key })));
+  await tasks();
+  for (const key of keys) for (const r of runs) d.rebuildSoon(r, key);
+  d.rebuildNow(new Set(["loss"]));
+  assert.deepEqual([d.pending("loss"), d.pending("acc")], [false, true]);
+  await tasks();
+  assert.deepEqual([d.pending("acc"), d.busy], [false, false]);
+});
+
 test("an array is freed once no block entry names it, and a dropped run leaves every block", () => {
   const { d, runs } = withRuns(2);
   d.addArray({ key: "loss", level: 0, index: 0 }, emptyArray(0, 0, ["r0", "r1"], [10, 10]));
@@ -73,7 +166,7 @@ test("queued requests go out spread over the free request slots, one batch each"
   assert.deepEqual([sent.length, sent.reduce((a, b) => a + b, 0), d.queue.length], [5, 22, 0]);
 });
 
-test("fetching ahead asks for every chart's wanted layers before finer levels of the charts shown", () => {
+test("fetching ahead asks for every chart's wanted layers before the finer levels a zoom of any would want", () => {
   const demands = [];
   const d = new Data({ ...UI, ahead: () => demands });
   d.fetchMany = async (xs) => xs.map(() => null);
@@ -85,15 +178,17 @@ test("fetching ahead asks for every chart's wanted layers before finer levels of
   const ch = d.charts.get("loss"), { level, indices } = ch.want.coarse;
   for (const index of indices) d.addArray({ key: "loss", level, index }, emptyArray(level, index, ["r0", "r1", "r2"], [10, 10, 10]));
   d.settleChart("loss", ch);
-  const asks = d.nextAhead(100), finer = asks.findIndex((x) => x.key === "loss");
-  assert.ok(asks.some((x) => x.key === "acc") && finer > asks.findLastIndex((x) => x.key === "acc"));
-  assert.ok(asks.filter((x) => x.key === "loss").every((x) => x.level < level));
+  const asks = d.nextAhead(100), want = d.layersOf(demands[1], runs).coarse.level; // of "acc", not shown yet
+  const wanted = asks.findLastIndex((x) => x.key === "acc" && x.level === want), finer = asks.findIndex((x) => x.level < (x.key === "loss" ? level : want));
+  assert.ok(wanted >= 0 && finer > wanted);
+  assert.ok(asks.filter((x) => x.key === "loss").every((x) => x.level < level), "the shown chart's layers are here: only finer ones are asked for");
+  assert.ok(asks.some((x) => x.key === "acc" && x.level < want), "a chart not shown yet gets its finer levels too");
 });
 
-test("a run that appears while the scope is being listed reaches the page through the stream it opened first", async () => {
+test("a scope's runs are listed once its stream is open, and a run that appears meanwhile reaches the page through it", async () => {
   const sources = [], meta = (id) => ({ id, seq: 1, mseq: 0, compiled: 1, keys: [], summary: {}, state: "finished" });
   const realFetch = globalThis.fetch;
-  let answer;
+  let answer = null;
   globalThis.EventSource = class {
     constructor(url) { this.url = url; this.on = {}; sources.push(this); }
     addEventListener(kind, fn) { this.on[kind] = fn; }
@@ -103,6 +198,10 @@ test("a run that appears while the scope is being listed reaches the page throug
   try {
     const d = new Data(UI), loading = d.loadScope("");
     assert.equal(sources.length, 1);
+    await tasks();
+    assert.equal(answer, null);
+    sources[0].onopen();
+    await tasks();
     sources[0].on.run({ data: JSON.stringify(meta("b")) });
     answer();
     await loading;
@@ -272,4 +371,60 @@ test("the UI is asked to plan again once a failed block is due", async () => {
   assert.equal(replans, 0);
   for (let waited = 0; !replans && waited < 2000; waited += 5) await tasks();
   assert.deepEqual([replans, d.planned], [1, null]);
+});
+
+/** A Data holding running run "r" with its levels at row 49, whose server answers /api/run with `run` (fields over the
+ * run's) and /api/rows with `rows`, counting the requests (and failing past 20); the delays of resyncs are recorded,
+ * not waited for. */
+function resyncing(run, rows) {
+  const d = new Data(UI), base = { id: "r", seq: 49, mseq: 0, compiled: 49, keys: ["loss"], summary: {}, state: "running" };
+  const r = d.newRun(base), asked = [], delays = [], realFetch = globalThis.fetch, timer = globalThis.setTimeout;
+  globalThis.fetch = async (url) => {
+    asked.push(url.split("?")[0]);
+    if (asked.length > 20) throw new Error("resyncing without end");
+    return { ok: true, json: async () => (url.includes("/api/rows") ? rows : { run: { ...base, ...run }, media: [] }) };
+  };
+  globalThis.setTimeout = (f, ms) => (ms >= 500 ? delays.push(ms) : timer(f, ms));
+  const restore = () => {
+    globalThis.fetch = realFetch;
+    globalThis.setTimeout = timer;
+  };
+  return { d, r, asked, delays, restore };
+}
+
+const rowsFrom = (seq0, n) => ({ run: "r", seq0, rows: Array.from({ length: n }, (_, i) => [seq0 + i, 0, { loss: 1 }]) });
+
+test("a resync after which the rows waiting for it still leave a gap is tried again later, twice as late each time", () => quietly(async () => {
+  const { d, asked, delays, restore } = resyncing({}, null);
+  try {
+    d.dispatch("rows", rowsFrom(50, 1));
+    await tasks();
+    await tasks();
+    assert.deepEqual([asked, delays], [["/api/run"], [1000]]);
+  } finally {
+    restore();
+  }
+}));
+
+test("rows a resync takes that begin past the run's levels are its tail from their first row, and the rows after follow", () => quietly(async () => {
+  const { d, r, asked, delays, restore } = resyncing({ seq: 52 }, rowsFrom(50, 2));
+  try {
+    d.dispatch("rows", rowsFrom(50, 1));
+    await tasks();
+    d.dispatch("rows", rowsFrom(52, 1));
+    assert.deepEqual([asked, delays, r.seq, d.tailOf(r, "loss").q], [["/api/run", "/api/rows"], [], 53, [50, 51, 52]]);
+  } finally {
+    restore();
+  }
+}));
+
+test("a plan finding every block of a binned chart in the store tells the UI of it at once", () => {
+  const told = [], d = new Data({ ...UI, data: (keys) => told.push([...keys]) });
+  d.fetchMany = async () => assert.fail("nothing to fetch");
+  const runs = ["r0", "r1"].map((id) => d.newRun({ id, seq: 10, mseq: 0, compiled: 10, keys: ["loss"], summary: { _step: 1000 }, state: "finished" }));
+  const demand = { ...demandOf(runs), many: true }, { level, indices } = d.layersOf(demand, runs).coarse;
+  for (const index of indices) d.addArray({ key: "loss", level, index }, emptyArray(level, index, ["r0", "r1"], [10, 10]));
+  told.length = 0;
+  d.plan([demand]);
+  assert.deepEqual([d.charts.get("loss").ready?.coarse.level, told], [level, [["loss"]]]);
 });

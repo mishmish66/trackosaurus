@@ -1,6 +1,7 @@
 // Numeric kernel for the UI: resident metric columns (in located chunks, so workers can be sent copies), time-weighted
 // EMA smoothing, per-pixel decimation, group aggregation, and axis quantiles. Pure JS on typed arrays; it runs in the
 // page and in its workers.
+//# allFunctionsCalledOnLoad
 
 /** `flags` bits accepted by prep, agg and yrange; IQM (agg only) adds the interquartile mean. */
 export const LOGY = 1, RAW = 2, LOGX = 4, IQM = 8;
@@ -343,10 +344,11 @@ export function medianCiCoverage(n) {
   return 1 - 2 * cdf;
 }
 
-/** Bins of width a power of two at whole multiples of it, covering [x0, x1] with at most `most` + 2 bins:
- * {g0 (first edge), dx (width), bins}. Edges do not move as the range grows. */
-export function binGrid(x0, x1, most) {
-  const dx = 2 ** Math.ceil(Math.log2((x1 - x0) / most)), b0 = Math.floor(x0 / dx);
+/** Bins of width a power of two at whole multiples of it, covering [x0, x1] with at most `most` + 2 bins, none
+ * narrower than `least` (a power of two, or 0): {g0 (first edge), dx (width), bins}. Edges do not move as the range
+ * grows. */
+export function binGrid(x0, x1, most, least = 0) {
+  const dx = Math.max(least, 2 ** Math.ceil(Math.log2((x1 - x0) / most))), b0 = Math.floor(x0 / dx);
   return { g0: b0 * dx, dx, bins: Math.max(1, Math.floor(x1 / dx) + 1 - b0) };
 }
 
@@ -492,7 +494,7 @@ function closeBin(run, row) {
 
 export const BLOCK = 256; // buckets of a block (buckets.BLOCK)
 const BUCKETS_MAGIC = 0x31424b54; // "TKB1"
-const SOFF_SCALE = 65536; // step offsets, in fractions of a bucket (buckets.SOFF_SCALE)
+export const SOFF_SCALE = 65536; // step offsets, in fractions of a bucket (buckets.SOFF_SCALE)
 const pad8 = (n) => Math.ceil(n / 8) * 8;
 
 /** Views of the bucket array encoded at byte `off` of `buf`: {level, base (its first block), runs, count, first (run
@@ -530,6 +532,36 @@ export function bucketPaths(buf, v) {
 
 /** Mean step of bucket q of bucket array `v`. */
 export const bucketStep = (v, q) => (v.base * BLOCK + v.offset[q] + (v.soff[q] + 0.5) / SOFF_SCALE) * 2 ** v.level;
+
+/** Each row's [first, last, smallest positive] x of bucket array `v` (mean steps for X_STEP, else mean runtimes), three
+ * numbers a row: Infinity, -Infinity, Infinity for a row without buckets. */
+export function rowExtents(v, xmode) {
+  const x = xmode === X_STEP ? (q) => bucketStep(v, q) : (q) => v.tmean[q], out = new Float64Array(3 * v.runs);
+  for (let row = 0; row < v.runs; row++) {
+    const q0 = v.first[row], q1 = v.first[row + 1];
+    let q = q0;
+    while (q < q1 && !(x(q) > 0)) q++;
+    out[3 * row] = q1 > q0 ? x(q0) : Infinity;
+    out[3 * row + 1] = q1 > q0 ? x(q1 - 1) : -Infinity;
+    out[3 * row + 2] = q < q1 ? x(q) : Infinity;
+  }
+  return out;
+}
+
+/** [first, last, smallest positive] x over the rows of a bucket array, from their extents `ext` (rowExtents), whose
+ * run (`rowRun`: a run index per row, -1 for none) is binned from its buckets: `group` of it at least 0, `column` of it
+ * 0. */
+export function arrayExtent(ext, rowRun, group, column) {
+  let lo = Infinity, hi = -Infinity, pos = Infinity;
+  for (let row = 0; row < rowRun.length; row++) {
+    const k = rowRun[row];
+    if (k < 0 || !(group[k] >= 0) || column[k]) continue;
+    lo = Math.min(lo, ext[3 * row]);
+    hi = Math.max(hi, ext[3 * row + 1]);
+    pos = Math.min(pos, ext[3 * row + 2]);
+  }
+  return [lo, hi, pos];
+}
 
 /** Steps [lo, hi) of the block a part ({v, row}) holds. */
 const blockSteps = ({ v }) => [v.base * BLOCK * 2 ** v.level, (v.base + 1) * BLOCK * 2 ** v.level];

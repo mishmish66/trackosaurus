@@ -116,6 +116,13 @@ test("binGrid edges are multiples of a power-of-two width that a growing range k
   assert.equal(K.binGrid(0, 2001, 400).dx, 8);
 });
 
+test("binGrid takes no bin narrower than its least width, which a coarser grid leaves as it is", () => {
+  assert.deepEqual(K.binGrid(0, 19700, 56), { g0: 0, dx: 512, bins: 39 });
+  assert.deepEqual(K.binGrid(0, 19700, 56, 1024), { g0: 0, dx: 1024, bins: 20 });
+  assert.deepEqual(K.binGrid(500, 19700, 56, 256), { g0: 0, dx: 512, bins: 39 });
+  assert.deepEqual(K.binGrid(3100, 3500, 8, 1024), { g0: 3072, dx: 1024, bins: 1 });
+});
+
 test("agg over a growing binGrid range leaves every earlier bin unchanged", () => {
   const xs = Array.from({ length: 2000 }, (_, i) => i), noise = (i, k) => (Math.sin(i * 12.9898 + k * 78.233) * 43758.5453) % 1;
   const at = (n) => {
@@ -223,6 +230,33 @@ function fullBlock(level, base, mean, frac = 0.25) {
   new Uint32Array(buf, 48 + 1024 + 8 * n, n).fill(1);
   return { v: K.bucketViews(buf), row: 0 };
 }
+
+/** A bucket array of block `base` of `level` whose row r holds the buckets of `rows[r]`, each [offset, its mean step's
+ * offset within the bucket in 1/65536, mean runtime], of one row and mean 0 (buckets.encode). */
+function bucketArray(level, base, rows) {
+  const runs = rows.length, all = rows.flat(), count = all.length, pad8 = (n) => (n + 7) & ~7;
+  const first = 32, offset = first + pad8(4 * (runs + 1)) + pad8(4 * runs), soff = offset + pad8(2 * count), mean = soff + pad8(2 * count);
+  const b = new ArrayBuffer(mean + 12 * count);
+  new Uint32Array(b, 0, 8).set([0x31424b54, level, base, 0, runs, count, 0, 0]);
+  new Uint32Array(b, first, runs + 1).set(rows.reduce((f, r) => [...f, f[f.length - 1] + r.length], [0]));
+  new Uint16Array(b, offset, count).set(all.map((q) => q[0]));
+  new Uint16Array(b, soff, count).set(all.map((q) => q[1]));
+  new Float32Array(b, mean + 4 * count, count).set(all.map((q) => q[2]));
+  new Uint32Array(b, mean + 8 * count, count).fill(1);
+  return K.bucketViews(b);
+}
+
+test("an array's extent spans the buckets of the rows of shown runs binned from their buckets, and nothing else", () => {
+  // row 1's run is not shown, row 2's is drawn from its column, row 3 has no run, row 4's is past the table, row 6 is empty
+  const v = bucketArray(1, 0, [[[1, 0, 0], [3, 32768, 5]], [[0, 0, -10]], [[100, 0, 50]], [[90, 0, 60]], [[80, 0, 70]], [[2, 0, 1], [50, 0, 9]], []]);
+  const rowRun = Int32Array.from([4, 7, 2, -1, 9, 3, 1]), group = Int32Array.from([0, 0, 1, 1, 0, -1, -1, -1]);
+  const column = Uint8Array.from([0, 0, 1, 0, 0, 0, 0, 0]);
+  const steps = K.rowExtents(v, K.X_STEP), times = K.rowExtents(v, K.X_RUNTIME);
+  assert.deepEqual([...steps.subarray(18)], [Infinity, -Infinity, Infinity], "a row without buckets");
+  assert.deepEqual(K.arrayExtent(steps, rowRun, group, column), [K.bucketStep(v, 0), K.bucketStep(v, 7), K.bucketStep(v, 0)]);
+  assert.deepEqual(K.arrayExtent(times, rowRun, group, column), [0, 9, 1], "the smallest positive runtime of each row");
+  assert.deepEqual(K.arrayExtent(steps, rowRun, group.fill(-1), column), [Infinity, -Infinity, Infinity]);
+});
 
 test("a column takes each step from the finest level whose blocks hold it, in step order, however the levels' blocks lie", () => {
   const coarse = fullBlock(4, 0, (q) => 4000 + q), fine = fullBlock(0, 9, (q) => q);

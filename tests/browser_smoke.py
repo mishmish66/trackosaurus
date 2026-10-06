@@ -32,7 +32,7 @@ from typing import Any, Protocol
 
 import numpy as np
 import numpy.typing as npt
-from playwright.sync_api import ConsoleMessage, Page, Route, sync_playwright
+from playwright.sync_api import ConsoleMessage, Page, Request, Response, Route, sync_playwright
 
 from trex import chunks
 from trex.format import connect_ro
@@ -69,6 +69,25 @@ for r in runs:
     r.finish()
 """
 
+KEPT_WRITER = """
+import sys, trex
+def run(name, lr):
+    r = trex.init(f"{sys.argv[1]}/kept/{name}", config={"lr": lr}, commit_interval=0.05)
+    for step in range(40):
+        r.log({"loss": lr / (step + 1)}, step=step)
+    return r
+for name, lr in (("a0", 0.1), ("a1", 0.1), ("b0", 0.2)):
+    run(name, lr).finish()
+live = run("live", 0.2)
+print("ready", flush=True)
+sys.stdin.readline()
+live.finish()
+print("finished", flush=True)
+sys.stdin.readline()
+run("late", 0.1).finish()
+print("added", flush=True)
+"""
+
 EXTENT_WRITER = """
 import sys, trex
 for name, n in (("short", 100), ("long", 1000)):
@@ -97,11 +116,12 @@ RECORD_DRAWS = """() => {
   if (C.prototype.recorded) return;
   C.prototype.recorded = true;
   const draw = C.prototype.draw;
-  C.prototype.draw = function () {
-    draw.call(this);
+  C.prototype.draw = function (...args) {
+    draw.apply(this, args);
     const v = this.view;
     if (!v || !this.w) return;
     const lines = v.lines.map((ln) => {
+      if (v.gpu) return [ln.group ?? ln.id, v.gpu.bins, this.binX(ln, v.gpu.bins - 1, v.gpu.agg)]; // binned on the GPU: a point a bin
       const c = ln.cols?.[0], n = ln.xy ? ln.xy.length / 2 : c ? c.n : 0;
       return [ln.run?.id ?? ln.group ?? ln.label, n, ln.xy ? ln.xy[ln.xy.length - 2] : c && c.n ? c.s[c.n - 1] : null];
     });
@@ -109,6 +129,16 @@ RECORD_DRAWS = """() => {
   };
 }"""
 
+
+# [bin width, width of the finest buckets shown] of the loss chart's view binned from its buckets, on the GPU or on
+# its worker (a heatmap's lines then lie at the bins' centers); null when it shows none.
+BIN_FLOOR = ("(() => { const c = app.charts.get('loss'), L = app.data.charts.get('loss')?.ready, f = L && (L.fine || L.coarse);"
+             " const s = c.view?.lines?.find((l) => l.cols?.[0]?.n >= 2)?.cols[0].s, g = c.view?.gpu;"
+             " const dx = g ? g.dx : c.view?.lines?.[0]?.dx ?? (s ? s[1] - s[0] : null);"
+             " return dx && f ? [dx, 2 ** f.level] : null; })()")
+
+# Group line l of chart c as its bins: [center, band low, band high, runs, raw center] each, however it was binned.
+BINS = "((c, l) => Array.from({ length: c.gridOf(l).bins }, (_, i) => c.groupAt(l, i)))"
 
 type Draw = dict[str, Any]  # a chart draw RECORD_DRAWS records: key, paced, y0, y1, lines ([id, points, end])
 type At = Callable[[float, float], tuple[float, float]]  # a point of a chart's plot area by its fractions of it
@@ -233,8 +263,10 @@ def line_pixels_smoke(page: Page, url: str) -> bool:
 
 def binned_smoke(page: Page, url: str, runs: Path) -> bool:
     """Whether a zoom of more runs than a chart draws one by one draws them from bins of their buckets, as group
-    statistics (each group's median per bin of its runs' means of their rows) from the chart's worker, and as a
-    heatmap; and whether a server of another protocol is stated."""
+    statistics (each group's median per bin of its runs' means of their rows) binned on the GPU, while its drag rests
+    when it is dragged, so that its release reads nothing back from the GPU, and on the chart's worker once a pass on
+    the GPU fails, and as a heatmap; whether no such view takes bins narrower than the buckets it bins; and whether a
+    server of another protocol is stated."""
     subprocess.run([sys.executable, "-c", MANY_WRITER, str(runs)], check=True)
 
     def zoomed(query: str, hash_: str) -> None:
@@ -245,20 +277,63 @@ def binned_smoke(page: Page, url: str, runs: Path) -> bool:
         page.wait_for_timeout(300)
         page.wait_for_function(SETTLED, timeout=60000)
 
+    def floors() -> list[Any]:
+        """BIN_FLOOR of the view, then of zooms whose spans the planner rounds to a level coarser than the bins."""
+        out = [page.evaluate(BIN_FLOOR)]
+        for r in ([60, 130], [40, 175], [0, 140]):
+            page.evaluate(f"app.setXRange([{r[0]}, {r[1]}, 0])")
+            page.wait_for_timeout(300)
+            page.wait_for_function(SETTLED, timeout=60000)
+            out.append(page.evaluate(BIN_FLOOR))
+        page.evaluate("app.setXRange([60, 140, 0])")
+        page.wait_for_timeout(300)
+        page.wait_for_function(SETTLED, timeout=60000)
+        return out
+
     zoomed("", "group=run~1")
-    binned, lines, worker = page.evaluate("""(() => { const c = app.charts.get('loss');
-        return [c.binned, c.view.lines.map((l) => [l.label.split(' ')[0], l.g0, l.dx, [...l.center]]), !!c.stats]; })()""")
+    grouped_floors = floors()
+    centers = f"c.view.lines.map((l) => [l.label.split(' ')[0], c.gridOf(l).g0, c.gridOf(l).dx, {BINS}(c, l).map((b) => b[0])])"
+    binned, lines, worker, on_gpu = page.evaluate(f"(() => {{ const c = app.charts.get('loss'); return [c.binned, {centers}, !!c.stats, !!c.view.gpu]; }})()")
+    page.evaluate("app.setXRange(null)")
+    page.wait_for_function(SETTLED, timeout=60000)
+    page.evaluate("""(async () => { const gl = (await import('/static/gl.js')).renderer().gl, read = gl.readPixels;
+        window.reads = 0; gl.readPixels = function (...a) { window.reads++; return read.apply(this, a); }; })()""")
+    box = page.locator(".panel:has(.pname:text-is('loss')) canvas").nth(1).bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + 0.4 * box["width"], box["y"] + box["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 0.7 * box["width"], box["y"] + box["height"] / 2, steps=4)
+    page.wait_for_timeout(500)  # the drag rests
+    rested = page.evaluate("window.reads")
+    page.mouse.up()
+    page.wait_for_function("!!app.xrange", timeout=5000)
+    page.wait_for_function(SETTLED, timeout=60000)
+    released, dragged = page.evaluate(f"(() => {{ const c = app.charts.get('loss'); return [window.reads, {centers}]; }})()")
+    page.mouse.move(5, 5)
+    dragged_off = [abs(c - w) for g, g0, dx, center in dragged for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
+    page.evaluate("""(async () => { const gl = (await import('/static/gl.js')).renderer().gl, draw = gl.drawArrays;
+        gl.drawArrays = () => { gl.drawArrays = draw; throw new Error('a pass this GPU cannot run'); };
+        app.setXRange([60, 139, 0]); })()""")
+    page.wait_for_timeout(300)
+    page.wait_for_function(SETTLED, timeout=60000)
+    fell_back, by_worker = page.evaluate(f"(() => {{ const c = app.charts.get('loss'); return [!c.view.gpu, {centers}]; }})()")
+    worker_off = [abs(c - w) for g, g0, dx, center in by_worker for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
     zoomed("", "group=run")
     heat = page.evaluate("(() => { const c = app.charts.get('loss'); return [c.binned, c.view.density, c.view.lines.length]; })()")
+    heat_floors = floors()
+    narrow = [f for f in grouped_floors + heat_floors if not f or f[0] < f[1]]
     page.evaluate("app.showProtocol(1)")
     stated = page.evaluate("[!document.querySelector('#mismatch').hidden, document.querySelector('#mismatch').title]")
     off = [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
     groups = sorted(l[0] for l in lines)
-    print(f"binned: a zoom of 320 runs drew bins of their buckets {binned} on its worker {worker}, groups {groups} of "
-          f"{len(lines[0][3]) if lines else 0} bins, at most {max(off, default=1):.2g} off their exact medians; heatmap {heat}; "
-          f"protocol 1 stated {stated}")
+    print(f"binned: a zoom of 320 runs drew bins of their buckets {binned}, binned {worker} (on the GPU {on_gpu}), groups {groups} of "
+          f"{len(lines[0][3]) if lines else 0} bins, at most {max(off, default=1):.2g} off their exact medians; a dragged zoom read "
+          f"the GPU {rested} times while it rested and {released - rested} at its release, at most {max(dragged_off, default=1):.2g} off; "
+          f"after a failed pass on the worker {fell_back}, at most {max(worker_off, default=1):.2g} off; heatmap {heat}; "
+          f"bins as wide as the buckets {[f for f in grouped_floors + heat_floors]}; protocol 1 stated {stated}")
     return (binned is True and worker and groups == ["a", "b"] and bool(off) and max(off) < 1e-5 and heat == [True, True, 320]
-            and stated[0] and "the server 1" in stated[1])
+            and rested >= 1 and released == rested and bool(dragged_off) and max(dragged_off) < 1e-5 and not narrow
+            and fell_back and bool(worker_off) and max(worker_off) < 1e-5 and stated[0] and "the server 1" in stated[1])
 
 
 class Cdp(Protocol):
@@ -363,7 +438,10 @@ def file_columns(run_dir: Path) -> tuple[int, dict[str, int], int]:
 
 READY = ("window.app && app.data.runs.size > 0 && app.charts.size > 0 && !app.data.queue.length && !app.data.posts"
          " && [...app.charts.values()].some((c) => c.view)")
-SETTLED = READY + " && app.runList.length === app.data.runs.size && !app.data.busy && !app.round && !app.raf && !app.planTimer"
+# every run loaded under the path shown is listed
+LISTED = ("app.runList.length === [...app.data.runs.keys()].filter((id) => !app.opts.path || id === app.opts.path"
+          " || id.startsWith(app.opts.path + '/')).length")
+SETTLED = READY + f" && {LISTED} && !app.data.busy && !app.round && !app.raf && !app.soon && !app.planTimer"
 
 
 def group_levels_smoke(page: Page, url: str) -> bool:
@@ -537,7 +615,7 @@ def interactions_smoke(page: Page, url: str) -> bool:
     checks["a pinned row marks its run in the sidebar"] = page.evaluate("!!app.sideMark")
     tip_row.click()
     page.keyboard.up("Shift")
-    page.wait_for_function("app.scopeIsRun && app.data.runs.size === 1 && !!document.querySelector('#infoPanel .st')", timeout=10000)
+    page.wait_for_function("app.scopeIsRun && app.runList.length === 1 && !!document.querySelector('#infoPanel .st')", timeout=10000)
     checks["a pinned row opens its run"] = True
     page.go_back()
     page.wait_for_function(READY + " && !app.scopeIsRun", timeout=30000)
@@ -558,13 +636,22 @@ def interactions_smoke(page: Page, url: str) -> bool:
     checks["the sidebar keeps its width after a reload"] = page.evaluate(width) >= w0 + 100
     page.dblclick("#sideGrip")
     checks["double-clicking the grip resets the width"] = soon(f"{width} === {w0}")
+    page.goto(f"{url}/?alone#path=sweep")
+    page.wait_for_function(READY, timeout=30000)
+    top = page.evaluate("(() => { const p = document.getElementById('panels'); p.scrollTop = Math.min(400, p.scrollHeight - p.clientHeight); return p.scrollTop; })()")
+    page.evaluate("""() => { const p = document.getElementById('panels'), box = p.getBoundingClientRect();
+        [...p.querySelectorAll('.panel button.full')].find((b) => { const r = b.getBoundingClientRect(); return r.top > box.top && r.bottom < box.bottom; }).click(); }""")
+    page.wait_for_function("document.getElementById('panels').classList.contains('alone')", timeout=10000)
+    page.keyboard.press("Escape")
+    checks["leaving a chart shown alone returns to where the charts were scrolled"] = top > 0 and soon(
+        f"!document.getElementById('panels').classList.contains('alone') && Math.abs(document.getElementById('panels').scrollTop - {top}) <= 2")
     page.goto(f"{url}/?iqm#path=sweep&group=lr&center=iqm")
     page.wait_for_function(READY, timeout=30000)
     plot()
     checks["IQM draws each group's interquartile mean with a CI band"] = soon(
         f"(() => {{ const v = {chart}.view, k = v?.lines[0]; return document.querySelector('#center').value === 'iqm' && !!k"
-        " && k.center.some((c, i) => c > k.lo[i] && c < k.hi[i]); })()", timeout=10000)
-    span = page.evaluate(f"""(() => {{ const v = {chart}.view, c = v.lines.flatMap((l) => [...l.center].filter(Number.isFinite));
+        f" && {BINS}({chart}, k).some(([c, lo, hi]) => c > lo && c < hi); }})()", timeout=10000)
+    span = page.evaluate(f"""(() => {{ const v = {chart}.view, c = v.lines.flatMap((l) => {BINS}({chart}, l).map((b) => b[0]).filter(Number.isFinite));
         return [Math.min(...c), Math.max(...c), v.y0, v.y1]; }})()""")
     reach = (span[1] - span[0]) * 0.25
     checks["the y axis follows the group lines; a band widens it by at most a quarter"] = (
@@ -747,14 +834,15 @@ def filter_smoke(page: Page, url: str) -> bool:
         page.wait_for_timeout(600)
         results[text] = [page.evaluate(shown), page.evaluate("document.querySelector('#runFilter').classList.contains('bad')")]
     page.fill("#runFilter", "")
-    items = lambda: page.evaluate("[...document.querySelectorAll('#menu .mitem .ml')].map((e) => e.textContent)")
+    painted = "new Promise((ok) => requestAnimationFrame(() => setTimeout(ok, 0)))"  # completions of input follow the frame
+    items = lambda: page.evaluate(f"{painted}.then(() => [...document.querySelectorAll('#menu .mitem .ml')].map((e) => e.textContent))")
     page.click("#runFilter")
     page.keyboard.type("l")
     field_items = items()
     page.keyboard.press("Tab")
     after_field = page.input_value("#runFilter")
     page.keyboard.type("= ")
-    value_items = page.evaluate("[...document.querySelectorAll('#menu .mitem')].map((e) => e.textContent)")
+    value_items = page.evaluate(f"{painted}.then(() => [...document.querySelectorAll('#menu .mitem')].map((e) => e.textContent))")
     page.keyboard.press("ArrowDown")
     page.keyboard.press("Enter")
     picked = page.input_value("#runFilter")
@@ -773,6 +861,105 @@ def filter_smoke(page: Page, url: str) -> bool:
           f"↓ Enter gives {picked!r}, keeping {len(kept)}; then 'a' offers {joiners}")
     return (complete and want and results["lr = 0.001 and seed = 1"] == [want, False] and results["lr = 0.00"] == [[], False]
             and results["seed1"][0] == [r for r in every if "seed1" in r] and results["lr ="] == [every, True])
+
+
+def kept_runs_smoke(page: Page, url: str, runs: Path) -> bool:
+    """Whether a view shown again (the same path, filter, grouping and sorting) shows its runs as computing them anew
+    would: restored as they were kept while nothing they depend on changed, also through a change of a run's metadata
+    that leaves them as they were, and computed anew once a run's state changed what a filter passes, a run came, or a
+    run was hidden; and whether a filter on a run's rows, which grow without its metadata changing, is not kept."""
+    shown = "app.runList.filter((r) => r.shown).map((r) => r.id).sort()"
+    view = "JSON.stringify([app.runList.map((r) => [r.id, r.shown, r.match, r.color, r.part]), [...app.groups.keys()], app.grouped])"
+    box = "#runTable tr:has(td.name[title='kept/a0']) input[type=checkbox]"
+
+    def ids(*names: str) -> list[str]:
+        return [f"kept/{n}" for n in names]
+
+    def show(text: str, want: list[str]) -> tuple[list[str], str]:
+        """The shown runs and the view once the filter is `text` and shows `want` (or what it shows instead)."""
+        page.fill("#runFilter", text)
+        try:
+            page.wait_for_function(f"app.opts.filter === {json.dumps(text)} && JSON.stringify({shown}) === {json.dumps(json.dumps(want))}", timeout=5000)
+        except Exception:
+            pass
+        page.keyboard.press("Escape")  # the box's completions, which lie over the sidebar
+        return page.evaluate(shown), page.evaluate(view)
+
+    def keep(name: str) -> bool:
+        """Note the runs kept for the view shown, as `name`; whether there are any."""
+        return page.evaluate(f"(window.keptOf ||= {{}})[{json.dumps(name)}] = app.runsNow, !!app.runsNow")
+
+    def same(name: str) -> bool:
+        """Whether the view shown is of the kept runs noted as `name`."""
+        return page.evaluate(f"app.runsNow === window.keptOf[{json.dumps(name)}]")
+
+    writer = subprocess.Popen([sys.executable, "-c", KEPT_WRITER, str(runs)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert writer.stdin is not None
+    checks: dict[str, bool] = {}
+    try:
+        first_line(writer)
+        page.goto(f"{url}/?kept#path=kept&group=lr")
+        page.wait_for_function(f"window.app && app.data.runs.size === 4 && {LISTED} && app.data.runs.get('kept/live').meta.state === 'running'", timeout=30000)
+        every, every_view = show("", ids("a0", "a1", "b0", "live"))
+        checks["every run is shown, in two groups, and the view is kept"] = (every == ids("a0", "a1", "b0", "live") and page.evaluate("app.groups.size") == 2
+                                                                           and keep("every"))
+        running, running_view = show("state = 'running'", ids("live"))
+        checks["the running run passes a filter on its state"] = running == ids("live") and keep("running")
+        slow, slow_view = show("lr = 0.1", ids("a0", "a1"))
+        checks["two runs pass a filter on their config"] = slow == ids("a0", "a1") and keep("slow")
+        checks["a filter shown again is restored as it was kept"] = show("state = 'running'", ids("live")) == (running, running_view) and same("running")
+        checks["the unfiltered view shown again is restored as it was kept"] = show("", every) == (every, every_view) and same("every")
+        writer.stdin.write("\n")
+        writer.stdin.flush()
+        first_line(writer)
+        page.wait_for_function("app.data.runs.get('kept/live').meta.state === 'finished'", timeout=20000)
+        checks["a view kept through a change of metadata it does not depend on is restored"] = show("lr = 0.1", slow) == (slow, slow_view) and same("slow")
+        checks["a filter on a state that changed is computed anew"] = show("state = 'running'", [])[0] == [] and not same("running")
+        writer.stdin.write("\n")
+        writer.stdin.flush()
+        first_line(writer)
+        page.wait_for_function(f"app.data.runs.size === 5 && {LISTED}", timeout=20000)
+        checks["a view kept before a run came shows it"] = show("lr = 0.1", ids("a0", "a1", "late"))[0] == ids("a0", "a1", "late")
+        show("", ids("a0", "a1", "b0", "late", "live"))
+        page.locator(box).uncheck()
+        checks["a view kept before a run was hidden shows it hidden"] = show("lr = 0.1", ids("a1", "late"))[0] == ids("a1", "late")
+        show("", ids("a1", "b0", "late", "live"))
+        page.locator(box).check()
+        checks["and shown again once it is shown"] = show("lr = 0.1", ids("a0", "a1", "late"))[0] == ids("a0", "a1", "late")
+        rows = show("rows >= 40", ids("a0", "a1", "b0", "late", "live"))[0]
+        checks["a filter on rows shows the runs with them and is not kept"] = rows == ids("a0", "a1", "b0", "late", "live") and page.evaluate("app.runsNow === null")
+        page.fill("#runFilter", "")
+    finally:
+        writer.stdin.close()
+        writer.wait()
+    failed = [name for name, passed in checks.items() if not passed]
+    print(f"kept runs: {len(checks) - len(failed)}/{len(checks)} as intended" + (f"; not: {failed}" if failed else ""))
+    return not failed
+
+
+def listing_order_smoke(page: Page, url: str) -> bool:
+    """Whether a page asks for its runs only once their stream has answered: a run added between a listing and the
+    stream's start would be in neither."""
+    order: list[str] = []
+
+    def on_request(r: Request) -> None:
+        if "/api/runs" in r.url:
+            order.append("runs asked")
+
+    def on_response(r: Response) -> None:
+        if "/api/stream" in r.url:
+            order.append("stream answered")
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+    try:
+        page.goto(f"{url}/?order#path=sweep")
+        page.wait_for_function(READY, timeout=30000)
+    finally:
+        page.remove_listener("request", on_request)
+        page.remove_listener("response", on_response)
+    print(f"listing order: {order[:4]}")
+    return order[:2] == ["stream answered", "runs asked"]
 
 
 def sections_smoke(page: Page, url: str) -> bool:
@@ -882,7 +1069,7 @@ def grouping_modes_smoke(page: Page, url: str) -> bool:
     page.wait_for_function("[...document.querySelectorAll('#runTable tr.grp .gname')].some((e) => e.firstChild.textContent.startsWith('lr'))")
     nested = [page.evaluate(heads), page.evaluate("app.grouped")]
     page.click("#runTable tr.grp:has(td.gname[title='sweep/width128']) button.gfocus")
-    page.wait_for_function("app.opts.path === 'sweep/width128' && app.data.runs.size === 9 && document.querySelectorAll('#runTable tr.grp').length === 3")
+    page.wait_for_function("app.opts.path === 'sweep/width128' && app.runList.length === 9 && document.querySelectorAll('#runTable tr.grp').length === 3")
     opened = [page.evaluate("app.opts.focus.length"), page.evaluate(heads)]
     page.goto(f"{url}/?modes#path=&group=run")
     page.wait_for_function(READY, timeout=30000)
@@ -985,6 +1172,7 @@ def main() -> None:
                 print(f"{label}: {page.inner_text('#status')}")
                 page.screenshot(path=str(out / f"{label}.png"))
 
+            ok &= check("listing_order_smoke", listing_order_smoke(page, url))
             ok &= check("group_levels_smoke", group_levels_smoke(page, url))
             ok &= check("sections_smoke", sections_smoke(page, url))
             ok &= check("hidden_runs_smoke", hidden_runs_smoke(page, url))
@@ -993,6 +1181,7 @@ def main() -> None:
             ok &= check("filter_smoke", filter_smoke(page, url))
             ok &= check("interactions_smoke", interactions_smoke(page, url))
             ok &= check("flicker_smoke", flicker_smoke(page, url, runs))
+            ok &= check("kept_runs_smoke", kept_runs_smoke(page, url, runs))
             ok &= check("binned_smoke", binned_smoke(page, url, runs))
             ok &= check("hidden_extent_smoke", hidden_extent_smoke(page, url, runs))
             ok &= check("line_pixels_smoke", line_pixels_smoke(page, url))

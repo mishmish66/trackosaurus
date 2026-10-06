@@ -16,7 +16,7 @@ from trex.format import RunState
 from trex.node import Node, dir_base
 from trex.index import Explorer
 from trex.server import Server
-from trex.workspace import Member, Workspace
+from trex.workspace import Member, Workspace, parse_sse
 
 import helpers
 from helpers import PNG, committed_rows, get_json, post_bytes, post_json, request, wait_for
@@ -299,8 +299,44 @@ def test_a_workspace_stream_ends_its_member_pumps_when_the_client_leaves() -> No
     fake, stop = Endless(), threading.Event()
     ws = Workspace("w", [Member("m", cast(Explorer, fake))])
     gen = ws.messages("", stop)
+    assert next(gen) == b""
     next(gen)
     assert wait_for(lambda: fake.sent > 20_001)
     stop.set()
     gen.close()
     assert fake.ended.wait(5)
+
+
+def run_ids(msgs: list[bytes]) -> set[str]:
+    """The runs that `run` events among SSE messages `msgs` name."""
+    return {json.loads(data)["id"] for kind, data in parse_sse(b"".join(msgs).decode()) if kind == "run"}
+
+
+def test_a_workspace_stream_is_subscribed_to_every_member_by_its_first_message(node: Node, dirs: tuple[Path, Path]) -> None:
+    tracked(node, *dirs)
+    stop = threading.Event()
+    gen = node.everything().messages("", stop)
+    assert next(gen) == b""
+    b = node.by_id(next(d.id for d in node.served() if d.name == "runs<b>"))
+    write_run(dirs[1] / "new" / "r9")
+    b.sync()
+    msgs: list[bytes] = []
+    threading.Thread(target=lambda: msgs.extend(gen), daemon=True).start()
+    try:
+        assert wait_for(lambda: "runs<b>/new/r9" in run_ids(msgs))
+    finally:
+        stop.set()
+
+
+def test_a_directory_that_joins_the_root_view_while_its_stream_is_open_reaches_it_with_its_runs(node: Node, dirs: tuple[Path, Path]) -> None:
+    tracked(node, dirs[0])
+    stop = threading.Event()
+    gen = node.everything().messages("", stop)
+    assert next(gen) == b""
+    msgs: list[bytes] = []
+    threading.Thread(target=lambda: msgs.extend(gen), daemon=True).start()
+    try:
+        tracked(node, dirs[1])
+        assert wait_for(lambda: {"runs<b>/sac/r3", "runs<b>/shared/x"} <= run_ids(msgs))
+    finally:
+        stop.set()

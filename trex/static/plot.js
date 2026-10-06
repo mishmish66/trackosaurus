@@ -1,9 +1,11 @@
 // Line charts, drawn with WebGL (gl.js): every run's line stays on the GPU and zoom is a transform;
 // group statistics are uploaded per draw. Axes, labels and the hover overlay are Canvas 2D.
-import { Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, binGrid, medianCiCoverage, nearest,
-         prep as kprep, visibleRange, yrange } from "./kernel.js";
+//# allFunctionsCalledOnLoad
+import { Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, X_STEP, arrayExtent, binGrid, medianCiCoverage, nearest,
+         prep as kprep, rowExtents, visibleRange, yrange } from "./kernel.js";
 import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
 import { describe, onWorker } from "./pool.js";
+import { GpuLines, gpuBins, queueGpu } from "./gpustats.js";
 import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET } from "./data.js";
 import { nonFiniteText } from "./where.js";
 
@@ -91,7 +93,7 @@ export function smoothScale(span) {
 
 /** [lo, hi] per bin of `band` around `center`: ci (order-statistic for the median, Student t for the mean, Yuen's for
  * the IQM), iqr, minmax, ±std, ±stderr; none for one run. */
-function bandOf(st, center, band, bins) {
+export function bandOf(st, center, band, bins) {
   const lo = new Float64Array(bins), hi = new Float64Array(bins);
   const at = (k) => st.a.subarray(st.o + ROW[k] * bins, st.o + (ROW[k] + 1) * bins);
   const c = at(center), n = at("n"), std = at("std"), iqmse = at("iqmse"), iqmh = at("iqmh");
@@ -115,6 +117,8 @@ function bandOf(st, center, band, bins) {
 
 const ROW = Object.fromEntries(STATS.map((k, i) => [k, i])); // row of each statistic in aggGroups' result
 const WAITING = Symbol("waiting for a worker"); // what compute returns while a worker computes the chart's statistics
+const AXIS_FONT = "10px system-ui, sans-serif"; // of the axes' labels and the text a chart shows instead of lines
+const GPU_KEPT = 3; // binnings on the GPU a chart keeps for views it may return to (a filter cleared, a zoom reset, a folder left)
 let chartSlots = 0; // charts given a worker so far
 
 /** [first, last, smallest positive] x of columns' extent `e`, widened by `more` ([first, last], or null). */
@@ -128,6 +132,47 @@ function withExtent(e, more) {
 function rowLines(groups, rows, g0, dx, bins, logx) {
   const s = Float64Array.from({ length: bins }, (_, i) => (logx ? 10 ** (g0 + (i + 0.5) * dx) : g0 + (i + 0.5) * dx));
   return groups.map((ln, i) => ({ ...ln, cols: [Col.adopt(s, rows.subarray(i * bins, (i + 1) * bins), s, bins)] }));
+}
+
+const colIds = new WeakMap(); // column -> a number of its own
+let colSeq = 0;
+
+/** Column c's number: columns never change once built, so they are known by identity. */
+const colId = (c) => colIds.get(c) ?? (colIds.set(c, ++colSeq), colSeq);
+
+/** arrayExtent of the runs bucket array a's rows hold that run table `tab` bins from their buckets, kept on the array
+ * while its rows and the table stay (its rows' extents for good). */
+function arrayExt(a, tab, xmode) {
+  const sig = `${a.rowsVer}|${tab.ver}`, kept = (a.ext ||= [])[xmode];
+  if (kept?.sig === sig) return kept.e;
+  const rows = ((a.rowExt ||= [])[xmode] ||= rowExtents(a.v, xmode)), e = arrayExtent(rows, a.rowRun, tab.group, tab.column);
+  a.ext[xmode] = { sig, e };
+  return e;
+}
+
+const NO_COLS = [];
+/** What tells one binning on the GPU from another: its kind, what it is made from (`gpuSources`' key) and its binning. */
+const gpuSig = (kind, src, p) => `gpu|${kind}|${src.key}|${p.xmode}|${p.x0}|${p.x1}|${p.bins}|${p.flags}|${p.center}|${p.band}|${p.logy}|${p.xmax}|${p.b0}|${p.b1}`;
+
+const gpuTableSets = new WeakMap(); // lines of GPU views -> Map(their bins, bands and kind -> gpuTableSet's tables)
+
+/** The line tables of GPU view lines `lines` of `bins` bins: each group's center (`lines`) and band top and bottom
+ * (`bands`, when `band`) when `agg`, else each run's bin means, where the GPU puts them from a job's first point on.
+ * Shared by the charts drawing the same lines in as many bins (the metrics the same runs log). */
+function gpuTableSet(lines, bins, band, agg) {
+  let kept = gpuTableSets.get(lines);
+  if (!kept) gpuTableSets.set(lines, (kept = new Map()));
+  const key = `${bins}|${band}|${agg}`;
+  let t = kept.get(key);
+  if (t) return t;
+  const per = agg ? 3 * bins : bins, centers = new Table(lines.length), bands = new Table(band ? 2 * lines.length : 1);
+  for (const ln of lines) {
+    const at = (agg ? ln.gi : ln.idx) * per;
+    centers.push(at, bins, agg ? ln.color : "#000"); // a heatmap counts lines, whatever their color
+    if (band) bands.push(at + bins, bins, ln.color), bands.push(at + 2 * bins, bins, ln.color);
+  }
+  kept.set(key, (t = { lines: centers, bands }));
+  return t;
 }
 
 /** A hash of a typed array's 32-bit words. */
@@ -422,15 +467,92 @@ function glView(chart, v, ox, oy) {
   };
 }
 
-function isDark() {
-  const c = rgba(getComputedStyle(document.documentElement).getPropertyValue("--bg") || "#fff");
-  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2] < 128;
+let themeKept = null;
+globalThis.matchMedia?.("(prefers-color-scheme: dark)").addEventListener("change", () => (themeKept = null));
+
+/** The page's colors the charts draw with ({muted, grid, dark: whether the background is}), read from its style once
+ * and again when the color scheme changes: reading them at every draw would recompute the page's style whenever it
+ * changed. */
+function theme() {
+  if (themeKept) return themeKept;
+  const css = getComputedStyle(document.documentElement), c = rgba(css.getPropertyValue("--bg") || "#fff");
+  return (themeKept = { muted: css.getPropertyValue("--muted"), grid: css.getPropertyValue("--grid"), dark: 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2] < 128 });
+}
+
+const IMAGE_BYTES = 192 << 20; // images of drawn charts kept for views shown again, the least recently used freed beyond
+const images = new Map(); // a chart's image key (Chart.imageKey) -> {bitmap (null until made), bytes}, the least recently used first
+const imageQueue = []; // [chart, key] of charts drawn, whose images are to be kept
+let imageBytes = 0, imageIdle = false, chartIds = 0;
+
+/** The kept image of `key` (marked as the most recently used), or null. */
+function imageOf(key) {
+  const e = key ? images.get(key) : null;
+  if (!e?.bitmap) return null;
+  images.delete(key);
+  images.set(key, e);
+  return e.bitmap;
+}
+
+/** Keep, in an idle task, the image chart c's canvas holds of the view of `key`, if it still holds it then. */
+function keepImageSoon(c, key) {
+  if (images.has(key) || typeof createImageBitmap !== "function") return;
+  imageQueue.push([c, key]);
+  if (imageIdle) return;
+  imageIdle = true;
+  (globalThis.requestIdleCallback ?? setTimeout)(() => {
+    imageIdle = false;
+    for (const [chart, k] of imageQueue.splice(0)) if (chart.drawnKey === k && chart.canvas.width && !images.has(k)) keepImage(k, chart.canvas);
+  }, { timeout: 1000 });
+}
+
+function keepImage(key, canvas) {
+  const entry = { bitmap: null, bytes: 4 * canvas.width * canvas.height };
+  images.set(key, entry);
+  imageBytes += entry.bytes;
+  createImageBitmap(canvas).then((b) => (images.get(key) === entry ? (entry.bitmap = b) : b.close()), () => images.get(key) === entry && dropImage(key));
+  for (const k of images.keys()) {
+    if (imageBytes <= IMAGE_BYTES) break;
+    dropImage(k);
+  }
+}
+
+function dropImage(key) {
+  const e = images.get(key);
+  if (!e) return;
+  images.delete(key);
+  imageBytes -= e.bytes;
+  e.bitmap?.close();
+}
+
+let windowPx = null; // the window's size in device px, read again once it is resized
+globalThis.addEventListener?.("resize", () => (windowPx = null));
+
+/** Give the shared canvas room for a round of charts, images of `sizes` ([W, H] each) among them: a window full and
+ * those partly in view at its edges (one more column and two more rows of the smallest), so that it grows, which waits
+ * for the GPU, when the window does rather than while charts draw. Returns the width a row of images may take. */
+function makeRoom(r, sizes) {
+  windowPx ||= [innerWidth, innerHeight].map((n) => Math.ceil(n * (devicePixelRatio || 1)));
+  const w = Math.min(...sizes.map((s) => s[0])), h = Math.min(...sizes.map((s) => s[1]));
+  r.reserve(windowPx[0] + w, windowPx[1] + 2 * h);
+  return windowPx[0] + w;
+}
+
+/** Draw `charts`: first the lines of those with a view, each an image of its own on the shared canvas, then each
+ * chart's axes with its image copied, so the canvas is read once all are drawn rather than after each. */
+export function drawCharts(charts) {
+  const r = renderer(), drawn = r && !r.lost ? charts.filter((c) => c.prepared && c.next && c.w && !imageOf(c.imageKey(c.next))) : [];
+  const sizes = drawn.map((c) => c.deviceSize), wide = drawn.length ? makeRoom(r, sizes) : 0;
+  const at = new Map(), spots = drawn.length > 1 ? r.place(sizes, wide) : [];
+  drawn.forEach((c, i) => spots[i] && c.renderGL(c.next, spots[i]) && at.set(c, spots[i]));
+  for (const c of charts) if (at.has(c)) c.draw(at.get(c));
+  for (const c of charts) if (!at.has(c)) c.draw();
 }
 
 export class Chart {
   constructor(app, key) {
     this.app = app;
     this.key = key;
+    this.uid = ++chartIds; // in the keys of its kept images
     this.dirty = true;
     this.visible = false;
     this.el = document.createElement("div");
@@ -474,13 +596,15 @@ export class Chart {
   }
 
   setPinned(on) {
+    if (this.pinOn === on) return;
+    this.pinOn = on;
     this.pinBtn.classList.toggle("on", on);
     this.pinBtn.title = on ? "unpin" : "pin to the top";
   }
 
-  /** Whether this chart is shown alone (and so draws regardless of scroll visibility). */
+  /** Whether this chart is the one shown alone (and so draws regardless of scroll visibility). */
   get full() {
-    return this.app.opts.chart === this.key;
+    return !!this.alone && this.app.opts.chart === this.key;
   }
 
   /** Show this chart alone (or, when it is, go back to all charts). */
@@ -490,23 +614,49 @@ export class Chart {
 
   resize() {
     const w = this.body.clientWidth, h = this.body.clientHeight;
-    if (!w || !h) return;
+    if (!w || !h || (w === this.w && h === this.h)) return; // hidden, or shown again at its size: its drawing holds
     this.w = w;
     this.h = h;
     this.dirty = true;
     this.app.schedule(true);
   }
 
-  /** Give the canvases backing stores of the chart's size (allocated only for drawn charts). */
+  /** Give the chart's canvas a backing store of its size (allocated only for drawn charts). */
   fitCanvases() {
     const dpr = devicePixelRatio || 1, W = Math.round(this.w * dpr), H = Math.round(this.h * dpr);
-    for (const c of [this.canvas, this.overlay]) if (c.width !== W || c.height !== H) (c.width = W), (c.height = H);
+    if (this.canvas.width === W && this.canvas.height === H) return;
+    (this.canvas.width = W), (this.canvas.height = H);
+    this.canvas.getContext("2d").font = AXIS_FONT; // a resize resets the context; setting the font parses it, so not at each draw
   }
 
-  /** Free the canvas backing stores of a chart scrolled out of view; it redraws when back. */
+  /** Bytes of the chart's canvas backing store. */
+  get canvasBytes() {
+    return 4 * this.canvas.width * this.canvas.height;
+  }
+
+  /** Free the chart's canvas backing stores, drawn again when it shows. */
   releaseCanvases() {
     for (const c of [this.canvas, this.overlay]) if (c.width) (c.width = 0), (c.height = 0);
     this.dirty = true;
+    this.drawnKey = null;
+  }
+
+  /** What a drawing of GPU view `view` shows, as a key of its kept image: the binning, the axes' ranges, the canvas's
+   * size, the theme and the runs' colors; null for a view not binned on the GPU (its lines change as rows stream). */
+  imageKey(view) {
+    const g = view?.gpu;
+    if (!g?.sig) return null;
+    const [W, H] = this.deviceSize;
+    return `${this.uid}|${g.sig}|${view.x0}|${view.x1}|${view.y0}|${view.y1}|${W}x${H}|${theme().dark}|${this.app.drawnSig}`;
+  }
+
+  /** The hover overlay's 2D context, its backing store of the chart's size from now until `unhover`, in CSS pixels. */
+  overlayContext() {
+    const dpr = devicePixelRatio || 1, W = Math.round(this.w * dpr), H = Math.round(this.h * dpr), o = this.overlay;
+    if (o.width !== W || o.height !== H) (o.width = W), (o.height = H);
+    const ctx = o.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return ctx;
   }
 
   get pw() {
@@ -522,6 +672,8 @@ export class Chart {
     const app = this.app, o = app.panelOpts(this.key), r = renderer();
     if (!r) return null;
     if (r.lost) return WAITING;
+    const gpu = this.gpuView(r, o);
+    if (gpu !== undefined) return gpu;
     const groups = app.linesFor(this.key), allCols = colsOf(groups);
     const v = this.xView(o, allCols, groups);
     if (!v) return null;
@@ -531,17 +683,103 @@ export class Chart {
     const gl = app.grouped ? null : this.linesGL(r, rows || groups.filter((ln) => ln.cols[0]), v, yr);
     const lines = gl ? gl.lines : this.linesGrouped(groups, allCols, v, o, yr, binned);
     if (lines === WAITING) return WAITING;
-    const y = this.yView(o, yr, allCols, v);
-    if (!y) return null;
-    return { ...v, ...y, lines, o, lineSets: !!gl, density: !!gl?.density };
+    return this.withY(o, yr, allCols, v, { lines, lineSets: !!gl, density: !!gl?.density });
   }
 
-  /** x range (transformed) and smoothing of the view: the data's extent, or the zoom; null if empty. */
+  /** The view when the GPU bins this chart's runs (gpustats.js) as the run table (`App.runTab`) holds them: group
+   * statistics, or a heatmap of more runs than it draws one by one. WAITING until the round has binned them, null when
+   * there is nothing to show, undefined when the GPU does not bin them (smoothing, outlier quantiles, lines drawn one
+   * by one, or no GPU binning), and the chart takes the lines `App.linesFor` makes. */
+  gpuView(r, o) {
+    const b = this.gpuBinned(r, o);
+    if (!b) return undefined;
+    this.binned = b.binned;
+    const src = this.gpuSources(b.tab, b.runs, b.binned), v = this.xViewOf(o, this.gpuExtent(o.xmode, src));
+    if (!v) return null;
+    return this.app.grouped ? this.groupsOnGpu(src, v, o, b.binned) : this.rowsOnGpu(src, b.runs, v, o);
+  }
+
+  /** When the GPU bins this chart's runs: {tab (the run table), runs (those logging its metric), binned (whether they
+   * are drawn from bins of their buckets)}; undefined when it does not (`gpuView`). */
+  gpuBinned(r, o) {
+    const app = this.app, tab = app.runTab;
+    if (this.noGpu || !tab || o.smooth > 0 || o.outliers > 0) return undefined;
+    const runs = app.data.runsWith(app.shown, this.key), binned = runs.length > app.coarseAbove(o);
+    return app.grouped || (binned && r.heatmaps) ? { tab, runs, binned } : undefined;
+  }
+
+  /** Have the GPU bin this chart's runs as a zoom to x range `range` ([x0, x1, xmode]) would at once, from the layers
+   * `ready` it would then show (Data.layersIf), and keep the binning: the zoom finds it made (`fromGpu`). Queued for the
+   * next runGpuJobs; nothing when the GPU does not bin the chart, or that view shows nothing. */
+  binAhead(range, ready) {
+    const o = this.app.panelOpts(this.key), r = renderer(), b = r && !r.lost ? this.gpuBinned(r, o) : undefined;
+    if (!b) return;
+    const src = this.sourcesOf(b.tab, b.runs, b.binned, b.binned ? ready : null), v = this.xViewOf(o, this.gpuExtent(o.xmode, src), range);
+    if (!v) return;
+    const { kind, p } = this.app.grouped ? this.groupJob(src, v, o, b.binned) : this.rowsJob(src, v);
+    if (!gpuBins(src.tab, p)) return;
+    const sig = gpuSig(kind, src, p);
+    if (this.stats?.sig === sig || this.gpuKept?.some((j) => j.sig === sig && j.out.live)) return;
+    const job = { sig, result: null, out: new GpuLines() };
+    queueGpu(kind, src, p, job.out, (res) => (res ? ((job.result = res), this.keepGpu(job)) : job.out.release()), true);
+  }
+
+  /** What the GPU bins this chart's runs from: {arrays (the bucket arrays of the finest blocks shown), coarse (those of
+   * the coarse blocks), cols ([run index, column]), tab, data (what the arrays and columns are), key (with the run
+   * table's version, for fromGpu)}: when `binned` the columns of the running runs, shown or not (as the run table
+   * flags them), and the others' buckets, else every shown run's column. Kept while the run table and the metric's
+   * data stay. */
+  gpuSources(tab, runs, binned) {
+    const data = this.app.data, sig = `${tab.ver}|${data.keyVersion(this.key)}|${binned}`;
+    if (this.gsrc?.sig !== sig) this.gsrc = { sig, ...this.sourcesOf(tab, runs, binned, binned ? data.charts.get(this.key)?.ready : null) };
+    return this.gsrc;
+  }
+
+  /** `gpuSources` (but its `sig`) were the chart to show the layers `ready` (null: none); `layers` the layers its
+   * arrays come from. */
+  sourcesOf(tab, runs, binned, ready) {
+    const data = this.app.data, cols = [];
+    const arrays = ready ? data.arraysOf(this.key, ready.fine || ready.coarse) : [], coarse = ready ? data.arraysOf(this.key, ready.coarse) : [];
+    if (binned) for (const i of tab.running) {
+      const c = data.byIdx[i]?.cols.get(this.key);
+      if (c) cols.push([i, c]);
+    }
+    else for (const r of runs) {
+      const c = r.cols.get(this.key);
+      if (c) cols.push([r.idx, c]);
+    }
+    const from = `${arrays.map((a) => `${a.id}.${a.rowsVer}`).join()}|${cols.map(([i, c]) => `${i}.${colId(c)}`).join()}`;
+    return { arrays, coarse, cols, tab, layers: ready, data: from, key: `${from}|${tab.ver}`, ext: [] };
+  }
+
+  /** [first, last, smallest positive] x of the shown runs of what the GPU bins (`gpuSources`): their columns, and their
+   * buckets in the coarse blocks shown. */
+  gpuExtent(xmode, src) {
+    if (src.ext[xmode]) return src.ext[xmode];
+    let lo = Infinity, hi = -Infinity, pos = Infinity;
+    const add = (e) => e && ((lo = Math.min(lo, e[0])), (hi = Math.max(hi, e[1])), (pos = Math.min(pos, e[2])));
+    for (const [i, c] of src.cols) if (src.tab.group[i] >= 0) add(c.extent(xmode));
+    for (const a of src.coarse) add(arrayExt(a, src.tab, xmode));
+    return (src.ext[xmode] = [lo, hi, pos]);
+  }
+
+  /** The view `rest` with its y range (from yr); null when it has none. */
+  withY(o, yr, allCols, v, rest) {
+    const y = this.yView(o, yr, allCols, v);
+    return y ? { ...v, ...y, o, ...rest } : null;
+  }
+
+  /** x range (transformed) and smoothing of the view of lines `groups`: their extent, or the zoom; null if empty. */
   xView(o, allCols, groups) {
+    return this.xViewOf(o, withExtent(xExtent(allCols, o.xmode), this.bucketsExtent(groups, o.xmode)));
+  }
+
+  /** x range (transformed) and smoothing of the view of data whose x extent is [e0, e1] (epos its smallest positive
+   * x): the extent, or the zoom; null if empty. */
+  xViewOf(o, [e0, e1, epos], range = this.app.xrange) {
     const { xmode, logx, logy } = o;
-    const [e0, e1, epos] = withExtent(xExtent(allCols, xmode), this.bucketsExtent(groups, xmode));
     if (!(e1 >= e0)) return null;
-    const zoom = this.app.xrange && this.app.xrange[2] === xmode ? this.app.xrange : null;
+    const zoom = range && range[2] === xmode ? range : null;
     const [x0, x1] = xRange(o, zoom, e0, e1, epos);
     if (!(x1 > x0) || !Number.isFinite(x0)) return null;
     const t = (x) => (logx ? Math.log10(x) : x);
@@ -565,7 +803,7 @@ export class Chart {
   /** [first, last] x of the runs of `groups` drawn from their buckets (those without a column), kept while neither
    * the groups nor the data change. */
   bucketsExtent(groups, xmode) {
-    const data = this.app.data, sig = `${data.version}|${xmode}`;
+    const data = this.app.data, sig = `${data.keyVersion(this.key)}|${xmode}`;
     if (this.bucketExt?.groups === groups && this.bucketExt.sig === sig) return this.bucketExt.out;
     const runs = groups.flatMap((g) => (g.runs || [g.run]).filter((_, i) => !g.cols[i]));
     this.bucketExt = { groups, sig, out: data.extentOf(runs, this.key, xmode) };
@@ -577,12 +815,8 @@ export class Chart {
   linesGrouped(groups, allCols, v, o, yr, binned) {
     let longest = 0;
     for (const c of allCols) longest = Math.max(longest, c.len);
-    let n = 0;
-    for (const g of groups) n += g.cols.length; // runs, with or without a column
-    const px = n > DENSITY_AUTO ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET; // as finely as the data is planned
-    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / px), binned ? Infinity : longest)));
-    const p = { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: (v.logx ? LOGX : 0) | (o.center === "iqm" ? IQM : 0),
-                alpha: v.alpha, scale: v.scale };
+    const least = binned ? this.binFloor(v, this.app.data.charts.get(this.key)?.ready) : 0;
+    const { g0, dx, bins, p } = this.groupBinning(v, o, binned, longest, least);
     const st = this.groupStats(this.sources(groups, binned), p, v.alpha > 0);
     if (!st) return WAITING;
     const { main, raws } = st;
@@ -617,6 +851,66 @@ export class Chart {
     return lines;
   }
 
+  /** The bins group statistics take of runs binned from their buckets when `binned` (none narrower than `least`,
+   * `binFloor`), else from columns of at most `longest` points: {g0, dx, bins} of binGrid, and p, the binning
+   * aggGroups takes. */
+  groupBinning(v, o, binned, longest, least = 0) {
+    const px = binned ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET; // as finely as the data is planned
+    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.min(600, Math.floor(this.pw / px), binned ? Infinity : longest)), least);
+    const p = { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: (v.logx ? LOGX : 0) | (o.center === "iqm" ? IQM : 0),
+                alpha: v.alpha, scale: v.scale };
+    return { g0, dx, bins, p };
+  }
+
+  /** The narrowest bin of a view v binned from the buckets of layers `ready`: on a step axis their finest buckets'
+   * width, since a bin narrower than a bucket holds a point only where the bucket's mean step falls, and the bins
+   * between would be interpolated, drawing stripes and kinks where runs log at the same steps; else 0. */
+  binFloor(v, ready) {
+    const L = ready && (ready.fine || ready.coarse);
+    return L && v.xmode === X_STEP && !v.logx ? 2 ** L.level : 0;
+  }
+
+  /** The GPU's binning of the groups' statistics of `src` (`gpuSources`) in view v: {kind, p (as queueGpu takes them),
+   * g0, dx, bins (the bins)}. */
+  groupJob(src, v, o, binned) {
+    let longest = 0;
+    if (!binned) for (const [, c] of src.cols) longest = Math.max(longest, c.len);
+    const { g0, dx, bins, p } = this.groupBinning(v, o, binned, longest, binned ? this.binFloor(v, src.layers) : 0);
+    return { kind: "agg", p: { ...p, center: o.center, band: o.band, logy: v.logy, xmax: v.ex1 - g0 }, g0, dx, bins };
+  }
+
+  /** The same of a heatmap's runs in view v, the y range that of their bins in view. */
+  rowsJob(src, v) {
+    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.floor(this.pw / DENSITY_PX_PER_BUCKET)), this.binFloor(v, src.layers));
+    const b0 = Math.max(0, Math.ceil((v.x0 - g0) / dx - 0.5)), b1 = Math.min(bins - 1, Math.floor((v.x1 - g0) / dx - 0.5));
+    const p = { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: v.logx ? LOGX : 0, alpha: v.alpha, scale: v.scale, logy: v.logy, b0, b1 };
+    return { kind: "rows", p, g0, dx, bins };
+  }
+
+  /** The view of the groups' center lines and bands as the GPU bins them from `src` (`gpuSources`), its y range theirs
+   * (bands widening it by at most BAND_REACH); WAITING until the round has binned them, undefined when the GPU does
+   * not. */
+  groupsOnGpu(src, v, o, binned) {
+    const { p, g0, dx, bins } = this.groupJob(src, v, o, binned), res = this.fromGpu("agg", src, p);
+    if (!res) return res === null ? WAITING : undefined;
+    const [clo, chi, blo, bhi] = res.range, yr = new YRange(v.logy), bands = new YRange(v.logy);
+    yr.add(clo), yr.add(chi);
+    if (o.band !== "none") bands.add(blo), bands.add(bhi), yr.widen(bands, BAND_REACH);
+    const gpu = { out: this.gpuOut, sig: this.stats.sig, agg: true, band: o.band !== "none", n: src.tab.starts.length / 2, bins, g0, dx };
+    return this.withY(o, yr, NO_COLS, v, { lines: this.app.gpuGroupLines(this.key), gpu, lineSets: false, density: false });
+  }
+
+  /** The view of a heatmap of runs `runs` as the GPU bins them from `src` (`gpuSources`), its y range that of their
+   * bins in view; WAITING until the round has binned them, undefined when the GPU does not. Its lines are the runs. */
+  rowsOnGpu(src, runs, v, o) {
+    const { p, g0, dx, bins } = this.rowsJob(src, v), res = this.fromGpu("rows", src, p);
+    if (!res) return res === null ? WAITING : undefined;
+    const yr = new YRange(v.logy);
+    yr.add(res.range[0]), yr.add(res.range[1]);
+    const gpu = { out: this.gpuOut, sig: this.stats.sig, agg: false, band: false, n: Math.max(1, src.tab.n), bins, g0, dx };
+    return this.withY(o, yr, NO_COLS, v, { lines: runs, gpu, lineSets: false, density: true });
+  }
+
   /** Whether this chart (options o, lines `groups`) draws its runs from bins of their buckets: group statistics, or a
    * heatmap, of more runs than it draws one by one (`App.coarseAbove`). */
   binnedOf(o, groups) {
@@ -629,7 +923,7 @@ export class Chart {
    * `Data.partsOf`; they cover the bins) when `binned`, else (and for a running run) its column; runs with neither are
    * left out. Kept while neither the groups nor the data change. */
   sources(groups, binned) {
-    const data = this.app.data, sig = `${data.version}|${binned}`;
+    const data = this.app.data, sig = `${data.keyVersion(this.key)}|${binned}`;
     if (this.src?.groups === groups && this.src.sig === sig) return this.src.out;
     const level = data.levelOf(this.key);
     const one = (r, c) => {
@@ -642,19 +936,60 @@ export class Chart {
     return out;
   }
 
-  /** aggGroups of `cols` with binning p, and raw when `raw`: {main, raws}, by the chart's worker; null until it answers
-   * (the chart then prepares again). */
+  /** aggGroups of `cols` with binning p, and raw when `raw`: {main, raws}, by the GPU or else the chart's worker; null
+   * until it answers (the chart then prepares again). */
   groupStats(cols, p, raw) {
     return this.fromWorker("agg", describe(cols), p, raw);
   }
 
   /** A heatmap's lines: each run as its bin means (`rowLines`), from the chart's worker (WAITING until it answers). */
   binnedRows(groups, v) {
-    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.floor(this.pw / DENSITY_PX_PER_BUCKET)));
+    const least = this.binFloor(v, this.app.data.charts.get(this.key)?.ready);
+    const { g0, dx, bins } = binGrid(v.x0, v.x1, Math.max(8, Math.floor(this.pw / DENSITY_PX_PER_BUCKET)), least);
     const src = this.sources(groups, true), lines = groups.filter((_, i) => src[i].length), all = src.filter((s) => s.length);
     const p = { xmode: v.xmode, x0: g0, x1: g0 + bins * dx, bins, flags: v.logx ? LOGX : 0, alpha: v.alpha, scale: v.scale };
     const res = this.fromWorker("rows", describe(all), p, false);
     return res ? rowLines(lines, res.rows, g0, dx, bins, v.logx) : WAITING;
+  }
+
+  /** The GPU's binning (gpustats.js `queueGpu`, `kind`) of `src` (`gpuSources`) once the round has run it ({range};
+   * this.gpuOut then holds its lines); null until then (the chart then prepares again, in the same round), undefined
+   * when the GPU does not bin it. The last GPU_KEPT binnings are kept, so a view the chart showed before shows again
+   * without the GPU. */
+  fromGpu(kind, src, p) {
+    if (this.noGpu || !gpuBins(src.tab, p)) return undefined;
+    const sig = gpuSig(kind, src, p), had = this.stats?.sig === sig ? this.stats : this.gpuKept?.find((j) => j.sig === sig);
+    if (had && (!had.result || had.out.live)) return this.useGpu(had);
+    const job = (this.stats = { sig, result: null, out: new GpuLines() });
+    queueGpu(kind, src, p, job.out, (res) => {
+      if (!res) job.out.release();
+      else (job.result = res), this.keepGpu(job);
+      if (this.stats !== job) return;
+      if (res) this.gpuOut = job.out;
+      else (this.noGpu = true), (this.stats = null); // the workers bin it from now on
+      this.waiting = false;
+    });
+    return null;
+  }
+
+  /** Show binning `job` (fromGpu's), kept or under way: its result, or null while it is under way. */
+  useGpu(job) {
+    this.stats = job;
+    if (!job.result) return null;
+    this.gpuOut = job.out;
+    const kept = this.gpuKept, i = kept.indexOf(job);
+    if (i >= 0) kept.splice(i, 1), kept.push(job); // the most recently shown last
+    return job.result;
+  }
+
+  /** Keep binning `job`, giving up the oldest kept one (but the one shown) beyond GPU_KEPT. */
+  keepGpu(job) {
+    const kept = (this.gpuKept ||= []);
+    kept.push(job);
+    while (kept.length > GPU_KEPT) {
+      const i = kept[0] === this.stats ? 1 : 0;
+      kept.splice(i, 1)[0].out.release();
+    }
   }
 
   /** The chart's worker's answer (pool.onWorker `kind`) for described sources d, once it has come; null until then
@@ -709,18 +1044,23 @@ export class Chart {
     const g = this.glState;
     if (g) g.main.release(), g.faint.release(), g.tmp.release();
     this.glState = null;
+    for (const j of this.gpuKept || []) j.out.release();
+    if (this.stats?.out) this.stats.out.release();
+    this.gpuOut = this.stats = this.gpuKept = null;
   }
 
-  /** Draw bands and lines of `view` through WebGL onto ctx (device px, clipped to the plot). */
-  drawGL(ctx, view) {
-    const r = renderer(), dpr = devicePixelRatio || 1;
-    if (r.lost) return;
-    r.begin(this.canvas.width, this.canvas.height, [MARGIN.l * dpr, MARGIN.t * dpr, this.pw * dpr, this.ph * dpr]);
+  /** Draw bands and lines of `view` through WebGL into the shared canvas, the chart's image at `at` (its top-left
+   * corner, device px, clipped to the plot); false when the context is lost. */
+  renderGL(view, at = [0, 0]) {
+    const r = renderer(), dpr = devicePixelRatio || 1, [W, H] = this.deviceSize;
+    if (r.lost) return false;
+    r.begin(W, H, [MARGIN.l * dpr, MARGIN.t * dpr, this.pw * dpr, this.ph * dpr], at);
     const g = this.glLines(r);
-    if (view.lineSets) {
+    if (view.gpu) this.drawGpu(r, view, dpr);
+    else if (view.lineSets) {
       const { main, faint } = g;
       r.touch(main.pts);
-      if (view.density) r.density(main.pts, main.tableFor(view.lines, view, this.pw), glView(this, view, main.ox, main.oy), dpr, isDark());
+      if (view.density) r.density(main.pts, main.tableFor(view.lines, view, this.pw), glView(this, view, main.ox, main.oy), dpr, theme().dark);
       else {
         if (view.alpha > 0) {
           r.touch(faint.pts);
@@ -730,7 +1070,23 @@ export class Chart {
       }
       r.trim(new Set([main.pts, faint.pts]));
     } else this.drawGroupsGL(r, g.tmp, view, dpr);
-    r.copyTo(ctx);
+    return true;
+  }
+
+  /** Lines drawn from where the GPU binned them: each group's band and center, or a heatmap of the runs' bin means. */
+  drawGpu(r, view, dpr) {
+    const g = view.gpu, tv = { ...glView(this, view, g.g0, 0), first: g.out.first };
+    if (!g.out.live) return void (this.dirty = true); // gone with a lost context: binned again
+    const t = this.gpuTables(view), grid = g.bins - 1;
+    if (!g.agg) return r.density(g.out, t.lines, tv, dpr, theme().dark, grid);
+    if (t.bands.n) r.bands(g.out, t.bands, tv, 0.18, grid);
+    r.lines(g.out, t.lines, tv, 2 * dpr, 1, false, grid);
+  }
+
+  /** The line tables of a GPU view (`gpuTableSet`). */
+  gpuTables(view) {
+    const g = view.gpu;
+    return gpuTableSet(view.lines, g.bins, g.band, g.agg);
   }
 
   /** Group bands, faint raw centers and center lines, uploaded per draw. */
@@ -797,8 +1153,9 @@ export class Chart {
     this.prepared = true;
   }
 
-  /** Present the prepared view, preparing it first if it is not; the shown one stays while a worker computes it. */
-  draw() {
+  /** Present the prepared view, preparing it first if it is not; the shown one stays while a worker computes it. Its
+   * lines are the image `renderGL` drew at `at` on the shared canvas, or drawn here. */
+  draw(at = null) {
     if (!this.prepared) this.prepare();
     if (!this.prepared) return;
     this.prepared = false;
@@ -808,13 +1165,24 @@ export class Chart {
     const dpr = devicePixelRatio || 1, ctx = this.canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.w, this.h);
-    const view = (this.view = this.next);
-    const css = getComputedStyle(document.documentElement);
-    ctx.font = "10px system-ui, sans-serif";
-    ctx.fillStyle = css.getPropertyValue("--muted");
+    const view = (this.view = this.next), key = this.imageKey(view), img = imageOf(key);
+    this.drawnKey = null;
+    ctx.fillStyle = theme().muted;
     if (!view) return ctx.fillText(this.emptyText(), MARGIN.l + 4, MARGIN.t + 14);
-    this.drawAxes(ctx, view, css.getPropertyValue("--grid"));
-    this.drawGL(ctx, view);
+    if (img) return ctx.save(), ctx.setTransform(1, 0, 0, 1, 0, 0), ctx.drawImage(img, 0, 0), ctx.restore(), (this.drawnKey = key);
+    this.drawAxes(ctx, view, theme().grid);
+    const r = renderer();
+    if (r.lost) return;
+    if (!at && this.renderGL(view)) at = [0, 0];
+    if (at) r.copyTo(ctx, at, this.canvas.width, this.canvas.height);
+    this.drawnKey = key;
+    if (key && !this.app.paced) keepImageSoon(this, key); // a streamed redraw is not shown again
+  }
+
+  /** The device pixels of the chart's canvas once it is drawn: [W, H]. */
+  get deviceSize() {
+    const dpr = devicePixelRatio || 1;
+    return [Math.round(this.w * dpr), Math.round(this.h * dpr)];
   }
 
   /** Why the chart shows nothing: its blocks are on their way or failed, or its runs have no data in view. */
@@ -870,8 +1238,7 @@ export class Chart {
     if (!v || this.app.tipPinned) return;
     this.app.hovered = this;
     this.lastX = e.offsetX;
-    const dpr = devicePixelRatio || 1, ctx = this.overlay.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const ctx = this.overlayContext();
     ctx.clearRect(0, 0, this.w, this.h);
     if (this.drag) return this.drawDragBox(ctx, e);
     if (e.offsetX < MARGIN.l || e.offsetX > MARGIN.l + this.pw) return this.unhover();
@@ -880,7 +1247,7 @@ export class Chart {
     if (v.density) return this.hoverDensity(e, ctx, x);
     const rows = [];
     for (const ln of v.lines) {
-      const row = ln.lo ? this.groupRow(ln, x) : this.lineRow(ln, x, e.offsetX);
+      const row = v.gpu || ln.lo ? this.groupRow(ln, x) : this.lineRow(ln, x, e.offsetX);
       if (!row) continue;
       row.py = Number.isFinite(row.val) && (!v.logy || row.val > 0) ? this.py(row.val) : NaN;
       if (row.py === row.py) dot(ctx, row.px, row.py, ln.color);
@@ -909,13 +1276,50 @@ export class Chart {
 
   /** Tooltip row of a group line at x: its center, band and count in that bin. */
   groupRow(ln, x) {
-    const v = this.view, fx = v.logx ? Math.log10(x) : x;
-    const i = Math.min(ln.center.length - 1, Math.max(0, Math.floor((fx - ln.g0) / ln.dx))), val = ln.center[i];
+    const v = this.view, i = this.binAt(ln, x), [val, lo, hi, cnt, raw] = this.groupAt(ln, i);
     if (!Number.isFinite(val)) return null;
-    let extra = v.o.band !== "none" ? ` ${bandLabel(v.o.band, v.o.center, ln.cnt[i])} [${fmt(ln.lo[i])}, ${fmt(ln.hi[i])}]` : "";
-    extra += ` n=${ln.cnt[i]}`;
-    if (ln.raw && Number.isFinite(ln.raw[2 * i + 1])) extra += ` (raw ${fmt(ln.raw[2 * i + 1])})`;
-    return { ln, val, extra, px: this.px(ln.xy[2 * i]) };
+    let extra = v.o.band !== "none" ? ` ${bandLabel(v.o.band, v.o.center, cnt)} [${fmt(lo)}, ${fmt(hi)}]` : "";
+    extra += ` n=${cnt}`;
+    if (Number.isFinite(raw)) extra += ` (raw ${fmt(raw)})`;
+    return { ln, val, extra, px: this.px(this.binX(ln, i, true)) };
+  }
+
+  /** The bins line ln stands for: {g0, dx, bins}, its own, or its view's when the GPU binned it. */
+  gridOf(ln) {
+    return ln?.center ? { g0: ln.g0, dx: ln.dx, bins: ln.center.length } : this.view.gpu;
+  }
+
+  /** The bin of line ln (binned from g0 in steps of dx) holding data-space x. */
+  binAt(ln, x) {
+    const fx = this.view.logx ? Math.log10(x) : x, g = this.gridOf(ln);
+    return Math.min(g.bins - 1, Math.max(0, Math.floor((fx - g.g0) / g.dx)));
+  }
+
+  /** Data-space x of bin i of line ln: its center, at most the data's extent when `clamped` (as group lines draw). */
+  binX(ln, i, clamped) {
+    const v = this.view, g = this.gridOf(ln), kx = g.g0 + (i + 0.5) * g.dx, x = clamped ? Math.min(v.ex1, kx) : kx;
+    return v.logx ? 10 ** x : x;
+  }
+
+  /** Group line ln's [center, band low, band high, count, raw center] in bin i. */
+  groupAt(ln, i) {
+    if (!this.view.gpu) return [ln.center[i], ln.lo[i], ln.hi[i], ln.cnt[i], ln.raw ? ln.raw[2 * i + 1] : NaN];
+    const c = this.gpuValues(this.view.gpu, i), o = 4 * ln.gi;
+    if (!c) return [NaN, NaN, NaN, 0, NaN];
+    return [c[o], this.view.logy && !(c[o + 1] > 0) ? c[o] : c[o + 1], c[o + 2], c[o + 3], NaN];
+  }
+
+  /** Bin i of every line of GPU result g (4 numbers each), read back once while the pointer stays in that bin. */
+  gpuValues(g, i) {
+    if (this.gpuCol?.g !== g || this.gpuCol.i !== i) this.gpuCol = { g, i, vals: g.out.column(i, g.n) };
+    return this.gpuCol.vals;
+  }
+
+  /** GPU line ln's points (its group's centers, or its run's bin means) as (x, y) pairs, read back: [xy, n]. */
+  gpuXY(ln) {
+    const g = this.view.gpu, row = g.out.row(ln.gi, g.bins) ?? new Float32Array(4 * g.bins).fill(NaN), xy = new Float64Array(2 * g.bins);
+    for (let i = 0; i < g.bins; i++) (xy[2 * i] = this.binX(ln, i, g.agg)), (xy[2 * i + 1] = this.view.logy && !(row[4 * i] > 0) ? NaN : row[4 * i]);
+    return [xy, g.bins];
   }
 
   /** Tooltip row of a run line: its point nearest x, if within 40 px of the pointer. */
@@ -944,14 +1348,18 @@ export class Chart {
   /** Density tooltip: the runs whose value at x is nearest the pointer, the nearest one traced. */
   hoverDensity(e, ctx, x) {
     const v = this.view, near = [];
-    for (const ln of v.lines) {
-      const r = nearest(ln.cols[0], v.xmode, x, v.alpha, v.scale);
-      if (!r || !Number.isFinite(r.y) || (v.logy && !(r.y > 0)) || Math.abs(this.px(r.x) - e.offsetX) > 40) continue;
-      const d = Math.abs(this.py(r.y) - e.offsetY);
-      if (near.length === DENSITY_TIP && d >= near[DENSITY_TIP - 1].d) continue;
+    const consider = (ln, pointX, y, raw) => {
+      if (!Number.isFinite(y) || (v.logy && !(y > 0)) || Math.abs(this.px(pointX) - e.offsetX) > 40) return;
+      const d = Math.abs(this.py(y) - e.offsetY);
+      if (near.length === DENSITY_TIP && d >= near[DENSITY_TIP - 1].d) return;
       let i = near.length === DENSITY_TIP ? DENSITY_TIP - 1 : near.length;
       while (i > 0 && near[i - 1].d > d) (near[i] = near[i - 1]), i--;
-      near[i] = { d, ln, r };
+      near[i] = { d, ln, r: { x: pointX, y, raw } };
+    };
+    if (v.gpu) this.nearestOnGpu(x, consider, near);
+    else for (const ln of v.lines) {
+      const r = nearest(ln.cols[0], v.xmode, x, v.alpha, v.scale);
+      if (r) consider(ln, r.x, r.y, r.raw);
     }
     if (near.length) this.traceLine(ctx, near[0].ln, 1.5);
     for (const { ln, r } of near) dot(ctx, this.px(r.x), this.py(r.y), ln.color);
@@ -962,11 +1370,21 @@ export class Chart {
     this.app.tip(e, this, `${xLabel(v, x)} · ${near.length} nearest of ${v.lines.length}`, rows, rows.indexOf(closest));
   }
 
+  /** The GPU heatmap's runs at x: `consider(run, x, y, raw)` with each run's bin mean in the bin holding x; then each
+   * run `near` kept ({ln}) as a line {run, color, label, gi (its run index)}. */
+  nearestOnGpu(x, consider, near) {
+    const v = this.view, i = this.binAt(null, x), c = this.gpuValues(v.gpu, i), bx = this.binX(null, i, false);
+    if (!c) return;
+    for (const r of v.lines) consider(r, bx, c[4 * r.idx], c[4 * r.idx]);
+    for (const n of near) n.ln = { run: n.ln, color: n.ln.color, label: n.ln.meta.name, gi: n.ln.idx };
+  }
+
   /** Stroke one line of the current view on the overlay: a run's own line, or a group's center. */
   traceLine(ctx, ln, width) {
     const v = this.view;
     let xy, n;
-    if (ln.lo) (xy = ln.xy), (n = ln.xy.length >> 1);
+    if (v.gpu) [xy, n] = this.gpuXY(ln);
+    else if (ln.lo) (xy = ln.xy), (n = ln.xy.length >> 1);
     else {
       xy = outBuf(Math.ceil(this.pw) * 4 + 1024);
       n = kprep(ln.cols[0], v.xmode, v.x0, v.x1, this.pw, v.flags, v.alpha, v.scale, xy).n;
@@ -985,8 +1403,7 @@ export class Chart {
   /** Overlay showing the pinned crosshair with one line emphasized (null: none). */
   highlight(ln) {
     if (!this.view || !this.overlay.width) return;
-    const dpr = devicePixelRatio || 1, ctx = this.overlay.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const ctx = this.overlayContext();
     ctx.clearRect(0, 0, this.w, this.h);
     this.crosshair(ctx, this.lastX);
     if (ln) this.traceLine(ctx, ln, 3);
@@ -995,7 +1412,7 @@ export class Chart {
   unhover() {
     if (this.app.hovered === this) this.app.hovered = null;
     if (this.app.tipPinned) return;
-    if (this.overlay.width) this.overlay.getContext("2d").clearRect(0, 0, this.overlay.width, this.overlay.height);
+    if (this.overlay.width) (this.overlay.width = 0), (this.overlay.height = 0); // cleared, its backing store freed
     this.app.tip(null);
   }
 
@@ -1003,6 +1420,7 @@ export class Chart {
   endDrag(e) {
     const d = this.drag;
     this.drag = null;
+    this.app.endAim();
     if (!d || !this.view) return;
     const r = this.overlay.getBoundingClientRect();
     const ox = Math.min(Math.max(e.clientX - r.left, MARGIN.l), MARGIN.l + this.pw);

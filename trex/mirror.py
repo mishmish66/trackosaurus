@@ -3,8 +3,10 @@ walks, and for each run whose version differs takes the index rows it lacks (`PO
 a crawl scans: the record, new media, and the blocks of levels that changed since the rows it holds. Media files are
 copied before the rows naming them are written. It follows the upstream's stream, which tells it what to take, and
 keeps each running run's rows beyond its levels as the stream brings them (its tail), passing them on to its own
-stream. So its Explorer answers everything itself, and, as far as the stream brought it, while the upstream is
-unreachable. `Upstream` is the upstream's API for the directory, over http or a Unix socket.
+stream: a running run stays live by its rows, and its levels are taken anew only once its tail has grown (TAIL_ROWS),
+something its rows do not carry changed, or its tail does not continue them. So its Explorer answers everything
+itself, and, as far as the stream brought it, while the upstream is unreachable. `Upstream` is the upstream's API for
+the directory, over http or a Unix socket.
 """
 
 import contextlib
@@ -30,7 +32,8 @@ from .index import HEARTBEAT, Dump, Explorer, Have, Rows, RunRecord, RunsView, U
 
 TIMEOUT: Final = 60.0  # seconds a request to the upstream may take
 RETRY: Final = 2.0  # seconds before reaching the upstream again after it failed
-RUNNING_EVERY = 10.0  # seconds between dumps of a running run
+RUNNING_EVERY = 10.0  # seconds between dumps of a running run, at least
+TAIL_ROWS: Final = 64  # rows a running run's tail holds past its levels before those are taken anew
 LIST_EVERY: Final = 600.0  # seconds between reads of the whole run list, besides the stream's events
 DUMPS_AT_ONCE: Final = 16  # runs one request dumps
 FETCH_THREADS: Final = 8  # requests to the upstream at once for media files and tails
@@ -161,6 +164,7 @@ class Pull:
         self._dirty: set[str] = set()  # runs to dump
         self._heard: dict[str, float] = {}  # run -> monotonic time the stream last told of it
         self._dumped_at: dict[str, float] = {}  # run -> monotonic time of its last dump
+        self._urgent: set[str] = set()  # changed runs whose change rows do not carry: state, keys, uid or media
         self._tails: dict[str, Rows] = {}  # running run -> its rows beyond its levels
         self._wake = threading.Event()  # set when there is something to take
         self._relist = threading.Event()  # set when the whole run list is due
@@ -232,14 +236,12 @@ class Pull:
         ex.keep_folders(view.folders)
 
     def poll(self, ex: Explorer) -> list[str]:
-        """Dump the runs due one (a running one at most every RUNNING_EVERY seconds), copy their new media files and
-        apply them; then fetch the tails that running runs lack. The runs dumped."""
+        """Dump the changed runs due one (`_due`), copy their new media files and apply them; then fetch the tails that
+        running runs lack. The runs dumped."""
         with self._lock:
             left, self._dirty = self._dirty, set()
         now = time.monotonic()
-        wait = {p for p in left if (st := ex.records.get(p)) is not None and st.state == "running"
-                and now - self._dumped_at.get(p, -math.inf) < RUNNING_EVERY}
-        todo = sorted(left - wait)
+        todo = sorted(p for p in left if self._due(ex, p, now))
         try:
             for paths in batched(todo, DUMPS_AT_ONCE):
                 updates = self._dumped(ex, paths)
@@ -255,6 +257,21 @@ class Pull:
         self._fill(ex)
         return todo
 
+    def _due(self, ex: Explorer, path: str, now: float) -> bool:
+        """Whether changed run `path` is due a dump: at once unless it runs. A running run's rows reach the stream live,
+        so its levels are taken at most every RUNNING_EVERY seconds, and then once its tail holds TAIL_ROWS rows past
+        them, once something its rows do not carry changed (`_urgent`), or while it has no tail to follow it by or its
+        tail begins past them."""
+        st = ex.records.get(path)
+        if st is None or st.state != "running":
+            return True
+        if now - self._dumped_at.get(path, -math.inf) < RUNNING_EVERY:
+            return False
+        with self._lock:
+            tail = self._tails.get(path)
+            return (path in self._urgent or tail is None or tail.seq0 > st.compiled
+                    or tail.end - st.compiled >= TAIL_ROWS)
+
     def _dumped(self, ex: Explorer, paths: Sequence[str]) -> list[Update]:
         """What the upstream's dumps of `paths` change, as updates; runs it no longer has leave the index."""
         held = [{"path": p, **(Have(st.uid, st.mseq, st.compiled, st.rebuilt).wire() if (st := ex.records.get(p)) else {})}
@@ -264,6 +281,8 @@ class Pull:
         out: list[Update] = []
         for p, body in zip(paths, bodies, strict=True):
             self._dumped_at[p] = now
+            with self._lock:
+                self._urgent.discard(p)
             if body:
                 out.append(_update(p, Dump.decode(p, body), ex.records.get(p)))
             else:
@@ -274,6 +293,7 @@ class Pull:
         with self._lock:
             self._tails.pop(path, None)
             self._dirty.discard(path)
+            self._urgent.discard(path)
         if path in ex.records:
             ex.drop(path)
 
@@ -298,13 +318,12 @@ class Pull:
         index, folder notes are kept, and rows that follow their run's tail join it and go on to `ex`'s stream."""
         match kind:
             case "rows":
-                rows = Rows.read(ev)
-                if self._append(rows):
-                    ex.hub.publish_msg(rows.run, msg)
+                self._append(ex, Rows.read(ev), msg)
             case "run":
-                self._told(ex, ev["id"], ev["ver"])
+                st = ex.records.get(ev["id"])
+                self._told(ex, ev["id"], ev["ver"], st is None or (ev["state"], ev["keys"], ev["uid"]) != (st.state, st.keys, st.uid))
             case "media":
-                self._told(ex, ev[0], None)
+                self._told(ex, ev[0], None, True)
             case "delete":
                 self._gone(ex, ev["run"])
             case "folder":
@@ -313,29 +332,32 @@ class Pull:
             case _:
                 pass
 
-    def _told(self, ex: Explorer, path: str, ver: int | None) -> None:
+    def _told(self, ex: Explorer, path: str, ver: int | None, urgent: bool) -> None:
         """The stream told of run `path` at version `ver` (None: of something a version does not count): unless the
-        index holds that version, the run is due a dump."""
+        index holds that version, the run changed, `urgent` when its rows do not carry the change (`_due`)."""
         st = ex.records.get(path)
         with self._lock:
             self._heard[path] = time.monotonic()
             if ver is None or st is None or st.ver != ver:
                 self._dirty.add(path)
+                if urgent:
+                    self._urgent.add(path)
         self._wake.set()
 
-    def _append(self, rows: Rows) -> bool:
-        """Add a `rows` event's rows to their run's tail; whether they follow it. Rows that leave a gap end the tail, to
-        be fetched anew."""
+    def _append(self, ex: Explorer, rows: Rows, msg: bytes) -> None:
+        """Add a `rows` event's rows to their run's tail and pass the event (`msg`) on to `ex`'s stream, when they follow
+        the tail; rows that leave a gap end the tail, to be fetched anew. Both under the lock, as everything that grows
+        a tail, so that no run event, which counts the rows of the tail (`live`), counts rows not yet passed on."""
         with self._lock:
             tail = self._tails.get(rows.run)
             if tail is None:
-                return False
+                return
             if rows.seq0 > tail.end:
                 del self._tails[rows.run]
                 self._wake.set()
-                return False
+                return
             self._tails[rows.run] = Rows(tail.run, tail.seq0, [*tail.rows, *rows.since(tail.end).rows])
-            return True
+            ex.hub.publish_msg(rows.run, msg)
 
     def _trim(self, ex: Explorer, paths: Sequence[str]) -> None:
         """After `paths` were applied: a run's tail holds only rows beyond its levels, and only while it runs."""
@@ -367,8 +389,8 @@ class Pull:
                     self._dirty.add(path)
                     self._dumped_at.pop(path, None)
                     self._wake.set()
-            if tail.rows:
-                ex.hub.publish_msg(path, sse_text("rows", tail.text()))
+                if tail.rows:
+                    ex.hub.publish_msg(path, sse_text("rows", tail.text()))
 
         with ThreadPoolExecutor(FETCH_THREADS) as pool:
             list(pool.map(fetch, lacking))

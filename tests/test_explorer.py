@@ -589,6 +589,73 @@ def test_a_metric_saves_its_levels_at_most_once_every_levels_save_every(root: Pa
     assert saved_levels(ex) == [d.name] and {f.name: f.read_bytes() for f in d.iterdir()} == before
 
 
+def test_a_block_asked_for_while_an_update_commits_is_not_kept_past_it(root: Path, tmp_path: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    write_run(root / "a" / "r1", 300)
+    ex = explorer(root, tmp_path)
+    level = top_of(ex, "a/r1", "loss").level
+    body = lambda: bk.decode(ex.buckets_body("loss", level, 0, "", None, "finished")).paths
+    assert body() == ["a/r1"]
+    write_run(root / "a" / "r2", 300)
+    staged, go = threading.Event(), threading.Event()
+    stage = ex._stage
+
+    def paused(*args: Any) -> Any:
+        out = stage(*args)
+        staged.set()
+        go.wait(10)
+        return out
+
+    monkeypatch.setattr(ex, "_stage", paused)
+    syncing = threading.Thread(target=ex.sync)
+    syncing.start()
+    assert staged.wait(10)
+    during = body()  # staged, not yet committed
+    go.set()
+    syncing.join(10)
+    assert during == ["a/r1"] and body() == ["a/r1", "a/r2"]
+
+
+def test_a_block_answer_holds_one_set_of_finished_runs_while_another_run_finishes(root: Path, tmp_path: Path,
+                                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("a/r1", "a/r2"):
+        write_run(root / name, 300)
+    live = write_run(root / "a" / "r3", 300, finish=False)
+    assert wait_for(lambda: committed_rows(root / "a" / "r3") == 300)
+    ex = explorer(root, tmp_path)
+    level, runs = top_of(ex, "a/r1", "loss").level, ["a/r1", "a/r2", "a/r3"]
+    tops = ex._top_levels
+
+    def finishing(key: str, fin: trex_index.Finished) -> Any:
+        if ex.records["a/r3"].state == "running":  # the answer chose its finished runs; another finishes now
+            live.finish()
+            assert wait_for(lambda: (ex.sync(), ex.records["a/r3"].state != "running")[1])
+        return tops(key, fin)
+
+    monkeypatch.setattr(ex, "_top_levels", finishing)
+    during = block(ex, "loss", level, 0, runs=runs)
+    after = block(ex, "loss", level, 0, runs=runs)
+    assert during.paths == after.paths == runs
+    assert [int(of_run(during, p).n.sum()) for p in runs] == [int(of_run(after, p).n.sum()) for p in runs]
+
+
+def test_top_level_blocks_read_by_key_are_the_ones_a_join_over_every_level_finds(root: Path, tmp_path: Path,
+                                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(trex_index, "BLOCKS_PER_QUERY", 2)
+    for name, n in (("a/short", 300), ("a/long", 5000), ("b/mid", 1200)):
+        write_run(root / name, n)
+    ex = explorer(root, tmp_path)
+    c = sqlite3.connect(ex.db_path)
+    try:
+        for key in ("loss", "odd"):
+            spans = c.execute("SELECT path, top, lo, hi FROM metrics WHERE key=?", (key,)).fetchall()
+            joined = c.execute("SELECT l.path, l.data FROM levels l JOIN metrics m ON m.key=l.key AND m.path=l.path AND m.top=l.level "
+                               "WHERE l.key=? ORDER BY l.path, l.block", (key,)).fetchall()
+            assert len({top for _, top, _, _ in spans}) > 1 and trex_index._top_blocks(c, key, spans) == joined
+    finally:
+        c.close()
+
+
 def four_metrics(i: int) -> dict[str, float]:
     return {f"m{k}": float(i * k) for k in range(4)}
 
@@ -632,7 +699,7 @@ def test_the_saved_levels_an_explorer_keeps_hold_open_files_only_within_its_shar
 
 def test_a_saved_level_deleted_after_it_was_listed_is_merged_instead(root: Path, tmp_path: Path) -> None:
     again, want = saved_explorer(root, tmp_path)
-    saved = again._saved("m2")
+    saved = again._saved("m2", again._finished("m2"))
     assert saved is not None and saved.levels
     shutil.rmtree(saved.dir)
     assert {k: again.buckets_body(k[0], k[1], 0, "", None, "finished") for k in want if k[0] == "m2"} == \
@@ -657,6 +724,38 @@ def test_saved_levels_beyond_their_budget_go_least_recently_used_first(tmp_path:
     os.utime(tmp_path / "loose", (999, 999))
     trex_index._bound_dir(tmp_path, 250)
     assert sorted(f.name for f in tmp_path.iterdir()) == ["mid", "new"]
+
+
+def test_saved_levels_are_counted_once_and_kept_count_of_until_a_save_exceeds_their_budget(
+        root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_run(root / "a" / "r1", 3000, metrics=lambda i: {"m0": i, "m1": -i, "m2": 2 * i})
+    scans: list[int] = []
+    bound = trex_index._bound_dir
+
+    def counted(d: Path, limit: int) -> int:
+        scans.append(limit)
+        return bound(d, limit)
+
+    monkeypatch.setattr(trex_index, "_bound_dir", counted)
+    ex = explorer(root, tmp_path)
+    levels = ex.cache_dir / "levels"
+
+    def on_disk() -> int:
+        return sum(f.stat().st_size for f in levels.rglob("*") if f.is_file())
+
+    def save(key: str, n: int) -> None:
+        ex.buckets_body(key, top_of(ex, "a/r1", key).level, 0, "a", None, "finished")
+        mine = ex._levels_dir(key, b"").name  # its levels' directories begin so
+        assert wait_for(lambda: (len(names := saved_levels(ex)) == n and any(f.startswith(mine) for f in names)
+                                 and ex._levels_bytes == on_disk()))
+
+    save("m0", 1)
+    save("m1", 2)
+    held = on_disk()
+    assert len(scans) == 1
+    monkeypatch.setattr(trex_index, "LEVELS_BYTES", held)
+    save("m2", 2)
+    assert len(scans) == 2 and on_disk() <= held
 
 
 def test_a_changed_cache_version_deletes_the_saved_levels(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1146,10 +1245,10 @@ def test_failed_index_batch_changes_nothing_and_the_next_poll_applies_it(root: P
         write_run(root / name, 2)
     stage = ex._stage
 
-    def fail_on_b(r: Update, cur: RunRecord | None, now: float) -> tuple[RunRecord, list[Event]]:
+    def fail_on_b(r: Update, cur: RunRecord | None, now: float, bumps: set[str]) -> tuple[RunRecord, list[Event]]:
         if r.path == "b":
             raise RuntimeError("disk error")
-        return stage(r, cur, now)
+        return stage(r, cur, now, bumps)
 
     monkeypatch.setattr(ex, "_stage", fail_on_b)
     sub = ex.hub.subscribe("")

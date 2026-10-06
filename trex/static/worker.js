@@ -1,6 +1,7 @@
 // A pool.js worker: group statistics, or each run's bin means, of the page's charts, over copies the page sent of the
 // columns and bucket arrays they read; and bucket arrays fetched for the page.
-import { BinCache, Col, RAW, aggGroups, binRows, bucketPaths, bucketViews, buildColumn, runColumn, unframe } from "./kernel.js";
+//# allFunctionsCalledOnLoad
+import { BinCache, Col, RAW, X_STEP, aggGroups, binRows, bucketPaths, bucketViews, buildColumn, rowExtents, runColumn, unframe } from "./kernel.js";
 
 const copies = new Map(); // "chunk:generation" -> Map(float offset -> a copy of the page's floats from there)
 const arrays = new Map(); // "chunk:generation:offset" -> bucketViews of the bucket array there
@@ -36,7 +37,8 @@ function keepCopies(list) {
 const floats = (chunk, gen, off) => copies.get(`${chunk}:${gen}`).get(off);
 
 /** Fetch bucket arrays (POST m.body to m.url, answered as buckets.frame joins them), each into a buffer of its own,
- * handed over to the page. */
+ * handed over to the page with its runs and its rows' step extents (found here, while its bytes are at hand, rather
+ * than by the page when a chart first needs them). */
 async function fetchArrays(m) {
   try {
     const res = await fetch(m.url, { method: "POST", body: m.body });
@@ -44,8 +46,14 @@ async function fetchArrays(m) {
     const all = await readBody(res), arrays = [], moved = [];
     for (const { off, len } of unframe(all)) {
       const buf = len ? new ArrayBuffer(Math.ceil(len / 8) * 8) : null;
-      if (buf) new Uint8Array(buf).set(new Uint8Array(all, off, len)), moved.push(buf);
-      arrays.push(buf && { buf, bytes: len, paths: bucketPaths(buf, bucketViews(buf, 0)) });
+      if (!buf) {
+        arrays.push(null);
+        continue;
+      }
+      new Uint8Array(buf).set(new Uint8Array(all, off, len));
+      const v = bucketViews(buf, 0), ext = rowExtents(v, X_STEP);
+      arrays.push({ buf, bytes: len, paths: bucketPaths(buf, v), ext });
+      moved.push(buf, ext.buffer);
     }
     postMessage({ job: m.job, status: res.status, arrays, bytes: all.byteLength }, moved);
   } catch (e) {

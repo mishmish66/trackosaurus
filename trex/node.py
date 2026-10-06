@@ -389,7 +389,7 @@ class Node:
                     self.pulled[d] = p
             for w, members in saved.workspaces.items():
                 self.workspaces[w] = [self._id(m) for m in members]
-            self._views = {}
+            self._update_views()
 
     def _id(self, spec: str) -> str:
         """The id of the directory `spec` names: a local path is this node's."""
@@ -692,6 +692,17 @@ class Node:
                 view = self._views[""] = Workspace("/", self._members(list(self.entries)), nested=True)
             return view
 
+    def _update_views(self) -> None:
+        """Each view's members as they now are (inside the lock), in place, so that open streams follow them; views of
+        workspaces gone are dropped."""
+        for name, view in list(self._views.items()):
+            if not name:
+                view.members = self._members(list(self.entries))
+            elif name in self.workspaces:
+                view.members = self._members(self.workspaces[name])
+            else:
+                del self._views[name]
+
     def _members(self, ids: Sequence[str]) -> list[Member]:
         names = self.names()
         return [Member(names[d], self.entries[d]) for d in ids if d in self.entries]
@@ -723,8 +734,8 @@ class Node:
                 write_json(self.state.with_name("history.json"), self._history)
 
     def _changed(self, spec: str | None) -> None:
-        """After a change (inside the lock): remember `spec`, rebuild workspace views, save."""
-        self._views = {}
+        """After a change (inside the lock): remember `spec`, update the views' members, save."""
+        self._update_views()
         if self.state is None:
             return
         if spec is not None:

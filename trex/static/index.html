@@ -33,6 +33,7 @@ header { border-bottom:1px solid var(--line); }
 .chev:hover { background:var(--panel); color:var(--fg); }
 .chev.drill { font-size:15px; padding:0 6px; }
 .seg.rootseg .crumb { font-family:ui-monospace, monospace; }
+#fonts { position:absolute; top:0; left:0; visibility:hidden; pointer-events:none; }
 .fchip .crumb { color:var(--fg); background:var(--panel); border-radius:10px; font-size:12px; }
 .micon { width:10px; color:var(--muted); font-size:10px; text-align:center; }
 .folder { color:var(--muted); font-size:11px; }
@@ -159,12 +160,13 @@ details.section { scroll-margin-top:calc(var(--depth) * 26px); }
 .panel:hover .hide { opacity:1; }
 .media .hide { margin-left:auto; }
 .pin.on { opacity:1; color:var(--accent); }
-#panels.alone { display:flex; flex-direction:column; }
-#panels.alone > :not(.aloneview) { display:none; }
-.aloneview { flex:1; min-height:0; display:flex; padding-top:4px; }
-.aloneview .panel { flex:1; display:flex; flex-direction:column; min-height:0; }
-.aloneview .pbody { flex:1; height:auto; min-height:0; }
-.aloneview .ptitle { font-size:15px; }
+#panels, #alone { grid-column:3; grid-row:1; min-width:0; }
+#panels.alone { opacity:0; } /* under the chart shown alone: laid out and scrolled as it was, not seen at its edges */
+#alone { z-index:1; background:var(--bg); display:flex; min-height:0; padding:8px 10px 40px; }
+#alone[hidden] { display:none; }
+#alone .panel { flex:1; display:flex; flex-direction:column; min-height:0; }
+#alone .pbody { flex:1; height:auto; min-height:0; }
+#alone .ptitle { font-size:15px; }
 .panel:hover .gear, .gear.on { opacity:1; } .gear.on { color:var(--accent); }
 .grid { align-items:start; }
 .grid > .panel { content-visibility:auto; contain-intrinsic-size:auto 250px; }
@@ -199,7 +201,7 @@ table.kv { border-collapse:collapse; width:100%; font-size:12px; }
 table.kv td { border-bottom:1px solid var(--grid); padding:2px 6px; vertical-align:top; word-break:break-all; }
 table.kv td:first-child { color:var(--muted); white-space:nowrap; width:1%; }
 .actions { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
-@media (max-width: 800px) { main { grid-template-columns:1fr; grid-template-rows:35% 65%; } aside { border-right:0; border-bottom:1px solid var(--line); } #sideGrip { display:none; } }
+@media (max-width: 800px) { main { grid-template-columns:1fr; grid-template-rows:35% 65%; } aside { border-right:0; border-bottom:1px solid var(--line); } #sideGrip { display:none; } #panels, #alone { grid-column:1; grid-row:2; } }
 </style>
 </head>
 <body>
@@ -230,9 +232,14 @@ table.kv td:first-child { color:var(--muted); white-space:nowrap; width:1%; }
   </aside>
   <div id="sideGrip" title="drag to resize the sidebar · double-click to reset"></div>
   <section id="panels"><div id="infoPanel" hidden></div></section>
+  <section id="alone" hidden></section>
 </main>
 <div id="tip" hidden></div>
 <div id="menu" hidden></div>
+<!-- Text in the page's fonts, laid out with the page and never seen (app.js warmFonts adds its sizes and symbols): the
+     first text in a font, size and weight, or a symbol the font lacks, takes the browser milliseconds to find the font
+     for, which a view showing it first would otherwise wait for. The root's name in the path bar is monospace. -->
+<div id="fonts" aria-hidden="true"><span class="seg rootseg"><span class="crumb">/</span></span><span class="seg rootseg current"><span class="crumb">/</span></span></div>
 <script type="module" src="/static/app.js"></script>
 </body>
 </html>

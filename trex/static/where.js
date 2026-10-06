@@ -1,6 +1,7 @@
 // Run filters: a SQL WHERE clause over run fields, the same as the CLI's (`trex/where.py`, whose docstring
 // states the rules). compileWhere(text) -> {test(get), fields}, where get(field) returns a value or null; runField
 // reads a field of a UI run.
+//# allFunctionsCalledOnLoad
 
 const TOKEN = /\s*(?:('(?:[^']|'')*')|("(?:[^"]|"")*")|(>=|<=|!=|<>|==|!~|[=<>~(),])|([^\s'"=<>!~(),]+)|(\S))/y;
 const NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;

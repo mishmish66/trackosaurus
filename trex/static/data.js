@@ -1,9 +1,11 @@
 // Data layer: run metadata, the blocks of bucket arrays (buckets.py) the visible charts need (`plan`), and the SSE
 // stream. A run's column of a metric is built from its buckets in its chart's blocks (`buildColumn`) plus the rows
 // streamed since those buckets were made; a gap or a missed heartbeat resyncs the run.
+//# allFunctionsCalledOnLoad
 
-import { BLOCK, adoptStore, bucketStep, bucketViews, buildColumn, freeStore } from "./kernel.js";
+import { BLOCK, adoptStore, bucketStep, bucketViews, buildColumn, freeStore, rowExtents } from "./kernel.js";
 import { fetchArraysOnWorker } from "./pool.js";
+import { forgetArray } from "./gpustats.js";
 import { asNumber } from "./where.js";
 
 const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
@@ -23,7 +25,11 @@ const MIN_LEVEL = -20, MAX_LEVEL = 62; // levels a block may have (buckets.MIN_L
 const POINT_BUDGET = 1.5e6; // buckets one chart draws across all its runs
 const PARALLEL = 5; // requests in flight: the browser's six connections to a host, less the stream's
 const PREFETCH_PARALLEL = 2; // of them fetching ahead, at most
-const BATCH_BLOCKS = 32; // blocks one request asks for, at most (server.MAX_ASKS)
+const BATCH_BLOCKS = 32; // blocks one request asks for, at most (server.MAX_ASKS)...
+const AHEAD_REQUEST_BYTES = 16e6; // ...and about the bytes of them one fetching ahead does: blocks of thousands of runs
+// are megabytes each, and a request for many holds up the server and the connection a plan's requests then wait for
+const BUCKET_BYTES = 16; // of one bucket in a bucket array
+const EXTENT_BY_RUN = 32; // the extent of at most this many runs is found run by run, of more from their arrays' rows
 const ARRAY_BYTES = 2e9; // bucket arrays kept, the least recently used dropped beyond
 const AHEAD_BYTES = 1.5e9; // arrays fetched ahead of need, at most
 const KEEP_MS = 2000; // an array used this recently is not dropped
@@ -57,7 +63,10 @@ export function hasKey(r, key) {
 const blockId = (key, level, index) => `${key}|${level}|${index}`;
 
 /** What request x asks for: its block, and its runs or the scope's. */
-const askId = (x) => `${blockId(x.key, x.level, x.index)}|${x.runs === null ? "" : x.runs.map((r) => r.id).join("\0")}`;
+const askId = (x) => `${blockId(x.key, x.level, x.index)}|${x.runs === null ? `\0${x.scope}` : x.runs.map((r) => r.id).join("\0")}`;
+
+/** Whether run or folder `id` is folder (or run) `path` or lies under it ("": everything). */
+export const within = (id, path) => path === "" || id === path || id.startsWith(`${path}/`);
 /** Whether failed request record f (of `Data.failed`) covers run r: it named r, or asked for the scope's finished runs. */
 const failedFor = (f, r) => f.runs.has(r.id) || (f.runs.has("") && r.meta.state !== "running");
 
@@ -66,6 +75,13 @@ function covering(level, lo, hi) {
   const w = BLOCK * 2 ** level, k0 = Math.floor(lo / w), k1 = Math.floor(hi / w);
   return { level, indices: Array.from({ length: k1 - k0 + 1 }, (_, i) => k0 + i) };
 }
+
+/** Whether layer x and layer y ({level, indices}, or null) are the same blocks. */
+const sameLayer = (x, y) => x === y || (!!x && !!y && x.level === y.level && x.indices.length === y.indices.length
+                                        && x.indices.every((k, i) => k === y.indices[i]));
+
+/** Whether layers a and b ({coarse, fine}, or null) are the same blocks. */
+const sameLayers = (a, b) => !!a && !!b && sameLayer(a.coarse, b.coarse) && sameLayer(a.fine, b.fine);
 
 const clampLevel = (l) => Math.min(MAX_LEVEL, Math.max(MIN_LEVEL, l));
 
@@ -95,30 +111,44 @@ export async function getJSON(url) {
 
 export class Data {
   constructor(ui) {
-    this.ui = ui; // {runs(), data(keys, streamed), keys(), media(key), status(text), conn(live), idle(), ahead(), protocol(server's), replan()}
+    this.ui = ui; // {runs(), data(keys, streamed), keys(), media(key), status(text), conn(live), idle(), ahead(), protocol(server's), replan(),
+    // aimed() (the blocks asked for by `fetchFor` have come), runFields: the fields the UI keeps on each run, with their first values}
     this.info = null; // /api/info of what the page shows
     this.gen = 0; // bumped by `close`; work begun under an older generation is dropped
     this.version = 0; // bumped whenever runs, their metadata, blocks or rows change
+    this.metaVer = 0; // bumped whenever a run's metadata is set: a run's `ver` is its value then
+    this.listVer = 0; // bumped whenever a run comes or goes
+    this.keyVer = new Map(); // metric -> bumped whenever its blocks, layers or columns change, or a run logging it does
+    this.extents = new Map(); // metric -> extentOf answers, while its keyVersion stays
     this.runs = new Map();
+    this.byIdx = []; // run index -> run: each run's number in the GPU's tables (r.idx), never another's while the scope lasts
     this.keys = new Map(); // metric key -> number of runs having it
+    this.keyMasks = new Map(); // metric key -> Uint8Array, 1 at the run index of each run having it
+    this.runMasks = new WeakMap(); // run list -> Uint8Array, 1 at the run index of each run of it
+    this.lastSteps = new WeakMap(); // run list -> {done (doneVer), hi (the last step of its finished runs)}
     this.keysVer = 0; // bumped whenever `keys` changes
     this.newKeys = false; // a metric appeared since the UI was last told
-    this.keyRunsSrc = null; // the run list `keyRuns` was made from...
-    this.keyRunsVer = -1; // ...at this `keysVer`
-    this.keyRuns = new Map(); // metric -> the runs of `keyRunsSrc` that log it
+    this.keyRuns = new WeakMap(); // run list -> {ver (keysVer), by: keySet -> the runs of the list that log a metric of it}
+    this.keySets = new Map(); // metric -> {ver (keysVer), id}: `keySet`
+    this.every = null; // {ver (doneVer), runs}: every run loaded, as a list
     this.media = new Map(); // media key -> Map(runId -> records sorted by step)
     this.early = null; // stream events that came while the scope's runs were being listed
     this.folders = {}; // folder path -> info dict from its trex_info.json
-    this.scope = null;
+    this.scope = null; // the folder whose runs are loaded...
+    this.listed = false; // ...once they are listed
+    this.view = ""; // the folder (or run) under it that the page shows: the one its finished runs are asked for by
     this.rootKey = "";
     this.stream = null; // EventSource of /api/stream
-    this.arrays = new Map(); // id -> {key, level, index, v, seq, buf, loc, bytes, refs (block entries naming it)}
+    this.arrays = new Map(); // id -> {key, level, index, v, seq, buf, loc, bytes, refs (block entries naming it), block, rowRun, rowsVer, rowExt}
     this.arrayBytes = 0;
     this.nextArray = 0;
-    this.blocks = new Map(); // blockId -> {runs: Map(run id -> {a (array), row}), used}
+    this.blocks = new Map(); // blockId -> {runs: Map(run id -> {a (array), row}), arrays (those its entries name), used, ver, held, heldAll}
+    // ver: bumped whenever its entries change; held, heldAll: `finishedHeld`'s answers
+    this.doneVer = 0; // bumped whenever which runs are finished, or a finished run's compiled rows, change
+    this.runningLists = new WeakMap(); // run list -> {done (doneVer), out (its running runs)}
     this.charts = new Map(); // metric -> {want ({coarse, fine} layers), ready (the layers shown), runs, many} of the last plan
-    this.queue = []; // requests to send: {key, level, index, runs (null: the scope's finished runs)}
-    this.inflight = new Map(); // blockId -> {scope (asked for the scope's finished runs), runs (ids asked for), n (requests)}
+    this.queue = []; // requests to send: {key, level, index, runs (null: the finished runs of folder `scope`)}
+    this.inflight = new Map(); // blockId -> {scope (the folder whose finished runs are asked for, or null), runs (ids asked for), n (requests)}
     this.failed = new Map(); // blockId -> {runs (ids whose request failed, "" the scope's finished runs), n (failures), until (when due again), error}
     this.retryT = 0;
     this.posts = 0; // requests in flight for plans
@@ -146,8 +176,12 @@ export class Data {
     if (this.stream) this.stream.close();
     this.stream = null;
     this.early = null;
+    this.listed = false;
     this.runs.clear();
+    this.byIdx = [];
     this.keys.clear();
+    this.keyMasks.clear();
+    this.keySets.clear();
     this.media.clear();
     this.folders = {};
     this.queue = [];
@@ -167,14 +201,29 @@ export class Data {
   }
 
   newRun(meta) {
-    const r = { id: meta.id, meta, seq: meta.compiled ?? 0, mseq: meta.mseq, cols: new Map(), built: new Map(), tail: [],
-                tailSeq0: meta.compiled ?? 0, pending: [], hbExpect: null, resyncs: 0, resyncInFlight: false, holding: false };
+    const r = { id: meta.id, idx: this.byIdx.length, meta, ver: ++this.metaVer, seq: meta.compiled ?? 0, mseq: meta.mseq, cols: new Map(), built: new Map(),
+                tail: [], tailSeq0: meta.compiled ?? 0, pending: [], hbExpect: null, resyncs: 0, resyncInFlight: false, holding: false, ...this.ui.runFields };
+    // the UI's fields made here, in one order, give every run one shape, so that code reading them over all runs stays fast
+    this.byIdx.push(r);
+    this.doneVer++;
+    this.listVer++;
     // built: key -> {sig, layers} (the inputs of its column, and the layers of its chart then); holding: events wait in
     // `pending` until a resync finishes
     this.runs.set(r.id, r);
     this.version++;
+    this.bumpKeys(meta.keys || []);
     this.countKeys(r, meta.keys || [], 1);
     return r;
+  }
+
+  /** Note that what metrics `keys` show changed (`keyVersion`). */
+  bumpKeys(keys) {
+    for (const k of keys) this.keyVer.set(k, (this.keyVer.get(k) || 0) + 1);
+  }
+
+  /** A token that changes whenever what metric `key` shows does: its blocks, layers or columns, or a run logging it. */
+  keyVersion(key) {
+    return `${this.gen}.${this.keyVer.get(key) || 0}`;
   }
 
   countKeys(r, keys, d) {
@@ -184,35 +233,68 @@ export class Data {
       if (c > 0) this.keys.set(k, c);
       else this.keys.delete(k);
       if (d > 0 && c === 1) this.newKeys = true;
+      this.markKey(k, r.idx, d > 0);
     }
+  }
+
+  /** Note in metric k's mask whether run index i has it. */
+  markKey(k, i, on) {
+    let m = this.keyMasks.get(k);
+    if (!m || m.length <= i) {
+      const grown = new Uint8Array(Math.max(64, 2 * (i + 1)));
+      if (m) grown.set(m);
+      this.keyMasks.set(k, (m = grown));
+    }
+    m[i] = on ? 1 : 0;
+  }
+
+  /** A mask of the runs of list `runs`: 1 at each one's run index; kept for the list. */
+  runMask(runs) {
+    let m = this.runMasks.get(runs);
+    if (!m) {
+      m = new Uint8Array(this.byIdx.length);
+      for (const r of runs) m[r.idx] = 1;
+      this.runMasks.set(runs, m);
+    }
+    return m;
   }
 
   /** Replace a run's metadata, keeping the key counts in step. */
   setMeta(r, meta) {
     const old = r.meta.keys || [], now = meta.keys || old;
+    if (meta.state !== r.meta.state || (meta.state !== "running" && meta.compiled !== r.meta.compiled)) this.doneVer++;
     if (old.join("\0") !== now.join("\0")) {
       this.countKeys(r, old, -1);
       this.countKeys(r, now, 1);
+      this.bumpKeys(now);
     }
     r.meta = { ...meta, keys: now };
+    r.ver = ++this.metaVer;
     this.version++;
+    this.bumpKeys(old);
   }
 
   dropRun(r) {
     this.countKeys(r, r.meta.keys || [], -1);
     for (const b of this.blocks.values()) this.unref(b, r.id);
     this.runs.delete(r.id);
+    this.byIdx[r.idx] = undefined;
+    this.doneVer++;
+    this.listVer++;
     this.version++;
+    this.bumpKeys(r.meta.keys || []);
   }
 
-  /** Load every run under folder `path` (relative to the served root; "" = everything). The stream opens first and
-   * its events wait until the runs are listed, so a run that appears in between is not missed. */
+  /** Load every run under folder `path` (relative to the served root; "" = everything). The stream opens first (the
+   * server opens it once subscribed) and its events wait until the runs are listed, so a run that appears in between is
+   * not missed. */
   async loadScope(path) {
     this.close();
-    this.scope = path;
+    this.scope = this.view = path;
     this.ui.status("loading runs…");
     this.early = [];
-    this.openStream();
+    await this.openStream();
+    if (this.scope !== path) return;
     const j = await getJSON(`${BASE}/api/runs?path=${encodeURIComponent(path)}`);
     if (this.scope !== path) return;
     for (const meta of j.runs) this.newRun(meta);
@@ -221,6 +303,7 @@ export class Data {
     this.flushKeys();
     const early = this.early;
     this.early = null;
+    this.listed = true;
     for (const [kind, ev] of early) this.dispatch(kind, ev);
   }
 
@@ -231,16 +314,43 @@ export class Data {
     }
   }
 
-  /** The runs of `runs` that log `key`, cached while neither the list nor any run's keys change. */
+  /** The runs of `runs` that log `key` (`runs` itself when every run does), cached while neither the list nor any
+   * run's keys change: one list for all the metrics the same runs log, so that what is kept per list is shared by their
+   * charts. */
   runsWith(runs, key) {
-    if (this.keyRunsSrc !== runs || this.keyRunsVer !== this.keysVer) {
-      this.keyRunsSrc = runs;
-      this.keyRunsVer = this.keysVer;
-      this.keyRuns = new Map();
+    if (this.keys.get(key) === this.runs.size) return runs;
+    let kept = this.keyRuns.get(runs);
+    if (kept?.ver !== this.keysVer) this.keyRuns.set(runs, (kept = { ver: this.keysVer, by: new Map() }));
+    const set = this.keySet(key);
+    let out = kept.by.get(set);
+    if (!out) {
+      const m = this.keyMasks.get(key);
+      kept.by.set(set, (out = m ? runs.filter((r) => m[r.idx] === 1) : []));
     }
-    let out = this.keyRuns.get(key);
-    if (!out) this.keyRuns.set(key, (out = runs.filter((r) => hasKey(r, key))));
     return out;
+  }
+
+  /** A token of which runs log `key`, the same for metrics the same runs log; kept while no run's keys change. */
+  keySet(key) {
+    let kept = this.keySets.get(key);
+    if (kept?.ver === this.keysVer) return kept.id;
+    const m = this.keyMasks.get(key), end = m ? Math.min(m.length, this.byIdx.length) : 0;
+    let a = 2166136261, b = 0, n = 0;
+    for (let i = 0; i < end; i++) if (m[i]) (a = Math.imul(a ^ i, 16777619)), (b = (b + Math.imul(i + 1, 0x9e3779b1)) | 0), n++;
+    this.keySets.set(key, (kept = { ver: this.keysVer, id: `${n}.${a >>> 0}.${b >>> 0}` }));
+    return kept.id;
+  }
+
+  /** Whether some run of `runs` logs `key`. */
+  someLog(runs, key) {
+    const m = this.keyMasks.get(key);
+    return !!m && runs.some((r) => m[r.idx] === 1);
+  }
+
+  /** Every run loaded, as a list kept while they stay. */
+  everyRun() {
+    if (this.every?.ver !== this.doneVer) this.every = { ver: this.doneVer, runs: [...this.runs.values()] };
+    return this.every.runs;
   }
 
   // ---- planning ----
@@ -256,6 +366,7 @@ export class Data {
     for (const d of demands) this.planChart(d, queue);
     this.queue = queue;
     this.pump();
+    this.flush(); // charts whose blocks were all here show them now
     const n = this.queue.length + this.planBlocks;
     this.ui.status(n ? `loading ${n} blocks…` : this.summary());
     return n;
@@ -263,20 +374,42 @@ export class Data {
 
   /** One chart: the layers it wants, the requests for their blocks, and its columns once they are all here. */
   planChart(d, queue) {
-    const runs = this.runsWith(d.runs, d.key), want = this.layersOf(d, runs);
-    const ch = this.charts.get(d.key) || { ready: null };
+    const runs = this.runsWith(d.runs, d.key), ch = this.charts.get(d.key) || { ready: null };
+    if (ch.runs === runs && ch.settled === this.planSig(d)) return; // as when it last showed all it wants: nothing to ask for
+    const want = this.layersOf(d, runs), n = queue.length, shown = ch.ready;
     Object.assign(ch, { want, runs, many: d.many });
     this.charts.set(d.key, ch);
     for (const L of [want.coarse, want.fine]) for (const index of L ? L.indices : []) this.need(d.key, L.level, index, runs, queue);
     this.settleChart(d.key, ch);
+    // settled once it already showed what it wants: what it wants depends on the extent of what it shows (`layersOf`)
+    ch.settled = queue.length === n && sameLayers(shown, want) && !this.rebuildLeft.has(d.key) && this.quiet(d.key, want) ? this.planSig(d) : null;
+  }
+
+  /** The layers chart d would show at once were its view d's: those it wants (`layersOf`) when their blocks are all
+   * here, as a plan of d would have it (`settleChart`), else those it shows. */
+  layersIf(d) {
+    const runs = this.runsWith(d.runs, d.key), want = this.layersOf(d, runs);
+    return this.complete(d.key, want, runs) ? want : this.charts.get(d.key)?.ready ?? null;
+  }
+
+  /** What chart d's plan depends on besides its runs: its metric's data, its view, and which runs are finished. */
+  planSig(d) {
+    return `${this.keyVersion(d.key)}|${this.doneVer}|${d.xmode}|${d.zoomed}|${d.x0}|${d.x1}|${d.pw}|${d.many}`;
+  }
+
+  /** Whether no block of `layers` of `key` is being asked for or failing: nothing of it will change unasked. */
+  quiet(key, layers) {
+    return [layers.coarse, layers.fine].every((L) => !L || L.indices.every((index) => {
+      const id = blockId(key, L.level, index);
+      return !this.inflight.has(id) && !this.failed.has(id);
+    }));
   }
 
   /** The layers chart d (of runs `runs`) wants: coarse ({level, indices}), its buckets over every step of its runs,
    * as wide as its width and point budget allow; and fine, over the steps it is zoomed into, when finer (else null). */
   layersOf(d, runs) {
     const px = d.many ? DENSITY_PX_PER_BUCKET : LINE_PX_PER_BUCKET, buckets = Math.min(d.pw / px, POINT_BUDGET / Math.max(runs.length, 1));
-    let lo = 0, hi = 0;
-    for (const r of runs) hi = Math.max(hi, num(r.meta.summary?._step ?? 0));
+    let lo = 0, hi = this.lastStep(runs);
     const ext = this.extentOf(runs, d.key);
     if (ext) (lo = Math.min(ext[0], hi)), (hi = Math.max(hi, ext[1]));
     const coarse = covering(levelFor(hi - lo, buckets), lo, hi);
@@ -285,6 +418,19 @@ export class Data {
     let level = levelFor(view[1] - view[0], buckets);
     while (level < coarse.level && covering(level, view[0], view[1]).indices.length > FINE_BLOCKS) level++;
     return { coarse, fine: level < coarse.level ? covering(level, view[0], view[1]) : null };
+  }
+
+  /** The last step any run of `runs` reached (its summary's _step): the finished ones' kept while they stay. */
+  lastStep(runs) {
+    let kept = this.lastSteps.get(runs);
+    if (kept?.done !== this.doneVer) {
+      let hi = 0;
+      for (const r of runs) if (r.meta.state !== "running") hi = Math.max(hi, num(r.meta.summary?._step ?? 0));
+      this.lastSteps.set(runs, (kept = { done: this.doneVer, hi }));
+    }
+    let hi = kept.hi;
+    for (const r of this.runningOf(runs)) hi = Math.max(hi, num(r.meta.summary?._step ?? 0));
+    return hi;
   }
 
   /** The steps chart d is zoomed into: its x range in steps, or found from its runs' columns for a runtime x (none
@@ -301,17 +447,19 @@ export class Data {
   }
 
   /** Queue requests for block (key, level, index) of the runs of `runs` that lack it, or hold a running run's buckets
-   * older than its compiled ones, and whose request for it is not failing: the scope's finished runs in one request when
-   * many lack it, by run ids otherwise. */
+   * older than its compiled ones, and whose request for it is not failing: the finished runs of the folder shown
+   * (`view`) in one request when many lack it, by run ids otherwise. */
   need(key, level, index, runs, queue, touch = true) {
     const id = blockId(key, level, index), have = this.blocks.get(id), asked = this.inflight.get(id);
     if (have && touch) have.used = performance.now();
     const failed = this.failed.get(id), backoff = failed && performance.now() < failed.until ? failed : null;
-    const missing = runs.filter((r) => !this.current(have?.runs.get(r.id), r) && !asked?.runs.has(r.id)
-                                       && !(asked?.scope && r.meta.state !== "running") && !(backoff && failedFor(backoff, r)));
+    const some = have && this.finishedHeld(have, runs, key) ? this.runningOf(runs) : runs;
+    const missing = some.filter((r) => !this.current(have?.runs.get(r.id), r) && !asked?.runs.has(r.id)
+                                       && !(asked && asked.scope !== null && r.meta.state !== "running" && within(r.id, asked.scope))
+                                       && !(backoff && failedFor(backoff, r)));
     const finished = missing.filter((r) => r.meta.state !== "running");
     const scope = finished.length >= SCOPE_MIN && finished.length * SCOPE_SHARE >= runs.length;
-    if (scope) queue.push({ key, level, index, runs: null });
+    if (scope) queue.push({ key, level, index, runs: null, scope: this.view });
     const byId = scope ? missing.filter((r) => r.meta.state === "running") : missing;
     for (let i = 0; i < byId.length; i += RUNS_PER_REQUEST) queue.push({ key, level, index, runs: byId.slice(i, i + RUNS_PER_REQUEST) });
   }
@@ -321,13 +469,44 @@ export class Data {
     return !!e && e.a.seq[e.row] >= r.meta.compiled;
   }
 
+  /** Whether block b (of metric `key`) holds every finished run of `runs` as it now is: every finished run that logs
+   * the metric, or else those of the list; each answer kept while the block's entries, the list and the finished runs
+   * stay. */
+  finishedHeld(b, runs, key) {
+    const all = this.runsWith(this.everyRun(), key);
+    if (this.heldOf(b, "heldAll", all)) return true;
+    return runs !== all && this.heldOf(b, "held", runs);
+  }
+
+  heldOf(b, slot, runs) {
+    const h = b[slot];
+    if (h?.runs === runs && h.ver === b.ver && h.done === this.doneVer) return h.ok;
+    let ok = true;
+    for (const r of runs) {
+      if (r.meta.state !== "running" && !this.current(b.runs.get(r.id), r)) {
+        ok = false;
+        break;
+      }
+    }
+    b[slot] = { runs, ver: b.ver, done: this.doneVer, ok };
+    return ok;
+  }
+
+  /** The running runs of `runs`, kept while neither the list nor which runs are finished change. */
+  runningOf(runs) {
+    let kept = this.runningLists.get(runs);
+    if (kept?.done !== this.doneVer) this.runningLists.set(runs, (kept = { done: this.doneVer, out: runs.filter((r) => r.meta.state === "running") }));
+    return kept.out;
+  }
+
   /** Whether every block of `layers` holds every run of `runs` (any version of a running one's) but those whose request
    * for it failed, so a chart shows the runs that came. */
   complete(key, layers, runs) {
     for (const L of [layers.coarse, layers.fine]) {
       for (const index of L ? L.indices : []) {
         const id = blockId(key, L.level, index), b = this.blocks.get(id), failed = this.failed.get(id);
-        if (runs.some((r) => !b?.runs.has(r.id) && !(failed && failedFor(failed, r)))) return false;
+        const some = b && this.finishedHeld(b, runs, key) ? this.runningOf(runs) : runs;
+        if (some.some((r) => !b?.runs.has(r.id) && !(failed && failedFor(failed, r)))) return false;
       }
     }
     return true;
@@ -336,10 +515,9 @@ export class Data {
   /** Show chart `key`'s wanted layers once they are all here, and have the columns it draws that were not built for
    * the layers it shows rebuilt. */
   settleChart(key, ch) {
-    const same = ch.ready && JSON.stringify(ch.ready) === JSON.stringify(ch.want);
-    if (!same && this.complete(key, ch.want, ch.runs)) (ch.ready = ch.want), this.touched.add(key);
+    if (!sameLayers(ch.ready, ch.want) && this.complete(key, ch.want, ch.runs)) (ch.ready = ch.want), this.touched.add(key), this.bumpKeys([key]);
     if (!ch.ready) return;
-    for (const r of ch.runs) if (r.built.get(key)?.layers !== ch.ready && this.drawsColumn(ch, r)) this.rebuildSoon(r, key);
+    for (const r of ch.many ? this.runningOf(ch.runs) : ch.runs) if (!sameLayers(r.built.get(key)?.layers, ch.ready) && this.drawsColumn(ch, r)) this.rebuildSoon(r, key);
   }
 
   /** Whether chart ch draws run r from a column (one of many runs is drawn from its buckets unless it is running). */
@@ -369,6 +547,23 @@ export class Data {
     return parts;
   }
 
+  /** The bucket arrays of the blocks of layer L ({level, indices}) of metric `key`: what the GPU bins its runs from. */
+  arraysOf(key, L) {
+    const out = [];
+    for (const index of L.indices) for (const a of this.blocks.get(blockId(key, L.level, index))?.arrays || []) out.push(a);
+    return out;
+  }
+
+  /** The bucket arrays here of the blocks a zoom into chart `key` would want (`finerAhead`): of the two levels below
+   * the finest it shows, over the steps it shows. */
+  zoomArrays(key) {
+    const ready = this.charts.get(key)?.ready, out = [];
+    if (!ready) return out;
+    const finest = ready.fine || ready.coarse, steps = this.stepsOf(finest);
+    for (const up of [1, 2]) out.push(...this.arraysOf(key, covering(finest.level - up, ...steps)));
+    return out;
+  }
+
   /** The coarse level chart `key` shows, or null. */
   levelOf(key) {
     return this.charts.get(key)?.ready?.coarse.level ?? null;
@@ -377,10 +572,25 @@ export class Data {
   /** [first, last] x (steps for xmode 0, else runtimes) of the buckets of `runs` in the coarse blocks chart `key`
    * shows, or null. */
   extentOf(runs, key, xmode = 0) {
+    const ver = this.keyVersion(key), kept = this.extents.get(key) || [], hit = kept.find((e) => e.runs === runs && e.xmode === xmode);
+    if (hit?.ver === ver) return hit.out;
+    const out = this.extentNow(runs, key, xmode);
+    this.extents.set(key, [{ runs, xmode, ver, out }, ...kept.filter((e) => e !== hit)].slice(0, 4));
+    return out;
+  }
+
+  extentNow(runs, key, xmode) {
     const ready = this.charts.get(key)?.ready;
+    if (!ready) return null;
+    const [lo, hi] = runs.length <= EXTENT_BY_RUN ? this.extentByRun(runs, key, ready.coarse, xmode) : this.extentByRow(runs, key, ready.coarse, xmode);
+    return hi >= lo ? [lo, hi] : null;
+  }
+
+  /** [first, last] x of the buckets of `runs` in the blocks of layer L, each run looked up in each block. */
+  extentByRun(runs, key, L, xmode) {
     let lo = Infinity, hi = -Infinity;
-    for (const index of ready ? ready.coarse.indices : []) {
-      const b = this.blocks.get(blockId(key, ready.coarse.level, index));
+    for (const index of L.indices) {
+      const b = this.blocks.get(blockId(key, L.level, index));
       for (const r of b ? runs : []) {
         const e = b.runs.get(r.id), v = e?.a.v;
         if (!v || v.first[e.row + 1] <= v.first[e.row]) continue;
@@ -388,7 +598,20 @@ export class Data {
         (lo = Math.min(lo, xmode ? v.tmean[q0] : bucketStep(v, q0))), (hi = Math.max(hi, xmode ? v.tmean[q1] : bucketStep(v, q1)));
       }
     }
-    return hi >= lo ? [lo, hi] : null;
+    return [lo, hi];
+  }
+
+  /** The same from the extents of the rows of the layer's arrays (kept with each array), for many runs. */
+  extentByRow(runs, key, L, xmode) {
+    const mask = this.runMask(runs);
+    let lo = Infinity, hi = -Infinity;
+    for (const a of this.arraysOf(key, L)) {
+      const ext = ((a.rowExt ||= [])[xmode] ||= rowExtents(a.v, xmode));
+      for (let row = 0; row < a.v.runs; row++) {
+        if (a.rowRun[row] >= 0 && mask[a.rowRun[row]]) (lo = Math.min(lo, ext[3 * row])), (hi = Math.max(hi, ext[3 * row + 1]));
+      }
+    }
+    return [lo, hi];
   }
 
   /** Keep answer `got` ({buf, bytes, paths}) of request x: each run it names as its entry of the block. Returns those
@@ -396,24 +619,30 @@ export class Data {
   addArray(x, got) {
     const { loc } = adoptStore(got.buf);
     const v = bucketViews(got.buf);
-    const a = { id: this.nextArray++, key: x.key, level: x.level, index: x.index, v, seq: v.seq, buf: got.buf, loc, bytes: got.bytes, refs: 0 };
-    this.arrays.set(a.id, a);
-    this.arrayBytes += a.bytes;
     const id = blockId(x.key, x.level, x.index);
     let b = this.blocks.get(id);
-    if (!b) this.blocks.set(id, (b = { runs: new Map(), used: performance.now() }));
+    if (!b) this.blocks.set(id, (b = { runs: new Map(), arrays: new Set(), used: performance.now(), ver: 0, held: null, heldAll: null }));
+    const a = { id: this.nextArray++, key: x.key, level: x.level, index: x.index, v, seq: v.seq, buf: got.buf, loc, bytes: got.bytes, refs: 0,
+                block: b, rowRun: new Int32Array(v.runs).fill(-1), rowsVer: 0, rowExt: got.ext ? [got.ext] : [] };
+    // rowRun: each row's run index, -1 once another array holds it; rowExt: its rows' extents (rowExtents), by xmode
+    this.arrays.set(a.id, a);
+    this.arrayBytes += a.bytes;
+    b.arrays.add(a);
     const runs = [];
     got.paths.forEach((p, row) => {
       const r = this.runs.get(p);
       if (!r) return;
       this.unref(b, p);
       b.runs.set(p, { a, row });
+      b.ver++;
       a.refs++;
+      a.rowRun[row] = r.idx;
       runs.push(r);
     });
     if (!a.refs) this.release(a);
     this.dropArrays();
     this.version++;
+    this.bumpKeys([x.key]);
     return runs;
   }
 
@@ -422,12 +651,17 @@ export class Data {
     const e = b.runs.get(id);
     if (!e) return;
     b.runs.delete(id);
+    b.ver++;
+    e.a.rowRun[e.row] = -1;
+    e.a.rowsVer++;
     if (--e.a.refs <= 0) this.release(e.a);
   }
 
   release(a) {
     if (!this.arrays.delete(a.id)) return;
+    a.block.arrays.delete(a);
     freeStore(a.loc);
+    forgetArray(a);
     this.arrayBytes -= a.bytes;
   }
 
@@ -444,9 +678,8 @@ export class Data {
 
   /** Bytes of the arrays a block refers to. */
   blockBytes(b) {
-    const seen = new Set();
     let n = 0;
-    for (const e of b.runs.values()) if (!seen.has(e.a)) seen.add(e.a), (n += e.a.bytes);
+    for (const a of b.arrays) n += a.bytes;
     return n;
   }
 
@@ -459,6 +692,7 @@ export class Data {
       if (this.arrayBytes <= ARRAY_BYTES) break;
       for (const runId of [...b.runs.keys()]) this.unref(b, runId);
       this.blocks.delete(id);
+      this.bumpKeys([id.slice(0, id.lastIndexOf("|", id.lastIndexOf("|") - 1))]);
     }
   }
 
@@ -490,9 +724,9 @@ export class Data {
   asking(x) {
     const id = blockId(x.key, x.level, x.index);
     let asked = this.inflight.get(id);
-    if (!asked) this.inflight.set(id, (asked = { scope: false, runs: new Set(), n: 0 }));
-    if (x.runs === null ? asked.scope : x.runs.every((r) => asked.runs.has(r.id))) return null;
-    if (x.runs === null) asked.scope = true;
+    if (!asked) this.inflight.set(id, (asked = { scope: null, runs: new Set(), n: 0 }));
+    if (x.runs === null ? asked.scope === x.scope : x.runs.every((r) => asked.runs.has(r.id))) return null;
+    if (x.runs === null) asked.scope = x.scope;
     else for (const r of x.runs) asked.runs.add(r.id);
     asked.n++;
     return asked;
@@ -597,7 +831,7 @@ export class Data {
   /** The answers of requests `xs`, null for a block not answered, fetched by a worker; throws when the request fails. */
   async fetchMany(xs) {
     const url = new URL(`${BASE}/api/buckets`, typeof location === "undefined" ? "http://localhost/" : location.href).href;
-    const blocks = xs.map((x) => (x.runs === null ? { key: x.key, level: x.level, index: x.index, scope: this.scope, which: "finished" }
+    const blocks = xs.map((x) => (x.runs === null ? { key: x.key, level: x.level, index: x.index, scope: x.scope, which: "finished" }
       : { key: x.key, level: x.level, index: x.index, runs: x.runs.map((r) => r.id) }));
     const body = JSON.stringify({ blocks });
     const got = await fetchArraysOnWorker(url, body);
@@ -622,12 +856,16 @@ export class Data {
 
   // ---- fetching ahead ----
 
-  /** While no plan's requests are under way, fetch what charts may soon show (`nextAhead`), each request once: BATCH_BLOCKS
-   * a request, PREFETCH_PARALLEL requests at a time, one after another until nothing is left or AHEAD_BYTES is reached. */
+  /** While no plan's requests are under way, fetch what charts may soon show (`nextAhead`), each request once: blocks
+   * of about AHEAD_REQUEST_BYTES a request (were every run to fill its block; BATCH_BLOCKS at most), PREFETCH_PARALLEL
+   * requests at a time, one after another until nothing is left or AHEAD_BYTES is reached. */
   prefetch() {
     while (!this.busy && this.aheadPosts < PREFETCH_PARALLEL) {
       const batch = [];
+      let bytes = 0;
       for (const x of this.nextAhead(BATCH_BLOCKS)) {
+        if (bytes >= AHEAD_REQUEST_BYTES) break;
+        bytes += (x.runs ? x.runs.length : this.runs.size) * BLOCK * BUCKET_BYTES;
         const asked = this.asking(x);
         this.aheadAsked.add(askId(x));
         if (asked) batch.push([x, asked]);
@@ -657,13 +895,14 @@ export class Data {
         this.aheadPosts--;
         this.aimPosts--;
         this.pump();
+        if (!this.aimPosts) this.ui.aimed?.();
       });
     }
   }
 
   /** Up to n requests, not made ahead before, for blocks a chart may soon show (`ui.ahead`: demands, nearest the view
-   * first): every chart's wanted layers first, then finer levels of the shown ones; while the blocks no chart uses hold
-   * less than AHEAD_BYTES. */
+   * first): every chart's wanted layers first, then the finer levels a zoom of each would want (`finerAhead`); while
+   * the blocks no chart uses hold less than AHEAD_BYTES. */
   nextAhead(n) {
     if (this.aheadBytes() >= AHEAD_BYTES) return [];
     const demands = this.ui.ahead?.() || [], out = [];
@@ -692,12 +931,11 @@ export class Data {
     for (const L of [want.coarse, want.fine]) for (const index of L ? L.indices : []) this.need(d.key, L.level, index, runs, out, false);
   }
 
-  /** Requests (into `out`) for the blocks of the two levels below the finest the chart of demand d shows, over the steps
-   * it shows. */
+  /** Requests (into `out`) for the blocks of the two levels below the finest the chart of demand d shows (or, not
+   * shown yet, would), over the steps it shows: what a zoom into it wants. */
   finerAhead(d, out) {
-    const ready = this.charts.get(d.key)?.ready;
-    if (!ready) return;
-    const runs = this.runsWith(d.runs, d.key), finest = ready.fine || ready.coarse, steps = this.stepsOf(finest);
+    const runs = this.runsWith(d.runs, d.key), ready = this.charts.get(d.key)?.ready ?? this.layersOf(d, runs);
+    const finest = ready.fine || ready.coarse, steps = this.stepsOf(finest);
     for (const up of [1, 2]) {
       const L = covering(finest.level - up, ...steps);
       for (const index of L.indices.length <= FINE_BLOCKS ? L.indices : []) this.need(d.key, L.level, index, runs, out, false);
@@ -742,18 +980,26 @@ export class Data {
     soon(() => this.rebuildSome());
   }
 
+  /** Rebuild the queued columns of the metrics `keys` now, as far as one task of `rebuildSome` goes, rather than in a
+   * task later. */
+  rebuildNow(keys) {
+    if (this.rebuildQ.size) this.rebuildSome(keys);
+  }
+
   /** Whether columns of metric `key` await rebuilding. */
   pending(key) {
     return this.rebuildLeft.has(key);
   }
 
-  /** Rebuild queued columns for REBUILD_SLICE_MS, going on to finish a metric's within REBUILD_WHOLE_MS; then tell
-   * the UI of the metrics done, and go on in another task while some are left. */
-  rebuildSome() {
+  /** Rebuild queued columns (those of the metrics `only`, when given) for REBUILD_SLICE_MS, going on to finish a
+   * metric's within REBUILD_WHOLE_MS; then tell the UI of the metrics done, and go on in another task while some are
+   * left (the task already due goes on with those `only` leaves). */
+  rebuildSome(only = null) {
     const t0 = performance.now();
     let last = null;
     try {
       for (const [id, [r, key]] of this.rebuildQ) {
+        if (only && !only.has(key)) continue;
         const spent = performance.now() - t0;
         if (spent > REBUILD_WHOLE_MS || (spent > REBUILD_SLICE_MS && key !== last)) break;
         last = key;
@@ -765,8 +1011,8 @@ export class Data {
       }
       this.flush();
     } finally {
-      this.rebuilding = this.rebuildQ.size > 0;
-      if (this.rebuilding) soon(() => this.rebuildSome());
+      if (!only) this.rebuilding = this.rebuildQ.size > 0;
+      if (!only && this.rebuilding) soon(() => this.rebuildSome());
     }
     this.settle();
   }
@@ -808,11 +1054,13 @@ export class Data {
     if (!keys.size) return;
     for (const k of keys) this.touched.delete(k);
     this.version++;
+    this.bumpKeys(keys);
     this.flushKeys();
     this.ui.data(keys, streamed);
   }
 
-  /** Discard a run's rows and reload it from its current server state. */
+  /** Discard a run's rows and reload it from its current server state; while the events that waited for it still
+   * leave a gap, again after a delay twice as long each time. */
   async resync(r) {
     if (r.resyncInFlight) return;
     r.resyncInFlight = true;
@@ -829,15 +1077,15 @@ export class Data {
       const rows = from < j.run.seq ? await getJSON(`${BASE}/api/rows?path=${encodeURIComponent(r.id)}&from=${from}`) : { seq0: from, rows: [] };
       if (this.runs.get(r.id) !== r) return;
       r.tail = [];
-      r.tailSeq0 = r.seq = from;
+      r.tailSeq0 = r.seq = rows.seq0; // a mirror's rows may begin past its levels, which then catch up
       this.appendRows(r, rows);
       r.built.clear();
       r.resyncInFlight = false;
       r.holding = false;
-      r.resyncs = 0;
       const pending = r.pending;
       r.pending = [];
       for (const [kind, ev] of pending) this.dispatch(kind, ev);
+      if (!r.resyncInFlight) r.resyncs = 0;
       this.ui.runs();
       this.ui.data(new Set(r.cols.keys()), true);
     } catch (e) {
@@ -849,17 +1097,24 @@ export class Data {
 
   // ---- stream ----
 
+  /** Open the stream of the scope; a promise of its first opening (or failing, which the listing then reports). */
   openStream() {
     const es = new EventSource(`${BASE}/api/stream?path=${encodeURIComponent(this.scope)}`);
     this.stream = es;
     for (const kind of ["rows", "run", "media", "delete", "hb", "folder"]) {
       es.addEventListener(kind, (e) => (this.early ? this.early.push([kind, JSON.parse(e.data)]) : this.dispatch(kind, JSON.parse(e.data))));
     }
-    es.onopen = () => {
-      this.ui.conn(true);
-      getJSON(`${BASE}/api/info`).then((i) => this.ui.protocol?.(i.protocol), () => {}); // a restarted server may be another trex
-    };
-    es.onerror = () => this.ui.conn(false);
+    return new Promise((opened) => {
+      es.onopen = () => {
+        opened();
+        this.ui.conn(true);
+        getJSON(`${BASE}/api/info`).then((i) => this.ui.protocol?.(i.protocol), () => {}); // a restarted server may be another trex
+      };
+      es.onerror = () => {
+        opened();
+        this.ui.conn(false);
+      };
+    });
   }
 
   dispatch(kind, ev) {

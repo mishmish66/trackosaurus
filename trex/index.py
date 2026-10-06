@@ -27,7 +27,7 @@ import threading
 import time
 import zlib
 from collections import OrderedDict
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import batched
@@ -381,6 +381,7 @@ HEARTBEAT: Final = 10.0  # seconds of stream silence after which a heartbeat is 
 STREAM_BATCH: Final = 2000  # events sent together at most
 STOP_POLL: Final = 0.5  # seconds between a stream's checks of its stop event
 PATHS_PER_QUERY: Final = 500  # runs one index query names
+BLOCKS_PER_QUERY: Final = 240  # blocks one index query names by key (4 variables each, within SQLite's oldest limit of 999)
 
 TABLES: Final = {
     "cache": "CREATE TABLE IF NOT EXISTS cache(key TEXT PRIMARY KEY, value TEXT)",
@@ -486,25 +487,34 @@ class Hub:
             s.put(msg)
 
 
-def _bound_dir(d: Path, limit: int) -> None:
+def _bound_dir(d: Path, limit: int) -> int:
     """Delete the least recently used entries of `d` (files, or directories of files) until the rest hold at most
-    `limit` bytes."""
+    `limit` bytes; the bytes the rest hold."""
     entries: list[tuple[float, int, Path]] = []
     for e in d.iterdir():
         try:
-            files = [e] if e.is_file() else list(e.iterdir())
-            entries.append((max(f.stat().st_mtime for f in files) if files else 0.0, sum(f.stat().st_size for f in files), e))
+            stats = [f.stat() for f in ([e] if e.is_file() else e.iterdir())]
         except OSError:
             continue
+        entries.append((max((x.st_mtime for x in stats), default=0.0), sum(x.st_size for x in stats), e))
     total = sum(x[1] for x in entries)
     for _, size, e in sorted(entries, key=lambda x: x[0]):
         if total <= limit:
-            return
+            break
         if e.is_dir():
             shutil.rmtree(e, ignore_errors=True)
         else:
             e.unlink(missing_ok=True)
         total -= size
+    return total
+
+
+def _dir_bytes(d: Path) -> int:
+    """Bytes of the files in directory `d`; 0 for one that is gone."""
+    try:
+        return sum(f.stat().st_size for f in d.iterdir())
+    except OSError:
+        return 0
 
 
 def _events(r: Update, cur: RunRecord | None, st: RunRecord) -> list[Event]:
@@ -529,12 +539,14 @@ def _record(r: Update, cur: RunRecord | None, now: float) -> RunRecord:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Finished:
-    """The finished runs logging a metric, in path order, the rows of each its levels hold, and a digest of them and
-    their levels."""
+    """The finished runs logging a metric, in path order, the rows of each its levels hold, a digest of them and their
+    levels, and each one's place in `paths`. What is derived from them is kept under the digest, so that an answer
+    never mixes two sets of finished runs."""
 
     paths: list[str]
     seq: npt.NDArray[np.uint32]
     sig: bytes
+    at: dict[str, int]
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -885,6 +897,8 @@ class Explorer:
         open_files()  # raised to the hard limit
         self._memo = Memo(MEMO_BYTES, _memo_maps())  # stacks, merged levels, block answers and `runs` answers
         self._saved_at: dict[str, float] = {}  # metric -> when its merged levels were last saved (monotonic)
+        self._levels_bytes: int | None = None  # bytes the saved levels hold, once counted
+        self._levels_lock = threading.Lock()
         self._view_gen = 0  # bumped whenever what `runs` answers may change
         origin.attach(self)
 
@@ -959,6 +973,7 @@ class Explorer:
         """Commit updates in one transaction, then publish their events in order; nothing once closed."""
         staged: dict[str, RunRecord] = {}
         events: list[tuple[str, list[Event]]] = []
+        bumps: set[str] = set()
         now = time.time()
         with self._write_lock:
             if self._closed:
@@ -966,7 +981,7 @@ class Explorer:
             self._writer.execute("BEGIN IMMEDIATE")
             try:
                 for r in updates:
-                    st, ev = self._stage(r, staged.get(r.path) or self.records.get(r.path), now)
+                    st, ev = self._stage(r, staged.get(r.path) or self.records.get(r.path), now, bumps)
                     staged[r.path] = st
                     events.append((r.path, ev))
             except BaseException:
@@ -975,6 +990,7 @@ class Explorer:
             self._writer.execute("COMMIT")
         with self.lock:
             self.records.update(staged)
+            self._bump(bumps)
             self._view_gen += 1
         for path, ev in events:
             for kind, data in ev:
@@ -985,18 +1001,19 @@ class Explorer:
                 else:
                     self.hub.publish(path, kind, data)
 
-    def _stage(self, r: Update, cur: RunRecord | None, now: float) -> tuple[RunRecord, list[Event]]:
-        """Write one update inside `apply`'s transaction; its record and events."""
+    def _stage(self, r: Update, cur: RunRecord | None, now: float, bumps: set[str]) -> tuple[RunRecord, list[Event]]:
+        """Write one update inside `apply`'s transaction; its record and events, and into `bumps` the metrics whose
+        finished runs or levels it changes."""
         ev: list[Event] = []
         if r.reset and cur is not None:
-            self._forget(r.path)
+            self._forget(r.path, bumps)
             ev.append(("delete", {"run": r.path}))
             cur = None
         self._writer.executemany("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)", [m.row() for m in r.media])
         st = _record(r, cur, now)
         was, done = cur is not None and cur.state != "running", st.state != "running"  # finished before, and now
         if (r.compiled is not None and done) or was != done:
-            self._bump(st.keys)
+            bumps.update(st.keys)
         if r.compiled is not None:
             if r.replace:
                 for t in ("levels", "metrics"):
@@ -1014,14 +1031,16 @@ class Explorer:
             if self._closed:
                 return
             self._writer.execute("BEGIN IMMEDIATE")
+            bumps: set[str] = set()
             try:
-                self._forget(path)
+                self._forget(path, bumps)
             except BaseException:
                 self._writer.execute("ROLLBACK")
                 raise
             self._writer.execute("COMMIT")
         with self.lock:
             self.records.pop(path, None)
+            self._bump(bumps)
             self._view_gen += 1
         self.hub.publish(path, "delete", {"run": path})
 
@@ -1042,26 +1061,30 @@ class Explorer:
         for p in sorted(changed):
             self.hub.publish(p, "folder", {"path": p, "info": notes.get(p)})
 
-    def _bump(self, keys: Sequence[str]) -> None:
-        """Note that the finished runs of `keys`, or their levels, changed."""
+    def _bump(self, keys: Iterable[str]) -> None:
+        """Note that the finished runs of `keys`, or their levels, changed: once the transaction changing them has
+        committed, so that whatever is built at the new generations reads them changed."""
         for k in keys:
             self._gens[k] = self._gens.get(k, 0) + 1
 
-    def _forget(self, path: str) -> None:
-        """Delete a run's index rows inside the caller's write transaction."""
+    def _forget(self, path: str, bumps: set[str]) -> None:
+        """Delete a run's index rows inside the caller's write transaction; its metrics go into `bumps`."""
         rec = self.records.get(path)
-        self._bump(rec.keys if rec else list(self._gens))
+        bumps.update(rec.keys if rec else self._gens)
         for t in ("runs", "media", "metrics", "levels"):
             self._writer.execute(f"DELETE FROM {t} WHERE path=?", (path,))
 
     # ---- runs ----
 
     def run_meta(self, path: str) -> RunMeta:
+        """The run as browsers see it; of a running run, the rows and media the origin has (`live`), which its stream
+        has brought before any event counting them."""
         st = self.records[path]
         p = st.public
+        seq, mseq = self.origin.live(path, st) if st.state == "running" else (st.seq, st.mseq)
         return RunMeta(id=path, uid=st.uid, name=p.name or path.rsplit("/", 1)[-1], parent=path.rpartition("/")[0],
                        tags=p.tags, config=p.config, info=p.info, summary={**p.user_summary, **st.summary}, state=st.state,
-                       created=p.created, updated=st.heartbeat, seq=st.seq, mseq=st.mseq, keys=st.keys,
+                       created=p.created, updated=st.heartbeat, seq=seq, mseq=mseq, keys=st.keys,
                        compiled=st.compiled, ver=st.ver)
 
     def info(self) -> dict[str, object]:
@@ -1229,17 +1252,17 @@ class Explorer:
         places in `paths`: finished ones cut from the finished runs' merged level (`_level`), running ones merged from
         their top levels. And the places of the other runs, in order."""
         lo, hi = index * bk.BLOCK, (index + 1) * bk.BLOCK
-        done, tops, _ = self._runs(key)
-        positions = self._positions(key)
-        at = np.array([positions.get(p, -1) for p in paths], np.int64)  # each run's index in `done`, or -1
+        fin = self._finished(key)
+        tops = self._top_levels(key, fin)
+        at = np.array([fin.at.get(p, -1) for p in paths], np.int64)  # each run's place in `fin`, or -1
         finished = at >= 0
         coarse = finished.copy()
         coarse[finished] = tops[at[finished]] <= level
         parts: list[Buckets] = []
         if coarse.any():
-            out = np.full(len(done), -1, np.int32)
+            out = np.full(len(fin.paths), -1, np.int32)
             out[at[coarse]] = np.flatnonzero(coarse)
-            part = bk.cut(self._level(key, level), lo, hi, out >= 0)
+            part = bk.cut(self._level(key, level, fin), lo, hi, out >= 0)
             parts.append(part.of(out[part.run]))
         others = np.flatnonzero(~finished)
         deep = [int(i) for i in np.flatnonzero(finished & ~coarse)]
@@ -1253,17 +1276,15 @@ class Explorer:
 
     def _tops(self, key: str, paths: Sequence[str]) -> Stack:
         """The top levels of `key` of runs `paths` (in path order), read from the index."""
-        tops: dict[str, int] = {}
-        rows: list[tuple[str, bytes]] = []
+        spans: list[tuple[str, int, float, float]] = []
         c = self.reader()
         try:
             for part in batched(paths, PATHS_PER_QUERY):
-                tops.update(c.execute(f"SELECT path, top FROM metrics WHERE key=? AND path IN ({_marks(part)})", (key, *part)))
-                rows += c.execute("SELECT l.path, l.data FROM levels l JOIN metrics m ON m.key=l.key AND m.path=l.path AND m.top=l.level "
-                                  f"WHERE l.key=? AND l.path IN ({_marks(part)}) ORDER BY l.path, l.block", (key, *part)).fetchall()
+                spans += c.execute(f"SELECT path, top, lo, hi FROM metrics WHERE key=? AND path IN ({_marks(part)})", (key, *part)).fetchall()
+            rows = _top_blocks(c, key, spans)
         finally:
             self.release(c)
-        return self._stacked(paths, tops, rows)
+        return self._stacked(paths, {p: top for p, top, _, _ in spans}, rows)
 
     def _stacked(self, paths: Sequence[str], tops: Mapping[str, int], rows: Sequence[tuple[str, bytes]]) -> Stack:
         """The Stack of runs `paths` at their `tops`, of their top levels' stored blocks `rows` (path, data), in path then
@@ -1277,32 +1298,22 @@ class Explorer:
         with self.lock:
             return np.array([st.compiled if (st := self.records.get(p)) else 0 for p in paths], np.uint32)
 
-    def _runs(self, key: str) -> tuple[list[str], npt.NDArray[np.int8], npt.NDArray[np.uint32]]:
-        """The finished runs of `key` in path order, each one's top level and the rows its levels hold: from their saved
-        levels when those are current, else from their stack."""
-        saved = self._saved(key)
-        if saved is not None:
-            fin = self._finished(key)
-            return fin.paths, saved.tops, fin.seq
-        st = self._stack(key)
-        return st.paths, st.level, st.seq
+    def _top_levels(self, key: str, fin: Finished) -> npt.NDArray[np.int8]:
+        """Each of the finished runs `fin`'s top level of `key`: from the levels saved for them, else from their stack."""
+        saved = self._saved(key, fin)
+        return saved.tops if saved is not None else self._stack(key, fin).level
 
-    def _positions(self, key: str) -> dict[str, int]:
-        """Each finished run of `key` by its index in path order."""
-        return self._memo.get(("positions", key), self._gens.get(key, 0),
-                              lambda: ({p: i for i, p in enumerate(self._finished(key).paths)}, 0))
-
-    def _level(self, key: str, level: int) -> Buckets:
-        """The buckets of every finished run of `key` whose top level is `level` or finer, merged to `level`: mapped from
-        the levels saved for them when those hold it, else merged (on threads); kept as stacks are."""
-        gen, saved = self._gens.get(key, 0), self._saved(key)
+    def _level(self, key: str, level: int, fin: Finished) -> Buckets:
+        """The buckets of every one of the finished runs `fin` whose top level of `key` is `level` or finer, merged to
+        `level`: mapped from the levels saved for them when those hold it, else merged (on threads)."""
+        saved = self._saved(key, fin)
         if saved is not None and level in saved.levels:
             with contextlib.suppress(OSError):  # deleted since it was listed: merged instead
-                return self._memo.get(("level", key, level), gen, lambda: saved.level(level), maps=len(bk.COLUMNS))
-        return self._memo.get(("level", key, level), gen, lambda: self._merge_level(key, level))
+                return self._memo.get(("level", key, level, fin.sig), 0, lambda: saved.level(level), maps=len(bk.COLUMNS))
+        return self._memo.get(("level", key, level, fin.sig), 0, lambda: self._merge_level(key, level, fin))
 
-    def _merge_level(self, key: str, level: int) -> tuple[Buckets, int]:
-        st = self._stack(key)
+    def _merge_level(self, key: str, level: int, fin: Finished) -> tuple[Buckets, int]:
+        st = self._stack(key, fin)
         part = self._merged(st, level, st.level <= level)
         return part, part.nbytes
 
@@ -1322,38 +1333,35 @@ class Explorer:
             parts = list(pool.map(one, bounds, bounds[1:]))
         return bk.concat(parts)
 
-    def _stack(self, key: str) -> Stack:
-        """The finished runs' top levels of `key` (`buckets.stack`, runs in path order); kept while they stay the same.
-        A new stack gets its levels from the coarsest a first view takes to the finest it keeps merged and saved, on
-        a thread of its own."""
-        return self._memo.get(("stack", key), self._gens.get(key, 0), lambda: self._read_stack(key))
+    def _stack(self, key: str, fin: Finished) -> Stack:
+        """The top levels of `key` of the finished runs `fin` (`buckets.stack`, runs in path order). A new stack gets its
+        levels from the coarsest a first view takes to the finest it keeps merged and saved, on a thread of its own."""
+        return self._memo.get(("stack", key, fin.sig), 0, lambda: self._read_stack(key, fin))
 
-    def _read_stack(self, key: str) -> tuple[Stack, int]:
-        fin = self._finished(key)
-        done, sig = fin.paths, fin.sig
+    def _read_stack(self, key: str, fin: Finished) -> tuple[Stack, int]:
+        done = fin.paths
+        held = set(done)
         c = self.reader()
         try:
-            tops: dict[str, int] = dict(c.execute("SELECT path, top FROM metrics WHERE key=?", (key,)))
-            rows = c.execute("SELECT l.path, l.data FROM levels l JOIN metrics m ON m.key=l.key AND m.path=l.path AND m.top=l.level "
-                             "WHERE l.key=? ORDER BY l.path, l.block", (key,)).fetchall()
+            spans = [s for s in c.execute("SELECT path, top, lo, hi FROM metrics WHERE key=?", (key,)) if s[0] in held]
+            rows = _top_blocks(c, key, spans)
         finally:
             self.release(c)
-        held = set(done)
-        st = self._stacked(done, tops, [r for r in rows if r[0] in held])
+        st = self._stacked(done, {p: top for p, top, _, _ in spans}, rows)
         if done:
             top = int(st.level.max())
             levels = range(top + LEVELS_AHEAD, top - 1, -1)  # coarsest first, as views ask
-            threading.Thread(target=self._merge_ahead, args=(key, sig, st, levels), name="trex-levels", daemon=True).start()
+            threading.Thread(target=self._merge_ahead, args=(key, fin, st, levels), name="trex-levels", daemon=True).start()
         return st, st.buckets.nbytes
 
-    def _merge_ahead(self, key: str, sig: bytes, st: Stack, levels: range) -> None:
-        """Merge `levels` of `key` and save them (`_save_levels`) while its finished runs stay those of `sig`, at most
-        once every LEVELS_SAVE_EVERY seconds."""
-        parts = {x: self._level(key, x) for x in levels}
+    def _merge_ahead(self, key: str, fin: Finished, st: Stack, levels: range) -> None:
+        """Merge `levels` of `key` of the finished runs `fin` and save them (`_save_levels`) while they are still the
+        finished runs, at most once every LEVELS_SAVE_EVERY seconds."""
+        parts = {x: self._level(key, x, fin) for x in levels}
         due = time.monotonic() - self._saved_at.get(key, -math.inf) >= LEVELS_SAVE_EVERY
-        if due and self._finished(key).sig == sig and self._saved(key) is None:
+        if due and self._finished(key).sig == fin.sig and self._saved(key, fin) is None:
             self._saved_at[key] = time.monotonic()
-            self._save_levels(key, sig, st, parts)
+            self._save_levels(key, fin.sig, st, parts)
 
     def _finished(self, key: str) -> Finished:
         """The finished runs logging `key` (`Finished`)."""
@@ -1367,18 +1375,17 @@ class Explorer:
         h = hashlib.sha1(f"{CACHE_VERSION}\0{key}\0".encode())
         h.update("\0".join(paths).encode())
         h.update(np.array([(seq, ver) for _, seq, ver in done], np.int64).tobytes())
-        return Finished(paths, np.array([seq for _, seq, _ in done], np.uint32), h.digest())
+        return Finished(paths, np.array([seq for _, seq, _ in done], np.uint32), h.digest(), {p: i for i, p in enumerate(paths)})
 
     def _levels_dir(self, key: str, sig: bytes) -> Path:
         return self.cache_dir / "levels" / f"{hashlib.sha1(key.encode()).hexdigest()[:20]}-{sig.hex()[:20]}"
 
-    def _saved(self, key: str) -> Saved | None:
-        """The merged levels of `key` an earlier build saved (`_save_levels`) for its finished runs and their levels as
-        they are."""
-        return self._memo.get(("saved", key), self._gens.get(key, 0), lambda: (self._open_saved(key), 0))
+    def _saved(self, key: str, fin: Finished) -> Saved | None:
+        """The merged levels of `key` an earlier build saved (`_save_levels`) for the finished runs `fin`."""
+        return self._memo.get(("saved", key, fin.sig), 0, lambda: (self._open_saved(key, fin), 0))
 
-    def _open_saved(self, key: str) -> Saved | None:
-        d = self._levels_dir(key, self._finished(key).sig)
+    def _open_saved(self, key: str, fin: Finished) -> Saved | None:
+        d = self._levels_dir(key, fin.sig)
         try:
             os.utime(d / "levels.npy")
             tops = np.load(d / "levels.npy")
@@ -1390,7 +1397,8 @@ class Explorer:
     def _save_levels(self, key: str, sig: bytes, st: Stack, parts: Mapping[int, Buckets]) -> None:
         """Write merged levels of `key` beside the index as numpy arrays (`.npy`, memory-mapped when read): each run's
         top level (`levels`) and each level's buckets (`L<level>-<field>`); then delete its levels saved for other runs
-        and the least recently used saved levels beyond LEVELS_BYTES."""
+        and, once the saved levels exceed LEVELS_BYTES, the least recently used. Their bytes are counted at the first
+        save and kept count of after, so a save reads only the directories it adds and replaces."""
         d = self._levels_dir(key, sig)
         tmp = d.with_name(f"{d.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
@@ -1403,10 +1411,16 @@ class Explorer:
         except OSError:
             shutil.rmtree(tmp, ignore_errors=True)
             return
+        grown = _dir_bytes(d)
         for old in d.parent.glob(f"{d.name.split('-')[0]}-*"):
             if old != d:
+                grown -= _dir_bytes(old)
                 shutil.rmtree(old, ignore_errors=True)
-        _bound_dir(d.parent, LEVELS_BYTES)
+        with self._levels_lock:
+            if self._levels_bytes is None or self._levels_bytes + grown > LEVELS_BYTES:
+                self._levels_bytes = _bound_dir(d.parent, LEVELS_BYTES)
+            else:
+                self._levels_bytes += grown
 
 
 def _free_index(base: Path) -> tuple[Path, TextIO]:
@@ -1428,3 +1442,16 @@ def _free_index(base: Path) -> tuple[Path, TextIO]:
 
 def _marks(part: Sequence[str]) -> str:
     return ",".join("?" * len(part))
+
+
+def _top_blocks(c: sqlite3.Connection, key: str, spans: Sequence[tuple[str, int, float, float]]) -> list[tuple[str, bytes]]:
+    """(path, data) of the stored top-level blocks of `key` of the runs whose spans are `spans` (path, top, lo, hi), in
+    path then block order: each looked up by its key among the blocks its span covers at its top level, so that no
+    other level is read."""
+    want = [(key, top, b, path) for path, top, lo, hi in spans for b in bk.blocks(top, lo, hi)]
+    rows: list[tuple[str, int, bytes]] = []
+    for part in batched(want, BLOCKS_PER_QUERY):
+        rows += c.execute(f"SELECT path, block, data FROM levels WHERE (key, level, block, path) IN (VALUES {','.join(['(?,?,?,?)'] * len(part))})",
+                          [v for w in part for v in w]).fetchall()
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return [(p, data) for p, _, data in rows]
