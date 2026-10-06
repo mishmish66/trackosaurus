@@ -1,7 +1,8 @@
 """Headless-browser smoke test against a throwaway trex server on a temporary runs directory.
 
 Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, panels of
-hidden runs, the x range of hidden runs, the filter box, console errors, UI line coverage (at least UI_COVERAGE of the modules' code lines run),
+hidden runs, the x range of hidden runs, charts while the server refuses blocks, the filter box, console errors, UI line coverage (at least
+UI_COVERAGE of the modules' code lines run),
 and that a client dropping every 5th stream event still converges to the run files: every row and media item, and columns whose
 points' counts add up to each metric's finite values. Then a trex pulling another's runs through a link added in its panel,
 and, as this machine's trex (with a private TREX_DAEMON_DIR): adding a directory with `trex serve -y`, the root view of
@@ -31,7 +32,7 @@ from typing import Any, Protocol
 
 import numpy as np
 import numpy.typing as npt
-from playwright.sync_api import ConsoleMessage, Page, sync_playwright
+from playwright.sync_api import ConsoleMessage, Page, Route, sync_playwright
 
 from trex import chunks
 from trex.format import connect_ro
@@ -702,6 +703,36 @@ r.finish()
 """
 
 
+VISIBLE = ("[...app.charts.values()].filter((c) => { const r = c.el.getBoundingClientRect(); "
+           "return r.bottom > 0 && r.top < innerHeight && r.width; })")
+
+
+def failing_blocks_smoke(page: Page, url: str) -> bool:
+    """Whether, while the server refuses block requests, the charts and the status say why and the requests back off,
+    and the charts draw once it answers again."""
+    error, asked, t0 = "internal error: OSError(24, 'Too many open files')", list[float](), time.monotonic()
+
+    def refuse(route: Route) -> None:
+        asked.append(time.monotonic() - t0)
+        route.fulfill(status=500, content_type="application/json", body=json.dumps({"error": error}))
+
+    page.route("**/api/buckets", refuse)
+    try:
+        page.goto(f"{url}/?failing#path=sweep")
+        page.wait_for_function(f"window.app && {VISIBLE}.length && {VISIBLE}.every((c) => app.data.failure(c.key))", timeout=30000)
+        page.wait_for_timeout(5000)
+        said: list[list[Any]] = page.evaluate(f"{VISIBLE}.map((c) => [!!c.view, c.emptyText()])")
+        status = page.inner_text("#status")
+    finally:
+        page.unroute("**/api/buckets")
+    page.wait_for_function(f"{VISIBLE}.every((c) => c.view) && !app.data.failed.size", timeout=40000)
+    recovered = page.inner_text("#status")
+    print(f"failing blocks: {len(asked)} requests in {asked[-1]:.1f} s ({', '.join(f'{t:.1f}' for t in asked)}); charts said "
+          f"{sorted({t for _, t in said})}; status {status!r}; after the server answered again {recovered!r}")
+    return (bool(said) and all(s == [False, f"failed to load: {error}"] for s in said) and status.endswith(f"failing: {error}")
+            and len(asked) <= 30 and "failing" not in recovered)
+
+
 def filter_smoke(page: Page, url: str) -> bool:
     """Whether the filter box keeps the runs a WHERE clause or a name search selects, marks a clause that does not
     parse while filtering nothing, and completes fields, a field's values (with counts) and and / or from the keyboard."""
@@ -965,6 +996,7 @@ def main() -> None:
             ok &= check("binned_smoke", binned_smoke(page, url, runs))
             ok &= check("hidden_extent_smoke", hidden_extent_smoke(page, url, runs))
             ok &= check("line_pixels_smoke", line_pixels_smoke(page, url))
+            ok &= check("failing_blocks_smoke", failing_blocks_smoke(page, url))
             writer = subprocess.Popen([sys.executable, "-c", LIVE_WRITER, str(runs)])
             deadline = time.time() + 20
             while not (runs / "live").exists() and time.time() < deadline:

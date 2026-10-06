@@ -34,6 +34,8 @@ const RUNS_PER_REQUEST = 2000; // run ids one request names
 const REBUILD_SLICE_MS = 8; // column rebuilds per task, in ms...
 const REBUILD_WHOLE_MS = 32; // ...or up to this to finish a metric's, so its chart draws them all at once
 const PREFETCH_IDLE_MS = 50; // quiet time before fetching ahead
+const RETRY_MS = 1000; // a block whose request failed is asked for again after this, twice as long after each failure...
+const RETRY_MAX_MS = 30000; // ...up to this
 export const LINE_PX_PER_BUCKET = 2; // chart width per bucket a line needs
 export const DENSITY_PX_PER_BUCKET = 8; // the same in a density heatmap or group statistics of many runs
 const NO_TAIL = Object.freeze({ s: [], v: [], t: [], q: [], n: 0 });
@@ -56,6 +58,8 @@ const blockId = (key, level, index) => `${key}|${level}|${index}`;
 
 /** What request x asks for: its block, and its runs or the scope's. */
 const askId = (x) => `${blockId(x.key, x.level, x.index)}|${x.runs === null ? "" : x.runs.map((r) => r.id).join("\0")}`;
+/** Whether failed request record f (of `Data.failed`) covers run r: it named r, or asked for the scope's finished runs. */
+const failedFor = (f, r) => f.runs.has(r.id) || (f.runs.has("") && r.meta.state !== "running");
 
 /** The blocks of `level` covering steps [lo, hi]: {level, indices}. */
 function covering(level, lo, hi) {
@@ -91,7 +95,7 @@ export async function getJSON(url) {
 
 export class Data {
   constructor(ui) {
-    this.ui = ui; // {runs(), data(keys, streamed), keys(), media(key), status(text), conn(live), idle(), ahead(), protocol(server's)}
+    this.ui = ui; // {runs(), data(keys, streamed), keys(), media(key), status(text), conn(live), idle(), ahead(), protocol(server's), replan()}
     this.info = null; // /api/info of what the page shows
     this.gen = 0; // bumped by `close`; work begun under an older generation is dropped
     this.version = 0; // bumped whenever runs, their metadata, blocks or rows change
@@ -115,6 +119,8 @@ export class Data {
     this.charts = new Map(); // metric -> {want ({coarse, fine} layers), ready (the layers shown), runs, many} of the last plan
     this.queue = []; // requests to send: {key, level, index, runs (null: the scope's finished runs)}
     this.inflight = new Map(); // blockId -> {scope (asked for the scope's finished runs), runs (ids asked for), n (requests)}
+    this.failed = new Map(); // blockId -> {runs (ids whose request failed, "" the scope's finished runs), n (failures), until (when due again), error}
+    this.retryT = 0;
     this.posts = 0; // requests in flight for plans
     this.planBlocks = 0; // blocks they ask for
     this.aheadPosts = 0; // requests in flight fetching ahead
@@ -146,6 +152,8 @@ export class Data {
     this.folders = {};
     this.queue = [];
     this.inflight.clear();
+    this.failed.clear();
+    clearTimeout(this.retryT);
     this.aheadAsked.clear();
     for (const a of this.arrays.values()) freeStore(a.loc);
     this.arrays.clear();
@@ -293,12 +301,14 @@ export class Data {
   }
 
   /** Queue requests for block (key, level, index) of the runs of `runs` that lack it, or hold a running run's buckets
-   * older than its compiled ones: the scope's finished runs in one request when many lack it, by run ids otherwise. */
+   * older than its compiled ones, and whose request for it is not failing: the scope's finished runs in one request when
+   * many lack it, by run ids otherwise. */
   need(key, level, index, runs, queue, touch = true) {
     const id = blockId(key, level, index), have = this.blocks.get(id), asked = this.inflight.get(id);
     if (have && touch) have.used = performance.now();
+    const failed = this.failed.get(id), backoff = failed && performance.now() < failed.until ? failed : null;
     const missing = runs.filter((r) => !this.current(have?.runs.get(r.id), r) && !asked?.runs.has(r.id)
-                                       && !(asked?.scope && r.meta.state !== "running"));
+                                       && !(asked?.scope && r.meta.state !== "running") && !(backoff && failedFor(backoff, r)));
     const finished = missing.filter((r) => r.meta.state !== "running");
     const scope = finished.length >= SCOPE_MIN && finished.length * SCOPE_SHARE >= runs.length;
     if (scope) queue.push({ key, level, index, runs: null });
@@ -311,12 +321,13 @@ export class Data {
     return !!e && e.a.seq[e.row] >= r.meta.compiled;
   }
 
-  /** Whether every block of `layers` holds every run of `runs` (any version of a running one's). */
+  /** Whether every block of `layers` holds every run of `runs` (any version of a running one's) but those whose request
+   * for it failed, so a chart shows the runs that came. */
   complete(key, layers, runs) {
     for (const L of [layers.coarse, layers.fine]) {
       for (const index of L ? L.indices : []) {
-        const b = this.blocks.get(blockId(key, L.level, index));
-        if (!b || runs.some((r) => !b.runs.has(r.id))) return false;
+        const id = blockId(key, L.level, index), b = this.blocks.get(id), failed = this.failed.get(id);
+        if (runs.some((r) => !b?.runs.has(r.id) && !(failed && failedFor(failed, r)))) return false;
       }
     }
     return true;
@@ -490,15 +501,86 @@ export class Data {
   /** Request the blocks of `batch` ([x, its record]) in one request and take their answers in: the charts they complete
    * show their new layers. */
   async send(batch) {
-    const gen = this.gen;
+    const gen = this.gen, xs = batch.map(([x]) => x);
     try {
-      const got = await this.fetchMany(batch.map(([x]) => x));
-      if (gen !== this.gen) return;
-      batch.forEach(([x], i) => got[i] && this.take(x, got[i]));
+      const got = await this.answers(xs, gen);
+      if (!got || gen !== this.gen) return;
+      xs.forEach((x, i) => {
+        this.answered(x);
+        if (got[i]) this.take(x, got[i]);
+      });
       this.flush();
+      if (!this.busy) this.ui.status(this.summary());
     } finally {
       for (const [x, asked] of batch) if (--asked.n === 0) this.inflight.delete(blockId(x.key, x.level, x.index));
     }
+  }
+
+  /** The answers of requests xs (`fetchMany`), or null when the request failed (`fail`). */
+  async answers(xs, gen) {
+    try {
+      return await this.fetchMany(xs);
+    } catch (e) {
+      if (gen === this.gen) this.fail(xs, e instanceof Error ? e.message : String(e));
+      return null;
+    }
+  }
+
+  /** Requests xs failed with `error`: the runs they named are asked for again once their block is due (RETRY_MS, twice
+   * as long after each further failure, at most RETRY_MAX_MS), and meanwhile their charts show the runs that came. */
+  fail(xs, error) {
+    console.warn("block fetch failed", error);
+    const now = performance.now();
+    for (const x of xs) {
+      const id = blockId(x.key, x.level, x.index), f = this.failed.get(id) ?? { runs: new Set(), n: 0, until: 0, error };
+      f.n++;
+      f.until = now + Math.min(RETRY_MAX_MS, RETRY_MS * 2 ** (f.n - 1));
+      f.error = error;
+      for (const run of x.runs ? x.runs.map((r) => r.id) : [""]) f.runs.add(run);
+      this.failed.set(id, f);
+      this.aheadAsked.delete(askId(x)); // fetched ahead again once due
+      const ch = this.charts.get(x.key);
+      if (ch) this.settleChart(x.key, ch);
+      this.touched.add(x.key);
+    }
+    this.flush();
+    this.retrySoon();
+    if (!this.busy) this.ui.status(this.summary());
+  }
+
+  /** Request x was answered: the runs it named are no longer failing for its block. */
+  answered(x) {
+    const id = blockId(x.key, x.level, x.index), f = this.failed.get(id);
+    if (!f) return;
+    for (const r of x.runs ?? []) f.runs.delete(r.id);
+    if (x.runs === null) f.runs.delete("");
+    if (!f.runs.size) this.failed.delete(id);
+  }
+
+  /** Plan again whenever a failed block falls due; one already due is asked for by the next plan that wants it. */
+  retrySoon() {
+    clearTimeout(this.retryT);
+    const now = performance.now();
+    let due = Infinity;
+    for (const f of this.failed.values()) if (f.until > now) due = Math.min(due, f.until);
+    if (due === Infinity) return;
+    this.retryT = setTimeout(() => {
+      this.planned = null;
+      this.ui.replan?.();
+      this.retrySoon();
+    }, due - now);
+  }
+
+  /** The error of a failing request for a block chart `key` wants, or null. */
+  failure(key) {
+    const want = this.charts.get(key)?.want;
+    for (const L of want ? [want.coarse, want.fine] : []) {
+      for (const index of L ? L.indices : []) {
+        const f = this.failed.get(blockId(key, L.level, index));
+        if (f) return f.error;
+      }
+    }
+    return null;
   }
 
   /** Keep answer `got` of request x: its chart shows the layers it completes, and when it shows this block, the
@@ -512,14 +594,14 @@ export class Data {
     this.touched.add(x.key);
   }
 
-  /** The answers of requests `xs`, null for a block not answered, fetched by a worker. */
+  /** The answers of requests `xs`, null for a block not answered, fetched by a worker; throws when the request fails. */
   async fetchMany(xs) {
     const url = new URL(`${BASE}/api/buckets`, typeof location === "undefined" ? "http://localhost/" : location.href).href;
     const blocks = xs.map((x) => (x.runs === null ? { key: x.key, level: x.level, index: x.index, scope: this.scope, which: "finished" }
       : { key: x.key, level: x.level, index: x.index, runs: x.runs.map((r) => r.id) }));
     const body = JSON.stringify({ blocks });
     const got = await fetchArraysOnWorker(url, body);
-    if (got.error) console.warn("block fetch failed", got.error);
+    if (got.error || got.status !== 200) throw new Error(got.error || `status ${got.status}`);
     this.stats.blocks += got.arrays.filter(Boolean).length;
     this.stats.bytes += got.bytes;
     return xs.map((_, i) => got.arrays[i] || null);
@@ -629,8 +711,9 @@ export class Data {
   }
 
   summary() {
-    const s = this.stats;
-    return `${this.runs.size} runs · ${s.blocks} blocks fetched (${(s.bytes / 1e6).toFixed(1)} MB)`;
+    const s = this.stats, text = `${this.runs.size} runs · ${s.blocks} blocks fetched (${(s.bytes / 1e6).toFixed(1)} MB)`;
+    const failing = [...this.failed.values()];
+    return failing.length ? `${text} · ${failing.length} failing: ${failing.at(-1).error}` : text;
   }
 
   // ---- columns ----

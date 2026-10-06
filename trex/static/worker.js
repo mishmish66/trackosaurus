@@ -40,7 +40,7 @@ const floats = (chunk, gen, off) => copies.get(`${chunk}:${gen}`).get(off);
 async function fetchArrays(m) {
   try {
     const res = await fetch(m.url, { method: "POST", body: m.body });
-    if (!res.ok) return postMessage({ job: m.job, status: res.status, arrays: [], bytes: 0 });
+    if (!res.ok) return postMessage({ job: m.job, status: res.status, arrays: [], bytes: 0, error: await errorOf(res) });
     const all = await readBody(res), arrays = [], moved = [];
     for (const { off, len } of unframe(all)) {
       const buf = len ? new ArrayBuffer(Math.ceil(len / 8) * 8) : null;
@@ -51,6 +51,12 @@ async function fetchArrays(m) {
   } catch (e) {
     postMessage({ job: m.job, status: 0, arrays: [], bytes: 0, error: String(e) });
   }
+}
+
+/** What a failed answer says: the error its JSON body states, else its status. */
+async function errorOf(res) {
+  const j = await res.json().catch(() => null);
+  return j?.error ?? `${res.status} ${res.statusText}`.trim();
 }
 
 /** The body of `res`, read as it streams in when its length is known ahead (an uncompressed answer; far faster than

@@ -812,9 +812,17 @@ export class Chart {
     const css = getComputedStyle(document.documentElement);
     ctx.font = "10px system-ui, sans-serif";
     ctx.fillStyle = css.getPropertyValue("--muted");
-    if (!view) return ctx.fillText(renderer() ? "no data" : "charts need WebGL2", MARGIN.l + 4, MARGIN.t + 14);
+    if (!view) return ctx.fillText(this.emptyText(), MARGIN.l + 4, MARGIN.t + 14);
     this.drawAxes(ctx, view, css.getPropertyValue("--grid"));
     this.drawGL(ctx, view);
+  }
+
+  /** Why the chart shows nothing: its blocks are on their way or failed, or its runs have no data in view. */
+  emptyText() {
+    if (!renderer()) return "charts need WebGL2";
+    const data = this.app.data, error = data.failure(this.key);
+    if (error) return `failed to load: ${error}`;
+    return data.charts.get(this.key)?.ready && !data.pending(this.key) ? "no data" : "loading…";
   }
 
   /** Grid lines and tick labels. */

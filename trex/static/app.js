@@ -425,6 +425,7 @@ class App {
       idle: () => this.nextFrame(),
       ahead: () => this.aheadOf(),
       protocol: (n) => this.showProtocol(n),
+      replan: () => this.replan(true),
       conn: (live) => {
         $("#conn").className = live ? "live" : "down";
         $("#conn").title = live ? "streaming" : "stream disconnected, retrying";

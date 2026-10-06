@@ -5,6 +5,8 @@ import os
 import shutil
 import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -585,6 +587,64 @@ def test_a_metric_saves_its_levels_at_most_once_every_levels_save_every(root: Pa
     assert block(ex, "loss", level, 0, "a", which="finished").paths == ["a/r1", "a/r2"]
     time.sleep(0.5)
     assert saved_levels(ex) == [d.name] and {f.name: f.read_bytes() for f in d.iterdir()} == before
+
+
+def four_metrics(i: int) -> dict[str, float]:
+    return {f"m{k}": float(i * k) for k in range(4)}
+
+
+def saved_explorer(root: Path, tmp_path: Path) -> tuple[Explorer, dict[tuple[str, int], bytes]]:
+    """A new Explorer over runs of four metrics whose levels an earlier one saved, and each saved level's first block
+    as the earlier one answered it."""
+    for name in ("a/r1", "a/r2"):
+        write_run(root / name, 3000, metrics=four_metrics)
+    ex = explorer(root, tmp_path)
+    top = top_of(ex, "a/r1", "m1").level
+    want = {(f"m{k}", lv): ex.buckets_body(f"m{k}", lv, 0, "", None, "finished") for k in range(4) for lv in range(top, top + 4)}
+    assert wait_for(lambda: len(saved_levels(ex)) == 4)
+    ex.close()
+    return explorer(root, tmp_path), want
+
+
+def open_npy() -> int:
+    """The `.npy` files this process holds open."""
+    fds = Path("/proc/self/fd")
+    return sum(1 for f in fds.iterdir() if os.path.realpath(f).endswith(".npy")) if fds.exists() else 0
+
+
+def test_a_memo_drops_the_least_recently_used_beyond_its_maps() -> None:
+    memo = trex_index.Memo(limit=1 << 20, maps=12)
+    for k in "abc":
+        memo.get((k,), 0, lambda: (k, 1), maps=6)
+    memo.get(("plain",), 0, lambda: ("plain", 1))
+    assert list(memo.items) == [("b",), ("c",), ("plain",)] and memo.maps == 12
+
+
+def test_the_saved_levels_an_explorer_keeps_hold_open_files_only_within_its_share(root: Path, tmp_path: Path,
+                                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(trex_index, "MEMO_MAPS", 2 * len(bk.COLUMNS))
+    again, want = saved_explorer(root, tmp_path)
+    before = open_npy()
+    assert {k: again.buckets_body(k[0], k[1], 0, "", None, "finished") for k in want} == want
+    assert 0 < again._memo.maps <= 2 * len(bk.COLUMNS)
+    assert open_npy() - before <= (0 if sys.version_info >= (3, 13) else again._memo.maps)
+
+
+def test_a_saved_level_deleted_after_it_was_listed_is_merged_instead(root: Path, tmp_path: Path) -> None:
+    again, want = saved_explorer(root, tmp_path)
+    saved = again._saved("m2")
+    assert saved is not None and saved.levels
+    shutil.rmtree(saved.dir)
+    assert {k: again.buckets_body(k[0], k[1], 0, "", None, "finished") for k in want if k[0] == "m2"} == \
+        {k: v for k, v in want.items() if k[0] == "m2"}
+
+
+def test_open_files_raises_the_soft_limit_to_the_hard_limit() -> None:
+    code = ("import resource; from trex import index; hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]; "
+            "resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard)); "
+            "print(index.open_files(), *resource.getrlimit(resource.RLIMIT_NOFILE))")
+    raised, soft, hard = map(int, subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.split())
+    assert raised == soft == hard
 
 
 def test_saved_levels_beyond_their_budget_go_least_recently_used_first(tmp_path: Path) -> None:

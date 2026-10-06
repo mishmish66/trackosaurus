@@ -212,3 +212,64 @@ test("columns queued behind one whose rebuild throws are still rebuilt", async (
   }
   assert.deepEqual([errors, built, d.pending("loss"), d.rebuilding], [["bad column"], ["r1"], false, false]);
 });
+
+/** fn's result, with console.warn silenced (a failed request warns). */
+async function quietly(fn) {
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    return await fn();
+  } finally {
+    console.warn = warn;
+  }
+}
+
+test("a block whose request failed is asked for again only once it is due, twice as late after each failure", () => quietly(async () => {
+  const { d, runs } = withRuns(2), sent = [];
+  d.fetchMany = async (xs) => {
+    sent.push(xs.map((x) => x.runs.map((r) => r.id)));
+    throw new Error("internal error: OSError(24, 'Too many open files')");
+  };
+  const ask = async () => {
+    const before = performance.now();
+    d.need("loss", 0, 0, runs, d.queue);
+    d.pump();
+    await tasks();
+    return [before, performance.now()];
+  };
+  const [t0, t1] = await ask(), f = d.failed.get("loss|0|0");
+  assert.ok(f.until >= t0 + 1000 && f.until <= t1 + 1000);
+  await ask();
+  assert.equal(sent.length, 1);
+  f.until = performance.now();
+  const [t2, t3] = await ask();
+  assert.deepEqual([sent, f.n, f.error], [[[["r0", "r1"]], [["r0", "r1"]]], 2, "internal error: OSError(24, 'Too many open files')"]);
+  assert.ok(f.until >= t2 + 2000 && f.until <= t3 + 2000);
+  d.close();
+}));
+
+test("a chart shows the runs that came while the others' requests fail, and says why until they come", () => quietly(() => {
+  const { d, runs } = withRuns(2);
+  d.plan([demandOf(runs)]);
+  const ch = d.charts.get("loss"), { level, indices } = ch.want.coarse, asks = indices.map((index) => ({ key: "loss", level, index, runs: [runs[1]] }));
+  for (const index of indices) d.addArray({ key: "loss", level, index }, emptyArray(level, index, ["r0"], [10]));
+  d.settleChart("loss", ch);
+  assert.deepEqual([ch.ready, d.failure("loss")], [null, null]);
+  d.fail(asks, "boom");
+  assert.deepEqual([ch.ready, d.failure("loss")], [ch.want, "boom"]);
+  assert.match(d.summary(), new RegExp(`· ${indices.length} failing: boom$`));
+  for (const x of asks) d.answered(x);
+  assert.deepEqual([d.failure("loss"), d.failed.size, d.summary().includes("failing")], [null, 0, false]);
+  d.close();
+}));
+
+test("the UI is asked to plan again once a failed block is due", async () => {
+  let replans = 0;
+  const d = new Data({ ...UI, replan: () => replans++ });
+  d.planned = "the last plan";
+  d.failed.set("loss|0|0", { runs: new Set(["r0"]), n: 1, until: performance.now() + 5, error: "boom" });
+  d.retrySoon();
+  assert.equal(replans, 0);
+  for (let waited = 0; !replans && waited < 2000; waited += 5) await tasks();
+  assert.deepEqual([replans, d.planned], [1, null]);
+});

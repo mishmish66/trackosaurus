@@ -147,7 +147,10 @@ have)` is the other direction: what a mirror holding `have` of a run lacks.
   `TREX_LEVELS_MB` (least recently used deleted). A later Explorer whose finished runs and their `compiled` and `ver`
   are the same (`Finished.sig`) maps them instead of merging again.
 - **In memory**: `Explorer._memo` (`Memo`, `MEMO_BYTES`) holds stacks, merged levels and a folder's finished-run block
-  answers until those runs change (`_gens`); `/api/runs` answers are kept until what the index holds changes.
+  answers until those runs change (`_gens`), and at most `MEMO_MAPS` memory maps of saved levels; `/api/runs` answers
+  are kept until what the index holds changes. A saved level is mapped without holding its file open (`index.mapped`;
+  before Python 3.13, where each map holds a descriptor, an Explorer keeps maps of at most 1/`MAPS_PER_FILES` of the
+  open-file limit), and an Explorer raises the process's soft open-file limit to the hard one (`open_files`).
 - **Media files**: a crawled run's are its own `media/` files; a pulled directory's are copied into `<index
   dir>/media/`, named by their contents, so one copy serves every run.
 - **Node state** (`$TREX_DAEMON_DIR`): `node.json` (`Identity`: id, name), `roots.json` (`Saved`: tracked directories,
@@ -237,7 +240,11 @@ event. Every run gets a `dir` field: its member's name.
   Requests go out in batches of at most `BATCH_BLOCKS` blocks, spread over the free request slots (`Data.pump`), the
   chart last pressed first (`App.lead`).
 - **The store**: answers fill one store, `Data.blocks` (block -> run -> its row of a bucket array); a chart shows its
-  wanted layers once every block holds every run, and keeps showing the previous ones until then. A run drawn as a line
+  wanted layers once every block holds every run but those whose request failed, and keeps showing the previous ones
+  until then. A failed request (`Data.fail`) is asked for again once due, `RETRY_MS` after its block's first failure and
+  twice as long after each further one, up to `RETRY_MAX_MS` (`Data.need` skips it until then, `Data.retrySoon` plans
+  again when it falls due); a chart showing nothing says why (`Chart.emptyText`: loading, the server's error, or no
+  data), and the status counts the failing blocks. A run drawn as a line
   has a column (`kernel.buildColumn`): its buckets in the shown blocks, a finer level's where its blocks lie and the
   coarse level's elsewhere (in step order without sorting: the finer blocks, when they join into one range, replace
   the coarse buckets inside it, `emitBuckets`), then the streamed rows those blocks do not hold, bucketed as the server

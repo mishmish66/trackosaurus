@@ -13,9 +13,11 @@ import hashlib
 import itertools
 import json
 import math
+import mmap
 import multiprocessing
 import os
 import queue
+import resource
 import shutil
 import signal
 import sqlite3
@@ -360,6 +362,8 @@ class Origin(Protocol):
 CACHE_VERSION: Final = 15  # bump whenever what the index stores changes; older caches are rebuilt
 CLOSE_WAIT: Final = 5.0  # longest `close` waits for a pass in progress
 MEMO_BYTES = 1 << 30  # stacks, merged levels and answers an Explorer keeps in memory, least recently used dropped
+MEMO_MAPS: Final = 2048  # memory maps of saved levels an Explorer keeps (Linux allows a process 65530 maps by default)
+MAPS_PER_FILES: Final = 32  # before Python 3.13 each map holds a file descriptor: an Explorer then keeps at most 1/32 of the limit
 LEVELS_BYTES = int(os.environ.get("TREX_LEVELS_MB", "4096")) << 20  # saved merged levels an index keeps, least recently used deleted
 LEVELS_SAVE_EVERY = 60.0  # seconds between saves of one metric's merged levels
 LEVELS_AHEAD: Final = 3  # levels above a metric's coarsest top level merged and saved ahead of requests
@@ -533,19 +537,35 @@ class Finished:
     sig: bytes
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class Saved:
+    """A metric's merged levels an Explorer saved for its finished runs (`Explorer._save_levels`): their directory,
+    each run's top level, and the levels it holds."""
+
+    dir: Path
+    tops: npt.NDArray[np.int8]
+    levels: frozenset[int]
+
+    def level(self, level: int) -> tuple[Buckets, int]:
+        """The buckets of `level`, memory-mapped (`mapped`), and the bytes a memo counts them as (their run column's)."""
+        b = Buckets(*(mapped(self.dir / f"L{level}-{name}.npy") for name in bk.COLUMNS))
+        return b, b.run.nbytes
+
+
 class Memo:
     """Values kept under keys while their generation stays the same, the least recently used dropped beyond `limit`
-    bytes; a value is built by one thread while others asking for it wait."""
+    bytes or `maps` memory maps; a value is built by one thread while others asking for it wait."""
 
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self.items: OrderedDict[tuple[object, ...], tuple[int, object, int]] = OrderedDict()  # key -> (gen, value, bytes)
-        self.bytes = 0
+    def __init__(self, limit: int, maps: int = MEMO_MAPS) -> None:
+        self.limit, self.max_maps = limit, maps
+        self.items: OrderedDict[tuple[object, ...], tuple[int, object, int, int]] = OrderedDict()  # key -> (gen, value, bytes, maps)
+        self.bytes = self.maps = 0
         self.lock = threading.Lock()
         self.building: dict[tuple[object, ...], threading.Lock] = {}
 
-    def get[T](self, k: tuple[object, ...], gen: int, build: Callable[[], tuple[T, int]]) -> T:
-        """The value kept under `k` at generation `gen`, else the value of build() (value, bytes), kept."""
+    def get[T](self, k: tuple[object, ...], gen: int, build: Callable[[], tuple[T, int]], maps: int = 0) -> T:
+        """The value kept under `k` at generation `gen`, else the value of build() (value, bytes), kept; a built value
+        holds `maps` memory maps."""
         hit = self._hit(k, gen)
         if hit is None:
             with self.lock:
@@ -555,7 +575,7 @@ class Memo:
                     hit = self._hit(k, gen)
                     if hit is None:
                         value, nbytes = build()
-                        self._put(k, gen, value, nbytes)
+                        self._put(k, gen, value, nbytes, maps)
                         hit = (value,)
             finally:
                 with self.lock:
@@ -570,17 +590,58 @@ class Memo:
             self.items.move_to_end(k)
             return (item[1],)
 
-    def _put(self, k: tuple[object, ...], gen: int, value: object, nbytes: int) -> None:
+    def _put(self, k: tuple[object, ...], gen: int, value: object, nbytes: int, maps: int) -> None:
         with self.lock:
             old = self.items.pop(k, None)
             self.bytes += nbytes - (old[2] if old else 0)
-            self.items[k] = (gen, value, nbytes)
-            while self.bytes > self.limit and len(self.items) > 1:
-                self.bytes -= self.items.popitem(last=False)[1][2]
+            self.maps += maps - (old[3] if old else 0)
+            self.items[k] = (gen, value, nbytes, maps)
+            while (self.bytes > self.limit or self.maps > self.max_maps) and len(self.items) > 1:
+                _, _, dropped, dropped_maps = self.items.popitem(last=False)[1]
+                self.bytes -= dropped
+                self.maps -= dropped_maps
 
 
 def _sized(body: bytes) -> tuple[bytes, int]:
     return body, len(body)
+
+
+def mapped(path: Path) -> npt.NDArray[Any]:
+    """The array a `.npy` file holds, memory-mapped read-only; from Python 3.13 without holding the file open, so that
+    the maps an Explorer keeps take no file descriptors."""
+    if sys.version_info < (3, 13):
+        return np.load(path, mmap_mode="r")
+    with open(path, "rb") as f:
+        version = np.lib.format.read_magic(f)
+        read = np.lib.format.read_array_header_2_0 if version == (2, 0) else np.lib.format.read_array_header_1_0
+        shape, fortran, dtype = read(f)
+        m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ, trackfd=False)
+        start = f.tell()
+    return np.frombuffer(m, dtype, math.prod(shape), start).reshape(shape, order="F" if fortran else "C")
+
+
+@functools.cache
+def open_files() -> int:
+    """This process's limit on open files (2^20 standing for none), raised once to its hard limit, or as far toward it
+    as the system allows (macOS refuses more than kern.maxfilesperproc)."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY:
+        return 1 << 20
+    cap = math.inf if hard == resource.RLIM_INFINITY else hard
+    for want in sorted({hard, 1 << 20, 1 << 16, 10240}, reverse=True):
+        if soft < want <= cap:
+            with contextlib.suppress(ValueError, OSError):
+                resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+                return want
+    return soft
+
+
+def _memo_maps() -> int:
+    """The memory maps an Explorer's memo keeps: MEMO_MAPS; before Python 3.13, where each holds a file descriptor, at
+    most 1/MAPS_PER_FILES of the open-file limit."""
+    if sys.version_info < (3, 13):
+        return min(MEMO_MAPS, open_files() // MAPS_PER_FILES)
+    return MEMO_MAPS
 
 
 # ---- stored blocks: read and joined by the asking thread, or by a block worker ----
@@ -821,7 +882,8 @@ class Explorer:
         self._closed = False
         self.ready = threading.Event()
         self._gens: dict[str, int] = {}  # metric -> bumped whenever its finished runs, or their levels, change
-        self._memo = Memo(MEMO_BYTES)  # stacks, merged levels, block answers and `runs` answers
+        open_files()  # raised to the hard limit
+        self._memo = Memo(MEMO_BYTES, _memo_maps())  # stacks, merged levels, block answers and `runs` answers
         self._saved_at: dict[str, float] = {}  # metric -> when its merged levels were last saved (monotonic)
         self._view_gen = 0  # bumped whenever what `runs` answers may change
         origin.attach(self)
@@ -1221,7 +1283,7 @@ class Explorer:
         saved = self._saved(key)
         if saved is not None:
             fin = self._finished(key)
-            return fin.paths, np.load(saved / "levels.npy", mmap_mode="r"), fin.seq
+            return fin.paths, saved.tops, fin.seq
         st = self._stack(key)
         return st.paths, st.level, st.seq
 
@@ -1231,15 +1293,15 @@ class Explorer:
                               lambda: ({p: i for i, p in enumerate(self._finished(key).paths)}, 0))
 
     def _level(self, key: str, level: int) -> Buckets:
-        """The buckets of every finished run of `key` whose top level is `level` or finer, merged to `level` (on
-        threads); kept as stacks are."""
-        return self._memo.get(("level", key, level), self._gens.get(key, 0), lambda: self._merge_level(key, level))
+        """The buckets of every finished run of `key` whose top level is `level` or finer, merged to `level`: mapped from
+        the levels saved for them when those hold it, else merged (on threads); kept as stacks are."""
+        gen, saved = self._gens.get(key, 0), self._saved(key)
+        if saved is not None and level in saved.levels:
+            with contextlib.suppress(OSError):  # deleted since it was listed: merged instead
+                return self._memo.get(("level", key, level), gen, lambda: saved.level(level), maps=len(bk.COLUMNS))
+        return self._memo.get(("level", key, level), gen, lambda: self._merge_level(key, level))
 
     def _merge_level(self, key: str, level: int) -> tuple[Buckets, int]:
-        saved = self._saved(key)
-        if saved is not None and (saved / f"L{level}-run.npy").exists():
-            part = Buckets(*(np.load(saved / f"L{level}-{name}.npy", mmap_mode="r") for name in bk.COLUMNS))
-            return part, part.run.nbytes
         st = self._stack(key)
         part = self._merged(st, level, st.level <= level)
         return part, part.nbytes
@@ -1310,18 +1372,20 @@ class Explorer:
     def _levels_dir(self, key: str, sig: bytes) -> Path:
         return self.cache_dir / "levels" / f"{hashlib.sha1(key.encode()).hexdigest()[:20]}-{sig.hex()[:20]}"
 
-    def _saved(self, key: str) -> Path | None:
-        """The directory of the merged levels of `key` an earlier build saved (`_save_levels`) for its finished runs and
-        their levels as they are."""
+    def _saved(self, key: str) -> Saved | None:
+        """The merged levels of `key` an earlier build saved (`_save_levels`) for its finished runs and their levels as
+        they are."""
         return self._memo.get(("saved", key), self._gens.get(key, 0), lambda: (self._open_saved(key), 0))
 
-    def _open_saved(self, key: str) -> Path | None:
+    def _open_saved(self, key: str) -> Saved | None:
         d = self._levels_dir(key, self._finished(key).sig)
         try:
             os.utime(d / "levels.npy")
-            return d
-        except OSError:
+            tops = np.load(d / "levels.npy")
+            levels = frozenset(int(f.name.removeprefix("L").removesuffix("-run.npy")) for f in d.glob("L*-run.npy"))
+        except (OSError, ValueError):
             return None
+        return Saved(d, tops, levels)
 
     def _save_levels(self, key: str, sig: bytes, st: Stack, parts: Mapping[int, Buckets]) -> None:
         """Write merged levels of `key` beside the index as numpy arrays (`.npy`, memory-mapped when read): each run's
