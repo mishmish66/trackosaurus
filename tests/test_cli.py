@@ -420,6 +420,7 @@ def test_systemd_unit_runs_this_trex_and_restarts_it_after_an_update(capsys: pyt
 
 def test_systemd_unit_updates_from_the_trex_repository_by_default(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TREX_SOURCE", raising=False)
+    monkeypatch.setattr(update, "RUNNING", update.Install("0.1.0", None))
     main(["systemd-unit"])
     assert f"Environment=TREX_SOURCE={update.DEFAULT_SOURCE}" in capsys.readouterr().out.split("[Unit]")[1].splitlines()
 
@@ -448,6 +449,7 @@ def test_launchd_plist_runs_this_trex_and_restarts_it_after_an_update(capsys: py
 
 def test_launchd_plist_updates_from_the_trex_repository_by_default(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TREX_SOURCE", raising=False)
+    monkeypatch.setattr(update, "RUNNING", update.Install("0.1.0", None))
     main(["launchd-plist"])
     assert plistlib.loads(capsys.readouterr().out.encode())["EnvironmentVariables"]["TREX_SOURCE"] == update.DEFAULT_SOURCE
 
@@ -489,8 +491,19 @@ def test_runit_service_runs_this_trex_as_you_and_runsv_starts_it_again_after_an_
 def test_runit_service_updates_from_the_trex_repository_by_default(capsys: pytest.CaptureFixture[str], tmp_path: Path,
                                                                    monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TREX_SOURCE", raising=False)
+    monkeypatch.setattr(update, "RUNNING", update.Install("0.1.0", None))
     main(["runit-service"])
     assert runit_env(capsys.readouterr().out, tmp_path)["TREX_SOURCE"] == update.DEFAULT_SOURCE
+
+
+def test_service_files_update_from_the_git_branch_this_trex_was_installed_from(capsys: pytest.CaptureFixture[str], tmp_path: Path,
+                                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TREX_SOURCE", raising=False)
+    monkeypatch.setattr(update, "RUNNING", update.Install("0.1.0", "abc123", "git+https://example.org/trex.git@mesh"))
+    main(["runit-service"])
+    assert runit_env(capsys.readouterr().out, tmp_path)["TREX_SOURCE"] == "git+https://example.org/trex.git@mesh"
+    main(["systemd-unit"])
+    assert "Environment=TREX_SOURCE=git+https://example.org/trex.git@mesh" in capsys.readouterr().out.splitlines()
 
 
 def test_runit_service_with_an_empty_source_has_no_update_source(capsys: pytest.CaptureFixture[str], tmp_path: Path,

@@ -24,10 +24,13 @@ def fake_env(prefix: Path, version: str = "0.1.0", direct: dict[str, JSONValue] 
     return prefix
 
 
-def test_installed_version_and_commit_come_from_the_environment(tmp_path: Path) -> None:
+def test_installed_version_commit_and_source_come_from_the_environment(tmp_path: Path) -> None:
     git = fake_env(tmp_path / "git", "0.2.0", {"url": "https://x", "vcs_info": {"vcs": "git", "commit_id": "abc123"}})
+    branch = fake_env(tmp_path / "branch", direct={"url": "https://x/trex.git",
+                                                   "vcs_info": {"vcs": "git", "commit_id": "def456", "requested_revision": "mesh"}})
     editable = fake_env(tmp_path / "editable", direct={"url": "file:///src", "dir_info": {"editable": True}})
-    assert update.installed(git) == update.Install(version="0.2.0", commit="abc123")
+    assert update.installed(git) == update.Install(version="0.2.0", commit="abc123", source="git+https://x")
+    assert update.installed(branch) == update.Install(version="0.1.0", commit="def456", source="git+https://x/trex.git@mesh")
     assert update.installed(editable) == update.Install(version="0.1.0", commit=None)
     assert update.installed(tmp_path / "empty") == update.Install(version="unknown", commit=None)
 

@@ -325,8 +325,9 @@ Port = Annotated[int | None, typer.Option(help=f"Port (default the first free on
 ServicePort = Annotated[int, typer.Option(help="Port.")]
 ServiceCache = Annotated[str | None, typer.Option(help="Cache directory (default ~/.cache/trex).")]
 ServiceSource = Annotated[str | None, typer.Option(envvar="TREX_SOURCE", show_envvar=False,
-                          help="What the UI's update button installs (default $TREX_SOURCE, else "
-                               "git+https://github.com/mishmish66/trackosaurus; '' for no update button).")]
+                          help="What the UI's update button installs (default $TREX_SOURCE, else the git source this "
+                               "trex was installed from, else git+https://github.com/mishmish66/trackosaurus; '' for no "
+                               "update button).")]
 
 
 def listen(node: Node, hosts: list[str] | None, port: int | None, allow: list[str] | None) -> list[Server]:
@@ -503,8 +504,9 @@ def service_args(hosts: list[str], allow: list[str]) -> list[str]:
 
 
 def service_source(source: str | None) -> str | None:
-    """The default repository when not given; None for ''."""
-    return update.DEFAULT_SOURCE if source is None else source or None
+    """When not given, the git source this trex was installed from (at the branch asked for), else the default
+    repository; None for ''."""
+    return (update.RUNNING.source or update.DEFAULT_SOURCE) if source is None else source or None
 
 
 def service_env(cache: str | None, source: str | None) -> dict[str, str]:
@@ -594,7 +596,7 @@ RUNIT_RUN: Final = """\
 #   trex runit-service{args} | sudo tee /etc/sv/trex/run >/dev/null && sudo chmod +x /etc/sv/trex/run
 #   sudo ln -s /usr/bin/vlogger /etc/sv/trex/log/run  # its log: syslog, tagged trex (socklog: svlogtail daemon)
 #   sudo ln -s /etc/sv/trex /var/service/
-#   sudo sv status trex  # also sv restart, sv down, sv up
+#   sudo sv status trex  # once runsvdir has found it (within 5 s); also sv restart, sv down, sv up
 # runsv starts it again whenever it exits: after a failed start (an address that is not up yet), and after an update,
 # when trex exits with {status}, on the new trex.
 exec 2>&1

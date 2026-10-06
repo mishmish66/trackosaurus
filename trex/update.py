@@ -22,10 +22,12 @@ RESTART_STATUS: Final = 75  # exit status asking the service manager to start th
 
 @dataclass(frozen=True, slots=True)
 class Install:
-    """A trex installed: its version, and the git commit for a git source."""
+    """A trex installed: its version; for a git source, its commit and the source as `uv tool install` takes it (the
+    URL, at the revision asked for)."""
 
     version: str
     commit: str | None
+    source: str | None = None
 
     def wire(self) -> dict[str, str | None]:
         return {"version": self.version, "commit": self.commit}
@@ -62,8 +64,11 @@ def installed(prefix: Path | None = None) -> Install:
     else:
         version = found.name.removeprefix("trex-").removesuffix(".dist-info")
         direct = (found / "direct_url.json").read_text() if (found / "direct_url.json").is_file() else None
-    vcs = as_dict(as_dict(json.loads(direct)).get("vcs_info")) if direct else {}
-    return Install(version, as_str(vcs.get("commit_id")))
+    info = as_dict(json.loads(direct)) if direct else {}
+    vcs = as_dict(info.get("vcs_info"))
+    kind, url, rev = as_str(vcs.get("vcs")), as_str(info.get("url")), as_str(vcs.get("requested_revision"))
+    source = f"{kind}+{url}" + (f"@{rev}" if rev else "") if kind and url else None
+    return Install(version, as_str(vcs.get("commit_id")), source)
 
 
 RUNNING: Final = installed()  # the trex this process runs, as installed when it started

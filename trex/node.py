@@ -35,8 +35,8 @@ socklog: `svlogtail daemon`):
     sudo ln -s /etc/sv/trex /var/service/
 
 The update button in the panel installs the newest trex from the `--source` given to `trex systemd-unit`,
-`trex launchd-plist` or `trex runit-service` (default this repository), and systemd, launchd or runit restarts it on
-it.
+`trex launchd-plist` or `trex runit-service` (default the git source this trex was installed from, such as a branch of
+this repository, else this repository), and systemd, launchd or runit restarts it on it.
 
 A directory given as `host:path` is crawled on that machine over ssh: the node copies this trex there and runs it
 with uvx (`trex.remote`), one for all the directories it tracks on that host, so the machine needs only uv and an ssh
