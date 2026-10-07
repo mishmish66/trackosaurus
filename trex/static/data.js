@@ -97,6 +97,9 @@ const clampLevel = (l) => Math.min(MAX_LEVEL, Math.max(MIN_LEVEL, l));
  * span crosses a power of two, as a run's top level does. */
 const levelFor = (span, buckets) => clampLevel(Math.ceil(Math.log2(Math.max(span, 2 ** MIN_LEVEL) / BLOCK)) + Math.ceil(Math.log2(BLOCK / Math.max(buckets, 1))));
 
+/** The levels a zoom into a view whose finest level is `level` would want: the two below it, of those there are. */
+const finerLevels = (level) => [level - 1, level - 2].filter((l) => l >= MIN_LEVEL);
+
 const early = new Map(); // url -> its response, requested by `preload` and not yet taken
 
 /** Request `urls` now, all at once; the next getJSON of each takes its answer. */
@@ -590,7 +593,7 @@ export class Data {
     const ready = this.charts.get(key)?.ready, out = [];
     if (!ready) return out;
     const finest = ready.fine || ready.coarse, steps = this.stepsOf(finest);
-    for (const up of [1, 2]) out.push(...this.arraysOf(key, covering(finest.level - up, ...steps)));
+    for (const level of finerLevels(finest.level)) out.push(...this.arraysOf(key, covering(level, ...steps)));
     return out;
   }
 
@@ -995,8 +998,8 @@ export class Data {
   finerAhead(d, out) {
     const runs = this.runsWith(d.runs, d.key), ready = this.charts.get(d.key)?.ready ?? this.layersOf(d, runs);
     const finest = ready.fine || ready.coarse, steps = this.stepsOf(finest);
-    for (const up of [1, 2]) {
-      const L = covering(finest.level - up, ...steps);
+    for (const level of finerLevels(finest.level)) {
+      const L = covering(level, ...steps);
       for (const index of L.indices.length <= FINE_BLOCKS ? L.indices : []) this.need(d.key, L.level, index, runs, out, false);
     }
   }

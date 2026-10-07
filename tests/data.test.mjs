@@ -185,6 +185,18 @@ test("fetching ahead asks for every chart's wanted layers before the finer level
   assert.ok(asks.some((x) => x.key === "acc" && x.level < want), "a chart not shown yet gets its finer levels too");
 });
 
+test("fetching ahead asks for no level below the lowest there is", () => {
+  const demands = [], d = new Data({ ...UI, ahead: () => demands });
+  d.fetchMany = async (xs) => xs.map(() => null);
+  // steps a millionth apart: the chart's buckets are of the lowest level already
+  const runs = Array.from({ length: 3 }, (_, i) => d.newRun({ id: `r${i}`, seq: 10, mseq: 0, compiled: 10, keys: ["loss"], summary: { _step: 1e-6 }, state: "finished" }));
+  demands.push({ key: "loss", runs, runsSig: "a", xmode: 0, zoomed: false, x0: -Infinity, x1: Infinity, pw: 600, many: false });
+  assert.equal(d.layersOf(demands[0], runs).coarse.level, -20);
+  const asks = d.nextAhead(100, Infinity);
+  assert.ok(asks.length > 0 && asks.every((x) => x.level >= -20), `levels asked for: ${[...new Set(asks.map((x) => x.level))]}`);
+  assert.deepEqual(d.zoomArrays("loss"), []);
+});
+
 /** A Data of 3 finished runs logging metrics k0..k(n-1), nothing fetched, whose UI says to fetch ahead for each metric in
  * turn; `looked` lists the metrics whose wanted layers `nextAhead` looks at, `lists` counts its calls of `ui.ahead`. */
 function aheadOver(n) {

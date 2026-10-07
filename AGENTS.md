@@ -352,7 +352,9 @@ Every run gets a `dir` field: its member's name.
   binned from buckets on a step axis takes no bin narrower than its finest buckets (`Chart.binFloor`, the least width of
   `kernel.binGrid`): the planner rounds its level up (`levelFor`), and in narrower bins each bucket's point would fall
   in one bin and the bins between it be interpolated, drawing stripes in a heatmap and kinks in group lines where runs
-  log at the same steps. The charts binned together make a round (`runGpuJobs`, `runRound`): their bins lie side by side
+  log at the same steps. A view no wider than a bucket takes no such floor (a metric logged at one step of runs that
+  go on has one): a bin as wide as the bucket would put the run's one point at its own center, out of view.
+  The charts binned together make a round (`runGpuJobs`, `runRound`): their bins lie side by side
   as columns of shared textures, a run a row, and each step is one pass over all of them: each run's sums per bin
   (gathered per bin by bisection over the run's buckets on a step axis; a point a bucket for runtimes), means with empty
   bins interpolated, each group's values in a bin put in order and summarized (inside the statistics pass for groups of
@@ -381,7 +383,8 @@ Every run gets a `dir` field: its member's name.
   flight (`Data.nextAhead`, each request once a page, while the blocks no chart uses hold less than `AHEAD_BYTES`), each
   of blocks of about `AHEAD_REQUEST_BYTES` in all, so that none holds up a plan's requests: every chart's wanted layers
   first, visible charts first and then the nearest the view (`App.aheadOf`), then the two levels below the finest each
-  chart shows, or would, over the steps it shows (`finerAhead`). The scan of the charts for the next requests goes on
+  chart shows, or would, over the steps it shows (`finerAhead`; none below the lowest level, which the server
+  refuses). The scan of the charts for the next requests goes on
   where the last call's found its first one and takes `AHEAD_SCAN_MS` a call (`Data.nextAhead`, `aheadScan`); it starts
   over when the view planned for, the runs or their metrics change, or a request fails. So an answer costs the charts
   the scan gets to rather than all of them (with 525 charts and 3,900 runs, 0.9 ms a call in place of 7, about 30 times
@@ -399,16 +402,23 @@ Every run gets a `dir` field: its member's name.
   under the chart shown alone. A binning is found by what it was made of (`gpuSig`), so one made for a view that never
   comes is only work lost. The means of binnings made ahead are kept until the next ones are made
   (`gpustats.dropAhead`), so a drag does not push other views' means out.
-- **Rendering**: WebGL2; a browser without it gets no charts, and a lost context keeps the charts as drawn until it is
-  restored. Above 300 lines a chart draws a density heatmap: each pixel's count of the lines crossing it, a run binned
+- **Rendering**: WebGL2. A browser without it gets the page without its charts: each says so (`Chart.emptyText`), as
+  does a notice beside the status (`#needsGl`), and the rest works as ever (`no_webgl_smoke`). A lost context keeps the
+  charts as drawn until it is restored.
+  Above 300 lines a chart draws a density heatmap: each pixel's count of the lines crossing it, a run binned
   on the GPU as a 1 px line strip (`Renderer.countLines`). The charts of a round draw their lines into regions of the
   one shared canvas, and then each copies its own (`plot.drawCharts`, `Renderer.place`); the canvas has room for a
   window full of charts from the first round on (`makeRoom`, `Renderer.reserve`), since growing it waits for the GPU. No
   upload overwrites GPU data a queued draw may read: each draw's line table takes fresh rows of the table texture
   (`Renderer.bind`), and columns, which never change once built, each take a slot of their own after the others
   (`LineSet.update`; a set whose columns are mostly new is uploaded whole). Charts then never depend on how a driver
-  orders uploads against earlier draws. A draw's instances are each line's segments in view (`LineSet.tableFor`), not
-  all of its points. Opaque lines are drawn without the depth test that makes a translucent line blend into a pixel once
+  orders uploads against earlier draws. A draw's instances are the points of each line whose segments can show in view
+  (`LineSet.tableFor`), not all of its points: a point is drawn with the segment to the next one, and one that no
+  segment reaches (the only point of its line, or one between breaks: a run of one row, a metric logged once, a group
+  with a value in one bin) as a dot (`LINE_VS`, `DOT_PX`), since a line of one point would show nothing. A dot on a
+  side of the plot is drawn whole, past the side, where segments end (`LINE_FS`). A heatmap counts a run whose bins
+  all lie at one place as a dot too (`COUNT_VS`); `dots_smoke` covers them.
+  Opaque lines are drawn without the depth test that makes a translucent line blend into a pixel once
   (`LINE_FS`), which costs the GPU a third of their time; the line tables of GPU views are shared by the charts drawing
   the same lines (`gpuTableSet`). A chart's canvas keeps its drawing while out of view (up to `CANVAS_BYTES` in all, the
   least recently seen freed), and the chart shown alone lies over the grid (`#alone`), which keeps its layout, scroll
@@ -576,11 +586,12 @@ within 10 ms of its input, and no task should block input for more than about 50
   timer query around its draws does (`EXT_disjoint_timer_query_webgl2`), per round rather than per pass, since a query
   adds to a small pass. Known costs on an integrated GPU (a Radeon 760M): it idles at 800 MHz of 2599 and raises its
   clock only after some 30 ms of continuous load (40% of the time busy does not), so an interaction's GPU work all runs
-  at the idle clock, and takes time in inverse proportion to the clock. At 800 MHz: pixels written through thin
-  primitives go at about 1.4e9 a second whatever the blending, the format or the primitive (a render backend writes one
-  2×2 block a clock, of which a 1 px line fills one pixel), so the 15 heatmaps of 2048 runs in view take 12.6 ms
-  (writing 7.6, shading 3, geometry 2); 15 grouped charts of 256 groups take 7 ms (filling the bands 3.2, the lines
-  2.8); binning a zoom of them 3.5 ms; and a texture upload moves about 2 GB/s.
+  at the idle clock, and takes time in inverse proportion to the clock. At 800 MHz: the 15 heatmaps of 2048 runs in
+  view take 7.1 ms, as long as the fragment shader of their counts reads the fragment's place: `COUNT_FS` reads
+  `gl_PointCoord` (for its dots), and one that reads neither that nor `gl_FragCoord` (a constant, or varyings alone)
+  takes 12.7 ms for the same strips and the same pixels, at about 1.4e9 pixels a second whatever the blending, the
+  format or the primitive; 15 grouped charts of 256 groups take 7 ms (filling the bands 3.2, the lines 2.8); binning a
+  zoom of them 3.5 ms; and a texture upload moves about 2 GB/s.
 
 ## Conventions
 

@@ -49,6 +49,7 @@ button { cursor:pointer; }
 #status { margin-left:auto; color:var(--muted); font-size:12px; }
 #conn { width:8px; height:8px; border-radius:50%; background:var(--line); }
 #mismatch { border:0; background:transparent; padding:0; color:var(--danger); font-size:12px; text-decoration:underline; }
+#needsGl { color:var(--danger); font-size:12px; }
 #conn.live { background:#59a14f; } #conn.down { background:var(--danger); }
 #menu { position:fixed; z-index:20; background:var(--bg); border:1px solid var(--line); border-radius:6px; box-shadow:0 4px 16px rgba(0,0,0,.18); padding:6px; min-width:220px; max-width:min(460px, 94vw); }
 #menu input[type=search] { width:100%; margin-bottom:4px; }
@@ -215,7 +216,7 @@ table.kv td:first-child { color:var(--muted); white-space:nowrap; width:1%; }
   <nav id="crumbs">
     <b class="brand" title="trackosaurus exp">trex</b>
     <span id="crumbPath"></span>
-    <span id="status"></span><button id="mismatch" hidden></button><span id="conn" title="not connected"></span>
+    <span id="status"></span><span id="needsGl" hidden>charts need WebGL2, which this browser lacks</span><button id="mismatch" hidden></button><span id="conn" title="not connected"></span>
   </nav>
   <div id="toolbar">
     <input id="runFilter" type="search" placeholder="filter: name, or lr = 0.001 and …" size="28" spellcheck="false">

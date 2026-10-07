@@ -10,7 +10,8 @@ import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET, sameLayers } from "./data.js
 import { nonFiniteText } from "./where.js";
 
 const GPU_POINTS = 8e6; // points per line set kept at full resolution (at most half a texture); larger sets are decimated
-const EDGE_PX = 4; // px beyond the plot's sides within which a segment's end may still draw inside it
+const EDGE_PX = 4; // px beyond the plot's sides within which a segment's end may still draw inside it: more than a
+// dot's radius (gl.js DOT_PX), so that the first or last point a draw takes of a line that goes on shows no dot there
 export const DENSITY_AUTO = 300; // "auto" draws a density heatmap above this many lines
 const DENSITY_TIP = 8; // runs listed by the density tooltip
 
@@ -936,10 +937,12 @@ export class Chart {
 
   /** The narrowest bin of a view v binned from the buckets of layers `ready`: on a step axis their finest buckets'
    * width, since a bin narrower than a bucket holds a point only where the bucket's mean step falls, and the bins
-   * between would be interpolated, drawing stripes and kinks where runs log at the same steps; else 0. */
+   * between would be interpolated, drawing stripes and kinks where runs log at the same steps; else 0. Also 0 in a
+   * view no wider than a bucket (a metric logged at one step of runs that go on has such a one): it shows a point
+   * or two of a run, each where it is, which a bin as wide as the bucket would put at its own center, out of view. */
   binFloor(v, ready) {
-    const L = ready && (ready.fine || ready.coarse);
-    return L && v.xmode === X_STEP && !v.logx ? 2 ** L.level : 0;
+    const L = ready && (ready.fine || ready.coarse), wide = L && v.xmode === X_STEP && !v.logx ? 2 ** L.level : 0;
+    return wide < v.x1 - v.x0 ? wide : 0;
   }
 
   /** The GPU's binning of the groups' statistics of `src` (`gpuSources`) in view v: {kind, p (as queueGpu takes them),

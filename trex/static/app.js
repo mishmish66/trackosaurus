@@ -552,7 +552,7 @@ class App {
     (window.requestIdleCallback ?? setTimeout)(() => { // its setup blocks, so it runs while blocks load
       const r = renderer();
       if (r) r.onRestore = () => this.redrawAll();
-      else $("#status").textContent = "charts need WebGL2, which this browser lacks";
+      else $("#needsGl").hidden = false; // beside the status, whose text the data's progress replaces
     });
   }
 
@@ -2335,12 +2335,20 @@ class App {
   }
 
   /** After a round: canvases trimmed, blocks planned, and the charts still due drawn next: what an interaction left
-   * (`later`) once the GPU has drawn this round, so that binning them does not wait for it. */
+   * (`later`) once the GPU has drawn this round, so that binning them does not wait for it (a browser without WebGL2
+   * has no GPU to wait for). */
   endRound(drew) {
     if (drew) this.trimCanvases(), this.warmSoon();
     if (drew || this.planSoon) this.replan(this.planSoon), (this.planSoon = false);
-    if (this.later) renderer().whenDone(() => this.afterFrame());
+    if (this.later) this.afterGpu(() => this.afterFrame());
     else if ([...this.charts.values()].some((c) => this.due(c))) this.schedule(this.urgent);
+  }
+
+  /** Call `then` once the GPU has run what was asked of it; at once where there is none. */
+  afterGpu(then) {
+    const r = renderer();
+    if (r) r.whenDone(then);
+    else then();
   }
 
   /** Draw the dirty visible charts in a task once the next frame has painted: the rounds an interaction left, which

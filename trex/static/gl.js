@@ -9,6 +9,7 @@ const MW = 1024; // lines per row of a line table
 const META_ROWS = 64; // rows of a line-table texture
 const BREAK = 1e38; // coordinate marking a line break
 const MAX_BINS = 16; // texels of the density maximum
+export const DOT_PX = 3; // radius, in CSS px, of the dot a point is drawn as when no segment of its line reaches it
 
 const ext = (gl, name) => gl.getExtension(name);
 
@@ -58,26 +59,38 @@ vec4 toClip(vec2 P) { return vec4(P.x / u_size.x * 2.0 - 1.0, 1.0 - P.y / u_size
 vec4 unpack(ivec4 m) { return vec4(float((m.z >> 16) & 255), float((m.z >> 8) & 255), float(m.z & 255), float(m.w)) / 255.0; }
 `;
 
+// Whether image point P lies outside the plot (u_inside).
+const OUTSIDE = "bool outside(vec2 P) { return any(lessThan(P, u_inside.xy)) || any(greaterThan(P, u_inside.zw)); }";
+
 // Segment quad: two triangles around segment i -> i+1, padded by half width plus the half pixel coverage reaches. Its
-// line is the draw's, or with u_grid segments a line, the instance's.
+// line is the draw's, or with u_grid points a line, the instance's; an instance is a point of its line, drawn with the
+// segment to the next one. A point no segment reaches (the only one of its line, or one between breaks) is a dot of
+// radius u_dot instead: a segment of no length that wide, since a line of one point would show nothing; none when the
+// point lies outside the plot (u_inside: its rectangle in the image, x0, y0, x1, y1).
 const LINE_VS = (multi) => `${header(multi)}
-uniform float u_half, u_count;
+uniform float u_half, u_dot, u_count;
+uniform vec4 u_inside;
+${OUTSIDE}
 out vec2 v_uv;
-flat out float v_len, v_depth;
+flat out float v_len, v_depth, v_half, v_dot;
 flat out vec4 v_color;
 void main() {
   int line = u_grid > 0 ? gl_InstanceID / u_grid : DRAW_ID + u_base;
   ivec4 m = meta(line);
-  int i = m.x + (u_grid > 0 ? gl_InstanceID - line * u_grid : gl_InstanceID);
-  vec2 a = fetch(i), b = fetch(i + 1);
-  if (broken(a) || broken(b)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
-  vec2 A = toPx(a), B = toPx(b), d = B - A;
+  int k = u_grid > 0 ? gl_InstanceID - line * u_grid : gl_InstanceID, i = m.x + k;
+  vec2 a = fetch(i), b = k + 1 < m.y ? fetch(i + 1) : vec2(1.0e38);
+  bool lone = !broken(a) && broken(b) && (k == 0 || broken(fetch(i - 1)));
+  if (broken(a) || (broken(b) && !lone)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  vec2 A = toPx(a), B = lone ? A : toPx(b), d = B - A;
+  if (lone && outside(A)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   float len = length(d);
   vec2 dir = len > 1e-4 ? d / len : vec2(1.0, 0.0), nrm = vec2(-dir.y, dir.x);
   int c = gl_VertexID;
   float end = (c == 1 || c == 4 || c == 5) ? 1.0 : 0.0;
   float side = (c == 2 || c == 3 || c == 5) ? 1.0 : -1.0;
-  float h = u_half + 0.5, s = end * 2.0 - 1.0;
+  v_half = lone ? u_dot : u_half;
+  v_dot = lone ? 1.0 : 0.0;
+  float h = v_half + 0.5, s = end * 2.0 - 1.0;
   v_uv = vec2(end * len + s * h, side * h);
   v_len = len;
   v_color = unpack(m);
@@ -85,22 +98,26 @@ void main() {
   gl_Position = toClip(mix(A, B, end) + dir * s * h + nrm * side * h);
 }`;
 
-// Coverage of a round-capped segment of width 2*u_half. With `once`, depth decreases with draw order and coverage, so
-// each line blends into a pixel about once (as a stroked path would): a translucent line's joints then show no beads.
-// Writing depth for each fragment takes the GPU about half again as long, and an opaque line's joints blended twice
-// differ only in their edges' few pixels, so opaque lines are drawn without (`Renderer.lines`).
+// Coverage of a round-capped segment of width 2*v_half, which ends at the plot's sides (u_plot: x0, y0, x1, y1 in the
+// target), while a dot on one is drawn whole (`Renderer.lines` lets it reach past them). With `once`, depth decreases
+// with draw order and coverage, so each line blends into a pixel about once (as a stroked path would): a translucent
+// line's joints then show no beads. Writing depth for each fragment takes the GPU about half again as long, and an
+// opaque line's joints blended twice differ only in their edges' few pixels, so opaque lines are drawn without
+// (`Renderer.lines`).
 const LINE_FS = (once) => `#version 300 es
 precision highp float;
-uniform float u_half, u_alpha, u_count;
+uniform float u_alpha, u_count;
+uniform vec4 u_plot;
 uniform int u_density;
 in vec2 v_uv;
-flat in float v_len, v_depth;
+flat in float v_len, v_depth, v_half, v_dot;
 flat in vec4 v_color;
 out vec4 o;
 void main() {
+  if (v_dot == 0.0 && (any(lessThan(gl_FragCoord.xy, u_plot.xy)) || any(greaterThanEqual(gl_FragCoord.xy, u_plot.zw)))) discard;
   float u = v_uv.x, v = v_uv.y;
   float d = u < 0.0 ? length(vec2(u, v)) : u > v_len ? length(vec2(u - v_len, v)) : abs(v);
-  float cov = clamp(u_half + 0.5 - d, 0.0, 1.0);
+  float cov = clamp(v_half + 0.5 - d, 0.0, 1.0);
   if (cov <= 0.0) discard;
   ${once ? "gl_FragDepth = v_depth - cov * 0.5 / (u_count + 1.0);" : ""}
   if (u_density == 1) { o = vec4(cov, 0.0, 0.0, 1.0); return; }
@@ -109,17 +126,34 @@ void main() {
 }`;
 
 // A heatmap's counts: line gl_InstanceID as a 1 px line strip through its points (none broken but all of a line's),
-// each pixel it crosses getting one.
+// each pixel it crosses getting one. With u_dots, as a point instead when its points all lie at one place (a run with
+// a value in one bin only, whose other bins' points gpustats puts there): its strip has no length and draws nothing,
+// so a dot of radius u_dot there counts it, when the place lies in the plot.
 const COUNT_VS = `${header(false)}
+uniform int u_dots;
+uniform float u_dot;
+uniform vec4 u_inside;
+${OUTSIDE}
 void main() {
-  vec2 p = fetch(meta(gl_InstanceID).x + gl_VertexID);
-  gl_Position = broken(p) ? vec4(2.0, 2.0, 2.0, 1.0) : toClip(toPx(p));
+  ivec4 m = meta(gl_InstanceID);
+  vec2 p = fetch(m.x + gl_VertexID);
+  bool none = broken(p) || (u_dots == 1 && (p != fetch(m.x + m.y - 1) || outside(toPx(p))));
+  gl_Position = none ? vec4(2.0, 2.0, 2.0, 1.0) : toClip(toPx(p));
+  gl_PointSize = 2.0 * u_dot;
 }`;
 
+// Reading the fragment's place (gl_PointCoord, for the dots) also makes the strips cheaper on a Radeon 760M: the 15
+// heatmaps of 2048 runs a window shows take it 7.1 ms, and 12.7 with a shader that reads neither that nor
+// gl_FragCoord (a constant, or varyings alone), for the same pixels.
 const COUNT_FS = `#version 300 es
 precision highp float;
+precision highp int;
+uniform int u_dots;
 out vec4 o;
-void main() { o = vec4(1.0, 0.0, 0.0, 1.0); }`;
+void main() {
+  if (u_dots == 1 && length(gl_PointCoord - 0.5) > 0.5) discard;
+  o = vec4(1.0, 0.0, 0.0, 1.0);
+}`;
 
 // Band quad between bins i and i+1: line-table entry (hi offset, bins, rgb, alpha) with the lo
 // offset in the entry after it.
@@ -212,6 +246,9 @@ void main() {
   float a = clamp(d, 0.0, 1.0) * (u_dark == 1 ? mix(0.55, 1.0, t) : mix(0.45, 1.0, t));
   o = vec4(c * a, a);
 }`;
+
+/** A dot's radius in device px. */
+const dotRadius = () => DOT_PX * (globalThis.devicePixelRatio || 1);
 
 /** RGBA bytes of a CSS hex or rgb() color. */
 const colorCache = new Map();
@@ -496,7 +533,19 @@ class Renderer {
   /** Scissor to the plot rectangle of an image whose bottom-left corner is at `base` (GL coordinates). */
   scissor(base) {
     const [x, y, w, h] = this.clip;
-    this.gl.scissor(base[0] + x, base[1] + this.H - y - h, w, h);
+    this.scissorTo([base[0] + x, base[1] + this.H - y - h, w, h]);
+  }
+
+  /** Tell `prog` the plot's rectangle in the image (u_inside), half a pixel out: a point on a side lies in it. */
+  inside(prog) {
+    const [x, y, w, h] = this.clip;
+    this.gl.uniform4f(prog.u.u_inside, x - 0.5, y - 0.5, x + w + 0.5, y + h + 0.5);
+  }
+
+  /** Scissor to `plot` ([x, y, w, h] in the target drawn to): the plot's rectangle there, which `lines` draws to. */
+  scissorTo(plot) {
+    this.plot = plot;
+    this.gl.scissor(...plot);
   }
 
   /** Bind `pts`, a line table and `view` {off: data at the plot origin, scale: px per unit, org: device px, first: the
@@ -556,17 +605,24 @@ class Renderer {
   }
 
   /** Every line of `table` as a `width` px (device) stroke at opacity `alpha`, in table order; lines of `grid` + 1
-   * points each when grid is set. */
+   * points each when grid is set. A point no segment reaches is drawn as a dot (`LINE_VS`), so an instance is a
+   * point; a dot on a side of the plot is drawn whole, past the side, except in a heatmap's counts. */
   lines(pts, table, view, width, alpha, density = false, grid = 0) {
     const gl = this.gl, once = density || alpha < 1 || table.translucent, prog = this.program(once ? "line" : "lineOpaque"), a = table.a;
+    const [x, y, w, h] = this.plot, dot = dotRadius(), past = density ? 0 : Math.ceil(dot + 0.5);
     this.bind(prog, pts, table, view);
     gl.uniform1f(prog.u.u_half, width / 2);
+    gl.uniform1f(prog.u.u_dot, dot);
+    this.inside(prog);
+    gl.uniform4f(prog.u.u_plot, x, y, x + w, y + h);
     gl.uniform1f(prog.u.u_alpha, alpha);
     gl.uniform1f(prog.u.u_count, table.n);
     gl.uniform1i(prog.u.u_density, density ? 1 : 0);
+    if (past) gl.scissor(x - past, y - past, w + 2 * past, h + 2 * past);
     if (once) gl.enable(gl.DEPTH_TEST), gl.depthFunc(gl.LESS), gl.clear(gl.DEPTH_BUFFER_BIT);
-    this.draws(prog, table.n, (i) => a[4 * i + 1] - 1, grid);
+    this.draws(prog, table.n, (i) => a[4 * i + 1], grid && grid + 1);
     gl.disable(gl.DEPTH_TEST);
+    if (past) gl.scissor(x, y, w, h);
   }
 
   /** Filled bands: table entries in (hi, lo) pairs with equal counts (`grid` + 1 points each when grid is set). */
@@ -598,7 +654,7 @@ class Renderer {
     const [cx, cy, cw, ch] = this.clip, rect = [cx, H - cy - ch, cw, ch]; // the plot in the density texture
     gl.bindFramebuffer(gl.FRAMEBUFFER, d.fbo);
     gl.viewport(0, 0, W, H);
-    gl.scissor(...rect);
+    this.scissorTo(rect);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.blendFunc(gl.ONE, gl.ONE);
@@ -625,11 +681,16 @@ class Renderer {
   }
 
   /** Every line of `table` (`grid` + 1 points each, broken only where all are) as a 1 px line strip, adding one to
-   * each pixel it crosses. */
+   * each pixel it crosses; one whose points all lie at one place as a dot there (`COUNT_VS`). */
   countLines(pts, table, view, grid) {
-    const prog = this.program("count");
+    const gl = this.gl, prog = this.program("count");
     this.bind(prog, pts, table, view);
-    this.gl.drawArraysInstanced(this.gl.LINE_STRIP, 0, grid + 1, table.n);
+    gl.uniform1f(prog.u.u_dot, dotRadius());
+    this.inside(prog);
+    gl.uniform1i(prog.u.u_dots, 0);
+    gl.drawArraysInstanced(gl.LINE_STRIP, 0, grid + 1, table.n);
+    gl.uniform1i(prog.u.u_dots, 1);
+    gl.drawArraysInstanced(gl.POINTS, 0, 1, table.n);
   }
 
   /** The density texture's maximum over `rect` (the plot's [x, y, w, h] in it) into the maximum texels: each tile's,

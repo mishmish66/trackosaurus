@@ -2,7 +2,7 @@
 
 Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, panels of
 hidden runs, the x range of hidden runs, charts while the server refuses blocks, the filter box, the canvases' colors in a
-page that is dark, console errors, UI line coverage (at least UI_COVERAGE of the modules' code lines run),
+page that is dark, the page without WebGL2, dots where a line has one point, console errors, UI line coverage (at least UI_COVERAGE of the modules' code lines run),
 and that a client dropping every 5th stream event still converges to the run files: every row and media item, and columns whose
 points' counts add up to each metric's finite values. Then a trex pulling another's runs through a link added in its panel,
 and, as this machine's trex (with a private TREX_DAEMON_DIR): adding a directory with `trex serve -y`, the root view of
@@ -34,7 +34,7 @@ from typing import Any, Protocol
 
 import numpy as np
 import numpy.typing as npt
-from playwright.sync_api import ConsoleMessage, Page, Request, Response, Route, sync_playwright
+from playwright.sync_api import ConsoleMessage, Error, Page, Request, Response, Route, sync_playwright
 
 from trex import chunks
 from trex.format import connect_ro
@@ -1409,6 +1409,166 @@ def theme_smoke(page: Page, url: str, out: Path) -> bool:
     return not failed
 
 
+# Leaves a page whose address ends in ?nowebgl without WebGL2, as a browser that lacks it does: no canvas gives a
+# context of it.
+NO_WEBGL = """if (location.search === "?nowebgl") { const get = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (kind, ...more) { return kind === "webgl2" ? null : get.call(this, kind, ...more); }; }"""
+
+# Per chart: its metric, what it says while it shows nothing, whether anything is drawn on its canvas, whether it is in view.
+CHART_NOTICES = """[...app.charts.values()].map((c) => { const d = c.canvas.width ? c.canvas.getContext("2d").getImageData(0, 0, c.canvas.width, c.canvas.height).data : [];
+  let drawn = false;
+  for (let i = 3; i < d.length && !drawn; i += 4) drawn = d[i] > 0;
+  return [c.key, c.emptyText(), drawn, c.inView]; })"""
+
+
+def no_webgl_smoke(page: Page, url: str) -> bool:
+    """Whether a browser without WebGL2 gets the page without its charts: every chart says that charts need WebGL2,
+    those below the view too, a notice beside the status says so and stays while the status changes, the runs are
+    listed and filtered as ever, the media panels are there, and nothing throws."""
+    thrown: list[str] = []
+    checks: dict[str, object] = {}
+
+    def on_error(e: Error) -> None:
+        thrown.append(str(e))
+
+    def soon(js: str) -> bool:
+        try:
+            page.wait_for_function(js, timeout=5000)
+            return True
+        except Exception:
+            return False
+
+    page.add_init_script(NO_WEBGL)
+    page.on("pageerror", on_error)
+    try:
+        page.goto(f"{url}/?nowebgl#path=sweep")
+        page.wait_for_function(f"window.app && app.data.runs.size > 0 && app.charts.size > 0 && !app.data.queue.length && !app.data.posts && {LISTED}", timeout=30000)
+        checks["the page has no WebGL2 (what the check is of)"] = page.evaluate("!document.createElement('canvas').getContext('webgl2')")
+        checks["every chart says that charts need WebGL2, drawn on its canvas"] = soon(
+            f"(() => {{ const cs = {CHART_NOTICES}; return cs.length > 0 && cs.every((c) => c[1] === 'charts need WebGL2' && c[2]); }})()")
+        notices = page.evaluate(CHART_NOTICES)
+        checks["some of them lie below the view"] = any(not c[3] for c in notices)
+        checks["a notice beside the status says so, and stays as the status changes"] = soon(
+            "(() => { const n = document.querySelector('#needsGl'); return !n.hidden && n.textContent.includes('WebGL2')"
+            " && /blocks fetched/.test(document.querySelector('#status').textContent); })()")
+        checks["the runs are listed"] = page.evaluate("app.runList.length") == 18
+        checks["the media panels are there"] = page.locator("#panels .panel.media").count() == 3
+        page.fill("#runFilter", "lr = 0.01")
+        checks["a filter narrows them"] = soon("app.runList.filter((r) => r.shown).length === 6")
+        page.fill("#runFilter", "")
+        checks["cleared, it shows them all"] = soon("app.runList.filter((r) => r.shown).length === 18")
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+        checks["nothing throws"] = not thrown
+    finally:
+        page.remove_listener("pageerror", on_error)
+    failed = [name for name, passed in checks.items() if not passed]
+    print(f"no WebGL2: {len(checks) - len(failed)}/{len(checks)} as intended; charts {[c[0] for c in notices]}"
+          + (f"; not: {failed}; thrown: {thrown}" if failed else ""))
+    return not failed
+
+
+# Two runs of 100 steps and one that has logged a single row, at step 0; each logs `once` at step 0 alone.
+DOTS_WRITER = """
+import math, sys, trex
+for k, (name, n, lr) in enumerate((("long0", 100, 0.01), ("long1", 100, 0.01), ("new", 1, 0.02))):
+    r = trex.init(f"{sys.argv[1]}/dots/{name}", config={"lr": lr})
+    r.log({"once": k + 1.0}, step=0)
+    for s in range(n):
+        r.log({"loss": 3.0 if n == 1 else 2 * math.exp(-s / 30) + 0.1 * k}, step=s)
+    r.finish()
+"""
+
+# Of chart `key`'s canvas, the pixels of color `css` (#rrggbb, to within 2 a channel): how many lie within a dot's
+# radius of data point (x, y), how many there are in all, and how far past the plot's left side the leftmost one lies
+# (device px).
+DOT_PIXELS = """([key, x, y, css]) => { const c = app.charts.get(key), cv = c.canvas, dpr = devicePixelRatio, d = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height).data;
+  const [r, g, b] = css.match(/[0-9a-f]{2}/gi).map((h) => parseInt(h, 16)), cx = c.px(x) * dpr, cy = c.py(y) * dpr;
+  let near = 0, all = 0, left = cv.width;
+  for (let j = 0; j < cv.height; j++) for (let i = 0; i < cv.width; i++) { const o = 4 * (j * cv.width + i);
+    if (Math.abs(d[o] - r) > 2 || Math.abs(d[o + 1] - g) > 2 || Math.abs(d[o + 2] - b) > 2 || d[o + 3] < 250) continue;
+    all++;
+    left = Math.min(left, i);
+    if (Math.hypot(i + 0.5 - cx, j + 0.5 - cy) <= 3.5 * dpr) near++; }
+  return [near, all, Math.round(c.px(c.view.x0) * dpr) - left]; }"""
+
+# How many colored pixels (as LINE_PIXELS counts them) of chart `key`'s canvas lie outside its plot: in its margins.
+MARGIN_PIXELS = """(key) => { const c = app.charts.get(key), cv = c.canvas, v = c.view, dpr = devicePixelRatio, d = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height).data;
+  const x0 = Math.round(c.px(v.x0) * dpr), x1 = Math.round(c.px(v.x1) * dpr), y0 = Math.round(c.py(v.y1) * dpr), y1 = Math.round(c.py(v.y0) * dpr);
+  let n = 0;
+  for (let j = 0; j < cv.height; j++) for (let i = 0; i < cv.width; i++) { const o = 4 * (j * cv.width + i);
+    if ((i < x0 || i >= x1 || j < y0 || j >= y1) && d[o + 3] && Math.max(d[o], d[o + 1], d[o + 2]) - Math.min(d[o], d[o + 1], d[o + 2]) > 60) n++; }
+  return n; }"""
+
+
+def dots_smoke(page: Page, url: str, runs: Path) -> bool:
+    """Whether a point no segment of its line reaches is drawn as a dot, where a line of one point would show nothing: a
+    run that has logged one row among longer ones (whole, though it lies on the plot's left side, where lines that go
+    on past a side end), a metric logged at one step of each run, a group of one such run, and the same in a heatmap;
+    and whether a run of a single row loads without a failing block (the levels finer than its charts' are not asked
+    for where there are none)."""
+    subprocess.run([sys.executable, "-c", DOTS_WRITER, str(runs)], check=True)
+    checks: dict[str, object] = {}
+
+    def dot(found: list[int]) -> bool:
+        """Whether `found` (of DOT_PIXELS) is a dot's pixels and no other of its color."""
+        return found[0] >= 12 and found[1] == found[0]
+
+    def show(hash_: str, n: int) -> None:
+        page.goto(f"{url}/?dots{n}#path={hash_}")  # a page of its own for the run opened alone: its runs are that run
+        page.wait_for_function(f"window.app && app.data.runs.size === {n}", timeout=60000)
+        page.wait_for_function(SETTLED + " && [...app.charts.values()].every((c) => c.view)", timeout=60000)
+        page.wait_for_timeout(300)
+
+    def color(name: str) -> str:
+        return page.evaluate(f"app.data.runs.get('dots/{name}').color")
+
+    def found(key: str, x: float, y: float, css: str) -> list[int]:
+        return page.evaluate(DOT_PIXELS, [key, x, y, css])
+
+    show("dots&group=", 3)
+    new = found("loss", 0, 3.0, color("new"))
+    checks["a run of one row is a dot among the others' lines"] = dot(new)
+    checks["on the plot's left side, it is drawn whole"] = new[2] >= 2 and page.evaluate(MARGIN_PIXELS, "loss") >= 6
+    page.evaluate("app.setXRange([20, 60, 0])")
+    page.wait_for_function(SETTLED + " && app.charts.get('loss').view?.x0 === 20", timeout=60000)
+    page.wait_for_timeout(300)
+    crossing = [page.evaluate(LINE_PIXELS, "loss"), page.evaluate(MARGIN_PIXELS, "loss")]
+    checks["lines that go on past the plot's sides end there"] = crossing[0] > 300 and crossing[1] == 0
+    # the run of one row 2 px left of the plot, on a y axis that holds its value
+    page.evaluate("(() => { app.panelCfg.loss = { ymin: 0, ymax: 4 }; app.savePanelCfg('loss'); app.setXRange([2 * 99 / app.charts.get('loss').pw, 99, 0]); })()")
+    page.wait_for_function(SETTLED + " && app.charts.get('loss').view?.x0 > 0 && app.charts.get('loss').view.y1 === 4", timeout=60000)
+    page.wait_for_timeout(300)
+    past = found("loss", 0, 3.0, color("new"))
+    checks["a point just past the plot's side shows no dot"] = past[1] == 0
+    page.evaluate("(() => { delete app.panelCfg.loss; app.savePanelCfg('loss'); })()")
+    page.evaluate("app.setXRange(null)")
+    page.wait_for_function(SETTLED + " && [...app.charts.values()].every((c) => c.view)", timeout=60000)
+    page.wait_for_timeout(300)
+    once = [found("once", 0, k + 1.0, color(name)) for k, name in enumerate(("long0", "long1", "new"))]
+    checks["a metric logged at one step is a dot a run"] = all(dot(f) for f in once)
+    page.evaluate("(() => { app.panelCfg.once = { render: 'density' }; app.savePanelCfg('once'); })()")
+    page.wait_for_function(SETTLED + " && app.charts.get('once').view?.density && app.charts.get('once').view.gpu", timeout=60000)
+    page.wait_for_timeout(300)
+    heat = page.evaluate(LINE_PIXELS, "once")
+    checks["as a heatmap, its points are counted where they are"] = heat >= 3 * 12
+    page.evaluate("(() => { delete app.panelCfg.once; app.savePanelCfg('once'); })()")
+    show("dots&group=lr", 3)
+    group = page.evaluate("app.charts.get('loss').view.lines.map((l) => [l.label, l.color]).find(([label]) => label.startsWith('0.02'))")
+    lone = found("loss", 0, 3.0, group[1]) if group else [0, 0, 0]
+    checks["a group of one such run is a dot"] = page.evaluate("!!app.charts.get('loss').view.gpu") and 12 <= lone[1] <= 60
+    show("dots/new", 1)
+    page.wait_for_timeout(2500)  # what is fetched ahead has been asked for
+    alone = [found(key, 0, y, color("new")) for key, y in (("loss", 3.0), ("once", 3.0))]
+    checks["a run of one row shows a dot a chart"] = all(dot(f) for f in alone)
+    failing = page.evaluate("[app.data.failed.size, document.querySelector('#status').textContent]")
+    checks["and no block of it fails"] = failing[0] == 0 and "failing" not in failing[1]
+    failed = [name for name, passed in checks.items() if not passed]
+    print(f"dots: {len(checks) - len(failed)}/{len(checks)} as intended; a run of one row {new}, lines zoomed into {crossing}, past the side {past}, a metric logged once {once}, "
+          f"as a heatmap {heat} px, a group {lone}, a run alone {alone}, {failing}" + (f"; not: {failed}" if failed else ""))
+    return not failed
+
+
 def main() -> None:
     out = Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="trex-shots-"))
     out.mkdir(parents=True, exist_ok=True)
@@ -1462,6 +1622,8 @@ def main() -> None:
             ok &= check("filter_smoke", filter_smoke(page, url))
             ok &= check("interactions_smoke", interactions_smoke(page, url))
             ok &= check("theme_smoke", theme_smoke(page, url, out))
+            ok &= check("no_webgl_smoke", no_webgl_smoke(page, url))
+            ok &= check("dots_smoke", dots_smoke(page, url, runs))
             ok &= check("flicker_smoke", flicker_smoke(page, url, runs))
             ok &= check("kept_runs_smoke", kept_runs_smoke(page, url, runs))
             ok &= check("binned_smoke", binned_smoke(page, url, runs))
