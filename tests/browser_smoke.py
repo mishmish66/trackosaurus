@@ -1,8 +1,8 @@
 """Headless-browser smoke test against a throwaway trex server on a temporary runs directory.
 
 Checks cold and warm loads, grouping, opening groups as path levels, nested chart sections and pinning, panels of
-hidden runs, the x range of hidden runs, charts while the server refuses blocks, the filter box, console errors, UI line coverage (at least
-UI_COVERAGE of the modules' code lines run),
+hidden runs, the x range of hidden runs, charts while the server refuses blocks, the filter box, the canvases' colors in a
+page that is dark, console errors, UI line coverage (at least UI_COVERAGE of the modules' code lines run),
 and that a client dropping every 5th stream event still converges to the run files: every row and media item, and columns whose
 points' counts add up to each metric's finite values. Then a trex pulling another's runs through a link added in its panel,
 and, as this machine's trex (with a private TREX_DAEMON_DIR): adding a directory with `trex serve -y`, the root view of
@@ -13,10 +13,12 @@ re-adding it from the remembered ones.
     uv run python tests/browser_smoke.py [screenshot_dir]
 """
 
+import base64
 import functools
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import statistics
@@ -64,7 +66,21 @@ for step in range(260):
 print("ready", flush=True)
 for step in range(260, 500):  # no power of two between: the top tiles keep their level
     log(step)
-    time.sleep(0.04)
+    time.sleep(0.05)
+for r in runs:
+    r.finish()
+"""
+
+HIDDEN_LIVE_WRITER = """
+import math, sys, time, trex
+runs = [trex.init(f"{sys.argv[1]}/hiddenlive/r{i}", commit_interval=0.05) for i in range(2)]
+for r in runs:
+    r.log({"loss": 1.0}, step=0)
+print("ready", flush=True)
+for step in range(1, 500):
+    for r in runs:
+        r.log({"loss": math.exp(-step / 100)}, step=step)
+    time.sleep(0.02)
 for r in runs:
     r.finish()
 """
@@ -130,15 +146,25 @@ RECORD_DRAWS = """() => {
 }"""
 
 
-# [bin width, width of the finest buckets shown] of the loss chart's view binned from its buckets, on the GPU or on
-# its worker (a heatmap's lines then lie at the bins' centers); null when it shows none.
-BIN_FLOOR = ("(() => { const c = app.charts.get('loss'), L = app.data.charts.get('loss')?.ready, f = L && (L.fine || L.coarse);"
-             " const s = c.view?.lines?.find((l) => l.cols?.[0]?.n >= 2)?.cols[0].s, g = c.view?.gpu;"
-             " const dx = g ? g.dx : c.view?.lines?.[0]?.dx ?? (s ? s[1] - s[0] : null);"
-             " return dx && f ? [dx, 2 ** f.level] : null; })()")
+# Count the page's reads from the GPU in window.reads, from 0.
+READS_HOOK = """(async () => { const gl = (await import('/static/gl.js')).renderer().gl;
+    if (!gl.__counted) { const read = gl.readPixels; gl.readPixels = function (...a) { window.reads++; return read.apply(this, a); }; gl.__counted = true; }
+    window.reads = 0; })()"""
 
-# Group line l of chart c as its bins: [center, band low, band high, runs, raw center] each, however it was binned.
-BINS = "((c, l) => Array.from({ length: c.gridOf(l).bins }, (_, i) => c.groupAt(l, i)))"
+# [bin width, width of the finest buckets shown, whether the bins the chart's width asks for are narrower] of the loss
+# chart's view binned from its buckets, on the GPU or on its worker (a heatmap's lines then lie at the bins'
+# centers); null when it shows none.
+BIN_FLOOR = ("async () => { const { binGrid } = await import('/static/kernel.js'), c = app.charts.get('loss'), v = c.view;"
+             " const L = app.data.charts.get('loss')?.ready, f = L && (L.fine || L.coarse);"
+             " const s = v?.lines?.find((l) => l.cols?.[0]?.n >= 2)?.cols[0].s, g = v?.gpu;"
+             " const dx = g ? g.dx : v?.lines?.[0]?.dx ?? (s ? s[1] - s[0] : null);"
+             " return dx && f ? [dx, 2 ** f.level, binGrid(v.x0, v.x1, Math.max(8, Math.floor(c.pw / 8))).dx < 2 ** f.level] : null; }")
+
+# Group line l of chart c as its bins: [center, band low, band high, runs, raw center] each, however it was binned (by a
+# worker: the line's own arrays; on the GPU: its row of the binning, read back).
+BINS = ("((c, l) => { const g = c.view.gpu, row = g && g.out.row(l.gi, g.bins);"
+        " return Array.from({ length: c.gridOf(l).bins }, (_, i) => (g ? [row[4 * i], c.view.logy && !(row[4 * i + 1] > 0) ? row[4 * i] : row[4 * i + 1],"
+        " row[4 * i + 2], row[4 * i + 3], NaN] : [l.center[i], l.lo[i], l.hi[i], l.cnt[i], l.raw ? l.raw[2 * i + 1] : NaN])); })")
 
 type Draw = dict[str, Any]  # a chart draw RECORD_DRAWS records: key, paced, y0, y1, lines ([id, points, end])
 type At = Callable[[float, float], tuple[float, float]]  # a point of a chart's plot area by its fractions of it
@@ -171,9 +197,31 @@ def flicker_faults(draws: list[Draw]) -> list[str]:
     return faults
 
 
+# Move the pointer to and fro over a chart for 800 ms, a move a frame, then let it rest on the chart: the streamed
+# redraws RECORD_DRAWS recorded [while it moved, by 700 ms after it came to rest], and the elements of the page changed
+# [once it was moving (its first frames show the tooltip), by then]; the data layer gives a status while it moves.
+POINTER_MOVES = """async () => {
+  const c = [...app.charts.values()].find((c) => c.view && c.inView), r = c.overlay.getBoundingClientRect(), t0 = performance.now();
+  const move = (k) => c.overlay.dispatchEvent(new MouseEvent("mousemove", { clientX: r.left + 70 + (k % 30) * 6, clientY: r.top + r.height / 2, bubbles: true }));
+  const changed = [], seen = new MutationObserver((ms) => { if (performance.now() - t0 > 150) for (const m of ms) changed.push((m.target.nodeType === 1 ? m.target : m.target.parentElement)?.id || m.target.nodeName); });
+  seen.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+  draws = [];
+  let k = 0;
+  await new Promise((done) => { const t = setInterval(() => (performance.now() - t0 < 800 ? (move(k++), k === 20 && app.data.ui.status("given while it moved")) : (clearInterval(t), done())), 16); });
+  const moving = [draws.filter((d) => d.paced).length, [...new Set(changed)]];
+  await new Promise((ok) => setTimeout(ok, 700));
+  seen.disconnect();
+  const out = [moving[0], draws.filter((d) => d.paced).length, moving[1], changed.length];
+  app.data.ui.status(app.data.summary());
+  c.overlay.dispatchEvent(new MouseEvent("mouseleave"));
+  return out;
+}"""
+
+
 def flicker_smoke(page: Page, url: str, runs: Path) -> bool:
     """Whether charts drawing runs that stream, line by line and grouped, never show a line shrink, its end move back
-    or vanish for a draw, nor a streamed redraw shrink the y axis."""
+    or vanish for a draw, nor a streamed redraw shrink the y axis; and whether streamed redraws wait for a pointer
+    moving over a chart to rest."""
     writer = subprocess.Popen([sys.executable, "-c", FLICKER_WRITER, str(runs)], stdout=subprocess.PIPE, text=True)
     try:
         first_line(writer)
@@ -182,6 +230,7 @@ def flicker_smoke(page: Page, url: str, runs: Path) -> bool:
         page.evaluate(RECORD_DRAWS)
         page.wait_for_timeout(3500)
         lines = page.evaluate("draws")
+        moving, rested, changed, changes = page.evaluate(POINTER_MOVES)
         page.evaluate("draws = []; app.setGroup('run~1')")
         page.wait_for_timeout(3500)
         groups = page.evaluate("draws")
@@ -189,8 +238,10 @@ def flicker_smoke(page: Page, url: str, runs: Path) -> bool:
         writer.wait()
     faults = flicker_faults(lines) + flicker_faults(groups)
     print(f"flicker: {len(lines)} draws of lines, {len(groups)} of groups while 6 runs streamed; "
-          + (f"faults {faults[:5]}" if faults else "no line shrank, moved back or vanished, no streamed redraw shrank an axis"))
-    return len(lines) > 4 and len(groups) > 4 and not faults
+          + (f"faults {faults[:5]}" if faults else "no line shrank, moved back or vanished, no streamed redraw shrank an axis")
+          + f"; {moving} streamed redraws while the pointer moved over a chart, {rested} once it rested; elements changed while it moved"
+          + f" {changed}, {changes} changes by the time it had rested")
+    return len(lines) > 4 and len(groups) > 4 and not faults and moving == 0 and rested > 0 and not changed and changes > 0
 
 
 def many_value(group: str, i: int, step: int) -> float:
@@ -261,79 +312,110 @@ def line_pixels_smoke(page: Page, url: str) -> bool:
     return grouped > 300 and lines > 300 and abs(again - grouped) <= 0.02 * grouped
 
 
-def binned_smoke(page: Page, url: str, runs: Path) -> bool:
-    """Whether a zoom of more runs than a chart draws one by one draws them from bins of their buckets, as group
-    statistics (each group's median per bin of its runs' means of their rows) binned on the GPU, while its drag rests
-    when it is dragged, so that its release reads nothing back from the GPU, and on the chart's worker once a pass on
-    the GPU fails, and as a heatmap; whether no such view takes bins narrower than the buckets it bins; and whether a
-    server of another protocol is stated."""
-    subprocess.run([sys.executable, "-c", MANY_WRITER, str(runs)], check=True)
+def near(off: list[float]) -> bool:
+    """Whether there are differences, all below 1e-5."""
+    return bool(off) and max(off) < 1e-5
 
-    def zoomed(query: str, hash_: str) -> None:
-        page.goto(f"{url}/?binned&{query}#path=many&{hash_}")
-        page.wait_for_function("window.app && app.data.runs.size === 320", timeout=60000)
-        page.wait_for_function(SETTLED, timeout=60000)
-        page.evaluate("app.setXRange([60, 140, 0])")
+
+def off_medians(lines: list[Any]) -> list[float]:
+    """How far each bin's center of group lines `lines` ([group, g0, dx, centers] each) lies from its exact median."""
+    return [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
+
+
+def zoom_many(page: Page, url: str, hash_: str) -> None:
+    """The many folder at `hash_`, zoomed to steps [60, 140] once settled."""
+    page.goto(f"{url}/?binned#path=many&{hash_}")
+    page.wait_for_function("window.app && app.data.runs.size === 320", timeout=60000)
+    page.wait_for_function(SETTLED, timeout=60000)
+    page.evaluate("app.setXRange([60, 140, 0])")
+    page.wait_for_timeout(300)
+    page.wait_for_function(SETTLED, timeout=60000)
+
+
+def bin_floors(page: Page) -> list[Any]:
+    """BIN_FLOOR of the loss chart's view, then of zooms whose spans the planner rounds to a level coarser than the
+    bins; back at [60, 140] after."""
+    out = [page.evaluate(BIN_FLOOR)]
+    for r in ([60, 130], [40, 175], [0, 140], [60, 140]):
+        page.evaluate(f"app.setXRange([{r[0]}, {r[1]}, 0])")
         page.wait_for_timeout(300)
         page.wait_for_function(SETTLED, timeout=60000)
+        out.append(page.evaluate(BIN_FLOOR))
+    return out[:-1]
 
-    def floors() -> list[Any]:
-        """BIN_FLOOR of the view, then of zooms whose spans the planner rounds to a level coarser than the bins."""
-        out = [page.evaluate(BIN_FLOOR)]
-        for r in ([60, 130], [40, 175], [0, 140]):
-            page.evaluate(f"app.setXRange([{r[0]}, {r[1]}, 0])")
-            page.wait_for_timeout(300)
-            page.wait_for_function(SETTLED, timeout=60000)
-            out.append(page.evaluate(BIN_FLOOR))
-        page.evaluate("app.setXRange([60, 140, 0])")
-        page.wait_for_timeout(300)
-        page.wait_for_function(SETTLED, timeout=60000)
-        return out
 
-    zoomed("", "group=run~1")
-    grouped_floors = floors()
-    centers = f"c.view.lines.map((l) => [l.label.split(' ')[0], c.gridOf(l).g0, c.gridOf(l).dx, {BINS}(c, l).map((b) => b[0])])"
-    binned, lines, worker, on_gpu = page.evaluate(f"(() => {{ const c = app.charts.get('loss'); return [c.binned, {centers}, !!c.stats, !!c.view.gpu]; }})()")
+def narrow_of(floors: list[Any]) -> list[Any]:
+    """The readings of BIN_FLOOR whose bins are narrower than their buckets, or that found no view."""
+    return [f for f in floors if not f or f[0] < f[1]]
+
+
+def rested_drag(page: Page, x0: float, x1: float, key: str = "loss") -> tuple[int, int]:
+    """Drag across chart `key` from x0 to x1 (fractions of its canvas's width; it extends past the plot by the axes'
+    margins), rest, release: how often the page read the GPU (READS_HOOK) while the drag rested, and at the release."""
     page.evaluate("app.setXRange(null)")
     page.wait_for_function(SETTLED, timeout=60000)
-    page.evaluate("""(async () => { const gl = (await import('/static/gl.js')).renderer().gl, read = gl.readPixels;
-        window.reads = 0; gl.readPixels = function (...a) { window.reads++; return read.apply(this, a); }; })()""")
-    box = page.locator(".panel:has(.pname:text-is('loss')) canvas").nth(1).bounding_box()
+    canvas = page.locator(f".panel:has(.pname:text-is('{key}')) canvas").nth(1)
+    canvas.scroll_into_view_if_needed()
+    page.wait_for_function(SETTLED, timeout=60000)
+    box = canvas.bounding_box()
     assert box is not None
-    page.mouse.move(box["x"] + 0.4 * box["width"], box["y"] + box["height"] / 2)
+    y = box["y"] + box["height"] / 2
+    page.mouse.move(box["x"] + x0 * box["width"], y)
     page.mouse.down()
-    page.mouse.move(box["x"] + 0.7 * box["width"], box["y"] + box["height"] / 2, steps=4)
-    page.wait_for_timeout(500)  # the drag rests
+    page.evaluate("window.reads = 0")  # a tooltip's reads before the drag are not the drag's
+    page.mouse.move(box["x"] + x1 * box["width"], y, steps=4)
+    page.wait_for_timeout(500)
     rested = page.evaluate("window.reads")
     page.mouse.up()
     page.wait_for_function("!!app.xrange", timeout=5000)
     page.wait_for_function(SETTLED, timeout=60000)
-    released, dragged = page.evaluate(f"(() => {{ const c = app.charts.get('loss'); return [window.reads, {centers}]; }})()")
     page.mouse.move(5, 5)
-    dragged_off = [abs(c - w) for g, g0, dx, center in dragged for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
+    return rested, page.evaluate("window.reads") - rested
+
+
+def binned_smoke(page: Page, url: str, runs: Path) -> bool:
+    """Whether a zoom of more runs than a chart draws one by one draws them from bins of their buckets, as group
+    statistics (each group's median per bin of its runs' means of their rows) binned on the GPU, while its drag rests
+    when it is dragged, so that its release reads nothing back from the GPU (also when it ends in the axis' margin),
+    and on the chart's worker once a pass on the GPU fails, and as a heatmap; whether no such view takes bins narrower
+    than the buckets it bins; and whether a server of another protocol is stated."""
+    subprocess.run([sys.executable, "-c", MANY_WRITER, str(runs)], check=True)
+    zoom_many(page, url, "group=run~1")
+    floors = bin_floors(page)
+    centers = f"c.view.lines.map((l) => [l.label.split(' ')[0], c.gridOf(l).g0, c.gridOf(l).dx, {BINS}(c, l).map((b) => b[0])])"
+    binned, lines, worker, on_gpu = page.evaluate(f"(() => {{ const c = app.charts.get('loss'); return [c.binned, {centers}, !!c.stats, !!c.view.gpu]; }})()")
+    page.evaluate(READS_HOOK)
+    dragged = rested_drag(page, 0.4, 0.7)
+    dragged_off = off_medians(page.evaluate(f"(() => {{ const c = app.charts.get('loss'); return {centers}; }})()"))
+    margin = rested_drag(page, 0.6, 0.02)  # its release lies in the y axis' margin: the zoom starts where the plot does
     page.evaluate("""(async () => { const gl = (await import('/static/gl.js')).renderer().gl, draw = gl.drawArrays;
         gl.drawArrays = () => { gl.drawArrays = draw; throw new Error('a pass this GPU cannot run'); };
         app.setXRange([60, 139, 0]); })()""")
     page.wait_for_timeout(300)
     page.wait_for_function(SETTLED, timeout=60000)
     fell_back, by_worker = page.evaluate(f"(() => {{ const c = app.charts.get('loss'); return [!c.view.gpu, {centers}]; }})()")
-    worker_off = [abs(c - w) for g, g0, dx, center in by_worker for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
-    zoomed("", "group=run")
+    floors += bin_floors(page)  # on the worker
+    zoom_many(page, url, "group=run")
     heat = page.evaluate("(() => { const c = app.charts.get('loss'); return [c.binned, c.view.density, c.view.lines.length]; })()")
-    heat_floors = floors()
-    narrow = [f for f in grouped_floors + heat_floors if not f or f[0] < f[1]]
+    floors += bin_floors(page)
     page.evaluate("app.showProtocol(1)")
     stated = page.evaluate("[!document.querySelector('#mismatch').hidden, document.querySelector('#mismatch').title]")
-    off = [abs(c - w) for g, g0, dx, center in lines for c, w in zip(center, group_medians(g, g0, dx, len(center))) if w is not None]
-    groups = sorted(l[0] for l in lines)
-    print(f"binned: a zoom of 320 runs drew bins of their buckets {binned}, binned {worker} (on the GPU {on_gpu}), groups {groups} of "
-          f"{len(lines[0][3]) if lines else 0} bins, at most {max(off, default=1):.2g} off their exact medians; a dragged zoom read "
-          f"the GPU {rested} times while it rested and {released - rested} at its release, at most {max(dragged_off, default=1):.2g} off; "
-          f"after a failed pass on the worker {fell_back}, at most {max(worker_off, default=1):.2g} off; heatmap {heat}; "
-          f"bins as wide as the buckets {[f for f in grouped_floors + heat_floors]}; protocol 1 stated {stated}")
-    return (binned is True and worker and groups == ["a", "b"] and bool(off) and max(off) < 1e-5 and heat == [True, True, 320]
-            and rested >= 1 and released == rested and bool(dragged_off) and max(dragged_off) < 1e-5 and not narrow
-            and fell_back and bool(worker_off) and max(worker_off) < 1e-5 and stated[0] and "the server 1" in stated[1])
+    off, groups = off_medians(lines), sorted(l[0] for l in lines)
+    checks = {
+        "a zoom of many runs draws bins of their buckets, binned on the GPU": all([binned is True, worker, on_gpu]),
+        "each group's center in a bin is its runs' exact median": all([groups == ["a", "b"], near(off)]),
+        "a dragged zoom is binned while it rests, and its release reads nothing back": all([dragged[0] >= 1, dragged[1] == 0, near(dragged_off)]),
+        "so is one released in the y axis' margin": all([margin[0] >= 1, margin[1] == 0]),
+        "after a failed pass on the GPU, the chart's worker bins it": all([fell_back, near(off_medians(by_worker))]),
+        "a heatmap of them is drawn": heat == [True, True, 320],
+        "no binned view takes bins narrower than its buckets, though some would have": all([not narrow_of(floors), any(f[2] for f in floors)]),
+        "a server of another protocol is stated": all([stated[0], "the server 1" in stated[1]]),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    print(f"binned: {len(checks) - len(failed)}/{len(checks)} as intended; groups {groups} of {len(lines[0][3]) if lines else 0} bins, "
+          f"at most {max(off, default=1):.2g} off their medians; reads of a rested drag {dragged}, of one released in the margin "
+          f"{margin}; heatmap {heat}; bins and buckets {floors}" + (f"; not: {failed}" if failed else ""))
+    return not failed
 
 
 class Cdp(Protocol):
@@ -480,6 +562,33 @@ def group_levels_smoke(page: Page, url: str) -> bool:
             and up[:3] == [1, "lr / seed", True] and back == [2, "lr / seed"] and home == [0, "lr / seed", True])
 
 
+# Whether the tooltip's canvas is shown and holds the tooltip where the app says it drew it: opaque inside its box, clear
+# outside.
+TIP_DRAWN = """(() => { const el = document.getElementById("tipCanvas"), at = app.tipAt, b = app.tipCanvas.box, dpr = devicePixelRatio;
+  if (el.hidden || !at || !b) return false;
+  const alpha = (x, y) => el.getContext("2d").getImageData(Math.round(x * dpr), Math.round(y * dpr), 1, 1).data[3];
+  return b[0] === at.x && b[1] === at.y && alpha(b[0] + b[2] / 2, b[1] + 8) === 255 && alpha(b[0] + b[2] / 2, b[1] + b[3] + 40) === 0; })()"""
+
+# Whether the pinned tooltip's elements lie where the canvas drew it, the canvas hidden, showing the rows it showed.
+TIP_PINNED = """(() => { const t = document.getElementById("tip"), r = t.getBoundingClientRect(), at = app.tipAt, rows = [...t.querySelectorAll(".trow")];
+  return !t.hidden && t.classList.contains("pinned") && document.getElementById("tipCanvas").hidden && Math.abs(r.left - at.x) < 1 && Math.abs(r.top - at.y) < 1
+    && rows.some((el) => el.classList.contains("near") && el._ln === app.tipView.rows[app.tipView.near].ln); })()"""
+
+
+def hover_mutations(page: Page, at: At) -> list[str]:
+    """Move the pointer over the plot `at`, its tooltip already shown, and return what the moves changed of the document
+    outside the header and the sidebar (which the data that comes meanwhile may change): the mutated nodes, each as its
+    tag, id and class."""
+    page.evaluate("""() => { window.__muts = [];
+      window.__mo = new MutationObserver((ms) => { for (const m of ms) { const t = m.target.nodeType === 1 ? m.target : m.target.parentElement;
+        if (!t?.closest("header, aside")) window.__muts.push(`${m.type} ${t?.tagName}#${t?.id}.${t?.className}`); } });
+      window.__mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true }); }""")
+    for k in range(8):
+        page.mouse.move(*at(0.3 + 0.05 * k, 0.5))
+        page.evaluate("new Promise((ok) => requestAnimationFrame(() => requestAnimationFrame(ok)))")
+    return list(page.evaluate("(() => { window.__mo.disconnect(); return window.__muts; })()"))
+
+
 def interactions_smoke(page: Page, url: str) -> bool:
     """Whether charts carry no legend and the chart controls do what they say: hover and Shift-pinned tooltips
     (which the wheel scrolls, and whose rows reveal and open runs), x and box zooms and their reset, the chart
@@ -507,7 +616,7 @@ def interactions_smoke(page: Page, url: str) -> bool:
     def hover(at: At) -> None:
         page.mouse.move(*at(0.5, 0.5))
         page.mouse.move(*at(0.55, 0.45))
-        page.wait_for_function("!document.querySelector('#tip').hidden", timeout=5000)
+        page.wait_for_function("!!app.tipAt", timeout=5000)
 
     page.goto(f"{url}/?ix#path=sweep&group=")
     page.wait_for_function(READY, timeout=30000)
@@ -548,7 +657,7 @@ def interactions_smoke(page: Page, url: str) -> bool:
     page.click("#menu button:text-is('close')")
     page.wait_for_function(f"{chart}.view?.density", timeout=10000)
     hover(plot())
-    checks["a density chart lists the nearest runs"] = "nearest" in page.inner_text("#tip")
+    checks["a density chart lists the nearest runs"] = "nearest" in page.evaluate("app.tipView.heading")
     page.mouse.move(5, 5)
     page.click(f"{sel} .gear")
     page.click("#menu button:text-is('reset chart')")
@@ -602,7 +711,13 @@ def interactions_smoke(page: Page, url: str) -> bool:
     checks["the media slider steps back"] = page.evaluate("[...app.mediaPanels.values()].some((m) => !m.follow)")
 
     hover(plot())
-    checks["the tooltip opens at the line nearest the cursor"] = page.evaluate("!!document.querySelector('#tip .trow.near')")
+    checks["the tooltip shows the line nearest the cursor"] = page.evaluate("(() => { const v = app.tipView, a = app.tipAt.a; return v.near >= a && v.near < a + 14; })()")
+    checks["the tooltip is drawn beside the pointer, on its canvas"] = page.evaluate(TIP_DRAWN)
+    checks["a hover changes no element of the page"] = hover_mutations(page, plot()) == []
+    page.keyboard.down("Shift")
+    checks["shift pins the tooltip, as elements in its place"] = page.evaluate(TIP_PINNED)
+    page.keyboard.up("Shift")
+    checks["letting shift go draws the tooltip again"] = page.evaluate("document.querySelector('#tip').hidden && " + TIP_DRAWN)
     page.keyboard.down("Shift")
     checks["shift pins the tooltip"] = page.evaluate("document.querySelector('#tip').classList.contains('pinned')")
     checks["a pinned tooltip lists every line"] = page.evaluate("app.tipView.rows.length === app.runList.filter((r) => r.shown).length")
@@ -962,6 +1077,45 @@ def listing_order_smoke(page: Page, url: str) -> bool:
     return order[:2] == ["stream answered", "runs asked"]
 
 
+def column_drag_smoke(page: Page, url: str) -> bool:
+    """Whether a dragged zoom of a grouped chart drawn from its runs' columns bins nothing while it rests that its
+    release bins anew: a release that changes the layers shown rebuilds the columns."""
+    page.goto(f"{url}/?coldrag#path=sweep&group=lr")
+    page.wait_for_function(READY, timeout=30000)
+    page.wait_for_function(SETTLED, timeout=30000)
+    page.evaluate(READS_HOOK)
+    rested, released = rested_drag(page, 0.45, 0.55, "train/loss")
+    binned = page.evaluate("!!app.charts.get('train/loss').view?.gpu && !app.charts.get('train/loss').binned")
+    print(f"column drag: reads while it rested {rested}, at its release {released}; grouped from columns on the GPU {binned}")
+    return binned and rested == 0 and released >= 1
+
+
+def hidden_live_smoke(page: Page, url: str, runs: Path) -> bool:
+    """Whether running runs that a filter hides leave the binned charts as they are while they stream: their columns
+    are not rebuilt until a chart draws them again, so the GPU bins nothing anew meanwhile."""
+    writer = subprocess.Popen([sys.executable, "-c", HIDDEN_LIVE_WRITER, str(runs)], stdout=subprocess.PIPE, text=True)
+    state = "[app.data.runs.get('hiddenlive/r0')?.seq ?? 0, app.charts.get('loss')?.stats?.sig ?? null, window.reads ?? null, !!app.charts.get('loss')?.view?.gpu]"
+    try:
+        first_line(writer)
+        page.goto(f"{url}/?hiddenlive#path=&group=run~1")
+        page.wait_for_function("window.app && app.data.runs.has('hiddenlive/r1') && app.charts.has('loss')", timeout=30000)
+        page.fill("#runFilter", "state = 'finished'")
+        page.keyboard.press("Escape")
+        page.evaluate("document.activeElement.blur()")
+        page.wait_for_function(SETTLED, timeout=30000)
+        page.wait_for_timeout(1000)
+        page.evaluate(READS_HOOK)
+        before = page.evaluate(state)
+        page.wait_for_timeout(2500)
+        after = page.evaluate(state)
+        page.fill("#runFilter", "")
+    finally:
+        writer.wait()
+    print(f"hidden live runs: rows {before[0]} to {after[0]} while hidden; the loss chart binned on the GPU {after[3]}, "
+          f"binned anew {before[1] != after[1]}, reads from the GPU {after[2]}")
+    return after[0] > before[0] and after[3] and before[1] == after[1] and after[2] == 0
+
+
 def sections_smoke(page: Page, url: str) -> bool:
     """Whether chart sections nest by key path and fold one at a time, and a pinned chart shows in the pinned section
     while staying in its own."""
@@ -1128,6 +1282,133 @@ def hidden_runs_smoke(page: Page, url: str) -> bool:
             and count == "0 sections · 0 panels" and back == before)
 
 
+def palette(n: int) -> dict[str, str]:
+    """The page's colors by name as index.html declares them: the light ones (0) or the dark ones (1)."""
+    return dict(re.findall(r"--(\w+):([^;]+);", re.findall(r":root \{([^}]*)\}", (STATIC / "index.html").read_text())[n]))
+
+
+def rgb(css: str) -> list[int]:
+    """[r, g, b] of a CSS hex color."""
+    h = css.lstrip("#")
+    return [int(c * 2, 16) for c in h] if len(h) == 3 else [int(h[i:i + 2], 16) for i in (0, 2, 4)]
+
+
+# How many pixels of chart `key`'s canvas have each of `colors` ([r, g, b]): its grid lines are drawn in the theme's.
+CANVAS_COLORS = """([key, colors]) => { const c = app.charts.get(key).canvas, d = c.width ? c.getContext("2d").getImageData(0, 0, c.width, c.height).data : [];
+  return colors.map(([r, g, b]) => { let n = 0; for (let i = 0; i < d.length; i += 4) n += d[i] === r && d[i + 1] === g && d[i + 2] === b && d[i + 3] === 255; return n; }); }"""
+
+# The tooltip's background as its canvas holds it, between its border and its text, and where in the window: [[r, g, b], x, y].
+TIP_BACKGROUND = """(() => { const [x, y, , h] = app.tipCanvas.box, at = [Math.round(x + 3), Math.round(y + h / 2)], dpr = devicePixelRatio;
+  return [[...document.getElementById("tipCanvas").getContext("2d").getImageData(at[0] * dpr, at[1] * dpr, 1, 1).data.slice(0, 3)], ...at]; })()"""
+
+# The colors of a PNG's pixels at `points`, as the browser decodes it.
+PNG_PIXELS = """async ([png, points]) => { const image = await createImageBitmap(new Blob([Uint8Array.from(atob(png), (c) => c.charCodeAt(0))], { type: "image/png" }));
+  const c = new OffscreenCanvas(image.width, image.height).getContext("2d");
+  c.drawImage(image, 0, 0);
+  return points.map(([x, y]) => [...c.getImageData(x, y, 1, 1).data.slice(0, 3)]); }"""
+
+# What the page knows of its colors: those its canvases draw with (plot.js `theme`), whether it is told that the browser
+# prefers dark, and the background color its own elements have.
+THEME = """async () => { const t = (await import("/static/plot.js")).theme();
+  return { draws: { bg: t.bg, fg: t.fg, muted: t.muted, grid: t.grid, line: t.line }, prefers: matchMedia("(prefers-color-scheme: dark)").matches,
+           own: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() }; }"""
+
+
+def theme_smoke(page: Page, url: str, out: Path) -> bool:
+    """Whether the charts and the tooltip, which are canvases, are drawn in the page's dark colors wherever the page is
+    dark: where the browser prefers the dark scheme, and where it darkens pages by force (Chromium's forced dark mode,
+    which DevTools' automatic dark mode switches and qutebrowser's `colors.webpage.darkmode.enabled` turns on: it
+    inverts the page's elements, tells the page it prefers light and leaves canvases as drawn). In a page loaded so, and
+    in an open page as either is switched: the charts in view, those below it, and a tooltip shown then."""
+    light, dark = palette(0), palette(1)
+    keys = ["lr", "train/loss"]  # the first chart, and one further down whose tooltip is shown, the first then out of view
+    plot = page.locator(".panel:has(.pname:text-is('train/loss')) canvas").nth(1)
+    cdp = cdp_session(page)
+    checks: dict[str, object] = {}
+
+    def named(colors: dict[str, str]) -> str:
+        return "dark" if colors is dark else "light"
+
+    def force(on: bool) -> None:
+        """Have the browser darken the page by force, or stop, as the page is."""
+        cdp.send("Emulation.setAutoDarkModeOverride", {"enabled": on})
+
+    def soon(js: str) -> bool:
+        try:
+            page.wait_for_function(js, timeout=5000)
+            return True
+        except Exception:
+            return False
+
+    def drawn(colors: dict[str, str]) -> bool:
+        """Whether both charts come to show grid lines in `colors`' and none in the other palette's."""
+        asked = json.dumps([rgb(colors["grid"]), rgb((light if colors is dark else dark)["grid"])])
+        return soon(f"{json.dumps(keys)}.every((key) => {{ const [n, other] = ({CANVAS_COLORS})([key, {asked}]); return n > 0 && other === 0; }})")
+
+    def tip_on(colors: dict[str, str]) -> bool:
+        """Whether the tooltip comes to be drawn on `colors`' background."""
+        return soon(f"{TIP_DRAWN} && JSON.stringify({TIP_BACKGROUND}[0]) === '{json.dumps(rgb(colors['bg']), separators=(',', ':'))}'")
+
+    def hover() -> bool:
+        """Show the tooltip of the chart further down, scrolled to the top of the view; whether the first chart is out
+        of view then."""
+        plot.evaluate("(canvas) => canvas.scrollIntoView({ block: 'start' })")
+        away = soon(f"!app.charts.get({keys[0]!r}).inView && app.charts.get({keys[1]!r}).inView")
+        b = plot.bounding_box()
+        assert b is not None
+        page.mouse.move(b["x"] + b["width"] * 0.5, b["y"] + b["height"] * 0.5)
+        page.mouse.move(b["x"] + b["width"] * 0.55, b["y"] + b["height"] * 0.45)
+        page.wait_for_function(TIP_DRAWN, timeout=5000)
+        return away
+
+    def shows(state: str, colors: dict[str, str], prefers: bool) -> None:
+        """Add the checks of the page in `state`, its tooltip shown: what the page knows (`THEME`), and how its tooltip
+        and the page around it look on screen. The screenshot is kept under the state's name."""
+        knows = page.evaluate(THEME)
+        bg, x, y = page.evaluate(TIP_BACKGROUND)
+        shot = page.screenshot()
+        (out / f"theme_{state.replace(' ', '_')}.png").write_bytes(shot)
+        tip, corner = page.evaluate(PNG_PIXELS, [base64.b64encode(shot).decode(), [[x, y], [2, 2]]])
+        checks[f"{state}: the canvases draw with the page's {named(colors)} colors"] = knows["draws"] == {k: colors[k] for k in knows["draws"]}
+        checks[f"{state}: the page is told the browser prefers {'dark' if prefers else 'light'}, and its elements have those colors"] = (
+            knows["prefers"] == prefers and knows["own"] == (dark if prefers else light)["bg"])
+        checks[f"{state}: the tooltip has that background, on its canvas and on screen"] = bg == tip == rgb(colors["bg"])
+        checks[f"{state}: the page around it is {named(colors)} on screen"] = max(corner) < 64 if colors is dark else min(corner) > 192
+
+    try:
+        page.goto(f"{url}/?theme#path=sweep")
+        page.wait_for_function(READY, timeout=30000)
+        checks["light: the charts are drawn in the light colors"] = drawn(light)
+        checks["the first chart lies out of view while the other is hovered"] = hover()
+        shows("light", light, False)
+        force(True)
+        checks["darkened by force: a tooltip shown then is drawn anew, dark"] = tip_on(dark)
+        checks["darkened by force: the charts are drawn anew in the dark colors, in view or not"] = drawn(dark)
+        shows("darkened by force", dark, False)
+        force(False)
+        checks["no longer darkened: the tooltip and the charts are light again"] = tip_on(light) and drawn(light)
+        page.emulate_media(color_scheme="dark")
+        checks["dark preferred: the tooltip and the charts are drawn anew, dark"] = tip_on(dark) and drawn(dark)
+        shows("dark preferred", dark, True)
+        page.emulate_media(color_scheme="light")
+        checks["light preferred: the tooltip and the charts are light again"] = tip_on(light) and drawn(light)
+        force(True)
+        page.goto(f"{url}/?darkened#path=sweep")
+        page.wait_for_function(READY, timeout=30000)
+        checks["loaded darkened by force: the charts are drawn in the dark colors"] = drawn(dark)
+        hover()
+        shows("loaded darkened by force", dark, False)
+        force(False)
+        checks["loaded darkened by force, then no longer: the tooltip and the charts are light"] = tip_on(light) and drawn(light)
+    finally:
+        cdp.send("Emulation.setAutoDarkModeOverride", {})
+        page.emulate_media(color_scheme="light")
+        page.mouse.move(5, 5)
+    failed = [name for name, passed in checks.items() if not passed]
+    print(f"theme: {len(checks) - len(failed)}/{len(checks)} as intended" + (f"; not: {failed}" if failed else ""))
+    return not failed
+
+
 def main() -> None:
     out = Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="trex-shots-"))
     out.mkdir(parents=True, exist_ok=True)
@@ -1180,9 +1461,12 @@ def main() -> None:
             ok &= check("hidden_panels_smoke", hidden_panels_smoke(page, url))
             ok &= check("filter_smoke", filter_smoke(page, url))
             ok &= check("interactions_smoke", interactions_smoke(page, url))
+            ok &= check("theme_smoke", theme_smoke(page, url, out))
             ok &= check("flicker_smoke", flicker_smoke(page, url, runs))
             ok &= check("kept_runs_smoke", kept_runs_smoke(page, url, runs))
             ok &= check("binned_smoke", binned_smoke(page, url, runs))
+            ok &= check("hidden_live_smoke", hidden_live_smoke(page, url, runs))
+            ok &= check("column_drag_smoke", column_drag_smoke(page, url))
             ok &= check("hidden_extent_smoke", hidden_extent_smoke(page, url, runs))
             ok &= check("line_pixels_smoke", line_pixels_smoke(page, url))
             ok &= check("failing_blocks_smoke", failing_blocks_smoke(page, url))

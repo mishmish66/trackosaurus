@@ -5,24 +5,29 @@ A headless Chromium on the GPU replays the interactions of a session against a t
 
 - wheel scrolls through the charts, to charts not drawn yet (their blocks fetched ahead) and back to drawn ones;
 - a chart shown alone (its ⛶ button) and left again (Escape);
-- hovering a chart (its tooltip);
-- a drag zoom, a scroll while zoomed, and a click resetting the zoom;
-- filtering the runs and clearing the filter, ungrouping and regrouping;
+- hovering a chart (its tooltip), and sweeping the pointer across one: grouped, as a heatmap, and in MANY_GROUPS groups;
+- a drag zoom, a scroll while zoomed, and a click resetting the zoom; a drag zoom released as it moves;
+- filtering the runs and clearing the filter, ungrouping and regrouping, also into MANY_GROUPS groups;
 - entering a run and leaving it.
 
 Inputs keep a user's timing where the page's work depends on it: a filter is typed KEY_GAP_MS after its box is clicked,
-and a drag is released DRAG_REST_MS after its last movement (the page bins a zoom while its drag rests).
+and a zoom's drag is released DRAG_REST_MS after its last movement (the page bins a zoom while its drag rests), or, for
+zoom-quick, with it.
 
 Each is timed from its input event to the end of the draw of the last chart in view showing its data as it now stands
-(every block of its view in hand, no column left to rebuild; "no data" counts as drawn), a hover to the end of its
-tooltip. Printed beside: the GPU time of the WebGL draws of that last chart's round (a timer query around them), which
-the lines take on the GPU after the page has issued them; the frame showing them needs both. With `--verify N` it then
-makes N random interactions and after each compares what the GPU binned for the grouped charts in view with what
-kernel.js computes of the same runs: a check of this machine's GPU and driver, which the smoke test's software
-rendering of a small folder cannot make. The generated runs (RUNS of them in sweeps of SEEDS, under DIRS, METRICS
-metrics each; LIVE of them logging while the benchmark runs) and the trex index of them are kept in `--data`, so only
-the first run of the benchmark writes and indexes them. Prints each interaction's median and worst over the rounds
-against the target, and exits 1 when some interaction's worst exceeds it.
+(every block of its view in hand, no column left to rebuild; "no data" counts as drawn), a hover from the pointer's
+entering a chart until its tooltip is drawn (TARGETS: the page takes its values from the GPU without waiting for them,
+so it has a few frames); a sweep's hovers (hover-move, hover-heatmap, hover-groups) each by the page's work in its frame: from the
+hover's start to the first task after the frame, so with the browser's own work on what the hover changed (style,
+layout and painting, which a tooltip made of elements costs at every move). Printed beside: the GPU time of the WebGL
+draws of that last chart's round (a timer query around them), which the lines take on the GPU after the page has
+issued them; the frame showing them needs both. With `--verify N` it then makes N random interactions and
+after each compares what the GPU binned for the grouped charts in view with what kernel.js computes of the same runs: a
+check of this machine's GPU and driver, which the smoke test's software rendering of a small folder cannot make. The
+generated runs (RUNS of them in sweeps of SEEDS, under DIRS, METRICS metrics each; LIVE of them logging while the
+benchmark runs) and the trex index of them are kept in `--data`, so only the first run of the benchmark writes and
+indexes them. Prints each interaction's median and worst over the rounds against the target, and exits 1 when some
+interaction's worst exceeds it.
 
 The browser's profile is kept too (`--profile`, by default in `--data`), as a used browser's is, for its cache of
 compiled shaders. Without it the browser compiles the shaders of its own drawing at their first use (a focus ring,
@@ -62,6 +67,8 @@ from trex.format import FORMAT, connect_rw
 
 REPO = Path(__file__).resolve().parents[1]
 TARGET_MS = 10.0
+TARGETS: dict[str, float] = {"hover": 50.0}  # another target for: a tooltip, whose values the page takes from the GPU without waiting
+# for them, shows within three frames of the pointer's entering a chart
 KEY_GAP_MS = 100  # from a click into a text box to the first key typed there
 DRAG_REST_MS = 80  # from the end of a drag's movement to the release of the button
 GPU_FLAGS = ["--headless=new", "--use-gl=angle", "--use-angle=gl-egl", "--ignore-gpu-blocklist", "--enable-gpu",
@@ -86,11 +93,12 @@ DEBUG = [f"debug/{k}" for k in ("grad_spike", "nan_count", "clip_frac", "var_rat
 METRICS = len(TRAIN) + len(EVAL) + len(DEBUG)
 LIVE = 32  # runs logging while the benchmark runs
 LIVE_RATE = 10.0  # rows per second each
+MANY_GROUPS = "algo, lr, net, seed"  # a grouping into RUNS / 2 groups of two runs: a line and a tooltip row each
 WRITERS = os.cpu_count() or 4
 
 INSTRUMENT = """async () => {
   if (window.__bench) return;
-  const B = (window.__bench = { draws: [], hovers: [], inputs: {} }), gl = (await import("/static/gl.js")).renderer()?.gl;
+  const B = (window.__bench = { draws: [], hovers: [], tips: [], inputs: {} }), gl = (await import("/static/gl.js")).renderer()?.gl;
   const C = [...app.charts.values()][0].constructor.prototype, draw = C.draw, fit = C.fitCanvases, hover = C.hover;
   // the GPU time of a task's chart drawing: a timer query from its first renderGL to the end of the task's draws
   const timer = gl?.getExtension("EXT_disjoint_timer_query_webgl2"), renderGL = C.renderGL;
@@ -122,7 +130,13 @@ INSTRUMENT = """async () => {
     }
     return out;
   };
-  C.hover = function (e) { hover.call(this, e); B.hovers.push(performance.now()); };
+  // a hover: [its start, its end, the first task after it]. Hovers run in a frame's callbacks, and the browser renders
+  // the frame before its next task, so the third is when the page is done with the frame the hover drew in.
+  const after = new MessageChannel(), waiting = [];
+  after.port1.onmessage = () => { const t = performance.now(); for (const h of waiting.splice(0)) h[2] = t; };
+  C.hover = function (e) { const h = [performance.now(), 0, null]; hover.call(this, e); h[1] = performance.now(); B.hovers.push(h); waiting.push(h); after.port2.postMessage(0); };
+  const tip = app.tip; // B.tips: when each tooltip was drawn
+  app.tip = function (e, ...rest) { tip.call(this, e, ...rest); if (e) B.tips.push(performance.now()); };
   for (const kind of ["wheel", "mouseup", "click", "keydown", "mousemove", "input"]) addEventListener(kind, () => (B.inputs[kind] = performance.now()), true);
 }"""
 
@@ -422,19 +436,20 @@ def type_filter(page: Page, text: str) -> float:
     return last_input(page, "input")
 
 
-def drag_zoom(page: Page) -> float | None:
-    """Drag across the middle of a chart in view, releasing where the pointer came to rest a moment before, as a
-    user's release follows the end of the movement; the time of the mouse release."""
+def drag_zoom(page: Page, rest: float = DRAG_REST_MS, span: tuple[float, float] = (0.3, 0.6)) -> float | None:
+    """Drag across a chart in view over `span` (fractions of its plot's width), releasing where the pointer came to rest
+    `rest` ms before (a user's release follows the end of the movement, or comes with it); the time of the release."""
     plot = page.evaluate(VISIBLE_PLOT)
     if not plot:
         return None
-    y = plot["top"] + plot["height"] / 2
-    page.mouse.move(plot["left"] + 0.3 * plot["width"], y)
+    y, (f0, f1) = plot["top"] + plot["height"] / 2, span
+    page.mouse.move(plot["left"] + f0 * plot["width"], y)
     page.mouse.down()
-    for f in (0.4, 0.5, 0.6):
-        page.mouse.move(plot["left"] + f * plot["width"], y)
+    for k in (1, 2, 3):
+        page.mouse.move(plot["left"] + (f0 + k * (f1 - f0) / 3) * plot["width"], y)
         page.wait_for_timeout(16)
-    page.wait_for_timeout(DRAG_REST_MS)
+    if rest:
+        page.wait_for_timeout(rest)
     page.mouse.up()
     return last_input(page, "mouseup")
 
@@ -460,7 +475,7 @@ def show_alone(page: Page) -> float | None:
 
 
 def hover_ms(page: Page) -> float | None:
-    """Move the pointer onto a chart in view: ms from the move to the end of its tooltip."""
+    """Move the pointer onto a chart in view: ms from the move until its tooltip is drawn."""
     plot = page.evaluate(VISIBLE_PLOT)
     if not plot:
         return None
@@ -468,12 +483,32 @@ def hover_ms(page: Page) -> float | None:
     t0 = last_input(page, "mousemove")
     end = time.monotonic() + 2
     while time.monotonic() < end:
-        done = page.evaluate("(t0) => window.__bench.hovers.find((t) => t >= t0) ?? null", t0)
+        done = page.evaluate("(t0) => window.__bench.tips.find((t) => t >= t0) ?? null", t0)
         if done is not None:
             page.mouse.move(5, 5)
             return float(done) - t0
         page.wait_for_timeout(5)
     return None
+
+
+def hover_sweep(page: Page, moves: int = 40) -> list[float]:
+    """Sweep the pointer onto a chart in view and across it, a move every 8 ms as a mouse polled at 125 Hz moves it:
+    the ms each hover drawn meanwhile took the page, its work in a frame to follow the pointer (crosshair, values under
+    it, tooltip) with the browser's rendering of what that changed."""
+    plot = page.evaluate(VISIBLE_PLOT)
+    if not plot:
+        return []
+    page.mouse.move(5, 5)
+    page.wait_for_timeout(100)
+    page.evaluate("window.__bench.hovers.length = 0")
+    y = plot["top"] + plot["height"] * 0.5
+    for k in range(moves + 1):
+        page.mouse.move(plot["left"] + plot["width"] * (0.1 + 0.8 * k / moves), y)
+        page.wait_for_timeout(8)
+    page.wait_for_timeout(100)
+    took: list[float] = page.evaluate("window.__bench.hovers.filter((h) => h[2] !== null).map(([t0, , t2]) => t2 - t0)")
+    page.mouse.move(5, 5)
+    return took
 
 
 def a_run(page: Page) -> str | None:
@@ -511,14 +546,26 @@ def round_of(page: Page, res: Results, r: int, timeout_ms: float) -> None:
     quiet(page, timeout_ms)
     for _ in range(3):
         res.add("hover", hover_ms(page))
+    for ms in hover_sweep(page):
+        res.add("hover-move", ms)
     timed("zoom", lambda: drag_zoom(page), True)
     timed("scroll-zoomed", lambda: wheel(page, 3))
+    timed("reset-zoom", lambda: click_plot(page), True)
+    timed("zoom-quick", lambda: drag_zoom(page, 0, (0.2, 0.7)), True)  # another view, released as it moves: nothing binned ahead
     timed("reset-zoom", lambda: click_plot(page), True)
     timed("filter", lambda: type_filter(page, "seed < 4"), True)
     timed("unfilter", lambda: type_filter(page, ""), True)
     page.keyboard.press("Escape")  # its completions
     page.evaluate("document.activeElement.blur()")
     timed("ungroup", lambda: api(page, "app.setGroup('run')"), True)
+    quiet(page, timeout_ms)
+    for ms in hover_sweep(page):
+        res.add("hover-heatmap", ms)
+    timed("regroup", lambda: api(page, "app.setGroup(app.defaultGroup(app.opts.path))"), True)
+    timed("group-many", lambda: api(page, f"app.setGroup({json.dumps(MANY_GROUPS)})"), True)
+    quiet(page, timeout_ms)
+    for ms in hover_sweep(page):
+        res.add("hover-groups", ms)
     timed("regroup", lambda: api(page, "app.setGroup(app.defaultGroup(app.opts.path))"), True)
 
 
@@ -613,8 +660,8 @@ def fmt(ms: float | None) -> str:
 
 
 def report(res: Results, target: float) -> bool:
-    """Print each interaction's median and worst against the target, with the median and worst GPU time of its draws;
-    whether every worst meets the target."""
+    """Print each interaction's median and worst against the target (its own, for those TARGETS names), with the median
+    and worst GPU time of its draws; whether every worst meets its target."""
     ok = True
     print(f"\n{'interaction':14} {'median':>9} {'worst':>9}  n   target {target:g} ms   GPU draws (median, worst)")
     def spread(v: list[float]) -> str:
@@ -623,11 +670,12 @@ def report(res: Results, target: float) -> bool:
     for name in [*res.ms, *(k for k in res.timeouts if k not in res.ms)]:
         ms, out = sorted(res.ms.get(name, [])), res.timeouts.get(name, 0)
         worst = float("inf") if out else ms[-1]
-        good = worst <= target
+        good = worst <= TARGETS.get(name, target)
         ok &= good
         med = f"{statistics.median(ms):7.1f} ms" if ms else "    -    "
         print(f"{name:14} {med:>9} {fmt(None if out else worst):>9} {len(ms) + out:2d}  {'ok  ' if good else 'SLOW'}"
-              f"          {spread(res.gpu.get(name, []))}" + (f" ({out} timed out)" if out else ""))
+              f"          {spread(res.gpu.get(name, []))}" + (f" ({out} timed out)" if out else "")
+              + (f"   (target {TARGETS[name]:g} ms)" if name in TARGETS else ""))
     return ok
 
 
@@ -684,7 +732,7 @@ def main() -> None:
             ctx.close()
         ok = report(res, a.target) and agree
         if a.json:
-            Path(a.json).write_text(json.dumps({"ms": res.ms, "gpu": res.gpu, "timeouts": res.timeouts, "target": a.target}))
+            Path(a.json).write_text(json.dumps({"ms": res.ms, "gpu": res.gpu, "timeouts": res.timeouts, "target": a.target, "targets": TARGETS}))
     finally:
         for proc in (writer, server):
             if proc is not None:

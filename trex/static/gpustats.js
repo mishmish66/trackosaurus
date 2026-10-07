@@ -569,6 +569,8 @@ function ciTable(c, n) {
   return c.ci;
 }
 
+const VALUES_BYTES = 32 << 20; // the values of one binning the CPU keeps a copy of for its tooltips, at most (`GpuLines.values`)
+
 /** A chart's results on the GPU, its share of the round it was binned in: the points it draws (`tex`, as gl.js
  * `Points` hold them, its own from point `first` on), and for its tooltips the statistics (center, lo, hi, n per bin
  * and group) or bin means (per bin and run) they were drawn from, in the round's columns from `x` on. */
@@ -577,6 +579,8 @@ export class GpuLines {
     this.round = null; // {pts, src (textures), refs (the charts sharing them), gen}
     this.first = 0;
     this.x = 0;
+    this.copy = null; // {w, h, vals}: its values as the CPU holds them, once read (`values`)
+    this.pending = null; // {w, h, buf, sync, gen}: their read into a pixel-pack buffer, under way (`fetch`)
   }
 
   /** The texture of the points a chart draws, for gl.js draws. */
@@ -609,6 +613,56 @@ export class GpuLines {
     return buf;
   }
 
+  /** Begin reading its values (w bins of h lines) into the CPU without waiting for the GPU: into a pixel-pack buffer,
+   * behind a fence, which `values` takes them from once the GPU has passed it. */
+  fetch(w, h) {
+    if (!this.live || this.copy || this.pending || 16 * w * h > VALUES_BYTES) return;
+    const c = ctx, gl = c.gl, buf = gl.createBuffer();
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buf);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, 16 * w * h, gl.STREAM_READ);
+    target(c, this.round.src);
+    gl.readPixels(this.x, 0, w, h, gl.RGBA, gl.FLOAT, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.pending = { w, h, buf, sync: gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0), gen: c.gen };
+    gl.flush();
+  }
+
+  /** Its values, w bins of h lines (4 numbers a bin, line after line), as the CPU holds them, read once and never
+   * waited for: undefined while their read is under way (`fetch`, begun here when none is); null when they are gone,
+   * or more than VALUES_BYTES (read a bin or a line at a time then: `column`, `row`). */
+  values(w, h) {
+    if (this.copy?.w === w && this.copy.h === h) return this.copy.vals;
+    if (!this.live || 16 * w * h > VALUES_BYTES) return null;
+    const gl = ctx.gl, p = this.pending;
+    if (p?.w !== w || p.h !== h) {
+      this.forget();
+      this.fetch(w, h);
+      return undefined;
+    }
+    if (![gl.ALREADY_SIGNALED, gl.CONDITION_SATISFIED].includes(gl.clientWaitSync(p.sync, 0, 0))) return undefined;
+    const vals = new Float32Array(4 * w * h);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, p.buf);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, vals);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    this.dropFetch();
+    this.copy = { w, h, vals };
+    return vals;
+  }
+
+  /** Give up the read `fetch` began. */
+  dropFetch() {
+    const p = this.pending;
+    this.pending = null;
+    if (p && ctx?.gen === p.gen) ctx.gl.deleteBuffer(p.buf), ctx.gl.deleteSync(p.sync);
+  }
+
+  /** Give up its values as the CPU holds them, and their read under way: no tooltip reads them any more. */
+  forget() {
+    this.copy = null;
+    this.dropFetch();
+  }
+
   /** Take a share of `round`: its points from `first` on, its columns from `x` on. */
   share(round, first, x) {
     this.release();
@@ -620,6 +674,7 @@ export class GpuLines {
   release() {
     const r = this.round;
     this.round = null;
+    this.forget();
     if (r && --r.refs === 0 && ctx?.gen === r.gen) give(ctx, r.pts), give(ctx, r.src);
   }
 }
@@ -671,6 +726,8 @@ function rangesOf(c, jobs) {
   gl.disable(gl.BLEND);
   gl.bindVertexArray(c.r.vao);
   c.use++;
+  const ahead = jobs.filter((j) => j.ahead);
+  if (ahead.length) dropAhead(c, ahead.map(meansKey)); // the means of the binnings ahead before these
   let at = 0;
   for (const round of roundsOf(jobs, Math.min(MAX_COLS, c.r.maxRows))) {
     runRound(c, round, at, ranges, temps);
@@ -768,19 +825,17 @@ function columnPoints(cols, p) {
  * of the same data and binning (job.src.data, job.p) over the same runs drawn from columns, whichever of them are shown
  * or grouped, and copied from there; only the others are added up. When the round needs the texture no longer than
  * its statistics take (`whole`), the texture is kept too, for a round of the same jobs in the same columns: a filter
- * or a regrouping of the charts in view then copies nothing. The means that jobs binned ahead make (`ahead`) replace
- * those the jobs ahead before them made, unless a job not ahead has used them since: a drag bins a view every few
- * frames, and only the last one's means may serve. */
+ * or a regrouping of the charts in view then copies nothing. The means that jobs binned ahead make (`ahead`) are kept
+ * until the next call binning ahead (`dropAhead`), unless a job not ahead uses them first: a drag may bin a view at
+ * each rest, and only the last one's means may serve. */
 function meansOf(c, jobs, lay, tab, temps, whole, ahead) {
-  const gl = c.gl, slots = Math.max(1, tab.n);
-  const keys = jobs.map(({ src, p }) => `${slots}|${src.tab.columns}|${src.data}|${p.xmode}|${p.x0}|${p.x1}|${p.bins}|${p.flags & LOGX}`);
+  const gl = c.gl, slots = Math.max(1, tab.n), keys = jobs.map(meansKey);
   const all = `${lay.cols}\n${keys.join("\n")}`, had = whole ? c.rounds.get(all) : undefined;
   if (had) {
     c.rounds.delete(all); // the most recently used last
     c.rounds.set(all, had);
     return had;
   }
-  if (ahead) dropAhead(c, keys);
   const means = take(c, gl.R32F, gl.RED, gl.FLOAT, lay.cols, slots);
   const kept = keys.map((k) => c.means.get(k)), made = jobs.flatMap((_, i) => (kept[i] ? [] : [i]));
   if (made.length) binned(c, jobs, made, lay, tab, means, temps);
@@ -797,10 +852,12 @@ function meansOf(c, jobs, lay, tab, temps, whole, ahead) {
     c.means.set(keys[i], t);
     c.meansBytes += 4 * t.w * t.h;
     if (ahead) c.ahead.add(keys[i]);
+    else c.ahead.delete(keys[i]);
   }
   for (const [k, t] of c.means) {
     if (c.meansBytes <= MEANS_BYTES || keys.includes(k)) break;
     c.means.delete(k);
+    c.ahead.delete(k);
     c.meansBytes -= 4 * t.w * t.h;
     give(c, t);
   }
@@ -808,13 +865,17 @@ function meansOf(c, jobs, lay, tab, temps, whole, ahead) {
   return means;
 }
 
+/** What a job's bin means are made of, as text: the runs' slots, which of them are binned from columns, the data and
+ * the binning. */
+const meansKey = ({ src, p }) => `${Math.max(1, src.tab.n)}|${src.tab.columns}|${src.data}|${p.xmode}|${p.x0}|${p.x1}|${p.bins}|${p.flags & LOGX}`;
+
 /** Give up the means that jobs binned ahead made and no other job has used, but those of `keys`. */
 function dropAhead(c, keys) {
   for (const k of c.ahead) {
     if (keys.includes(k)) continue;
     const t = c.means.get(k);
     c.ahead.delete(k);
-    if (!t) continue; // given up already, as the means used least recently
+    if (!t) continue;
     c.means.delete(k);
     c.meansBytes -= 4 * t.w * t.h;
     give(c, t);

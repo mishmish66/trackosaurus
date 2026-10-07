@@ -5,16 +5,15 @@
 import { BASE, Data, PROTOCOL, getJSON, hasKey, mediaURL, preload, within } from "./data.js";
 import { startWorkers } from "./pool.js";
 import { asNumber, compileWhere, completionContext, fieldText, literal, runField, textOf } from "./where.js";
-import { BAND_LABEL, Chart, DENSITY_AUTO, drawCharts, fmt, fmtDur, fmtSI } from "./plot.js";
+import { BAND_LABEL, Chart, DENSITY_AUTO, drawCharts, fmt, fmtDur, fmtSI, watchTheme } from "./plot.js";
 import { X_RUNTIME, X_STEP } from "./kernel.js";
 import { renderer } from "./gl.js";
 import { gpuQueued, runGpuJobs, warmArrays } from "./gpustats.js";
+import { TIP_ROWS, TIP_ROW_PX, TipCanvas } from "./tip.js";
 
 const PALETTE = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
                  "#9c755f", "#bab0ac", "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#17becf", "#bcbd22"];
 const SIDE_ROW = 24; // px height of a sidebar row
-const TIP_ROWS = 14; // value rows in view in the tooltip
-const TIP_ROW_PX = 18; // height of one (#tip .trow in index.html)
 const PINNED = "\0pinned"; // section of pinned charts
 const ALONE = "\0alone"; // the chart shown alone: a copy of its own, so the grid's keeps its drawing
 const HIDE_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M2.1 1.1 1 2.2l2.3 2.3C2.1 5.4 1.1 6.6.5 8c1.2 2.9 4 5 7.5 5 1.3 0 2.5-.3 3.6-.9l2.3 2.3 1.1-1.1L2.1 1.1zM8 11.5A3.5 3.5 0 0 1 4.5 8c0-.6.2-1.2.4-1.7l1.2 1.2V8a1.9 1.9 0 0 0 2.4 1.8l1.2 1.2c-.5.3-1.1.5-1.7.5zm7.5-3.5C14.3 5.1 11.5 3 8 3c-.9 0-1.8.2-2.6.5l1.3 1.3c.4-.2.9-.3 1.3-.3A3.5 3.5 0 0 1 11.5 8c0 .5-.1.9-.3 1.3l1.9 1.9c1-.8 1.9-1.9 2.4-3.2z"/></svg>';
@@ -27,7 +26,10 @@ const WARM_BYTES = 4 << 20; // bucket arrays copied to the GPU ahead of a zoom, 
 const FRAME_BUDGET_MS = 12; // chart drawing per frame...
 const URGENT_BUDGET_MS = 40; // ...or per round drawn for an interaction
 const AIM_MS = 40; // between fetches for a zoom being dragged
-const AIM_REST_MS = 24; // a dragged zoom at rest this long is binned ahead: more than a frame, so not while it moves
+const POINTER_REST_MS = 100; // the pointer rests once it has not moved over a chart for this long; streamed rows are drawn then...
+const POINTER_WAIT_MS = 1000; // ...or once they have waited this long for it
+const OVERLAY_IDLE_MS = 2000; // a chart's hover overlay keeps its backing store this long after the pointer left the charts
+const AIM_REST_MS = 50; // a dragged zoom at rest this long is binned ahead: longer than a frame at 30 Hz, so not while it moves
 const HOLD_MS = 120; // a chart whose columns are being rebuilt for a new view waits this long for them before drawing
 const PLAN_IDLE_MS = 250; // block planning interval while the view is unchanged
 const CANVAS_BYTES = 512 << 20; // drawn charts' canvases kept out of view; beyond, the least recently seen are freed
@@ -50,6 +52,11 @@ const h = (tag, attrs = {}, ...kids) => {
   return e;
 };
 const opt = (value, text, sel) => h("option", { value, textContent: text, selected: sel });
+/** Set element el's text to `text` (nothing for null), unless it is that already: an unchanged text costs no layout. */
+const setText = (el, text) => {
+  const t = text == null ? "" : String(text);
+  if (el.textContent !== t) el.textContent = t;
+};
 
 /** Make `kids` the children of `el`, in order, moving only those not in place: the others keep their layout. */
 function setChildren(el, kids) {
@@ -460,6 +467,13 @@ class App {
     this.lead = null; // metric of the chart last pressed: its demand is planned first
     this.holdUntil = 0; // until when charts wait for columns being rebuilt (`due`)
     this.tipWheel = (e) => this.scrollTip(e); // listens only while the tooltip is pinned, so scrolling never waits for the page
+    this.tipCanvas = new TipCanvas($("#tipCanvas")); // the tooltip a hover draws
+    this.tipAt = null; // where it is drawn (`tip`)
+    this.hoverAt = -Infinity; // when the pointer last moved over a chart (`pointerHolds`, `atRest`)
+    this.heldSince = 0; // since when a round of streamed rows has waited for the pointer; 0: none does
+    this.resting = new Map(); // name -> {f, since}: what waits for the pointer to rest (`atRest`)
+    this.overlays = new Set(); // charts whose hover overlay has a backing store, the pointer gone (`overlayLeft`)
+    this.overlayT = 0;
     this.tree = [];
     const q = new URLSearchParams(location.hash.slice(1));
     this.opts = hashOpts(q);
@@ -468,11 +482,11 @@ class App {
     this.panelsSoon = throttle(() => this.renderPanels(), 300);
     this.data = new Data({
       runFields: RUN_FIELDS,
-      runs: throttle(() => this.onRuns(), 300),
+      runs: throttle(() => this.atRest("runs", () => this.onRuns()), 300),
       data: (keys, streamed) => this.onData(keys, streamed),
       keys: () => this.panelsSoon(),
       media: (k) => this.onMedia(k),
-      status: (t) => ($("#status").textContent = t),
+      status: (t) => this.atRest("status", () => setText($("#status"), t)),
       idle: () => (this.nextFrame(), this.warmSoon()),
       ahead: () => this.aheadOf(),
       protocol: (n) => this.showProtocol(n),
@@ -498,6 +512,7 @@ class App {
       { root: $("#panels"), rootMargin: `${NEAR_PX}px` },
     );
     this.ioView = new IntersectionObserver((es) => es.forEach((e) => (e.target._chart.inView = e.isIntersecting)), { root: $("#panels") });
+    watchTheme(() => this.onTheme());
   }
 
   /** Grouped rendering: some group holds several runs, and the scope is more than one run. */
@@ -1684,6 +1699,7 @@ class App {
       e.stopPropagation();
     });
     box.addEventListener("blur", () => {
+      due = false;
       if (menu.anchor === box) menu.close();
       on.blur?.();
     });
@@ -2194,7 +2210,7 @@ class App {
 
   /** Draw dirty visible charts: `now` (for the view, which then also draws the charts dirtied while drawing) as soon
    * as the task asking for it ends; streamed updates are coalesced to 4 Hz, or less often when drawing the visible
-   * charts takes more than a sixteenth of that. */
+   * charts takes more than a sixteenth of that, and wait for a pointer moving over a chart (`pointerHolds`). */
   schedule(now) {
     if (now) (this.urgent = true), this.drawSoon();
     else if (!this.slow) {
@@ -2205,6 +2221,38 @@ class App {
         this.nextFrame();
       }, Math.min(2000, Math.max(250, 16 * cost)));
     }
+  }
+
+  /** Do `f` once the pointer rests: at once, unless it moves over a chart (it did within POINTER_REST_MS); then
+   * when it has rested, POINTER_WAIT_MS later at most, and of the calls of one `name` waiting, the last one only. What
+   * the stream brings changes the page's elements (the run list, the status), which has the browser paint the page
+   * anew: between the frames that follow the pointer then, not in them. */
+  atRest(name, f) {
+    const now = performance.now(), waits = this.resting.get(name);
+    if (waits) return void (waits.f = f);
+    if (now - this.hoverAt >= POINTER_REST_MS) return void f();
+    const w = { f, since: now };
+    this.resting.set(name, w);
+    const tick = () => {
+      const t = performance.now();
+      if (t - this.hoverAt < POINTER_REST_MS && t - w.since < POINTER_WAIT_MS) return void setTimeout(tick, POINTER_REST_MS);
+      this.resting.delete(name);
+      w.f();
+    };
+    setTimeout(tick, POINTER_REST_MS);
+  }
+
+  /** Whether a round that would draw streamed rows only waits for the pointer: while it moves over a chart (it did
+   * within POINTER_REST_MS), the round is tried again that much later, POINTER_WAIT_MS at most in all. The frames that
+   * follow the pointer then carry the hover alone, and the rows are on screen once it rests. */
+  pointerHolds() {
+    const now = performance.now();
+    if (this.urgent || this.later || now - this.hoverAt >= POINTER_REST_MS || now - (this.heldSince ||= now) >= POINTER_WAIT_MS) return (this.heldSince = 0), false;
+    this.slow ||= setTimeout(() => {
+      this.slow = null;
+      this.nextFrame();
+    }, POINTER_REST_MS);
+    return true;
   }
 
   nextFrame() {
@@ -2234,7 +2282,7 @@ class App {
    * and are prepared again in the next round. */
   drawDirty() {
     this.raf = null;
-    if (!this.runList) return;
+    if (!this.runList || (!this.round && this.pointerHolds())) return;
     if (!this.round) this.beginRound();
     const t0 = performance.now();
     let n = this.prepareRound();
@@ -2414,7 +2462,7 @@ class App {
   plan(all = true) {
     if (all) clearTimeout(this.planTimer), (this.planTimer = null), (this.plannedAt = performance.now());
     this.partPlanned = !all;
-    if (this.runList) this.data.plan(this.demands(this.xrange, all));
+    if (this.runList) this.data.plan(this.demands(this.xrange, all), !all);
   }
 
   /** What the visible charts (or those in view, when not `all`) show, were the x zoom `range`: one demand per metric,
@@ -2448,7 +2496,8 @@ class App {
    * binning nor reads anything back. */
   binAhead(r) {
     if (gpuQueued()) return; // a round's binnings are queued: they run with it
-    for (const c of this.charts.values()) if (c.inView || c.full) c.binAhead(r, this.data.layersIf(this.demand(c, this.shown, 600, r)));
+    const alone = !!this.opts.chart; // the grid under the chart shown alone is unseen
+    for (const c of this.charts.values()) if (alone ? c.full : c.inView || c.full) c.binAhead(r, this.data.layersIf(this.demand(c, this.shown, 600, r)));
     if (gpuQueued()) runGpuJobs();
   }
 
@@ -2479,49 +2528,116 @@ class App {
     this.setXRange(null);
   }
 
-  /** Value tooltip: every row by value, in a list TIP_ROWS tall centered on `near` (the line nearest the pointer). */
-  tip(e, chart, heading, rows, near = -1) {
-    if (!e) return ($("#tip").hidden = true);
-    this.tipView = { e, chart, heading, rows, near };
-    this.renderTip();
+  /** Value tooltip: every row ({ln, val, ...}) by value, the TIP_ROWS around `near` (the line nearest the pointer) drawn
+   * beside the pointer on the tooltip's canvas (`TipCanvas`), so that a hover changes nothing of the document;
+   * `note(row)` is what a row says after its value, asked of the rows shown only. `tipAt` is where it is drawn ({x, y,
+   * w, a: the first row shown}), null while none is. Shift pins it, as elements (`pinTip`). */
+  tip(e, chart, heading, rows, near = -1, note = null) {
+    if (!e) return this.hideTip();
+    this.tipView = { e, chart, heading, rows, near, note };
+    this.tipAt = this.tipCanvas.draw(this.tipView);
   }
 
-  /** The tooltip beside the pointer: a heading, the scrolling list of rows, and a hint. */
-  renderTip() {
-    const t = $("#tip"), v = this.tipView, { e, chart, heading, rows, near } = v;
-    v.body = h("div", {});
-    v.list = h("div", { className: "tlist", style: `height:${Math.min(rows.length, TIP_ROWS) * TIP_ROW_PX}px`, onscroll: () => this.tipWindow() }, v.body);
-    v.a = v.b = -1;
-    t.replaceChildren(h("div", { className: "th", textContent: `${chart?.key} · ${heading}` }), v.list, h("div", { className: "tf" }));
-    this.tipFooter();
-    t.hidden = false;
-    v.body.style.paddingBottom = `${rows.length * TIP_ROW_PX}px`; // the list's full height, so it can scroll to `near`
-    v.list.scrollTop = Math.max(0, (near - (TIP_ROWS >> 1)) * TIP_ROW_PX);
-    this.tipWindow();
-    v.list.style.minWidth = `${v.body.offsetWidth}px`;
-    const W = t.offsetWidth, H = t.offsetHeight;
-    let x = e.clientX + 16, y = e.clientY + 12;
-    if (x + W > innerWidth) x = e.clientX - W - 16;
-    if (y + H > innerHeight) y = Math.max(0, innerHeight - H - 4);
+  /** The colors the canvases draw with changed (plot.js `watchTheme`): the charts are drawn anew, their kept images being
+   * of the other colors, and so is a tooltip drawn on its canvas. Pinned, it is elements, which follow the page. */
+  onTheme() {
+    if (this.tipAt && !this.tipPinned) this.tipAt = this.tipCanvas.draw(this.tipView);
+    this.redrawAll();
+  }
+
+  /** Take the tooltip off the page, drawn or pinned. */
+  hideTip() {
+    this.tipAt = null;
+    this.tipCanvas.clear();
+    $("#tip").hidden = true;
+  }
+
+  /** The pointer left chart c, whose hover overlay is clear: free the overlays' backing stores OVERLAY_IDLE_MS after the
+   * last chart was left. Sizing a canvas changes the document; a pointer crossing the charts it just crossed does not. */
+  overlayLeft(c) {
+    this.overlays.add(c);
+    clearTimeout(this.overlayT);
+    this.overlayT = setTimeout(() => {
+      for (const o of this.overlays) if (o !== this.hovered && o !== this.pinned) o.freeOverlay(), this.overlays.delete(o);
+    }, OVERLAY_IDLE_MS);
+  }
+
+  /** The tooltip as elements, where the canvas drew it and showing the same rows: a heading, the list of rows and a hint
+   * (`tipParts`, made once), which `tipScroll` turns into a list scrolling over every row. */
+  tipElements() {
+    const t = $("#tip"), v = this.tipView, { chart, heading, rows } = v, { x, y, w, a } = this.tipAt, p = this.tipParts();
+    [v.list, v.body] = [p.list, p.body];
+    setText(p.head, `${chart?.key} · ${heading}`);
+    p.list.style.height = `${Math.min(rows.length, TIP_ROWS) * TIP_ROW_PX}px`;
+    if (p.scrolled) this.tipUnscroll(p);
+    v.top = a * TIP_ROW_PX;
+    this.tipRows(a, Math.min(rows.length, a + TIP_ROWS));
+    t.style.minWidth = `${w}px`;
     t.style.transform = `translate(${x}px, ${y}px)`;
+    t.hidden = false;
   }
 
-  /** The rows in view of the tooltip's list (and a few beyond), between spacers standing for the rest. */
+  /** The pinned tooltip's parts, made once: {head, list, body (its rows, between spacers while it scrolls), foot,
+   * scrolled}. */
+  tipParts() {
+    if (this.tipEls) return this.tipEls;
+    const rowOf = (e) => e.target.closest?.(".trow");
+    const body = h("div", {
+      onmouseover: (e) => rowOf(e) && rowOf(e) !== this.tipOver && ((this.tipOver = rowOf(e)), this.tipRowEnter(this.tipView?.chart, this.tipOver._ln)),
+      onmouseleave: () => (this.tipOver = null),
+      onclick: (e) => rowOf(e) && this.tipRowOpen(rowOf(e)._ln),
+    });
+    const p = { head: h("div", { className: "th" }), list: h("div", { className: "tlist", onscroll: () => this.tipPinned && this.tipWindow() }, body), body,
+                foot: h("div", { className: "tf" }), scrolled: false };
+    $("#tip").replaceChildren(p.head, p.list, p.foot);
+    return (this.tipEls = p);
+  }
+
+  /** Rows a to b of the tooltip's list as its body's elements, kept from one rendering to the next and written where
+   * what they show changed. */
+  tipRows(a, b) {
+    const { rows, near, note } = this.tipView, body = this.tipEls.body;
+    while (body.childElementCount > b - a) body.lastElementChild.remove();
+    while (body.childElementCount < b - a) body.append(h("div", {}, h("span", { className: "sw" }), h("span", { className: "tl" }), h("b"), h("span", { className: "muted" })));
+    for (let i = a; i < b; i++) {
+      const el = body.children[i - a], [sw, label, val, extra] = el.children, row = rows[i], ln = row.ln;
+      el._ln = ln;
+      if (el.className !== (i === near ? "trow near" : "trow")) el.className = i === near ? "trow near" : "trow";
+      if (el._color !== ln.color) (el._color = ln.color), (sw.style.background = ln.color);
+      setText(label, ln.label), setText(val, fmt(row.val)), setText(extra, note ? note(row) : "");
+    }
+  }
+
+  /** The rows in view of the pinned tooltip's scrolling list (and a few beyond), between spacers standing for the rest. */
   tipWindow() {
-    const v = this.tipView, { list, body, rows, near, chart } = v, top = list.scrollTop;
+    const v = this.tipView, { list, body } = this.tipEls, top = list.scrollTop, n = v.rows.length;
     list.classList.toggle("up", top > 0);
     list.classList.toggle("down", top + list.clientHeight < list.scrollHeight - 1);
-    const a = Math.max(0, Math.floor(top / TIP_ROW_PX) - 3), b = Math.min(rows.length, a + TIP_ROWS + 6);
+    const a = Math.max(0, Math.floor(top / TIP_ROW_PX) - 3), b = Math.min(n, a + TIP_ROWS + 6);
     if (a === v.a && b === v.b) return;
     [v.a, v.b] = [a, b];
     body.style.paddingTop = `${a * TIP_ROW_PX}px`;
-    body.style.paddingBottom = `${(rows.length - b) * TIP_ROW_PX}px`;
-    body.replaceChildren(...rows.slice(a, b).map(({ ln, val, extra }, i) =>
-      h("div", { className: "trow" + (a + i === near ? " near" : ""), onmouseenter: () => this.tipRowEnter(chart, ln),
-                 onclick: () => this.tipRowOpen(ln) },
-        h("span", { className: "sw", style: `background:${ln.color}` }),
-        h("span", { className: "tl", textContent: ln.label }), h("b", { textContent: fmt(val) }),
-        h("span", { className: "muted", textContent: extra }))));
+    body.style.paddingBottom = `${(n - b) * TIP_ROW_PX}px`;
+    this.tipRows(a, b);
+  }
+
+  /** Turn the tooltip's list into one scrolling over every row, at the rows it shows, as wide as they are now. */
+  tipScroll() {
+    const v = this.tipView, p = this.tipEls;
+    if (!v || !p) return;
+    p.list.style.minWidth = `${p.body.offsetWidth}px`;
+    p.scrolled = true;
+    v.a = v.b = -1;
+    p.body.style.paddingBottom = `${v.rows.length * TIP_ROW_PX}px`;
+    p.list.scrollTop = v.top;
+    this.tipWindow();
+  }
+
+  /** The tooltip's list back to the rows around the nearest one. */
+  tipUnscroll(p) {
+    p.scrolled = false;
+    p.body.style.paddingTop = p.body.style.paddingBottom = p.list.style.minWidth = "";
+    p.list.scrollTop = 0;
   }
 
   /** While the tooltip is pinned, the wheel (vertical, or horizontal as Shift makes it) scrolls its list:
@@ -2533,33 +2649,32 @@ class App {
     if (d) this.tipView.list.scrollBy({ top: d, behavior: Math.abs(d) >= 40 ? "smooth" : "instant" });
   }
 
-  tipFooter() {
-    const f = $("#tip .tf");
-    const scroll = this.tipView?.rows.length > TIP_ROWS ? " · scroll for more" : "";
-    if (f) f.textContent = this.tipPinned ? `hover a row to find it in the list · click to open it${scroll}`
-      : "hold shift to pin · drag: zoom x · drag a box: zoom x and y · click: reset";
-  }
-
-  /** Freeze the value tooltip where it is, so the pointer can move into it. */
+  /** Freeze the value tooltip where it is, as elements (`tipElements`), so the pointer can move into it: a list of every
+   * row, to scroll, hover and click. */
   pinTip() {
-    if (this.tipPinned || !this.hovered || $("#tip").hidden) return;
+    if (this.tipPinned || !this.hovered || !this.tipAt || !this.tipCanvas.shown) return;
     this.tipPinned = true;
     this.pinned = this.hovered;
+    this.tipElements();
+    this.tipCanvas.hide();
     $("#tip").classList.add("pinned");
     document.addEventListener("wheel", this.tipWheel, { passive: false });
-    this.tipFooter();
+    this.tipScroll();
+    setText(this.tipEls.foot, `hover a row to find it in the list · click to open it${this.tipView.rows.length > TIP_ROWS ? " · scroll for more" : ""}`);
   }
 
+  /** Let the pinned tooltip go: drawn on its canvas again while its chart is still hovered. */
   unpinTip() {
     if (!this.tipPinned) return;
     this.tipPinned = false;
     $("#tip").classList.remove("pinned");
     document.removeEventListener("wheel", this.tipWheel);
-    this.tipFooter();
     const c = this.pinned;
     this.pinned = null;
-    if (c && this.hovered !== c) c.unhover();
-    else c?.highlight(null);
+    if (c && this.hovered !== c) return c.unhover();
+    c?.highlight(null);
+    $("#tip").hidden = true;
+    if (this.tipAt) this.tipAt = this.tipCanvas.draw(this.tipView);
   }
 
   tipRowEnter(chart, ln) {

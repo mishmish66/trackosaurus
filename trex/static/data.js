@@ -40,6 +40,7 @@ const RUNS_PER_REQUEST = 2000; // run ids one request names
 const REBUILD_SLICE_MS = 8; // column rebuilds per task, in ms...
 const REBUILD_WHOLE_MS = 32; // ...or up to this to finish a metric's, so its chart draws them all at once
 const PREFETCH_IDLE_MS = 50; // quiet time before fetching ahead
+const AHEAD_SCAN_MS = 2; // one task's share of finding what to fetch ahead next (`nextAhead`)
 const RETRY_MS = 1000; // a block whose request failed is asked for again after this, twice as long after each failure...
 const RETRY_MAX_MS = 30000; // ...up to this
 export const LINE_PX_PER_BUCKET = 2; // chart width per bucket a line needs
@@ -62,8 +63,14 @@ export function hasKey(r, key) {
 /** Id of block (key, level, index). */
 const blockId = (key, level, index) => `${key}|${level}|${index}`;
 
-/** What request x asks for: its block, and its runs or the scope's. */
-const askId = (x) => `${blockId(x.key, x.level, x.index)}|${x.runs === null ? `\0${x.scope}` : x.runs.map((r) => r.id).join("\0")}`;
+/** What request x asks for: its block, and the scope's runs or its own (how many, and a hash of their run indices: a
+ * collision only leaves a block to the plan that needs it). */
+export function askId(x) {
+  if (x.runs === null) return `${blockId(x.key, x.level, x.index)}|\0${x.scope}`;
+  let h = 2166136261;
+  for (const r of x.runs) h = Math.imul(h ^ r.idx, 16777619);
+  return `${blockId(x.key, x.level, x.index)}|${x.runs.length}:${h >>> 0}`;
+}
 
 /** Whether run or folder `id` is folder (or run) `path` or lies under it ("": everything). */
 export const within = (id, path) => path === "" || id === path || id.startsWith(`${path}/`);
@@ -81,7 +88,7 @@ const sameLayer = (x, y) => x === y || (!!x && !!y && x.level === y.level && x.i
                                         && x.indices.every((k, i) => k === y.indices[i]));
 
 /** Whether layers a and b ({coarse, fine}, or null) are the same blocks. */
-const sameLayers = (a, b) => !!a && !!b && sameLayer(a.coarse, b.coarse) && sameLayer(a.fine, b.fine);
+export const sameLayers = (a, b) => !!a && !!b && sameLayer(a.coarse, b.coarse) && sameLayer(a.fine, b.fine);
 
 const clampLevel = (l) => Math.min(MAX_LEVEL, Math.max(MIN_LEVEL, l));
 
@@ -147,6 +154,7 @@ export class Data {
     this.doneVer = 0; // bumped whenever which runs are finished, or a finished run's compiled rows, change
     this.runningLists = new WeakMap(); // run list -> {done (doneVer), out (its running runs)}
     this.charts = new Map(); // metric -> {want ({coarse, fine} layers), ready (the layers shown), runs, many} of the last plan
+    this.shownKeys = new Set(); // the metrics of the charts the last plan was for: those in or near the view
     this.queue = []; // requests to send: {key, level, index, runs (null: the finished runs of folder `scope`)}
     this.inflight = new Map(); // blockId -> {scope (the folder whose finished runs are asked for, or null), runs (ids asked for), n (requests)}
     this.failed = new Map(); // blockId -> {runs (ids whose request failed, "" the scope's finished runs), n (failures), until (when due again), error}
@@ -156,6 +164,9 @@ export class Data {
     this.aheadPosts = 0; // requests in flight fetching ahead
     this.aimPosts = 0; // those of them for a zoom being dragged
     this.aheadAsked = new Set(); // askId of each request fetching ahead has made
+    this.aheadAt = null; // where `nextAhead`'s scan of the charts is (`aheadScan`); null: at the start
+    this.aheadMore = false; // that scan stopped before its end
+    this.aheadView = null; // the view of the last plan: another one starts the scan over
     this.rebuildQ = new Map(); // "run\0key" -> [run, key] awaiting rebuildSoon
     this.rebuildLeft = new Map(); // metric -> how many of them are its
     this.rebuilding = false; // a task rebuilding them is under way
@@ -189,11 +200,13 @@ export class Data {
     this.failed.clear();
     clearTimeout(this.retryT);
     this.aheadAsked.clear();
+    this.aheadAt = null;
     for (const a of this.arrays.values()) freeStore(a.loc);
     this.arrays.clear();
     this.arrayBytes = 0;
     this.blocks.clear();
     this.charts.clear();
+    this.shownKeys.clear();
     clearTimeout(this.prefetchT);
     this.rebuildQ.clear();
     this.rebuildLeft.clear();
@@ -202,12 +215,13 @@ export class Data {
 
   newRun(meta) {
     const r = { id: meta.id, idx: this.byIdx.length, meta, ver: ++this.metaVer, seq: meta.compiled ?? 0, mseq: meta.mseq, cols: new Map(), built: new Map(),
-                tail: [], tailSeq0: meta.compiled ?? 0, pending: [], hbExpect: null, resyncs: 0, resyncInFlight: false, holding: false, ...this.ui.runFields };
+                tail: [], tailSeq0: meta.compiled ?? 0, pending: [], hbExpect: null, resyncs: 0, resyncInFlight: false, holding: false, keyList: null,
+                keySet: null, ...this.ui.runFields };
     // the UI's fields made here, in one order, give every run one shape, so that code reading them over all runs stays fast
     this.byIdx.push(r);
     this.doneVer++;
     this.listVer++;
-    // built: key -> {sig, layers} (the inputs of its column, and the layers of its chart then); holding: events wait in
+    // built: key -> {sig, layers, seq} (the inputs of its column, the layers of its chart then, and the rows it had); holding: events wait in
     // `pending` until a resync finishes
     this.runs.set(r.id, r);
     this.version++;
@@ -357,9 +371,12 @@ export class Data {
 
   /** The blocks the visible charts need and the requests for those not here: one demand per metric, {key, runs,
    * runsSig (a hash of the set of runs), xmode, zoomed, x0, x1, pw, many (its runs are drawn from bins of their
-   * buckets)}; the number of requests under way. */
-  plan(demands) {
-    const sig = [this.version, ...demands.map((d) => [d.key, d.xmode, d.zoomed, d.x0, d.x1, d.pw, d.many, d.runsSig].join("|"))].join("\n");
+   * buckets)}; the number of requests under way. `part`: the demands are of some of the visible charts only. */
+  plan(demands, part = false) {
+    if (!part) this.shownKeys.clear();
+    for (const d of demands) this.shownKeys.add(d.key);
+    const view = demands.map((d) => [d.key, d.xmode, d.zoomed, d.x0, d.x1, d.pw, d.many, d.runsSig].join("|")).join("\n"), sig = `${this.version}\n${view}`;
+    if (view !== this.aheadView) (this.aheadView = view), (this.aheadAt = null); // other charts, runs or steps to fetch ahead of
     if (sig === this.planned && !this.queue.length) return this.inflight.size; // the same plan, all of it asked for
     this.planned = sig;
     const queue = [];
@@ -453,15 +470,22 @@ export class Data {
     const id = blockId(key, level, index), have = this.blocks.get(id), asked = this.inflight.get(id);
     if (have && touch) have.used = performance.now();
     const failed = this.failed.get(id), backoff = failed && performance.now() < failed.until ? failed : null;
-    const some = have && this.finishedHeld(have, runs, key) ? this.runningOf(runs) : runs;
-    const missing = some.filter((r) => !this.current(have?.runs.get(r.id), r) && !asked?.runs.has(r.id)
-                                       && !(asked && asked.scope !== null && r.meta.state !== "running" && within(r.id, asked.scope))
-                                       && !(backoff && failedFor(backoff, r)));
-    const finished = missing.filter((r) => r.meta.state !== "running");
-    const scope = finished.length >= SCOPE_MIN && finished.length * SCOPE_SHARE >= runs.length;
+    // every run lacks a block of which nothing is here, asked for or failing: no run is looked at then
+    const missing = !have && !asked && !backoff ? runs : this.lacking(have, asked, backoff, runs, key);
+    const running = missing === runs ? this.runningOf(runs) : missing.filter((r) => r.meta.state === "running"), finished = missing.length - running.length;
+    const scope = finished >= SCOPE_MIN && finished * SCOPE_SHARE >= runs.length;
     if (scope) queue.push({ key, level, index, runs: null, scope: this.view });
-    const byId = scope ? missing.filter((r) => r.meta.state === "running") : missing;
+    const byId = scope ? running : missing;
     for (let i = 0; i < byId.length; i += RUNS_PER_REQUEST) queue.push({ key, level, index, runs: byId.slice(i, i + RUNS_PER_REQUEST) });
+  }
+
+  /** The runs of `runs` whose buckets block `have` (of metric `key`; undefined: not here) lacks as they now are, and
+   * which no request under way (`asked`) or failing (`backoff`) names. */
+  lacking(have, asked, backoff, runs, key) {
+    const some = have && this.finishedHeld(have, runs, key) ? this.runningOf(runs) : runs;
+    return some.filter((r) => !this.current(have?.runs.get(r.id), r) && !asked?.runs.has(r.id)
+                              && !(asked && asked.scope !== null && r.meta.state !== "running" && within(r.id, asked.scope))
+                              && !(backoff && failedFor(backoff, r)));
   }
 
   /** Whether block entry e holds run r's buckets as they now are. */
@@ -517,7 +541,13 @@ export class Data {
   settleChart(key, ch) {
     if (!sameLayers(ch.ready, ch.want) && this.complete(key, ch.want, ch.runs)) (ch.ready = ch.want), this.touched.add(key), this.bumpKeys([key]);
     if (!ch.ready) return;
-    for (const r of ch.many ? this.runningOf(ch.runs) : ch.runs) if (!sameLayers(r.built.get(key)?.layers, ch.ready) && this.drawsColumn(ch, r)) this.rebuildSoon(r, key);
+    for (const r of ch.many ? this.runningOf(ch.runs) : ch.runs) if (this.stale(r, key, ch.ready) && this.drawsColumn(ch, r)) this.rebuildSoon(r, key);
+  }
+
+  /** Whether run r's column of `key` was built for other layers than `layers`, or before rows it now has came. */
+  stale(r, key, layers) {
+    const b = r.built.get(key);
+    return !sameLayers(b?.layers, layers) || b.seq !== r.seq;
   }
 
   /** Whether chart ch draws run r from a column (one of many runs is drawn from its buckets unless it is running). */
@@ -773,6 +803,7 @@ export class Data {
       for (const run of x.runs ? x.runs.map((r) => r.id) : [""]) f.runs.add(run);
       this.failed.set(id, f);
       this.aheadAsked.delete(askId(x)); // fetched ahead again once due
+      this.aheadAt = null;
       const ch = this.charts.get(x.key);
       if (ch) this.settleChart(x.key, ch);
       this.touched.add(x.key);
@@ -799,10 +830,10 @@ export class Data {
     for (const f of this.failed.values()) if (f.until > now) due = Math.min(due, f.until);
     if (due === Infinity) return;
     this.retryT = setTimeout(() => {
-      this.planned = null;
+      this.planned = this.aheadAt = null;
       this.ui.replan?.();
       this.retrySoon();
-    }, due - now);
+    }, Math.ceil(due - now) + 1); // whole ms, past it: a timer may fire a little early, and then find nothing due
   }
 
   /** The error of a failing request for a block chart `key` wants, or null. */
@@ -858,7 +889,8 @@ export class Data {
 
   /** While no plan's requests are under way, fetch what charts may soon show (`nextAhead`), each request once: blocks
    * of about AHEAD_REQUEST_BYTES a request (were every run to fill its block; BATCH_BLOCKS at most), PREFETCH_PARALLEL
-   * requests at a time, one after another until nothing is left or AHEAD_BYTES is reached. */
+   * requests at a time, one after another until nothing is left or AHEAD_BYTES is reached; in another task when the
+   * scan for them stopped short with nothing to ask for. */
   prefetch() {
     while (!this.busy && this.aheadPosts < PREFETCH_PARALLEL) {
       const batch = [];
@@ -870,7 +902,11 @@ export class Data {
         this.aheadAsked.add(askId(x));
         if (asked) batch.push([x, asked]);
       }
-      if (!batch.length) return;
+      if (!batch.length) {
+        clearTimeout(this.prefetchT);
+        if (this.aheadMore) this.prefetchT = setTimeout(() => this.prefetch(), 0);
+        return;
+      }
       this.aheadPosts++;
       this.send(batch).finally(() => {
         this.aheadPosts--;
@@ -902,19 +938,42 @@ export class Data {
 
   /** Up to n requests, not made ahead before, for blocks a chart may soon show (`ui.ahead`: demands, nearest the view
    * first): every chart's wanted layers first, then the finer levels a zoom of each would want (`finerAhead`); while
-   * the blocks no chart uses hold less than AHEAD_BYTES. */
-  nextAhead(n) {
-    if (this.aheadBytes() >= AHEAD_BYTES) return [];
-    const demands = this.ui.ahead?.() || [], out = [];
-    for (const pass of [(d, q) => this.wantedAhead(d, q), (d, q) => this.finerAhead(d, q)]) {
-      for (const d of demands) {
-        const q = [];
-        pass(d, q);
-        out.push(...q.filter((x) => !this.aheadAsked.has(askId(x))));
-        if (out.length >= n) return out.slice(0, n);
-      }
+   * the blocks no chart uses hold less than AHEAD_BYTES. The scan of the charts goes on where the last call's found
+   * its first request (`aheadScan`: what lies before is asked for) and takes `budget` ms a call (`aheadMore`: it
+   * stopped before its end), so that a call costs the charts it gets to, not all of them. */
+  nextAhead(n, budget = AHEAD_SCAN_MS) {
+    const at = this.aheadScan(), out = [], t0 = performance.now();
+    let from = null, looked = 0; // where the first request was found; the demands looked at (one a call at least)
+    while (at && at.pass < 2 && out.length < n && (!looked || performance.now() - t0 <= budget)) {
+      if (at.i < at.demands.length) {
+        out.push(...this.aheadHere(at));
+        if (out.length) from ??= [at.pass, at.i];
+        at.i++;
+        looked++;
+      } else (at.pass++), (at.i = 0);
     }
-    return out;
+    this.aheadMore = !!at && at.pass < 2;
+    if (from) [at.pass, at.i] = from; // its requests may not all be taken: it is looked at again
+    return out.slice(0, n);
+  }
+
+  /** Where `nextAhead`'s scan is, {demands (`ui.ahead`'s when it began), pass (0: wanted layers, 1: finer levels), i (the
+   * demand)}: at the start again when the runs or their metrics changed since it began (and whenever the view planned
+   * for does, `plan`, or a request failed); null when nothing is left to scan, or AHEAD_BYTES are held. */
+  aheadScan() {
+    let at = this.aheadAt;
+    if (!at || at.done !== this.doneVer || at.keys !== this.keysVer) at = this.aheadAt = { demands: null, pass: 0, i: 0, done: this.doneVer, keys: this.keysVer };
+    if (at.pass > 1 || this.aheadBytes() >= AHEAD_BYTES) return null;
+    at.demands ||= this.ui.ahead?.() || [];
+    return at;
+  }
+
+  /** The requests, not made ahead before, of the demand scan `at` is at. */
+  aheadHere(at) {
+    const q = [], d = at.demands[at.i];
+    if (at.pass) this.finerAhead(d, q);
+    else this.wantedAhead(d, q);
+    return q.filter((x) => !this.aheadAsked.has(askId(x)));
   }
 
   /** Bytes of the blocks no chart shows or wants. */
@@ -956,18 +1015,39 @@ export class Data {
 
   // ---- columns ----
 
-  /** Rebuild run r's column of `key` from its buckets in the blocks its chart shows and the tail rows they lack,
-   * unless they are what it was built from. */
-  rebuild(r, key) {
+  /** Build run r's column of `key` from its buckets in the blocks its chart shows and the tail rows they lack, unless
+   * they are what it was built from; whether it changed. A column whose blocks the tail no longer continues (its rows
+   * between were dropped while no chart in view drew it, `pruneTail`) stays as it is until those blocks come anew. */
+  build(r, key) {
     const parts = this.partsOf(r, key);
-    if (!parts) return;
+    if (!parts || (r.cols.has(key) && parts.some((p) => p.v.seq[p.row] < r.tailSeq0))) return false;
     const tail = this.tailOf(r, key), had = r.built.get(key);
     const sig = `${parts.map((p) => `${p.a.id}:${p.row}`).join()}|${r.tailSeq0}|${tail.n}`;
-    r.built.set(key, { sig, layers: this.charts.get(key).ready });
-    if (r.cols.has(key) && had?.sig === sig) return;
+    r.built.set(key, { sig, layers: this.charts.get(key).ready, seq: r.seq });
+    if (r.cols.has(key) && had?.sig === sig) return false;
     r.cols.set(key, buildColumn(parts, tail, this.levelOf(key) ?? 0));
     if (r.tail.length) this.pruneTail(r);
-    this.touched.add(key);
+    return true;
+  }
+
+  /** Rebuild run r's column of `key` (`build`); the UI is told of the metric at the next `flush`. */
+  rebuild(r, key) {
+    if (this.build(r, key)) this.touched.add(key);
+  }
+
+  /** Have the columns chart `key` draws take in the rows streamed since they were built, which `onRows` leaves out: a
+   * chart calls this before it draws, so that rows cost a chart nothing while it is not drawn. Whether a column
+   * changed (and with it the metric's version). */
+  catchUp(key) {
+    const ch = this.charts.get(key);
+    if (!ch?.ready || !ch.runs) return false;
+    let changed = false;
+    for (const r of ch.many ? this.runningOf(ch.runs) : ch.runs) {
+      const b = r.built.get(key);
+      if (b && b.seq !== r.seq && sameLayers(b.layers, ch.ready) && this.build(r, key)) changed = true;
+    }
+    if (changed) this.bumpKeys([key]);
+    return changed;
   }
 
   /** Rebuild run r's column of `key` later, in a task of rebuilds, so a view change never blocks input. */
@@ -1017,11 +1097,15 @@ export class Data {
     this.settle();
   }
 
-  /** Drop the first tail rows while every metric's blocks hold them: rows before every block's (and the compiled
-   * levels') sequence number, at steps before the end of the blocks shown. */
+  /** Drop the first tail rows that the run's compiled levels hold and no chart in or near the view (`shownKeys`) needs
+   * for the run's column: rows before the sequence number of every block such a chart draws it from, at steps before
+   * the end of those blocks. A chart out of view holds no rows back, or a running run's tail would grow for as long as
+   * the page lasts; it draws the run from its blocks fetched anew once it is shown again (`build`). */
   pruneTail(r) {
+    if (r.tailSeq0 >= r.meta.compiled) return;
     let keep = r.meta.compiled, end = Infinity;
-    for (const key of r.cols.keys()) {
+    for (const key of this.shownKeys) {
+      if (!r.cols.has(key)) continue;
       const ready = this.charts.get(key)?.ready;
       if (ready) end = Math.min(end, this.stepsOf(ready.coarse)[1]);
       for (const p of this.partsOf(r, key) || []) keep = Math.min(keep, p.v.seq[p.row]);
@@ -1166,6 +1250,7 @@ export class Data {
       summary._runtime = row[1];
     }
     r.seq = ev.seq0 + rows.length;
+    r.ver = ++this.metaVer; // its summary changed
     const known = new Set(r.meta.keys || []), fresh = [...keys].filter((k) => !known.has(k));
     if (fresh.length) {
       this.countKeys(r, fresh, 1);
@@ -1181,10 +1266,19 @@ export class Data {
       return this.resync(r);
     }
     for (const k of this.appendRows(r, ev)) {
-      if (this.charts.get(k)?.ready) this.rebuild(r, k);
-      else this.touched.add(k);
+      const ch = this.charts.get(k);
+      if (!ch?.ready || this.drawsNow(ch, r)) this.touched.add(k); // its column takes the rows in when its chart next draws (`catchUp`)
     }
+    this.pruneTail(r);
     this.flush(true);
+  }
+
+  /** Whether chart ch draws run r from a column: r is one of the runs it was last planned for (`drawsColumn`). A
+   * column no chart draws is left as it is while rows stream (what the GPU bins from it then does not change), and
+   * rebuilt with them once a chart draws it again (`settleChart`); one a chart draws, when the chart next draws
+   * (`catchUp`): the rows of a page's running runs cost a chart nothing while it is out of view. */
+  drawsNow(ch, r) {
+    return !!ch.runs && this.runMask(ch.runs)[r.idx] === 1 && this.drawsColumn(ch, r);
   }
 
   onRunMeta(meta) {

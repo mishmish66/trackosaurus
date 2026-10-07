@@ -6,7 +6,7 @@ import { Col, IQM, LOGX, LOGY, NSTAT, RAW, STATS, X_RUNTIME, X_STEP, arrayExtent
 import { BREAK, Points, Table, pointBuffer, renderer, rgba } from "./gl.js";
 import { describe, onWorker } from "./pool.js";
 import { GpuLines, gpuBins, queueGpu } from "./gpustats.js";
-import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET } from "./data.js";
+import { DENSITY_PX_PER_BUCKET, LINE_PX_PER_BUCKET, sameLayers } from "./data.js";
 import { nonFiniteText } from "./where.js";
 
 const GPU_POINTS = 8e6; // points per line set kept at full resolution (at most half a texture); larger sets are decimated
@@ -193,11 +193,32 @@ function bandLabel(band, center, n) {
 /** Tooltip heading for x: a runtime or a step. */
 const xLabel = (v, x) => (v.xmode === X_RUNTIME ? fmtDur(x) : `step ${fmtSI(Math.round(x))}`);
 
-function dot(ctx, x, y, color) {
-  ctx.fillStyle = color;
-  ctx.beginPath();
-  ctx.arc(x, y, 3, 0, 7);
-  ctx.fill();
+/** A dot at each row's point (those with one), filled one path a color: a tooltip of a thousand lines fills a few. */
+function dots(ctx, rows) {
+  const paths = new Map();
+  for (const r of rows) {
+    if (r.py !== r.py) continue;
+    let p = paths.get(r.ln.color);
+    if (!p) paths.set(r.ln.color, (p = new Path2D()));
+    p.moveTo(r.px + 3, r.py);
+    p.arc(r.px, r.py, 3, 0, 7);
+  }
+  for (const [color, p] of paths) (ctx.fillStyle = color), ctx.fill(p);
+}
+
+/** What a tooltip row of view v says after its value (`App.tip`): a group's band and count in its bin, and the raw
+ * value of a smoothed one. Rows hold numbers, and only the rows in view are put into words. */
+const rowNote = (v) => (r) => {
+  if (r.cnt === undefined) return v.alpha > 0 ? ` (raw ${fmt(r.raw)})` : "";
+  const band = v.o.band !== "none" ? ` ${bandLabel(v.o.band, v.o.center, r.cnt)} [${fmt(r.lo)}, ${fmt(r.hi)}]` : "";
+  return `${band} n=${r.cnt}${Number.isFinite(r.raw) ? ` (raw ${fmt(r.raw)})` : ""}`;
+};
+
+/** Bin i of each of n lines of `all` (GpuLines.values: `bins` bins a line), 4 numbers a line. */
+function binOf(all, bins, n, i) {
+  const out = new Float32Array(4 * n);
+  for (let l = 0, o = 4 * i; l < n; l++, o += 4 * bins) (out[4 * l] = all[o]), (out[4 * l + 1] = all[o + 1]), (out[4 * l + 2] = all[o + 2]), (out[4 * l + 3] = all[o + 3]);
+  return out;
 }
 
 /** Tooltip order: highest value first. */
@@ -468,15 +489,48 @@ function glView(chart, v, ox, oy) {
 }
 
 let themeKept = null;
-globalThis.matchMedia?.("(prefers-color-scheme: dark)").addEventListener("change", () => (themeKept = null));
+const isDark = ([r, g, b]) => 0.2126 * r + 0.7152 * g + 0.0722 * b < 128;
 
-/** The page's colors the charts draw with ({muted, grid, dark: whether the background is}), read from its style once
- * and again when the color scheme changes: reading them at every draw would recompute the page's style whenever it
- * changed. */
-function theme() {
+/** The page's colors the charts and the tooltip draw with ({bg, fg, muted, grid, line, rgb: the background's "r, g, b",
+ * dark: whether it is}), read from its style once and again when they change (`watchTheme`): reading them at every
+ * draw would recompute the page's style whenever it changed. They are the dark ones also where the browser darkens the
+ * page by force (`darkened`), which leaves what a canvas draws as it is. */
+export function theme() {
   if (themeKept) return themeKept;
-  const css = getComputedStyle(document.documentElement), c = rgba(css.getPropertyValue("--bg") || "#fff");
-  return (themeKept = { muted: css.getPropertyValue("--muted"), grid: css.getPropertyValue("--grid"), dark: 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2] < 128 });
+  const css = (darkened() && darkColors()) || getComputedStyle(document.documentElement), of = (name) => css.getPropertyValue(name).trim(), c = rgba(of("--bg") || "#fff");
+  return (themeKept = { bg: of("--bg") || "#fff", fg: of("--fg"), muted: of("--muted"), grid: of("--grid"), line: of("--line"), rgb: c.slice(0, 3).join(", "),
+                        dark: isDark(c) });
+}
+
+/** Whether the browser darkens the page by force, as Chromium's forced dark mode does (qutebrowser's
+ * `colors.webpage.darkmode.enabled`): it inverts the colors of the page's elements, whatever scheme they ask for, tells
+ * the page it prefers the light scheme unless it is set to prefer the dark one, and leaves canvases as they are drawn.
+ * #scheme asks for the light scheme alone, and its `canvas` color is a dark one only then. */
+function darkened() {
+  const probe = document.getElementById("scheme");
+  return !!probe && isDark(rgba(getComputedStyle(probe).backgroundColor));
+}
+
+/** The page's dark colors as its style sheet (index.html's #css) declares them: the first rule under
+ * `prefers-color-scheme: dark`, which its elements take only where the browser says it prefers dark. */
+function darkColors() {
+  for (const rule of document.getElementById("css")?.sheet.cssRules ?? []) {
+    if (rule instanceof CSSMediaRule && rule.conditionText.includes("prefers-color-scheme: dark")) return rule.cssRules[0].style;
+  }
+  return null;
+}
+
+/** Call `changed` whenever the colors the canvases draw with change, while the page is open: with the browser's color
+ * scheme, and with its forced darkening (qutebrowser switches it in open pages when its setting changes), which
+ * changes #scheme's color: the end of that color's transition is the one event that tells of it. */
+export function watchTheme(changed) {
+  const again = () => {
+    const was = themeKept;
+    themeKept = null;
+    if (was && theme().bg !== was.bg) changed();
+  };
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", again);
+  document.getElementById("scheme")?.addEventListener("transitionend", again);
 }
 
 const IMAGE_BYTES = 192 << 20; // images of drawn charts kept for views shown again, the least recently used freed beyond
@@ -522,6 +576,12 @@ function dropImage(key) {
   images.delete(key);
   imageBytes -= e.bytes;
   e.bitmap?.close();
+}
+
+/** Drop the kept images of chart number `uid` (Chart.uid). */
+function dropImagesOf(uid) {
+  const prefix = `${uid}|`;
+  for (const k of [...images.keys()]) if (k.startsWith(prefix)) dropImage(k);
 }
 
 let windowPx = null; // the window's size in device px, read again once it is resized
@@ -571,12 +631,11 @@ export class Chart {
     this.el._chart = this;
     this.drag = null;
     this.yzoom = null; // [y0, y1] in data space from a box drag on this chart
+    this.overlay.addEventListener("mouseenter", () => this.fetchValues());
     this.overlay.addEventListener("mousemove", (e) => {
       this.hoverEvent = e;
-      this.hoverRaf ||= requestAnimationFrame(() => {
-        this.hoverRaf = 0;
-        if (this.hoverEvent) this.hover(this.hoverEvent);
-      });
+      app.hoverAt = performance.now();
+      this.rehover();
     });
     this.overlay.addEventListener("mouseleave", () => {
       this.hoverEvent = null;
@@ -584,7 +643,8 @@ export class Chart {
     });
     this.overlay.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
-      this.drag = { x: e.offsetX, y: e.offsetY };
+      const b = this.overlay.getBoundingClientRect();
+      this.drag = { x: e.offsetX, y: e.offsetY, left: b.left, top: b.top };
       this.app.lead = this.key;
       const up = (ev) => {
         window.removeEventListener("mouseup", up);
@@ -639,6 +699,9 @@ export class Chart {
     for (const c of [this.canvas, this.overlay]) if (c.width) (c.width = 0), (c.height = 0);
     this.dirty = true;
     this.drawnKey = null;
+    const kept = this.gpuKept || []; // and the binnings of views it may return to, but the one shown: their GPU memory
+    for (const j of kept) if (j !== this.stats) j.out.release();
+    this.gpuKept = kept.filter((j) => j === this.stats);
   }
 
   /** What a drawing of GPU view `view` shows, as a key of its kept image: the binning, the axes' ranges, the canvas's
@@ -650,13 +713,19 @@ export class Chart {
     return `${this.uid}|${g.sig}|${view.x0}|${view.x1}|${view.y0}|${view.y1}|${W}x${H}|${theme().dark}|${this.app.drawnSig}`;
   }
 
-  /** The hover overlay's 2D context, its backing store of the chart's size from now until `unhover`, in CSS pixels. */
+  /** The hover overlay's 2D context, its backing store of the chart's size from now until a while after the pointer
+   * has left the chart (`unhover`, `App.overlayLeft`), in CSS pixels. */
   overlayContext() {
     const dpr = devicePixelRatio || 1, W = Math.round(this.w * dpr), H = Math.round(this.h * dpr), o = this.overlay;
     if (o.width !== W || o.height !== H) (o.width = W), (o.height = H);
     const ctx = o.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     return ctx;
+  }
+
+  /** Free the hover overlay's backing store. */
+  freeOverlay() {
+    if (this.overlay.width) (this.overlay.width = 0), (this.overlay.height = 0);
   }
 
   get pw() {
@@ -710,12 +779,15 @@ export class Chart {
 
   /** Have the GPU bin this chart's runs as a zoom to x range `range` ([x0, x1, xmode]) would at once, from the layers
    * `ready` it would then show (Data.layersIf), and keep the binning: the zoom finds it made (`fromGpu`). Queued for the
-   * next runGpuJobs; nothing when the GPU does not bin the chart, or that view shows nothing. */
+   * next runGpuJobs; nothing when the GPU does not bin the chart, that view shows nothing, or the zoom would rebuild the
+   * columns binned (layers other than those shown). */
   binAhead(range, ready) {
     const o = this.app.panelOpts(this.key), r = renderer(), b = r && !r.lost ? this.gpuBinned(r, o) : undefined;
     if (!b) return;
+    this.app.data.catchUp(this.key); // the columns the release will bin
     const src = this.sourcesOf(b.tab, b.runs, b.binned, b.binned ? ready : null), v = this.xViewOf(o, this.gpuExtent(o.xmode, src), range);
-    if (!v) return;
+    // columns of other layers than those shown are rebuilt at the release, which then bins them anew
+    if (!v || (src.cols.length && !sameLayers(ready, this.app.data.charts.get(this.key)?.ready))) return;
     const { kind, p } = this.app.grouped ? this.groupJob(src, v, o, b.binned) : this.rowsJob(src, v);
     if (!gpuBins(src.tab, p)) return;
     const sig = gpuSig(kind, src, p);
@@ -896,7 +968,7 @@ export class Chart {
     const [clo, chi, blo, bhi] = res.range, yr = new YRange(v.logy), bands = new YRange(v.logy);
     yr.add(clo), yr.add(chi);
     if (o.band !== "none") bands.add(blo), bands.add(bhi), yr.widen(bands, BAND_REACH);
-    const gpu = { out: this.gpuOut, sig: this.stats.sig, agg: true, band: o.band !== "none", n: src.tab.starts.length / 2, bins, g0, dx };
+    const gpu = { out: this.gpuOut, sig: this.stats.sig, tab: src.tab, agg: true, band: o.band !== "none", n: src.tab.starts.length / 2, bins, g0, dx };
     return this.withY(o, yr, NO_COLS, v, { lines: this.app.gpuGroupLines(this.key), gpu, lineSets: false, density: false });
   }
 
@@ -907,7 +979,7 @@ export class Chart {
     if (!res) return res === null ? WAITING : undefined;
     const yr = new YRange(v.logy);
     yr.add(res.range[0]), yr.add(res.range[1]);
-    const gpu = { out: this.gpuOut, sig: this.stats.sig, agg: false, band: false, n: Math.max(1, src.tab.n), bins, g0, dx };
+    const gpu = { out: this.gpuOut, sig: this.stats.sig, tab: src.tab, agg: false, band: false, n: Math.max(1, src.tab.n), bins, g0, dx };
     return this.withY(o, yr, NO_COLS, v, { lines: runs, gpu, lineSets: false, density: true });
   }
 
@@ -1046,18 +1118,19 @@ export class Chart {
     this.glState = null;
     for (const j of this.gpuKept || []) j.out.release();
     if (this.stats?.out) this.stats.out.release();
-    this.gpuOut = this.stats = this.gpuKept = null;
+    this.gpuOut = this.stats = this.gpuKept = this.drawnKey = null;
+    dropImagesOf(this.uid);
   }
 
   /** Draw bands and lines of `view` through WebGL into the shared canvas, the chart's image at `at` (its top-left
-   * corner, device px, clipped to the plot); false when the context is lost. */
+   * corner, device px, clipped to the plot); false when it drew nothing: the context is lost, or its binning is gone. */
   renderGL(view, at = [0, 0]) {
     const r = renderer(), dpr = devicePixelRatio || 1, [W, H] = this.deviceSize;
     if (r.lost) return false;
     r.begin(W, H, [MARGIN.l * dpr, MARGIN.t * dpr, this.pw * dpr, this.ph * dpr], at);
     const g = this.glLines(r);
-    if (view.gpu) this.drawGpu(r, view, dpr);
-    else if (view.lineSets) {
+    if (view.gpu) return this.drawGpu(r, view, dpr);
+    if (view.lineSets) {
       const { main, faint } = g;
       r.touch(main.pts);
       if (view.density) r.density(main.pts, main.tableFor(view.lines, view, this.pw), glView(this, view, main.ox, main.oy), dpr, theme().dark);
@@ -1073,14 +1146,18 @@ export class Chart {
     return true;
   }
 
-  /** Lines drawn from where the GPU binned them: each group's band and center, or a heatmap of the runs' bin means. */
+  /** Lines drawn from where the GPU binned them: each group's band and center, or a heatmap of the runs' bin means;
+   * false when the binning is gone (given up, or with a lost context), which is then made again. */
   drawGpu(r, view, dpr) {
     const g = view.gpu, tv = { ...glView(this, view, g.g0, 0), first: g.out.first };
-    if (!g.out.live) return void (this.dirty = true); // gone with a lost context: binned again
+    if (!g.out.live) return (this.dirty = true), false;
     const t = this.gpuTables(view), grid = g.bins - 1;
-    if (!g.agg) return r.density(g.out, t.lines, tv, dpr, theme().dark, grid);
-    if (t.bands.n) r.bands(g.out, t.bands, tv, 0.18, grid);
-    r.lines(g.out, t.lines, tv, 2 * dpr, 1, false, grid);
+    if (!g.agg) r.density(g.out, t.lines, tv, dpr, theme().dark, grid);
+    else {
+      if (t.bands.n) r.bands(g.out, t.bands, tv, 0.18, grid);
+      r.lines(g.out, t.lines, tv, 2 * dpr, 1, false, grid);
+    }
+    return true;
   }
 
   /** The line tables of a GPU view (`gpuTableSet`). */
@@ -1146,6 +1223,7 @@ export class Chart {
   /** Compute what the chart shows next (the costly part), for `draw` to present. */
   prepare() {
     this.dirty = false;
+    if (this.w) this.app.data.catchUp(this.key); // the rows streamed since its columns were built
     const next = this.w ? this.compute() : null;
     this.waiting = next === WAITING; // a worker computes what it shows; it is prepared again once that is done
     if (this.waiting) return;
@@ -1174,7 +1252,9 @@ export class Chart {
     const r = renderer();
     if (r.lost) return;
     if (!at && this.renderGL(view)) at = [0, 0];
-    if (at) r.copyTo(ctx, at, this.canvas.width, this.canvas.height);
+    if (!at) return; // its lines were not drawn: no image of it is kept
+    r.copyTo(ctx, at, this.canvas.width, this.canvas.height);
+    if (this.app.hovered === this) this.fetchValues(), this.rehover(); // its tooltip shows what is drawn
     this.drawnKey = key;
     if (key && !this.app.paced) keepImageSoon(this, key); // a streamed redraw is not shown again
   }
@@ -1245,17 +1325,41 @@ export class Chart {
     const x = this.xAt(e.offsetX);
     this.crosshair(ctx, e.offsetX);
     if (v.density) return this.hoverDensity(e, ctx, x);
-    const rows = [];
-    for (const ln of v.lines) {
-      const row = v.gpu || ln.lo ? this.groupRow(ln, x) : this.lineRow(ln, x, e.offsetX);
-      if (!row) continue;
-      row.py = Number.isFinite(row.val) && (!v.logy || row.val > 0) ? this.py(row.val) : NaN;
-      if (row.py === row.py) dot(ctx, row.px, row.py, ln.color);
-      rows.push(row);
-    }
+    const rows = v.gpu ? this.gpuRows(x) : this.lineRows(x, e.offsetX);
+    if (!rows) return; // their values are on their way (`gpuAll`): the tooltip stays as it is until they come
+    dots(ctx, rows);
     const near = this.nearestRow(rows, e.offsetY);
     rows.sort(byValue);
-    this.app.tip(e, this, xLabel(v, x), rows, rows.indexOf(near));
+    this.app.tip(e, this, xLabel(v, x), rows, rows.indexOf(near), rowNote(v));
+  }
+
+  /** Where a tooltip row of value `val` has its point on the y axis, in px; NaN when it has none. */
+  rowY(val) {
+    return Number.isFinite(val) && (!this.view.logy || val > 0) ? this.py(val) : NaN;
+  }
+
+  /** Tooltip rows at x of the lines of a view the GPU did not bin: a group's center, band and count in its bin, a run's
+   * point nearest x. A row is {ln, val, px, py (its point on the chart)} and what `rowNote` puts into words. */
+  lineRows(x, offsetX) {
+    const rows = [];
+    for (const ln of this.view.lines) {
+      const row = ln.lo ? this.groupRow(ln, x) : this.lineRow(ln, x, offsetX);
+      if (row) rows.push(row);
+    }
+    return rows;
+  }
+
+  /** Tooltip rows at x of the groups the GPU binned: each one's center, band and count in the bin holding x; null while
+   * the bin's values are on their way (`gpuValues`). */
+  gpuRows(x) {
+    const v = this.view, i = this.binAt(null, x), c = this.gpuValues(i);
+    if (!c) return null;
+    const px = this.px(this.binX(null, i, true)), rows = [];
+    for (const ln of v.lines) {
+      const o = 4 * ln.gi, val = c[o];
+      if (Number.isFinite(val)) rows.push({ ln, val, lo: v.logy && !(c[o + 1] > 0) ? val : c[o + 1], hi: c[o + 2], cnt: c[o + 3], raw: NaN, px, py: this.rowY(val) });
+    }
+    return rows;
   }
 
   crosshair(ctx, px) {
@@ -1271,17 +1375,21 @@ export class Chart {
     ctx.fillStyle = "rgba(127,127,127,0.2)";
     if (h >= BOX_MIN) ctx.fillRect(Math.min(d.x, e.offsetX), Math.min(d.y, e.offsetY), w, h);
     else ctx.fillRect(Math.min(d.x, e.offsetX), MARGIN.t, w, this.ph);
-    if (w >= AIM_MIN) this.app.aimZoom([this.xAt(Math.min(d.x, e.offsetX)), this.xAt(Math.max(d.x, e.offsetX)), this.view.xmode]);
+    const [ax] = this.dragAt(d, e);
+    if (Math.abs(ax - d.x) >= AIM_MIN) this.app.aimZoom([this.xAt(Math.min(d.x, ax)), this.xAt(Math.max(d.x, ax)), this.view.xmode]);
   }
 
-  /** Tooltip row of a group line at x: its center, band and count in that bin. */
+  /** Where pointer event e lies, in the overlay's px, within the plot, for a drag begun at d (with its overlay's place
+   * then): what the drag aims at while it moves and what its release zooms to are the same. */
+  dragAt(d, e) {
+    return [Math.min(Math.max(e.clientX - d.left, MARGIN.l), MARGIN.l + this.pw), Math.min(Math.max(e.clientY - d.top, MARGIN.t), MARGIN.t + this.ph)];
+  }
+
+  /** Tooltip row of a group line a worker binned, at x: its center, band and count in that bin. */
   groupRow(ln, x) {
-    const v = this.view, i = this.binAt(ln, x), [val, lo, hi, cnt, raw] = this.groupAt(ln, i);
+    const i = this.binAt(ln, x), val = ln.center[i];
     if (!Number.isFinite(val)) return null;
-    let extra = v.o.band !== "none" ? ` ${bandLabel(v.o.band, v.o.center, cnt)} [${fmt(lo)}, ${fmt(hi)}]` : "";
-    extra += ` n=${cnt}`;
-    if (Number.isFinite(raw)) extra += ` (raw ${fmt(raw)})`;
-    return { ln, val, extra, px: this.px(this.binX(ln, i, true)) };
+    return { ln, val, lo: ln.lo[i], hi: ln.hi[i], cnt: ln.cnt[i], raw: ln.raw ? ln.raw[2 * i + 1] : NaN, px: this.px(this.binX(ln, i, true)), py: this.rowY(val) };
   }
 
   /** The bins line ln stands for: {g0, dx, bins}, its own, or its view's when the GPU binned it. */
@@ -1301,23 +1409,58 @@ export class Chart {
     return v.logx ? 10 ** x : x;
   }
 
-  /** Group line ln's [center, band low, band high, count, raw center] in bin i. */
-  groupAt(ln, i) {
-    if (!this.view.gpu) return [ln.center[i], ln.lo[i], ln.hi[i], ln.cnt[i], ln.raw ? ln.raw[2 * i + 1] : NaN];
-    const c = this.gpuValues(this.view.gpu, i), o = 4 * ln.gi;
-    if (!c) return [NaN, NaN, NaN, 0, NaN];
-    return [c[o], this.view.logy && !(c[o + 1] > 0) ? c[o] : c[o + 1], c[o + 2], c[o + 3], NaN];
+  /** The values of the GPU view shown as the CPU holds them (`GpuLines.values`, a copy read once and never waited for).
+   * While the copy is on its way the chart hovers again at the next frame (`rehover`), and meanwhile these are the
+   * values it last held of the same lines and bins, those of the view a streamed redraw replaced, so a hover neither
+   * waits for the GPU nor shows nothing; undefined when it held none. Null when they are too large to copy, or gone. */
+  gpuAll() {
+    const g = this.view.gpu, h = this.held;
+    if (this.fetched !== g.out) this.fetchValues();
+    const all = g.out.values(g.bins, g.n);
+    if (all === null) return null;
+    if (all) {
+      if (h?.all !== all) this.held = { all, tab: g.tab, agg: g.agg, bins: g.bins, n: g.n, g0: g.g0, dx: g.dx };
+      return all;
+    }
+    this.rehover();
+    return h && h.tab === g.tab && h.agg === g.agg && h.bins === g.bins && h.n === g.n && h.g0 === g.g0 && h.dx === g.dx ? h.all : undefined;
   }
 
-  /** Bin i of every line of GPU result g (4 numbers each), read back once while the pointer stays in that bin. */
-  gpuValues(g, i) {
+  /** Bin i of every line of the GPU view shown (4 numbers each), from `gpuAll`, or of values too large to copy read back
+   * while the pointer stays in that bin; null while they are on their way, or gone. */
+  gpuValues(i) {
+    const g = this.view.gpu, all = this.gpuAll();
+    if (all) return binOf(all, g.bins, g.n, i);
+    if (all === undefined) return null;
     if (this.gpuCol?.g !== g || this.gpuCol.i !== i) this.gpuCol = { g, i, vals: g.out.column(i, g.n) };
     return this.gpuCol.vals;
   }
 
-  /** GPU line ln's points (its group's centers, or its run's bin means) as (x, y) pairs, read back: [xy, n]. */
+  /** Hover at the next frame where the pointer last was (once a frame however often it moves). */
+  rehover() {
+    this.hoverRaf ||= requestAnimationFrame(() => {
+      this.hoverRaf = 0;
+      if (this.hoverEvent) this.hover(this.hoverEvent);
+    });
+  }
+
+  /** Have the values of the GPU view shown copied to the CPU for its tooltips, without waiting (`GpuLines.fetch`); the
+   * copy of the view it showed before is given up, so a chart holds one (and `held` while it is replaced). */
+  fetchValues() {
+    const g = this.view?.gpu, out = g ? g.out : null;
+    if (this.fetched && this.fetched !== out) this.fetched.forget();
+    this.fetched = out;
+    if (g) out.fetch(g.bins, g.n);
+  }
+
+  /** GPU line ln's points (its group's centers, or its run's bin means) as (x, y) pairs, from `gpuAll`, or of values too
+   * large to copy read back while the pointer stays by that line: [xy, n]; none while they are on their way. */
   gpuXY(ln) {
-    const g = this.view.gpu, row = g.out.row(ln.gi, g.bins) ?? new Float32Array(4 * g.bins).fill(NaN), xy = new Float64Array(2 * g.bins);
+    const g = this.view.gpu, all = this.gpuAll();
+    if (all === undefined) return [new Float64Array(0), 0];
+    if (!all && (this.gpuRow?.g !== g || this.gpuRow.gi !== ln.gi)) this.gpuRow = { g, gi: ln.gi, row: g.out.row(ln.gi, g.bins) };
+    const row = (all ? all.subarray(4 * g.bins * ln.gi, 4 * g.bins * (ln.gi + 1)) : this.gpuRow.row) ?? new Float32Array(4 * g.bins).fill(NaN);
+    const xy = new Float64Array(2 * g.bins);
     for (let i = 0; i < g.bins; i++) (xy[2 * i] = this.binX(ln, i, g.agg)), (xy[2 * i + 1] = this.view.logy && !(row[4 * i] > 0) ? NaN : row[4 * i]);
     return [xy, g.bins];
   }
@@ -1326,7 +1469,7 @@ export class Chart {
   lineRow(ln, x, offsetX) {
     const v = this.view, r = nearest(ln.cols[0], v.xmode, x, v.alpha, v.scale);
     if (!r || Math.abs(this.px(r.x) - offsetX) > 40) return null;
-    return { ln, val: r.y, extra: v.alpha > 0 ? ` (raw ${fmt(r.raw)})` : "", px: this.px(r.x) };
+    return { ln, val: r.y, raw: r.raw, px: this.px(r.x), py: this.rowY(r.y) };
   }
 
 
@@ -1356,27 +1499,29 @@ export class Chart {
       while (i > 0 && near[i - 1].d > d) (near[i] = near[i - 1]), i--;
       near[i] = { d, ln, r: { x: pointX, y, raw } };
     };
-    if (v.gpu) this.nearestOnGpu(x, consider, near);
-    else for (const ln of v.lines) {
+    if (v.gpu) {
+      if (!this.nearestOnGpu(x, consider, near)) return; // their values are on their way: the tooltip stays as it is
+    } else for (const ln of v.lines) {
       const r = nearest(ln.cols[0], v.xmode, x, v.alpha, v.scale);
       if (r) consider(ln, r.x, r.y, r.raw);
     }
     if (near.length) this.traceLine(ctx, near[0].ln, 1.5);
-    for (const { ln, r } of near) dot(ctx, this.px(r.x), this.py(r.y), ln.color);
-    const rows = near.map(({ ln, r }) => ({ ln, val: r.y, extra: v.alpha > 0 ? ` (raw ${fmt(r.raw)})` : "",
-                                           px: this.px(r.x), py: this.py(r.y) }));
+    const rows = near.map(({ ln, r }) => ({ ln, val: r.y, raw: r.raw, px: this.px(r.x), py: this.py(r.y) }));
+    dots(ctx, rows);
     const closest = this.nearestRow(rows, e.offsetY);
     rows.sort(byValue);
-    this.app.tip(e, this, `${xLabel(v, x)} · ${near.length} nearest of ${v.lines.length}`, rows, rows.indexOf(closest));
+    this.app.tip(e, this, `${xLabel(v, x)} · ${near.length} nearest of ${v.lines.length}`, rows, rows.indexOf(closest), rowNote(v));
   }
 
   /** The GPU heatmap's runs at x: `consider(run, x, y, raw)` with each run's bin mean in the bin holding x; then each
-   * run `near` kept ({ln}) as a line {run, color, label, gi (its run index)}. */
+   * run `near` kept ({ln}) as a line {run, color, label, gi (its run index)}. False while the bin's values are on their
+   * way, or gone. */
   nearestOnGpu(x, consider, near) {
-    const v = this.view, i = this.binAt(null, x), c = this.gpuValues(v.gpu, i), bx = this.binX(null, i, false);
-    if (!c) return;
+    const v = this.view, i = this.binAt(null, x), c = this.gpuValues(i), bx = this.binX(null, i, false);
+    if (!c) return false;
     for (const r of v.lines) consider(r, bx, c[4 * r.idx], c[4 * r.idx]);
     for (const n of near) n.ln = { run: n.ln, color: n.ln.color, label: n.ln.meta.name, gi: n.ln.idx };
+    return true;
   }
 
   /** Stroke one line of the current view on the overlay: a run's own line, or a group's center. */
@@ -1412,7 +1557,9 @@ export class Chart {
   unhover() {
     if (this.app.hovered === this) this.app.hovered = null;
     if (this.app.tipPinned) return;
-    if (this.overlay.width) (this.overlay.width = 0), (this.overlay.height = 0); // cleared, its backing store freed
+    if (this.overlay.width) this.overlayContext().clearRect(0, 0, this.w, this.h), this.app.overlayLeft(this);
+    this.fetched?.forget(); // no tooltip reads its values any more
+    this.fetched = this.held = this.gpuCol = this.gpuRow = null;
     this.app.tip(null);
   }
 
@@ -1422,10 +1569,7 @@ export class Chart {
     this.drag = null;
     this.app.endAim();
     if (!d || !this.view) return;
-    const r = this.overlay.getBoundingClientRect();
-    const ox = Math.min(Math.max(e.clientX - r.left, MARGIN.l), MARGIN.l + this.pw);
-    const oy = Math.min(Math.max(e.clientY - r.top, MARGIN.t), MARGIN.t + this.ph);
-    const dx = Math.abs(ox - d.x), dy = Math.abs(oy - d.y);
+    const [ox, oy] = this.dragAt(d, e), dx = Math.abs(ox - d.x), dy = Math.abs(oy - d.y);
     this.unhover();
     if (dx < CLICK_MAX && dy < CLICK_MAX) return this.resetAxes();
     if (dy >= BOX_MIN) this.yzoom = [this.yAt(Math.max(d.y, oy)), this.yAt(Math.min(d.y, oy))];
