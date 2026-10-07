@@ -176,6 +176,21 @@ def test_network_filesystems_are_told_by_their_mount(path: str, want: bool) -> N
     assert journal.on_network_fs(Path(path), MOUNTINFO) is want
 
 
+STACKED = """\
+22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+132 22 0:51 / /home rw,relatime shared:73 - autofs systemd-1 rw,fd=51,pgrp=1,timeout=600,minproto=5,maxproto=5,direct
+378 132 0:66 / /home rw,relatime shared:214 - nfs storage0001.nfs:/home rw,vers=3,proto=rdma
+140 22 0:52 / /data rw - nfs storage0001.nfs:/data rw
+141 140 8:17 / /data rw - xfs /dev/sdb1 rw
+150 22 0:53 / /idle rw,relatime - autofs systemd-1 rw,direct
+"""
+
+
+@pytest.mark.parametrize("path,want", [("/home/me/runs", True), ("/data/runs", False), ("/idle/runs", False)])
+def test_of_the_mounts_at_one_mount_point_the_last_mounted_tells(path: str, want: bool) -> None:
+    assert journal.on_network_fs(Path(path), STACKED) is want
+
+
 def test_the_explorer_follows_a_live_journaled_run(tmp_path: Path) -> None:
     root = tmp_path / "runs"
     run = trex.init(root / "r", commit_interval=0.02)

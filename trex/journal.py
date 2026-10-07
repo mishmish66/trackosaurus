@@ -58,8 +58,9 @@ def host() -> str:
 
 
 def on_network_fs(path: Path, mountinfo: str | None = None) -> bool:
-    """Whether `path` is on a network filesystem (Linux; elsewhere False). The path is touched first, which mounts
-    an automounted filesystem it lies on."""
+    """Whether `path` is on a network filesystem (Linux; elsewhere False): the one mounted last at the longest mount
+    point holding it, so an automounted filesystem is the one mounted over its autofs mount. The path is touched
+    first, which mounts an automounted filesystem it lies on."""
     if mountinfo is None:
         try:
             os.stat(path)
@@ -72,7 +73,7 @@ def on_network_fs(path: Path, mountinfo: str | None = None) -> bool:
         if len(fields) != 2:
             continue
         mount, fstype = fields[0].split(" ")[4].replace("\\040", " "), fields[1].split(" ")[0]
-        if (target == mount or target.startswith(mount.rstrip("/") + "/")) and len(mount) > len(best):
+        if (target == mount or target.startswith(mount.rstrip("/") + "/")) and len(mount) >= len(best):
             best, kind = mount, fstype
     return kind in NETWORK_FS
 

@@ -154,7 +154,12 @@ have)` is the other direction: what a mirror holding `have` of a run lacks.
 - **Journal** (`trex.journal`, runs on network filesystems, or `TREX_JOURNAL=1`): every commit's inserts, appended and
   fsync'd, because SQLite's WAL is readable only on the writer's host. `connect_ro` reads a live journaled run (one
   with a `-wal`) from a replica in `$TREX_REPLICAS` (default `<tmp>/trex-<uid>/replicas`), brought up to date from the
-  journal on each open.
+  journal on each open. A writer journals (`journal.wanted`) when `TREX_JOURNAL` is 1, never when it is 0, and
+  otherwise when the run directory is on a network filesystem (`journal.on_network_fs`): the kind (`NETWORK_FS`) of
+  the mount `/proc/self/mountinfo` lists last at the longest mount point holding the directory. An automounted
+  filesystem has two mounts at its mount point, autofs and then the filesystem itself, and the last one counts. A run
+  on such storage that is not journaled cannot be read from another host while it is written (over NFS, SQLite answers
+  `locking protocol`), so a trex on another host shows it only once it has finished.
 - **Buckets** (`trex.buckets`): at level L, bucket b holds steps [b·2^L, (b+1)·2^L); block i of a level is its buckets
   [i·BLOCK, (i+1)·BLOCK). A bucket array holds some runs' buckets of one metric at one level: per bucket the mean of its
   finite values (of its infinities when it has none), their mean step, mean runtime and count; per run the rows its
