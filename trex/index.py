@@ -962,6 +962,9 @@ class Explorer:
             return self._connect()
 
     def release(self, c: sqlite3.Connection) -> None:
+        """Return a reader to the pool, its transaction (one an error left open) rolled back."""
+        if c.in_transaction:
+            c.rollback()
         if self._closed:
             c.close()
         else:

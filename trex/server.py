@@ -35,7 +35,7 @@ STATIC: Final = Path(__file__).parent / "static"
 DEFAULT_PORT: Final = 13898
 PORT_TRIES: Final = 20  # ports tried from DEFAULT_PORT when none is given
 ROOT_PREFIX: Final = re.compile(r"/([wd])/([^/]+)(/.*)?")  # a directory's URLs (d, by id), a workspace's (w, by name)
-PROTOCOL: Final = 7  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
+PROTOCOL: Final = 8  # what the UI and this server say to each other; the UI states a mismatch (data.js PROTOCOL)
 WHICH: Final[dict[str, Which]] = {"all": "all", "finished": "finished", "running": "running"}
 MAX_ASKS: Final = 256  # blocks one POST /api/buckets may ask for
 MAX_DUMPS: Final = 256  # runs one POST /api/dumps may ask for
@@ -259,21 +259,24 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", r"/api/node")
     def node(self, q: Query) -> None:
-        """{node: {id, name}, saves, home, dirs: [{name, root, id, url, state, error, link}], links: [{url, name, state,
-        error}], workspaces: [{name, url, members}], history: [root], install, updates}: which node this is, whether it
-        saves what it holds, the directory `/` shows (none: every one), its directories, the trex it pulls from and its
-        workspaces, the remembered directories and links it does not serve, the trex it runs, and whether it can
-        update."""
+        """{node: {id, name}, saves, home, dirs: [{name, root, id, url, state, error, link, via}], links: [{url, id,
+        name, state, error}], nodes: [{id, name, via}], workspaces: [{name, url, members}], history: [root], install,
+        updates}: which node this is, whether it saves what it holds, the directory `/` shows (none: every one), its
+        directories, the trex it pulls from, every node it reaches through them (`via` from that node to a link of this
+        one), its workspaces, the remembered directories and links it does not serve, the trex it runs, and whether it
+        can update."""
         node = self.srv.node
         self._json({"node": node.identity.wire(), "saves": node.saves, "home": node.home,
                     "dirs": [d.wire() for d in node.served()], "links": [link.wire() for link in node.links_info()],
+                    "nodes": [p.wire() for p in node.peers()],
                     "workspaces": node.workspace_list(), "history": node.history(), "install": update.RUNNING.wire(),
                     "updates": update.updates().wire()})
 
     @route("GET", r"/api/holdings")
     def holdings(self, q: Query) -> None:
-        """{node: {id, name}, dirs: [{id, via}]}: this node, and each directory it holds with the nodes it came through,
-        from the one crawling it to this one; another trex pulls each from /d/<id>/."""
+        """{node: {id, name}, dirs: [{id, via}], nodes: [{id, name, via}]}: this node, each directory it holds with the
+        nodes it came through, from the one crawling it to this one (another trex pulls each from /d/<id>/), and each
+        node it reaches with the nodes between, itself first."""
         self._json(self.srv.node.holdings().wire())
 
     def _parsed(self) -> JSONValue:
@@ -296,20 +299,27 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("POST", r"/api/node/add")
     def node_add(self, q: Query) -> None:
-        """Body: {path, id?}: absolute, ~/…, host:path for a remote directory (which this waits to start), or
+        """Body: {path, id?, at?}: absolute, ~/…, host:path for a remote directory (which this waits to start), or
         http://host:port for a trex to pull every directory of; `id` names a local directory (a node asking this one to
-        crawl it). Response: {name, id, url} (none and the root view's for a trex), or 400 with {error} for a path it
-        refuses, a remote that fails to start or a trex that does not answer."""
-        node, path, d = self.srv.node, self.body_field("path").strip(), self.body_json().get("id")
+        crawl it); `at` (node ids, from one this node links to) has the node at its end track it, and this one pull it
+        (`Node.add_at`). Response: {name, id, url} (none and the root view's for a trex), or 400 with {error} for a path
+        a node refuses, a remote that fails to start or a trex that does not answer."""
+        node, req = self.srv.node, self.body_json()
+        path, d, at = self.body_field("path").strip(), req.get("id"), req.get("at") or []
         try:
+            if not isinstance(at, list) or not all(isinstance(n, str) for n in at):
+                raise ValueError("expected at: [node ids]")
             if not remote.parse(path) and not link_url(path) and not Path(path).expanduser().is_absolute():
                 raise ValueError(f"{path} is not an absolute path, host:path or http://host:port")
-            got = node.add(resolve_root(path, force=False), str(d)) if isinstance(d, str) else node.track(path)
+            if at:
+                got = node.add_at(path, [str(n) for n in at])
+            else:
+                got = node.add(resolve_root(path, force=False), str(d)) if isinstance(d, str) else node.track(path)
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
         if got is None:
             return self._json({"name": None, "id": None, "url": "/"})
-        self._json({"name": node.names()[got], "id": got, "url": dir_base(got) + "/"})
+        self._json({"name": node.names().get(got, got), "id": got, "url": dir_base(got) + "/"})
 
     @route("POST", r"/api/node/remove")
     def node_remove(self, q: Query) -> None:

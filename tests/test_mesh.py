@@ -184,13 +184,55 @@ def test_links_are_added_listed_and_removed_over_http(make: Make) -> None:
     assert post_json(f"{b_url}/api/node/add", {"path": a_url + "/"}) == (200, {"name": None, "id": None, "url": "/"})
     info = get_json(f"{b_url}/api/node")
     assert info["node"] == {"id": b.identity.id, "name": "B"}
-    assert info["links"] == [{"url": a_url, "name": "A", "state": "connected", "error": ""}]
-    assert [(r["name"], r["root"], r["link"]) for r in info["dirs"]] == [("runs", own(a), a_url)]
+    assert info["links"] == [{"url": a_url, "id": a.identity.id, "name": "A", "state": "connected", "error": ""}]
+    assert info["nodes"] == [{"id": a.identity.id, "name": "A", "via": [a.identity.id]}]
+    assert [(r["name"], r["root"], r["link"], r["via"]) for r in info["dirs"]] == [("runs", own(a), a_url, [a.identity.id])]
     status, body = post_json(f"{b_url}/api/node/remove", {"name": "runs"})
     assert status == 400 and a_url in body["error"]
     assert post_json(f"{b_url}/api/node/remove", {"name": a_url}) == (200, {"ok": True})
     assert get_json(f"{b_url}/api/node")["dirs"] == [] and b.history() == [a_url]
     assert post_json(f"{b_url}/api/node/add", {"path": "http://127.0.0.1:1"})[0] == 400
+
+
+def test_a_trex_tells_of_every_node_it_reaches_by_the_nodes_between(make: Make) -> None:
+    (a, _, _), (b, _, b_url), (c, _, c_url) = make("A", crawls=False), make("B", crawls=False), make("C")
+    b.add_link(c_url)
+    a.add_link(b_url)
+    named = {x.identity.id: x.identity.name for x in (a, b, c)}
+    assert wait_for(lambda: {named[p.id]: [named[v] for v in p.via] for p in a.peers()} == {"B": ["B"], "C": ["C", "B"]})
+    assert [(named[p.id], [named[v] for v in p.via]) for p in a.holdings().nodes or []] == [("A", ["A"]), ("B", ["B", "A"]), ("C", ["C", "B", "A"])]
+    assert [(d.name, [named[v] for v in d.via]) for d in a.served()] == [("runs", ["C", "B"])]
+
+
+def test_an_add_passed_along_links_is_tracked_by_the_last_node_and_pulled_by_the_others(make: Make, tmp_path: Path) -> None:
+    (a, _, a_url), (b, _, b_url), (c, _, c_url) = make("A", crawls=False), make("B", crawls=False), make("C", crawls=False)
+    b.add_link(c_url)
+    a.add_link(b_url)
+    assert wait_for(lambda: len(a.peers()) == 2)
+    far = tmp_path / "files" / "far" / "runs"
+    write_run(far / "r1")
+    status, body = post_json(f"{a_url}/api/node/add", {"path": str(far), "at": [b.identity.id, c.identity.id]})
+    d = f"C:{far}"
+    assert (status, body["id"]) == (200, d) and c.tracked() == [str(far)] and b.tracked() == a.tracked() == []
+    assert d in b.pulled and d in a.pulled and a.pulled[d].via == [c.identity.id, b.identity.id]
+    near = tmp_path / "files" / "near" / "runs"
+    write_run(near / "r1")
+    assert a.add_at(str(near), [b.identity.id]) == f"B:{near}" and b.tracked() == [str(near)] and f"B:{near}" in a.pulled
+
+
+def test_an_add_a_node_on_the_way_refuses_says_why(make: Make, tmp_path: Path) -> None:
+    (a, _, _), (b, _, b_url), (c, _, c_url) = make("A", crawls=False), make("B", crawls=False), make("C", crawls=False)
+    b.add_link(c_url)
+    a.add_link(b_url)
+    assert wait_for(lambda: len(a.peers()) == 2)
+    with pytest.raises(ValueError, match="missing is not a directory"):
+        a.add_at(str(tmp_path / "missing"), [b.identity.id, c.identity.id])
+    with pytest.raises(ValueError, match="has no link to node nobody"):
+        a.add_at(str(tmp_path), [b.identity.id, "nobody"])
+    a.links[b_url].peers = None  # as from a trex that tells of no nodes
+    with pytest.raises(ValueError, match="passes no add on"):
+        a.add_at(str(tmp_path), [b.identity.id, c.identity.id])
+    assert c.tracked() == b.tracked() == []
 
 
 def test_a_trex_will_not_pull_from_itself(make: Make) -> None:
@@ -208,6 +250,8 @@ def test_every_node_serves_its_directories_by_id_and_tells_what_it_holds(make: M
     temporary = node_of(alone)
     url = http_server(server.serve(temporary, "127.0.0.1", 0))
     holdings = get_json(f"{url}/api/holdings")
-    assert holdings == temporary.holdings().wire() == {"node": temporary.identity.wire(), "dirs": [{"id": temporary.home, "via": [temporary.identity.id]}]}
+    me = temporary.identity
+    assert holdings == temporary.holdings().wire() == {"node": me.wire(), "dirs": [{"id": temporary.home, "via": [me.id]}],
+                                                       "nodes": [{"id": me.id, "name": me.name, "via": [me.id]}]}
     assert [r["id"] for r in get_json(f"{url}{dir_base(str(temporary.home))}/api/runs")["runs"]] == ["r1"]
     assert request(f"{url}/d/{urllib.parse.quote('elsewhere:/x', safe='')}/api/runs")[0] == 404

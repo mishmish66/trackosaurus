@@ -87,6 +87,10 @@ class Upstream:
             raise Unreachable(f"{self.label}: {status} {data[:200]!r}")
         return data
 
+    def answer(self, method: str, target: str, body: bytes | None, timeout: float) -> tuple[int, bytes]:
+        """(status, body) answering `target`, on a new connection given `timeout` seconds; Unreachable for no answer."""
+        return self._exchange(self.connect(timeout), method, target, body)
+
     def _exchange(self, conn: http.client.HTTPConnection, method: str, target: str, body: bytes | None) -> tuple[int, bytes]:
         """(status, body) of one request on `conn`, which is kept for the next when the server leaves it open."""
         headers = {"Accept-Encoding": "gzip", **({"Content-Type": "application/json"} if body is not None else {})}

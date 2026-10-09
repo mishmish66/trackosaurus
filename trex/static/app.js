@@ -71,6 +71,19 @@ const REMOTE = /^((?:[^@/:\s]+@)?(?:\[[^\]\s]+\]|[^@/:\s[\]]+)):(.+)$/;
 /** The last `n` characters of `s`, after an ellipsis when cut. */
 const tailOf = (s, n) => (s.length > n ? `…${s.slice(1 - n)}` : s);
 
+/** This trex and the trex it reaches (`/api/node` nodes) as a tree of {id, name, at (node ids from a link of this one
+ * to it), dirs, kids}: a trex's parent is the next on its way here (`via`), a directory's the trex crawling it; `names`
+ * by id. */
+function nodeTree(d) {
+  const root = { id: d.node.id, name: d.node.name, at: [], dirs: [], kids: [] }, all = new Map([[root.id, root]]);
+  for (const p of d.nodes) all.set(p.id, { id: p.id, name: p.name, via: p.via, at: [...p.via].reverse(), dirs: [], kids: [] });
+  for (const n of all.values()) if (n !== root) (all.get(n.via[1]) ?? root).kids.push(n);
+  for (const n of all.values()) n.kids.sort((a, b) => cmpNames(a.name, b.name));
+  for (const r of d.dirs) (all.get(r.via[0]) ?? root).dirs.push(r);
+  root.names = new Map([...all].map(([id, n]) => [id, n.name]));
+  return root;
+}
+
 /** `/api/node`: {node, saves, home, dirs, links, workspaces, history, install, updates}. */
 const nodeInfo = () => getJSON("/api/node");
 
@@ -591,8 +604,7 @@ class App {
     const show = (...kids) => panel.replaceChildren(...kids.filter((k) => k != null));
     const home = () => show(h("div", { className: "mtitle", textContent: "workspaces" }), ...this.workspaceRows(d, refresh, edit),
       h("button", { className: "mclear", textContent: "+ new workspace", onclick: () => edit(null) }),
-      h("div", { className: "mtitle msec", textContent: "tracked directories" }), ...this.trackedRows(d, refresh, err), err,
-      d.links.length ? h("div", { className: "mtitle msec", textContent: "pulled from" }) : null, ...this.linkRows(d),
+      h("div", { className: "mtitle msec", textContent: "directories, by the trex crawling them" }), ...this.trackedRows(d, refresh, err), err,
       this.versionRow(d, err));
     const edit = (ws) => show(this.workspaceEditor(d, ws, home));
     home();
@@ -635,51 +647,85 @@ class App {
     else refresh();
   }
 
-  /** Rows of the trex this one pulls every directory of; stopping pulling from one opens the root view anew. */
-  linkRows(d) {
-    const unlink = async (l) => {
-      if (!confirm(`Stop pulling from ${l.url}? What only it offers is no longer served here.`)) return;
-      await post("/api/node/remove", { name: l.url });
-      openPage("/");
-    };
-    return d.links.map((l) => h("div", { className: "mrow" },
-      h("div", { className: "mitem", title: l.error || l.url },
-        h("span", { className: "ml", textContent: l.name || l.url }),
-        h("span", { className: "ms", textContent: tailOf(l.url, 36) + (l.state === "connected" ? "" : ` · ${l.state}`) })),
-      h("button", { className: "chev", textContent: "×", title: "stop pulling from this trex", onclick: () => unlink(l) })));
-  }
-
-  /** Rows of the tracked directories (one pulled from another trex is removed with its link), the add box and the
-   * remembered directories and links. */
+  /** The directories as a tree of the trex holding them (`nodeTree`): this one's (one it tracks is removed here), its
+   * add box and the remembered directories and links; then each trex it pulls from (`nodeBranch`), with the
+   * directories crawled there, the trex beyond it, and a box to add a directory there. */
   trackedRows(d, refresh, err) {
-    const note = h("div", { className: "mhint" });
-    const add = async (path) => {
-      const link = /^http:\/\//.test(path.trim()), host = link ? null : REMOTE.exec(path.trim())?.[1];
-      [err.textContent, note.textContent] = ["", link ? `asking ${path.trim()}…` : host ? `starting trex on ${host}…` : ""];
-      const [ok, j] = await post("/api/node/add", { path: path.trim() });
-      note.textContent = "";
+    const tree = nodeTree(d), note = h("div", { className: "mhint" });
+    /** Have the trex at the end of `at` (node ids from a link of this one; none: this one) track `path`. */
+    const add = async (path, at, where, errEl, noteEl) => {
+      const spec = path.trim(), link = !at.length && /^http:\/\//.test(spec), host = at.length || link ? null : REMOTE.exec(spec)?.[1];
+      [errEl.textContent, noteEl.textContent] = ["", at.length ? `asking ${where}…` : link ? `asking ${spec}…` : host ? `starting trex on ${host}…` : ""];
+      const [ok, j] = await post("/api/node/add", { path: spec, ...(at.length ? { at } : {}) });
+      noteEl.textContent = "";
       if (ok) openPage(j.url);
-      else err.textContent = j.error;
+      else errEl.textContent = j.error;
     };
     const input = h("input", { type: "text", placeholder: "/path/to/runs, ~/runs, host:path or http://host:port", spellcheck: false,
-      onkeydown: (e) => e.key === "Enter" && add(input.value) });
-    const served = d.dirs.map((r) => h("div", { className: "mrow" },
-      h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || (r.link ? `${r.root}, pulled from ${r.link}` : r.root),
-        onclick: () => openPage(r.url) },
-        h("span", { className: "ml", textContent: r.name }),
-        h("span", { className: "ms", textContent: tailOf(r.root, 36) + (r.state === "local" || r.state === "connected" ? "" : ` · ${r.state}`) })),
-      r.link ? null : h("button", { className: "chev", textContent: "×", title: "stop tracking this directory (its files are kept)",
-        onclick: () => this.forget(`Stop serving ${r.root}? Its run files are kept.`, "/api/node/remove", { name: r.name }, r.url, refresh) })));
-    const recent = d.history.map((path) => h("button", { className: "mitem", title: `track ${path}`, onclick: () => add(path) },
+      onkeydown: (e) => e.key === "Enter" && add(input.value, [], "", err, note) });
+    const recent = d.history.map((path) => h("button", { className: "mitem", title: `track ${path}`, onclick: () => add(path, [], "", err, note) },
       h("span", { className: "micon", textContent: "+" }), h("span", { className: "ml", textContent: tailOf(path, 56) })));
     const clear = async () => {
       await post("/api/node/history/clear");
       refresh();
     };
-    return [served.length ? h("div", { className: "mlist" }, ...served) : h("div", { className: "mhint", textContent: "none tracked" }),
-      h("div", { className: "madd" }, input, h("button", { textContent: "add", onclick: () => add(input.value) })), note,
-      recent.length ? h("div", { className: "mrecent" }, h("div", { className: "mtitle", textContent: "recent" }),
-        h("div", { className: "mlist" }, ...recent), h("button", { className: "mclear", textContent: "clear history", onclick: clear })) : null];
+    const dirRow = (r) => this.dirRow(r, tree, refresh);
+    return [h("div", { className: "mrow mnode" }, h("div", { className: "mitem", title: `this trex, ${d.node.id}` },
+      h("span", { className: "ndot up" }), h("span", { className: "ml", textContent: tree.name }), h("span", { className: "ms", textContent: "this trex" }))),
+      h("div", { className: "mbranch" }, ...(tree.dirs.length ? tree.dirs.map(dirRow) : [h("div", { className: "mhint", textContent: "none crawled here" })]),
+        h("div", { className: "madd" }, input, h("button", { textContent: "add", onclick: () => add(input.value, [], "", err, note) })), note,
+        recent.length ? h("div", { className: "mrecent" }, h("div", { className: "mtitle", textContent: "recent" }),
+          h("div", { className: "mlist" }, ...recent), h("button", { className: "mclear", textContent: "clear history", onclick: clear })) : null),
+      ...tree.kids.map((k) => this.nodeBranch(k, d, [tree.name], add, dirRow))];
+  }
+
+  /** A directory's row: open it; one this trex tracks (crawled here or over ssh) can be removed here. */
+  dirRow(r, tree, refresh) {
+    const from = r.via.length ? `crawled by ${tree.names.get(r.via[0]) ?? r.via[0]}${r.link ? `, pulled from ${r.link}` : ""}` : "crawled here";
+    return h("div", { className: "mrow" },
+      h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || `${r.root}, ${from}`, onclick: () => openPage(r.url) },
+        h("span", { className: "ml", textContent: r.name }),
+        h("span", { className: "ms", textContent: tailOf(r.root, 36) + (r.state === "local" || r.state === "connected" ? "" : ` · ${r.state}`) })),
+      r.link ? null : h("button", { className: "chev", textContent: "×", title: "stop tracking this directory (its files are kept)",
+        onclick: () => this.forget(`Stop serving ${r.root}? Its run files are kept.`, "/api/node/remove", { name: r.name }, r.url, refresh) }));
+  }
+
+  /** Trex `n` of the tree (reached through those named `names`, this one first): its row (a link of this one is
+   * removed here), its add box, opened by its + button, its directories, and the trex beyond it. */
+  nodeBranch(n, d, names, add, dirRow) {
+    const path = [...names, n.name], link = d.links.find((l) => l.id === n.id);
+    const form = h("div", { className: "mremote", hidden: true }, ...this.remoteAdd(n, path, add));
+    const unlink = async () => {
+      if (!confirm(`Stop pulling from ${link.url}? What only it offers is no longer served here.`)) return;
+      await post("/api/node/remove", { name: link.url });
+      openPage("/");
+    };
+    const how = link ? tailOf(link.url, 28) + (link.state === "connected" ? "" : ` · ${link.state}`) : names.length === 1 ? "over ssh" : `through ${names.at(-1)}`;
+    return h("div", { className: "mnest" },
+      h("div", { className: "mrow mnode" },
+        h("div", { className: "mitem", title: link?.error || `${n.name} (${n.id}), reached through ${path.slice(0, -1).join(" → ")}` },
+          h("span", { className: `ndot ${!link || link.state === "connected" ? "up" : "down"}` }),
+          h("span", { className: "ml", textContent: n.name }), h("span", { className: "ms", textContent: how })),
+        h("button", { className: "mclear", textContent: "+ add", title: `add a directory on ${n.name}`, onclick: () => {
+          form.hidden = !form.hidden;
+          if (!form.hidden) form.querySelector("input").focus();
+        } }),
+        link ? h("button", { className: "chev", textContent: "×", title: "stop pulling from this trex", onclick: unlink }) : null),
+      form, h("div", { className: "mbranch" }, ...n.dirs.map(dirRow), ...n.kids.map((k) => this.nodeBranch(k, d, path, add, dirRow))));
+  }
+
+  /** The box adding a directory on trex `n`, reached through `path` (this trex first): the way there, a path on it, and
+   * who does what. */
+  remoteAdd(n, path, add) {
+    const err = h("div", { className: "merr" }), note = h("div", { className: "mhint" }), where = path.slice(1).join(" → ");
+    const go = () => add(input.value, n.at, where, err, note);
+    const input = h("input", { type: "text", placeholder: `path on ${n.name}, e.g. ~/runs`, spellcheck: false, onkeydown: (e) => e.key === "Enter" && go() });
+    const between = path.slice(1, -1);
+    return [h("div", { className: "mchain" }, h("span", { className: "ms", textContent: "add on" }),
+      ...path.flatMap((name, i) => [i ? h("span", { className: "ms", textContent: "→" }) : null,
+        h("span", { className: "mchip" + (i === path.length - 1 ? " target" : ""), textContent: name })])),
+      h("div", { className: "madd" }, input, h("button", { textContent: `add on ${n.name}`, onclick: go })), note, err,
+      h("div", { className: "mhint", textContent: `${n.name} crawls the path${between.length > 1 ? `; ${between.slice(0, -1).join(", ")} and ${between.at(-1)} pass it on` : between.length ? `; ${between[0]} passes it on` : ""}; this trex pulls it.` })];
   }
 
   /** The node's trex version, with an update button when it can update itself. */
@@ -908,6 +954,7 @@ class App {
     };
     $("aside").addEventListener("scroll", () => (sideRaf ||= requestAnimationFrame(side)));
     new ResizeObserver(() => (sideRaf ||= requestAnimationFrame(side))).observe($("aside"));
+    $("#runTable").addEventListener("mouseleave", () => this.markSide(null)); // also when its rows were built anew under the pointer
     const o = this.opts;
     const bind = (sel, key, ev, after) => {
       const el = $(sel);
@@ -1806,9 +1853,10 @@ class App {
       this.saveCollapsed();
       this.renderRunTable();
     };
+    const markOn = (runs) => ({ onmouseenter: () => this.markSide(runs), onmouseleave: () => this.markSide(null) });
     const runRow = (r, depth) => {
       const s = r.meta.summary || {};
-      return h("tr", { className: (r.match ? "" : "nomatch") + (this.sideMark === r.id ? " mark" : "") },
+      return h("tr", { className: (r.match ? "" : "nomatch") + (this.sideMark === r.id ? " mark" : ""), ...markOn([r]) },
         h("td", { className: "tw" }),
         h("td", {}, h("input", { type: "checkbox", checked: r.visible, onchange: (e) => setHidden([r], !e.target.checked) })),
         h("td", {}, h("span", { className: "sw", style: `background:${r.color}` })),
@@ -1827,7 +1875,7 @@ class App {
     const headRow = ({ key, label, members, color, depth, open, openTitle, onOpen }) => {
       const vis = members.filter((r) => r.visible).length;
       return h("tr", { className: "grp" + (open ? " open" : "") + (this.sideMark === key ? " mark" : ""), title: open ? "click to collapse" : "click to expand",
-        onclick: (e) => !e.target.closest("input, button") && toggle(key) },
+        onclick: (e) => !e.target.closest("input, button") && toggle(key), ...markOn(members) },
         h("td", { className: "tw" }, h("span", { className: "caret", textContent: "▸" })),
         h("td", {}, h("input", { type: "checkbox", checked: vis > 0, indeterminate: vis > 0 && vis < members.length,
           onchange: (e) => setHidden(members, !e.target.checked) })),
@@ -1868,6 +1916,16 @@ class App {
     const ha = $("#hideAll");
     ha.textContent = anyVisible ? "hide all" : "show all";
     ha.onclick = () => setHidden(inScope, anyVisible);
+  }
+
+  /** Trace the lines of `runs` (a sidebar row's, under the pointer; null: none) on the charts in view: their own lines,
+   * or their groups' when the charts are grouped. Once a frame, however fast the pointer crosses the rows. */
+  markSide(runs) {
+    this.sideMarked = runs && { runs: new Set(runs.map((r) => r.id)), groups: new Set(runs.map((r) => r.part)) };
+    this.markRaf ||= requestAnimationFrame(() => {
+      this.markRaf = 0;
+      for (const c of this.charts.values()) if (c.inView || c.full || c.marked) c.markLines(this.sideMarked);
+    });
   }
 
   /** Offset of the run table within the sidebar's scrolled content. */

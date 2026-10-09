@@ -14,6 +14,7 @@ const EDGE_PX = 4; // px beyond the plot's sides within which a segment's end ma
 // dot's radius (gl.js DOT_PX), so that the first or last point a draw takes of a line that goes on shows no dot there
 export const DENSITY_AUTO = 300; // "auto" draws a density heatmap above this many lines
 const DENSITY_TIP = 8; // runs listed by the density tooltip
+const MARK_LINES = 64; // lines a chart traces for a sidebar row under the pointer
 
 const MARGIN = { l: 52, r: 10, t: 6, b: 20 };
 export const BAND_LABEL = { ci: "95% CI", iqr: "IQR", minmax: "min/max", std: "±std", stderr: "±stderr", none: "none" };
@@ -193,6 +194,15 @@ function bandLabel(band, center, n) {
 
 /** Tooltip heading for x: a runtime or a step. */
 const xLabel = (v, x) => (v.xmode === X_RUNTIME ? fmtDur(x) : `step ${fmtSI(Math.round(x))}`);
+
+/** Line ln of view v as `traceLine` takes it when `mark` ({runs, groups}) names it, else null: a group's line by its
+ * key, a run's by its id; a GPU heatmap's lines are the runs themselves, traced by their run index. */
+function markedLine(ln, v, mark) {
+  if (ln.group != null) return mark.groups.has(ln.group) ? ln : null;
+  const run = ln.run ?? (v.gpu ? ln : null);
+  if (!run || !mark.runs.has(run.id)) return null;
+  return ln.run ? ln : { run, color: run.color, gi: run.idx };
+}
 
 /** A dot at each row's point (those with one), filled one path a color: a tooltip of a thousand lines fills a few. */
 function dots(ctx, rows) {
@@ -1250,7 +1260,7 @@ export class Chart {
     this.drawnKey = null;
     ctx.fillStyle = theme().muted;
     if (!view) return ctx.fillText(this.emptyText(), MARGIN.l + 4, MARGIN.t + 14);
-    if (img) return ctx.save(), ctx.setTransform(1, 0, 0, 1, 0, 0), ctx.drawImage(img, 0, 0), ctx.restore(), (this.drawnKey = key);
+    if (img) return ctx.save(), ctx.setTransform(1, 0, 0, 1, 0, 0), ctx.drawImage(img, 0, 0), ctx.restore(), (this.drawnKey = key), this.remark();
     this.drawAxes(ctx, view, theme().grid);
     const r = renderer();
     if (r.lost) return;
@@ -1260,6 +1270,7 @@ export class Chart {
     if (this.app.hovered === this) this.fetchValues(), this.rehover(); // its tooltip shows what is drawn
     this.drawnKey = key;
     if (key && !this.app.paced) keepImageSoon(this, key); // a streamed redraw is not shown again
+    this.remark();
   }
 
   /** The device pixels of the chart's canvas once it is drawn: [W, H]. */
@@ -1555,6 +1566,37 @@ export class Chart {
     ctx.clearRect(0, 0, this.w, this.h);
     this.crosshair(ctx, this.lastX);
     if (ln) this.traceLine(ctx, ln, 3);
+  }
+
+  /** Overlay tracing the lines of the current view that `mark` names ({runs, groups}: the ids and group keys of the
+   * runs of a sidebar row under the pointer; null: none), at most MARK_LINES of them. The GPU's values of them come a
+   * frame or more after they are asked for, and the lines are traced again then. Left alone while the chart is hovered. */
+  markLines(mark) {
+    if (!this.view || !this.w || this.app.hovered === this || this.app.pinned === this) return;
+    const ctx = this.overlayContext(), v = this.view;
+    ctx.clearRect(0, 0, this.w, this.h);
+    this.marked = !!mark;
+    if (!mark) {
+      this.fetched?.forget();
+      this.fetched = this.held = this.gpuRow = null;
+      return this.app.overlayLeft(this);
+    }
+    let traced = 0;
+    for (const ln of v.lines) {
+      const line = markedLine(ln, v, mark);
+      if (!line) continue;
+      this.traceLine(ctx, line, 3);
+      if (++traced === MARK_LINES) break;
+    }
+    if (traced && v.gpu && this.gpuAll() === undefined) this.markRaf ||= requestAnimationFrame(() => {
+      this.markRaf = 0;
+      this.markLines(this.app.sideMarked);
+    });
+  }
+
+  /** Trace again what the sidebar marks, once the chart has drawn anew. */
+  remark() {
+    if (this.app.sideMarked || this.marked) this.markLines(this.app.sideMarked);
   }
 
   unhover() {

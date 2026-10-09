@@ -863,8 +863,8 @@ def node_smoke(page: Page, runs: Path, tmp: Path, env: dict[str, str], out: Path
 
 def link_smoke(page: Page, tmp: Path, env: dict[str, str], out: Path, upstream: str) -> bool:
     """Whether this machine's trex tracking nothing, given another trex's http://host:port in its panel, pulls and shows every run
-    that trex holds, lists the link under "pulled from" with no way to remove the pulled directory alone, and lets go
-    of that directory with the link."""
+    that trex holds, lists the directory under that trex, below this one, with no way to remove the pulled directory
+    alone, and lets go of that directory with the link, removed from that trex's row."""
     port = free_port()
     url = f"http://127.0.0.1:{port}"
     node = subprocess.Popen([sys.executable, "-m", "trex", "serve", "--port", str(port), "--cache", str(tmp / "cache-links"),
@@ -889,7 +889,8 @@ def link_smoke(page: Page, tmp: Path, env: dict[str, str], out: Path, upstream: 
         with urllib.request.urlopen(f"{url}/api/node") as r:
             d = json.loads(r.read())
         print(f"links: pulled {want} runs from {upstream}; panel rows {rows}; after removing the link: directories {d['dirs']}, links {d['links']}")
-        return want > 0 and len(rows) == 2 and rows[0] == ["runs", False] and rows[1][1] and d["dirs"] == [] == d["links"]
+        return (want > 0 and len(rows) == 3 and rows[0] == ["laptop", False] and rows[1][1] and rows[2] == ["runs", False]
+                and d["dirs"] == [] == d["links"])
     finally:
         node.terminate()
         node.wait()
@@ -1282,6 +1283,29 @@ def hidden_runs_smoke(page: Page, url: str) -> bool:
             and count == "0 sections · 0 panels" and back == before)
 
 
+def side_mark_smoke(page: Page, url: str) -> bool:
+    """Whether hovering a sidebar row traces its lines on the charts in view: a group's line when grouped, a run's line
+    when not, and leaving the run table clears every chart's overlay."""
+    traced = """[...app.charts.values()].filter((c) => c.inView && c.overlay.width).map((c) => {
+      const d = c.overlay.getContext('2d').getImageData(0, 0, c.overlay.width, c.overlay.height).data;
+      let n = 0;
+      for (let i = 3; i < d.length; i += 4) n += d[i] > 0;
+      return n;
+    })"""
+    out: list[Any] = []
+    for hash_, row in (("#path=", "#runTable tr.grp"), ("#path=&group=run", "#runTable tr:has(td.name a)")):
+        page.goto(f"{url}/?mark{hash_}")
+        page.wait_for_function(READY, timeout=30000)
+        page.locator(row).first.hover()
+        page.wait_for_function(f"app.sideMarked && {traced}.some((n) => n > 0)", timeout=10000)
+        marked = page.evaluate(traced)
+        page.mouse.move(600, 300)
+        page.wait_for_function(f"!app.sideMarked && {traced}.every((n) => n === 0)", timeout=10000)
+        out.append([sum(1 for n in marked if n > 0), len(marked), page.evaluate("app.grouped")])
+    print(f"side mark: charts traced of those in view, grouped then by run: {out}")
+    return out[0][0] > 0 and out[0][2] is True and out[1][0] > 0 and out[1][2] is False
+
+
 def palette(n: int) -> dict[str, str]:
     """The page's colors by name as index.html declares them: the light ones (0) or the dark ones (1)."""
     return dict(re.findall(r"--(\w+):([^;]+);", re.findall(r":root \{([^}]*)\}", (STATIC / "index.html").read_text())[n]))
@@ -1629,6 +1653,7 @@ def main() -> None:
             ok &= check("binned_smoke", binned_smoke(page, url, runs))
             ok &= check("hidden_live_smoke", hidden_live_smoke(page, url, runs))
             ok &= check("column_drag_smoke", column_drag_smoke(page, url))
+            ok &= check("side_mark_smoke", side_mark_smoke(page, url))
             ok &= check("hidden_extent_smoke", hidden_extent_smoke(page, url, runs))
             ok &= check("line_pixels_smoke", line_pixels_smoke(page, url))
             ok &= check("failing_blocks_smoke", failing_blocks_smoke(page, url))

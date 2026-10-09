@@ -57,6 +57,10 @@ it is one top-level folder wherever it is held. A node offers each directory it 
 nodes it came through, from the one crawling it, and takes each directory it does not crawl itself through the link
 offering it by the shortest `via` without itself. It keeps a directory's link while that link offers it, and lets a
 directory go once its link answers without it (one whose link does not answer stays, to browse).
+
+The panel shows each directory under the trex crawling it, and each trex under the one it is reached through. A trex's
+"+ add" box adds a directory there, however many links away: that trex crawls the path (one reached over ssh is told
+to by the trex before it, which keeps it as host:path), and every trex on the way pulls it.
 """
 
 import contextlib
@@ -82,6 +86,7 @@ from .workspace import Member, Workspace
 
 HISTORY_MAX: Final = 50  # directories and links remembered for re-adding
 PULL_EVERY = 10.0  # seconds between asking each link what it holds
+ADD_SLACK: Final = 30.0  # seconds a node passing an add on waits, per node after it, beyond an ssh start's wait
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,19 +110,36 @@ class Offer:
 
 
 @dataclass(frozen=True, slots=True)
+class Peer:
+    """A node another reaches, and the nodes between: `via`, from it to the node telling of it."""
+
+    id: str
+    name: str
+    via: list[str]
+
+    def wire(self) -> dict[str, Any]:
+        return {"id": self.id, "name": self.name, "via": self.via}
+
+
+@dataclass(frozen=True, slots=True)
 class Holdings:
-    """A node, and every directory it holds."""
+    """A node, every directory it holds, and every node it reaches (itself first; None from a trex that tells of
+    none, and so passes no add on, `Node.add_at`)."""
 
     node: Identity
     dirs: list[Offer]
+    nodes: list[Peer] | None
 
     def wire(self) -> dict[str, Any]:
-        return {"node": self.node.wire(), "dirs": [{"id": o.id, "via": o.via} for o in self.dirs]}
+        return {"node": self.node.wire(), "dirs": [{"id": o.id, "via": o.via} for o in self.dirs],
+                "nodes": None if self.nodes is None else [p.wire() for p in self.nodes]}
 
     @classmethod
     def read(cls, d: Mapping[str, Any]) -> Self:
-        node = d["node"]
-        return cls(Identity(str(node["id"]), str(node["name"])), [Offer(str(o["id"]), [str(v) for v in o["via"]]) for o in d["dirs"]])
+        node, nodes = d["node"], d.get("nodes")
+        peers = None if nodes is None else [Peer(str(p["id"]), str(p["name"]), [str(v) for v in p["via"]]) for p in nodes]
+        return cls(Identity(str(node["id"]), str(node["name"])), [Offer(str(o["id"]), [str(v) for v in o["via"]]) for o in d["dirs"]],
+                   peers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +179,8 @@ class Saved:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DirInfo:
     """A directory as the panel shows it: `root` is how the node holds it (a path or host:path it tracks, else its id),
-    `link` the link it is pulled from unless the node tracks it."""
+    `link` the link it is pulled from unless the node tracks it, `via` the nodes it comes through, from the one
+    crawling it to a link of this node (none for one crawled here)."""
 
     name: str
     root: str
@@ -166,23 +189,25 @@ class DirInfo:
     state: str  # local, or a pulled directory's connection state
     error: str
     link: str | None
+    via: list[str]
 
     def wire(self) -> dict[str, Any]:
         return {"name": self.name, "root": self.root, "id": self.id, "url": self.url, "state": self.state,
-                "error": self.error, "link": self.link}
+                "error": self.error, "link": self.link, "via": self.via}
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class LinkInfo:
-    """A link as the panel shows it: the node's name once it answered."""
+    """A link as the panel shows it: the node's id and name once it answered."""
 
     url: str
+    id: str
     name: str
     state: str  # connecting, starting, connected or unreachable
     error: str
 
     def wire(self) -> dict[str, str]:
-        return {"url": self.url, "name": self.name, "state": self.state, "error": self.error}
+        return {"url": self.url, "id": self.id, "name": self.name, "state": self.state, "error": self.error}
 
 
 def host_name() -> str:
@@ -266,6 +291,14 @@ def _context(spec: str) -> list[str]:
     return [path[-1] or addr.path, addr.host.split("@")[-1].split(".")[0], *reversed([q for q in path[:-1] if q])]
 
 
+def _via(pulled: Pulled | None, link: "Link | None") -> list[str]:
+    """The nodes a directory comes through, from the one crawling it to a link of this node: none for one crawled here,
+    the ssh link's node for one crawled over ssh and not pulled yet."""
+    if pulled is not None:
+        return pulled.via
+    return [link.identity.id] if link is not None and link.identity is not None else []
+
+
 def write_json(path: Path, obj: object) -> None:
     """Replace `path` atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,6 +318,7 @@ class Link:
         self.error = ""
         self.identity: Identity | None = None
         self.offers: dict[str, list[str]] | None = None  # directory id -> the nodes it came through; None while unanswered
+        self.peers: list[Peer] | None = None  # the nodes it reaches, itself first; None from a trex that tells of none
         self._api = Upstream(connect, key)
 
     @classmethod
@@ -319,8 +353,21 @@ class Link:
 
     def _holdings(self) -> dict[str, list[str]]:
         held = Holdings.read(json.loads(self._api.request("GET", "/api/holdings")))
-        self.identity = held.node
+        self.identity, self.peers = held.node, held.nodes
         return {o.id: o.via for o in held.dirs}
+
+    def add(self, path: str, at: Sequence[str]) -> str | None:
+        """Have the link's node track `path`, or the node at the end of `at` (node ids, from one the link's node
+        links to); the directory's id (None for a trex to pull from). ValueError with why, when it will not."""
+        body = json.dumps({"path": path, **({"at": list(at)} if at else {})}).encode()
+        try:
+            status, data = self._api.answer("POST", "/api/node/add", body, remote.ADD_TIMEOUT + ADD_SLACK * (len(at) + 1))
+            reply = as_dict(json.loads(data))
+        except (Unreachable, ValueError) as e:
+            raise ValueError(f"{self.key} did not answer: {e}") from e
+        if status != 200:
+            raise ValueError(str(reply.get("error") or f"{self.key} answered {status}"))
+        return d if isinstance(d := reply.get("id"), str) else None
 
     def _crawl(self, path: str, d: str) -> str:
         """Have the link crawl `path` as directory `d`; why it would not, if it would not."""
@@ -476,6 +523,28 @@ class Node:
         self.reconcile()
         self._start_pulling()
 
+    def add_at(self, path: str, at: Sequence[str]) -> str | None:
+        """Have the node at the end of `at` (node ids, from one this node links to) track `path`, a path there (or
+        another spec it takes, `track`), and pull it here; the directory's id (None for a trex to pull from). The node
+        whose ssh link reaches the last one tracks `host:path` itself, so it keeps it. ValueError if a node on the way
+        refuses it or cannot pass it on (a trex telling of no nodes)."""
+        if not at:
+            return self.track(path)
+        with self.lock:
+            link = next((k for k in self.links.values() if k.identity is not None and k.identity.id == at[0]), None)
+        if link is None:
+            raise ValueError(f"{self.identity.name} has no link to node {at[0]}")
+        if link.session is not None and len(at) == 1:
+            if remote.parse(path) or link_url(path):
+                raise ValueError(f"{path} is not a path on {link.key}")
+            return self.add_remote(f"{link.key}:{path}")
+        if len(at) > 1 and link.peers is None:
+            raise ValueError(f"{link.key} runs a trex that passes no add on; update it")
+        got = link.add(path, at[1:])
+        link.refresh()
+        self.reconcile()
+        return got
+
     def remove(self, name: str) -> None:
         """Stop serving the directory `name` (or pulling from the link `name`) and drop it from every workspace; its
         index stays in the cache. ValueError for a directory pulled from an http link: remove that link instead."""
@@ -589,10 +658,25 @@ class Node:
             threading.Thread(target=self.entries.pop(d).close, daemon=True).start()
 
     def holdings(self) -> Holdings:
-        """This node, and each directory it holds with the nodes it came through, from the one crawling it to this one."""
+        """This node, each directory it holds with the nodes it came through, from the one crawling it to this one, and
+        each node it reaches with the nodes between, itself first."""
+        me = self.identity.id
+        peers = [Peer(me, self.identity.name, [me]), *(Peer(p.id, p.name, [*p.via, me]) for p in self.peers())]
         with self.lock:
-            return Holdings(self.identity, [Offer(d, [*self.pulled[d].via, self.identity.id] if d in self.pulled else [self.identity.id])
-                                            for d in self.entries])
+            return Holdings(self.identity, [Offer(d, [*self.pulled[d].via, me] if d in self.pulled else [me]) for d in self.entries], peers)
+
+    def peers(self) -> list[Peer]:
+        """Every node this one reaches through its links but itself, each by the fewest nodes from it to a link of
+        this one (`via`); a link telling of no nodes, as itself alone."""
+        best: dict[str, Peer] = {}
+        with self.lock:
+            for link in self.links.values():
+                if (who := link.identity) is None:
+                    continue
+                for p in link.peers if link.peers is not None else [Peer(who.id, who.name, [who.id])]:
+                    if self.identity.id not in p.via and (p.id not in best or len(p.via) < len(best[p.id].via)):
+                        best[p.id] = p
+        return list(best.values())
 
     # ---- what it holds ----
 
@@ -648,11 +732,12 @@ class Node:
             error = (link.error if link else "") or origin.error
         root = self.crawled.get(d, d)
         return DirInfo(name=name, root=root, id=d, url=dir_base(d) + "/", state=state, error=error,
-                       link=link.key if link and link.session is None else None)
+                       link=link.key if link and link.session is None else None, via=_via(pulled, link))
 
     def links_info(self) -> list[LinkInfo]:
         with self.lock:
-            return [LinkInfo(url=k, name=link.identity.name if link.identity else "", state=link.state, error=link.error)
+            return [LinkInfo(url=k, id=link.identity.id if link.identity else "", name=link.identity.name if link.identity else "",
+                             state=link.state, error=link.error)
                     for k, link in self.links.items() if link.session is None]
 
     # ---- workspaces ----

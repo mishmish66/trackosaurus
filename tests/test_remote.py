@@ -132,6 +132,26 @@ def test_a_remote_directory_is_crawled_there_by_a_temporary_trex_and_served_here
     assert answer.paths == ["a/r1"] and answer.buckets.run.size >= 1
 
 
+def test_an_add_whose_last_hop_is_an_ssh_link_is_tracked_as_host_path_by_the_node_before(
+        node: Node, runs: Path, http: str, tmp_path: Path, home: Path) -> None:
+    node.add_remote(f"box:{runs}")
+    box = node.links["box"].identity
+    assert box is not None and box.name == "box"
+    other = tmp_path / "remote data" / "other"
+    write_run(other / "r9")
+    laptop = Node(tmp_path / "laptop" / "cache", name="laptop")
+    try:
+        laptop.add_link(http)
+        assert wait_for(lambda: len(laptop.peers()) == 2)
+        assert laptop.add_at(str(other), [node.identity.id, box.id]) == f"box:{other}"
+        assert node.tracked() == [f"box:{runs}", f"box:{other}"] and laptop.tracked() == []
+        assert laptop.pulled[f"box:{other}"].via == [box.id, node.identity.id]
+        with pytest.raises(ValueError, match="is not a path on box"):
+            laptop.add_at(f"elsewhere:{other}", [node.identity.id, box.id])
+    finally:
+        laptop.close()
+
+
 def test_every_directory_on_a_host_shares_one_session(node: Node, runs: Path, tmp_path: Path, home: Path) -> None:
     other = tmp_path / "remote data" / "other"
     write_run(other / "r9")

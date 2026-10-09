@@ -235,6 +235,16 @@ def test_a_scope_block_holds_every_run_under_it_that_logs_the_metric(root: Path,
     assert block(ex, "odd", level, 0, runs=["a/r2", "nope", "a/short", "a/r2"]).paths == ["a/r2"]
 
 
+def test_a_dump_of_a_run_the_index_lacks_leaves_later_dumps_working(root: Path, tmp_path: Path) -> None:
+    write_run(root / "r", 600)
+    ex = explorer(root, tmp_path)
+    want = len(ex.dump("r", None).blocks)
+    for _ in range(3):
+        with pytest.raises(KeyError):
+            ex.dump("gone", None)
+        assert len(ex.dump("r", None).blocks) == want > 0
+
+
 def test_a_scopes_finished_blocks_are_kept_until_its_finished_runs_change(root: Path, tmp_path: Path) -> None:
     write_run(root / "a" / "r1", 600)
     ex = explorer(root, tmp_path)

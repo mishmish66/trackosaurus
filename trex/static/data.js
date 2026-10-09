@@ -14,7 +14,7 @@ const num = (v) => (typeof v === "number" ? v : asNumber(v) ?? NaN);
 const soon = (f) => void (globalThis.scheduler?.postTask ? globalThis.scheduler.postTask(f) : setTimeout(f, 0));
 
 /** What this page and the server say to each other (server.PROTOCOL); the page states a mismatch. */
-export const PROTOCOL = 7;
+export const PROTOCOL = 8;
 /** URL prefix of what the page shows: a directory ("/d/<id>") or a workspace ("/w/<name>"), else "" (the node's home). */
 export const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/[wd]\/[^/]+(?=\/)/) || [""])[0];
 
