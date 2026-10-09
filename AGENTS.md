@@ -229,16 +229,21 @@ Workers end with the process that started them (`worker_init`), also when it is 
 
 - **Links** (`Link`): trex a node pulls every directory of: `Link.http(url)`, or `Link.ssh(host)`, the remote node it
   starts (one per host for all the directories it tracks there). Every `PULL_EVERY` seconds the node asks each link for
-  `GET /api/holdings` ({node: {id, name}, dirs: [{id, via}], nodes: [{id, name, via}]}, `via` the nodes a directory
-  came through, from the one crawling it, and the nodes from each node it reaches to it; `Node.peers`); an ssh link is
-  first asked to crawl the paths it lacks (`POST /api/node/add {path, id}`).
+  `GET /api/holdings` ({node: {id, name}, dirs: [{id, via}], nodes: [{id, name, via, install, updates, why, ssh}]},
+  `via` the nodes a directory came through, from the one crawling it, and the nodes from each node it reaches to it,
+  with the trex it runs, whether it can update itself and why not, and whether its parent reaches it over ssh;
+  `Node.peers`); an ssh link is first asked to crawl the paths it lacks (`POST /api/node/add {path, id}`).
 - **Adding through links** (`Node.add_at`): `POST /api/node/add {path, at}` has the node at the end of `at` (node ids,
   from one this node links to) track `path`; each node passes it one link on (`Link.add`, waiting `ADD_SLACK` per node
   beyond an ssh start), and the node whose ssh link reaches the last one tracks `host:path` itself, so a temporary node
   never holds the only record of it. Each node then asks its link anew and pulls the directory before it answers. A
-  link whose holdings tell of no nodes (an older trex) passes nothing on. The panel draws the nodes as a tree (`nodeTree`
-  in `app.js`: a node under the next on its way here, a directory under the node crawling it), each with its own add
-  box.
+  link whose holdings tell of no nodes (an older trex) passes nothing on. `POST /api/node/remove {id, at}`
+  (`Node.remove_at`, `Link.remove`) goes the same way to the node tracking the directory, and each node on the way lets
+  it go once its link answers without it. `POST /api/node/update {at}` (`Node.update_at`, `Link.update`) updates the
+  node at its end; one reached over ssh is refused, since it runs the trex of the node before it, which starts it anew
+  when it restarts. The panel draws the nodes as a tree (`nodeTree` in `app.js`: a node under the
+  next on its way here, a directory under the node crawling it), each with its own add box, its version and its update
+  button, and removes any directory through the `at` of the node crawling it.
 - **Reconcile** (`Node.reconcile`): each directory the links offer that the node does not crawl is pulled through the
   link offering it by the shortest `via` not containing this node; a directory keeps its link while that link offers it
   (else its `Pull` is retargeted, `Pull.retarget`); a directory goes once its link answers without it, while an

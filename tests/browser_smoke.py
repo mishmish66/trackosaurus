@@ -863,8 +863,8 @@ def node_smoke(page: Page, runs: Path, tmp: Path, env: dict[str, str], out: Path
 
 def link_smoke(page: Page, tmp: Path, env: dict[str, str], out: Path, upstream: str) -> bool:
     """Whether this machine's trex tracking nothing, given another trex's http://host:port in its panel, pulls and shows every run
-    that trex holds, lists the directory under that trex, below this one, with no way to remove the pulled directory
-    alone, and lets go of that directory with the link, removed from that trex's row."""
+    that trex holds, lists the directory under that trex, below this one, each with its × (the directory's removes it
+    there), and lets go of that directory with the link, removed from that trex's row."""
     port = free_port()
     url = f"http://127.0.0.1:{port}"
     node = subprocess.Popen([sys.executable, "-m", "trex", "serve", "--port", str(port), "--cache", str(tmp / "cache-links"),
@@ -889,7 +889,7 @@ def link_smoke(page: Page, tmp: Path, env: dict[str, str], out: Path, upstream: 
         with urllib.request.urlopen(f"{url}/api/node") as r:
             d = json.loads(r.read())
         print(f"links: pulled {want} runs from {upstream}; panel rows {rows}; after removing the link: directories {d['dirs']}, links {d['links']}")
-        return (want > 0 and len(rows) == 3 and rows[0] == ["laptop", False] and rows[1][1] and rows[2] == ["runs", False]
+        return (want > 0 and len(rows) == 3 and rows[0] == ["laptop", False] and rows[1][1] and rows[2] == ["runs", True]
                 and d["dirs"] == [] == d["links"])
     finally:
         node.terminate()

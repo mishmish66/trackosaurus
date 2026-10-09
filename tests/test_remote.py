@@ -148,6 +148,11 @@ def test_an_add_whose_last_hop_is_an_ssh_link_is_tracked_as_host_path_by_the_nod
         assert laptop.pulled[f"box:{other}"].via == [box.id, node.identity.id]
         with pytest.raises(ValueError, match="is not a path on box"):
             laptop.add_at(f"elsewhere:{other}", [node.identity.id, box.id])
+        assert {p.name: p.ssh for p in laptop.peers()} == {node.identity.name: False, "box": True}
+        with pytest.raises(ValueError, match="runs the trex of"):
+            laptop.update_at([node.identity.id, box.id])
+        laptop.remove_at(f"box:{other}", [node.identity.id, box.id])
+        assert node.tracked() == [f"box:{runs}"] and f"box:{other}" not in laptop.entries and f"box:{runs}" in laptop.pulled
     finally:
         laptop.close()
 

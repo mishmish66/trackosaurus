@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-from .format import as_dict, as_str
+from .format import JSONValue, as_dict, as_str
 
 DEFAULT_SOURCE: Final = "git+https://github.com/mishmish66/trackosaurus"
 INSTALL_TIMEOUT: Final = 600.0  # seconds
@@ -31,6 +31,11 @@ class Install:
 
     def wire(self) -> dict[str, str | None]:
         return {"version": self.version, "commit": self.commit}
+
+    @classmethod
+    def read(cls, v: JSONValue) -> "Install":
+        d = as_dict(v)
+        return cls(as_str(d.get("version")) or "unknown", as_str(d.get("commit")))
 
 
 @dataclass(frozen=True, slots=True)

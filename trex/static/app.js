@@ -76,11 +76,12 @@ const tailOf = (s, n) => (s.length > n ? `…${s.slice(1 - n)}` : s);
  * by id. */
 function nodeTree(d) {
   const root = { id: d.node.id, name: d.node.name, at: [], dirs: [], kids: [] }, all = new Map([[root.id, root]]);
-  for (const p of d.nodes) all.set(p.id, { id: p.id, name: p.name, via: p.via, at: [...p.via].reverse(), dirs: [], kids: [] });
+  for (const p of d.nodes) all.set(p.id, { ...p, at: [...p.via].reverse(), dirs: [], kids: [] });
   for (const n of all.values()) if (n !== root) (all.get(n.via[1]) ?? root).kids.push(n);
   for (const n of all.values()) n.kids.sort((a, b) => cmpNames(a.name, b.name));
   for (const r of d.dirs) (all.get(r.via[0]) ?? root).dirs.push(r);
   root.names = new Map([...all].map(([id, n]) => [id, n.name]));
+  root.ats = new Map([...all].map(([id, n]) => [id, n.at]));
   return root;
 }
 
@@ -639,15 +640,16 @@ class App {
   }
 
   /** After `question` is confirmed, POST body to the node's `path`; then leave the page for "/" if it showed `url`, else
-   * refresh the panel. */
-  async forget(question, path, body, url, refresh) {
+   * refresh the panel; a refusal is shown in `err`, when given. */
+  async forget(question, path, body, url, refresh, err = null) {
     if (!confirm(question)) return;
-    await post(path, body);
+    const [ok, j] = await post(path, body);
+    if (!ok && err) return void (err.textContent = j.error);
     if (url === `${BASE}/`) openPage("/");
     else refresh();
   }
 
-  /** The directories as a tree of the trex holding them (`nodeTree`): this one's (one it tracks is removed here), its
+  /** The directories as a tree of the trex holding them (`nodeTree`): this one's, its
    * add box and the remembered directories and links; then each trex it pulls from (`nodeBranch`), with the
    * directories crawled there, the trex beyond it, and a box to add a directory there. */
   trackedRows(d, refresh, err) {
@@ -669,30 +671,34 @@ class App {
       await post("/api/node/history/clear");
       refresh();
     };
-    const dirRow = (r) => this.dirRow(r, tree, refresh);
+    const dirRow = (r) => this.dirRow(r, tree, refresh, err);
     return [h("div", { className: "mrow mnode" }, h("div", { className: "mitem", title: `this trex, ${d.node.id}` },
       h("span", { className: "ndot up" }), h("span", { className: "ml", textContent: tree.name }), h("span", { className: "ms", textContent: "this trex" }))),
       h("div", { className: "mbranch" }, ...(tree.dirs.length ? tree.dirs.map(dirRow) : [h("div", { className: "mhint", textContent: "none crawled here" })]),
         h("div", { className: "madd" }, input, h("button", { textContent: "add", onclick: () => add(input.value, [], "", err, note) })), note,
         recent.length ? h("div", { className: "mrecent" }, h("div", { className: "mtitle", textContent: "recent" }),
           h("div", { className: "mlist" }, ...recent), h("button", { className: "mclear", textContent: "clear history", onclick: clear })) : null),
-      ...tree.kids.map((k) => this.nodeBranch(k, d, [tree.name], add, dirRow))];
+      ...tree.kids.map((k) => this.nodeBranch(k, d, [tree.name], add, dirRow, refresh))];
   }
 
-  /** A directory's row: open it; one this trex tracks (crawled here or over ssh) can be removed here. */
-  dirRow(r, tree, refresh) {
-    const from = r.via.length ? `crawled by ${tree.names.get(r.via[0]) ?? r.via[0]}${r.link ? `, pulled from ${r.link}` : ""}` : "crawled here";
+  /** A directory's row: open it, or remove it: the trex tracking it stops (asked through the trex on the way,
+   * `Node.remove_at`), and every trex pulling it lets it go. */
+  dirRow(r, tree, refresh, err) {
+    const crawler = r.via.length ? tree.names.get(r.via[0]) ?? r.via[0] : null, at = r.via.length ? tree.ats.get(r.via[0]) ?? [] : [];
+    const from = crawler ? `crawled by ${crawler}${r.link ? `, pulled from ${r.link}` : ""}` : "crawled here";
+    const question = r.link ? `Remove ${r.root} from ${crawler}? It stops crawling it (its run files are kept), and every trex pulling it lets it go.`
+      : `Stop serving ${r.root}? Its run files are kept.`;
     return h("div", { className: "mrow" },
       h("button", { className: "mitem" + (r.url === `${BASE}/` ? " active" : ""), title: r.error || `${r.root}, ${from}`, onclick: () => openPage(r.url) },
         h("span", { className: "ml", textContent: r.name }),
         h("span", { className: "ms", textContent: tailOf(r.root, 36) + (r.state === "local" || r.state === "connected" ? "" : ` · ${r.state}`) })),
-      r.link ? null : h("button", { className: "chev", textContent: "×", title: "stop tracking this directory (its files are kept)",
-        onclick: () => this.forget(`Stop serving ${r.root}? Its run files are kept.`, "/api/node/remove", { name: r.name }, r.url, refresh) }));
+      h("button", { className: "chev", textContent: "×", title: `stop tracking this directory${crawler ? ` on ${crawler}` : ""} (its files are kept)`,
+        onclick: () => this.forget(question, "/api/node/remove", { id: r.id, ...(at.length ? { at } : {}) }, r.url, refresh, err) }));
   }
 
   /** Trex `n` of the tree (reached through those named `names`, this one first): its row (a link of this one is
    * removed here), its add box, opened by its + button, its directories, and the trex beyond it. */
-  nodeBranch(n, d, names, add, dirRow) {
+  nodeBranch(n, d, names, add, dirRow, refresh) {
     const path = [...names, n.name], link = d.links.find((l) => l.id === n.id);
     const form = h("div", { className: "mremote", hidden: true }, ...this.remoteAdd(n, path, add));
     const unlink = async () => {
@@ -711,7 +717,40 @@ class App {
           if (!form.hidden) form.querySelector("input").focus();
         } }),
         link ? h("button", { className: "chev", textContent: "×", title: "stop pulling from this trex", onclick: unlink }) : null),
-      form, h("div", { className: "mbranch" }, ...n.dirs.map(dirRow), ...n.kids.map((k) => this.nodeBranch(k, d, path, add, dirRow))));
+      this.remoteVersion(n, d, names.at(-1), refresh),
+      form, h("div", { className: "mbranch" }, ...n.dirs.map(dirRow), ...n.kids.map((k) => this.nodeBranch(k, d, path, add, dirRow, refresh))));
+  }
+
+  /** The trex that trex `n` (reached from `parent`) runs, and its update button when it can update itself; one reached
+   * over ssh runs its parent's, started anew when that one restarts. */
+  remoteVersion(n, d, parent, refresh) {
+    const inst = n.install, err = h("div", { className: "merr" });
+    const text = !inst ? "an older trex" : `trex ${inst.version.split("+")[0]}${inst.commit ? ` · ${inst.commit.slice(0, 7)}` : ""}`;
+    const differs = inst?.commit && d.install.commit && inst.commit !== d.install.commit ? " · not this trex's" : "";
+    const btn = n.updates ? h("button", { className: "mclear", textContent: "update", title: `install the newest trex on ${n.name} and restart it`,
+      onclick: () => this.updateRemote(n, btn, err, refresh) }) : null;
+    const how = n.ssh ? h("span", { className: "ms", textContent: `runs ${parent}'s trex` })
+      : btn ? null : h("span", { className: "ms", title: n.why || "it tells of no updates", textContent: "no updates" });
+    return h("div", {}, h("div", { className: "mver" }, h("span", { className: "ms", textContent: text + differs }), how, btn), err);
+  }
+
+  /** Update trex `n` through the trex on the way (`Node.update_at`); once this trex hears it runs the new one, show
+   * the panel anew. */
+  async updateRemote(n, btn, err, refresh) {
+    [btn.disabled, btn.textContent, err.textContent] = [true, "updating…", ""];
+    const [ok, j] = await post("/api/node/update", { at: n.at });
+    if (!ok || !j.updated) {
+      [btn.disabled, btn.textContent] = [false, "update"];
+      err.textContent = ok ? "already the newest trex" : j.error;
+      return;
+    }
+    btn.textContent = "restarting…";
+    for (let i = 0; i < 240; i++) {
+      await new Promise((ok) => setTimeout(ok, 500));
+      const now = (await nodeInfo().catch(() => null))?.nodes.find((p) => p.id === n.id);
+      if (now?.install && JSON.stringify(now.install) === JSON.stringify(j.to)) break;
+    }
+    refresh();
   }
 
   /** The box adding a directory on trex `n`, reached through `path` (this trex first): the way there, a path on it, and

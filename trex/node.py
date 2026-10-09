@@ -60,10 +60,13 @@ directory go once its link answers without it (one whose link does not answer st
 
 The panel shows each directory under the trex crawling it, and each trex under the one it is reached through. A trex's
 "+ add" box adds a directory there, however many links away: that trex crawls the path (one reached over ssh is told
-to by the trex before it, which keeps it as host:path), and every trex on the way pulls it.
+to by the trex before it, which keeps it as host:path), and every trex on the way pulls it. A directory's × removes it
+the same way, wherever it is crawled; its run files are kept. Each trex shows the trex it runs, and one running as a service has
+an update button there; one reached over ssh runs the trex of the one before it and updates with it.
 """
 
 import contextlib
+import dataclasses
 import json
 import os
 import socket
@@ -76,11 +79,11 @@ from pathlib import Path
 from typing import Any, Final, Self
 from urllib.parse import quote, urlsplit
 
-from . import remote
+from . import remote, update
 from .format import JSONValue, as_dict, as_str_list
 from .crawl import Crawl
 from .index import Explorer
-from .mirror import Connect, Pull, Unreachable, Upstream
+from .mirror import TIMEOUT, Connect, Pull, Unreachable, Upstream
 from .remote import Remote, UnixHTTPConnection
 from .workspace import Member, Workspace
 
@@ -109,16 +112,30 @@ class Offer:
     via: list[str]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Peer:
-    """A node another reaches, and the nodes between: `via`, from it to the node telling of it."""
+    """A node another reaches, and the nodes between: `via`, from it to the node telling of it; the trex it runs (None
+    from a trex that tells of none), whether it can update itself (`trex.update`) and why not, and whether the node
+    after it on `via` reaches it over ssh (it then runs that node's trex)."""
 
     id: str
     name: str
     via: list[str]
+    install: update.Install | None = None
+    updates: bool = False
+    why: str = ""
+    ssh: bool = False
 
     def wire(self) -> dict[str, Any]:
-        return {"id": self.id, "name": self.name, "via": self.via}
+        return {"id": self.id, "name": self.name, "via": self.via, "install": self.install.wire() if self.install else None,
+                "updates": self.updates, "why": self.why, "ssh": self.ssh}
+
+    @classmethod
+    def read(cls, d: Mapping[str, Any]) -> Self:
+        install = d.get("install")
+        return cls(id=str(d["id"]), name=str(d["name"]), via=[str(v) for v in d["via"]],
+                   install=update.Install.read(install) if install is not None else None,
+                   updates=d.get("updates") is True, why=str(d.get("why") or ""), ssh=d.get("ssh") is True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +154,7 @@ class Holdings:
     @classmethod
     def read(cls, d: Mapping[str, Any]) -> Self:
         node, nodes = d["node"], d.get("nodes")
-        peers = None if nodes is None else [Peer(str(p["id"]), str(p["name"]), [str(v) for v in p["via"]]) for p in nodes]
+        peers = None if nodes is None else [Peer.read(p) for p in nodes]
         return cls(Identity(str(node["id"]), str(node["name"])), [Offer(str(o["id"]), [str(v) for v in o["via"]]) for o in d["dirs"]],
                    peers)
 
@@ -359,15 +376,31 @@ class Link:
     def add(self, path: str, at: Sequence[str]) -> str | None:
         """Have the link's node track `path`, or the node at the end of `at` (node ids, from one the link's node
         links to); the directory's id (None for a trex to pull from). ValueError with why, when it will not."""
-        body = json.dumps({"path": path, **({"at": list(at)} if at else {})}).encode()
+        reply = self._post("/api/node/add", {"path": path, **({"at": list(at)} if at else {})},
+                           remote.ADD_TIMEOUT + ADD_SLACK * (len(at) + 1))
+        return d if isinstance(d := reply.get("id"), str) else None
+
+    def remove(self, d: str, at: Sequence[str]) -> None:
+        """Have the link's node stop tracking directory `d`, or the node at the end of `at` (as `add`). ValueError with
+        why, when it will not."""
+        self._post("/api/node/remove", {"id": d, **({"at": list(at)} if at else {})}, TIMEOUT + ADD_SLACK * len(at))
+
+    def update(self, at: Sequence[str]) -> dict[str, JSONValue]:
+        """Have the link's node update its trex, or the node at the end of `at` (as `add`): its answer ({updated, from,
+        to, output}). ValueError with why, when it will not."""
+        return self._post("/api/node/update", {"at": list(at)} if at else {}, update.INSTALL_TIMEOUT + ADD_SLACK * (len(at) + 1))
+
+    def _post(self, target: str, body: dict[str, JSONValue], timeout: float) -> dict[str, JSONValue]:
+        """The JSON object answering a POST of `body` to the link's node; ValueError with its error, or when it does
+        not answer."""
         try:
-            status, data = self._api.answer("POST", "/api/node/add", body, remote.ADD_TIMEOUT + ADD_SLACK * (len(at) + 1))
+            status, data = self._api.answer("POST", target, json.dumps(body).encode(), timeout)
             reply = as_dict(json.loads(data))
         except (Unreachable, ValueError) as e:
             raise ValueError(f"{self.key} did not answer: {e}") from e
         if status != 200:
             raise ValueError(str(reply.get("error") or f"{self.key} answered {status}"))
-        return d if isinstance(d := reply.get("id"), str) else None
+        return reply
 
     def _crawl(self, path: str, d: str) -> str:
         """Have the link crawl `path` as directory `d`; why it would not, if it would not."""
@@ -530,10 +563,7 @@ class Node:
         refuses it or cannot pass it on (a trex telling of no nodes)."""
         if not at:
             return self.track(path)
-        with self.lock:
-            link = next((k for k in self.links.values() if k.identity is not None and k.identity.id == at[0]), None)
-        if link is None:
-            raise ValueError(f"{self.identity.name} has no link to node {at[0]}")
+        link = self._link_to(at[0])
         if link.session is not None and len(at) == 1:
             if remote.parse(path) or link_url(path):
                 raise ValueError(f"{path} is not a path on {link.key}")
@@ -544,6 +574,40 @@ class Node:
         link.refresh()
         self.reconcile()
         return got
+
+    def remove_at(self, d: str, at: Sequence[str]) -> None:
+        """Have the node at the end of `at` (as `add_at`) stop tracking directory `d`, and let it go here once the link
+        no longer offers it; the node whose ssh link reaches the last one removes its own `host:path`. KeyError if this
+        node holds no such directory, ValueError if a node on the way refuses or cannot pass it on."""
+        if not at:
+            return self.remove_dir(d)
+        link = self._link_to(at[0])
+        if link.session is not None and len(at) == 1:
+            return self.remove_dir(d)
+        if len(at) > 1 and link.peers is None:
+            raise ValueError(f"{link.key} runs a trex that passes no removal on; update it")
+        link.remove(d, at[1:])
+        link.refresh()
+        self.reconcile()
+
+    def update_at(self, at: Sequence[str]) -> dict[str, JSONValue]:
+        """Have the node at the end of `at` (node ids, from one this node links to) update its trex; its answer.
+        ValueError if a node on the way refuses or cannot pass it on, or the last is reached over ssh (it runs the
+        trex of the node before it, which starts it anew when that one restarts)."""
+        link = self._link_to(at[0])
+        if link.session is not None and len(at) == 1:
+            raise ValueError(f"{link.key} runs the trex of {self.identity.name}, which starts it anew when it restarts: update {self.identity.name}")
+        if len(at) > 1 and link.peers is None:
+            raise ValueError(f"{link.key} runs a trex that passes no update on; update it")
+        return link.update(at[1:])
+
+    def _link_to(self, node: str) -> Link:
+        """This node's link to node `node` (an id); ValueError if it has none."""
+        with self.lock:
+            link = next((k for k in self.links.values() if k.identity is not None and k.identity.id == node), None)
+        if link is None:
+            raise ValueError(f"{self.identity.name} has no link to node {node}")
+        return link
 
     def remove(self, name: str) -> None:
         """Stop serving the directory `name` (or pulling from the link `name`) and drop it from every workspace; its
@@ -577,13 +641,17 @@ class Node:
         return next((link for link in self.links.values() if link.session and d in link.crawls.values()), None)
 
     def _forget_remote(self, link: Link, d: str) -> None:
-        """Stop having the ssh link crawl `d`, and pulling it; the link goes once it crawls nothing."""
+        """Stop having the ssh link crawl `d`, and pulling it, at once (the link asked anew); the link goes once it crawls
+        nothing."""
         link.forget(d)
         with self.lock:
-            if not link.crawls and self.links.get(link.key) is link:
+            kept = bool(link.crawls) or self.links.get(link.key) is not link
+            if not kept:
                 del self.links[link.key]
                 threading.Thread(target=link.close, name=f"trex-close-{link.key}", daemon=True).start()
             self._changed(None)
+        if kept:
+            link.refresh()
         self.reconcile()
 
     def remove_link(self, url: str) -> None:
@@ -661,7 +729,9 @@ class Node:
         """This node, each directory it holds with the nodes it came through, from the one crawling it to this one, and
         each node it reaches with the nodes between, itself first."""
         me = self.identity.id
-        peers = [Peer(me, self.identity.name, [me]), *(Peer(p.id, p.name, [*p.via, me]) for p in self.peers())]
+        can = update.updates()
+        peers = [Peer(id=me, name=self.identity.name, via=[me], install=update.RUNNING, updates=can.available, why=can.reason),
+                 *(dataclasses.replace(p, via=[*p.via, me]) for p in self.peers())]
         with self.lock:
             return Holdings(self.identity, [Offer(d, [*self.pulled[d].via, me] if d in self.pulled else [me]) for d in self.entries], peers)
 
@@ -673,9 +743,9 @@ class Node:
             for link in self.links.values():
                 if (who := link.identity) is None:
                     continue
-                for p in link.peers if link.peers is not None else [Peer(who.id, who.name, [who.id])]:
+                for p in link.peers if link.peers is not None else [Peer(id=who.id, name=who.name, via=[who.id])]:
                     if self.identity.id not in p.via and (p.id not in best or len(p.via) < len(best[p.id].via)):
-                        best[p.id] = p
+                        best[p.id] = dataclasses.replace(p, ssh=link.session is not None) if p.id == who.id else p
         return list(best.values())
 
     # ---- what it holds ----

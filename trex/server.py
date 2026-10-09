@@ -305,14 +305,13 @@ class Handler(BaseHTTPRequestHandler):
         (`Node.add_at`). Response: {name, id, url} (none and the root view's for a trex), or 400 with {error} for a path
         a node refuses, a remote that fails to start or a trex that does not answer."""
         node, req = self.srv.node, self.body_json()
-        path, d, at = self.body_field("path").strip(), req.get("id"), req.get("at") or []
+        path, d = self.body_field("path").strip(), req.get("id")
         try:
-            if not isinstance(at, list) or not all(isinstance(n, str) for n in at):
-                raise ValueError("expected at: [node ids]")
+            at = self.body_at()
             if not remote.parse(path) and not link_url(path) and not Path(path).expanduser().is_absolute():
                 raise ValueError(f"{path} is not an absolute path, host:path or http://host:port")
             if at:
-                got = node.add_at(path, [str(n) for n in at])
+                got = node.add_at(path, at)
             else:
                 got = node.add(resolve_root(path, force=False), str(d)) if isinstance(d, str) else node.track(path)
         except ValueError as e:
@@ -323,20 +322,43 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("POST", r"/api/node/remove")
     def node_remove(self, q: Query) -> None:
-        """Body: {name} (a directory's name, or a link's url) or {id}. Stops serving that directory, or pulling from that
-        trex; 400 for a directory pulled from a link."""
+        """Body: {name} (a directory's name, or a link's url), or {id, at?}. Stops serving that directory, or pulling from
+        that trex; with `at` (node ids, from one this node links to), has the node at its end stop tracking directory
+        `id` (`Node.remove_at`). 400 for a directory pulled from a link, or one a node on the way will not remove."""
         node, req = self.srv.node, self.body_json()
         try:
-            node.remove_dir(str(req["id"])) if "id" in req else node.remove(self.body_field("name"))
+            at = self.body_at()
+            if "id" in req:
+                node.remove_at(str(req["id"]), at)
+            else:
+                node.remove(self.body_field("name"))
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
         self._json({"ok": True})
 
     @route("POST", r"/api/node/update")
     def node_update(self, q: Query) -> None:
-        """Install the newest trex from $TREX_SOURCE and, if that changed it, restart the daemon.
-        Response: {updated, from, to, output}; 404 for a node that is not a daemon, 400 when updates are unavailable,
-        409 during another update, 502 when the install fails."""
+        """Body: {at?}. Install the newest trex from $TREX_SOURCE and, if that changed it, restart the daemon; with `at`
+        (node ids, from one this node links to), have the node at its end do so (`Node.update_at`).
+        Response: {updated, from, to, output}; 404 for a node that is not a daemon, 400 when updates are unavailable
+        (or a node on the way refuses), 409 during another update, 502 when the install fails."""
+        try:
+            at = self.body_at()
+            if at:
+                return self._json(self.srv.node.update_at(at))
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        self.update_here()
+
+    def body_at(self) -> list[str]:
+        """The node ids of the body's `at` (none without it, or without a body); ValueError for anything else."""
+        at = self.body_json().get("at") or [] if self.body() else []
+        if not isinstance(at, list) or not all(isinstance(n, str) for n in at):
+            raise ValueError("expected at: [node ids]")
+        return [str(n) for n in at]
+
+    def update_here(self) -> None:
+        """This node's update (`node_update`)."""
         restart = self.srv.restart
         if restart is None:
             raise KeyError("a daemon")

@@ -5,7 +5,7 @@ from typing import Protocol
 
 import pytest
 
-from trex import node as trex_node, server
+from trex import node as trex_node, server, update
 from trex.crawl import Crawl
 from trex.index import Explorer
 from trex.mirror import Pull
@@ -57,6 +57,12 @@ def vias(n: Node, *nodes: Node) -> dict[str, list[str]]:
     """The holdings of `n` with node ids written as the names of `nodes`."""
     names = {x.identity.id: x.identity.name for x in nodes}
     return {o.id: [names.get(v, v) for v in o.via] for o in n.holdings().dirs}
+
+
+def runs_here() -> dict[str, object]:
+    """What a node of this process tells of the trex it runs, in its holdings."""
+    can = update.updates()
+    return {"install": update.RUNNING.wire(), "updates": can.available, "why": can.reason, "ssh": False}
 
 
 def synced(n: Node) -> bool:
@@ -185,7 +191,7 @@ def test_links_are_added_listed_and_removed_over_http(make: Make) -> None:
     info = get_json(f"{b_url}/api/node")
     assert info["node"] == {"id": b.identity.id, "name": "B"}
     assert info["links"] == [{"url": a_url, "id": a.identity.id, "name": "A", "state": "connected", "error": ""}]
-    assert info["nodes"] == [{"id": a.identity.id, "name": "A", "via": [a.identity.id]}]
+    assert info["nodes"] == [{"id": a.identity.id, "name": "A", "via": [a.identity.id], **runs_here()}]
     assert [(r["name"], r["root"], r["link"], r["via"]) for r in info["dirs"]] == [("runs", own(a), a_url, [a.identity.id])]
     status, body = post_json(f"{b_url}/api/node/remove", {"name": "runs"})
     assert status == 400 and a_url in body["error"]
@@ -220,6 +226,45 @@ def test_an_add_passed_along_links_is_tracked_by_the_last_node_and_pulled_by_the
     assert a.add_at(str(near), [b.identity.id]) == f"B:{near}" and b.tracked() == [str(near)] and f"B:{near}" in a.pulled
 
 
+def test_a_removal_passed_along_links_stops_the_last_node_tracking_and_the_others_pulling(make: Make, tmp_path: Path) -> None:
+    (a, _, a_url), (b, _, b_url), (c, _, c_url) = make("A", crawls=False), make("B", crawls=False), make("C")
+    b.add_link(c_url)
+    a.add_link(b_url)
+    far = tmp_path / "files" / "far" / "runs"
+    write_run(far / "r1")
+    d = a.add_at(str(far), [b.identity.id, c.identity.id])
+    assert d == f"C:{far}" and d in a.pulled and d in b.pulled
+    status, body = post_json(f"{a_url}/api/node/remove", {"id": d, "at": [b.identity.id, c.identity.id]})
+    assert (status, body) == (200, {"ok": True})
+    assert c.tracked() == [str(tmp_path / "files" / "C" / "runs")] and d not in b.entries and d not in a.entries
+    assert own(c) in a.pulled  # the rest stays
+    status, body = post_json(f"{a_url}/api/node/remove", {"id": own(c), "at": [b.identity.id]})
+    assert status == 400 and "remove that link" in body["error"] and own(c) in a.pulled  # B pulls it, it does not track it
+
+
+def test_an_update_passed_along_links_updates_the_last_node(make: Make, monkeypatch: pytest.MonkeyPatch) -> None:
+    (a, _, a_url), (b, _, b_url), (c, c_srv, c_url) = make("A", crawls=False), make("B", crawls=False), make("C")
+    b.add_link(c_url)
+    a.add_link(b_url)
+    assert wait_for(lambda: len(a.peers()) == 2)
+    assert {p.name: (p.install, p.ssh) for p in a.peers()} == {"B": (update.RUNNING, False), "C": (update.RUNNING, False)}
+    status, body = post_json(f"{a_url}/api/node/update", {"at": [b.identity.id, c.identity.id]})
+    assert status == 400 and "not found" in body["error"]  # C runs no service that could restart it
+    restarts: list[str] = []
+    c_srv.restart = lambda: restarts.append("C")
+    commits = iter(["old", "new"])
+    monkeypatch.setattr(update, "updates", lambda: update.Updates(source="git+https://x", available=True, reason=""))
+    monkeypatch.setattr(update, "installed", lambda: update.Install(version="0.1.0", commit=next(commits)))
+
+    def install(source: str) -> str:
+        return f"installed {source}"
+
+    monkeypatch.setattr(update, "install", install)
+    status, body = post_json(f"{a_url}/api/node/update", {"at": [b.identity.id, c.identity.id]})
+    assert status == 200 and body["updated"] and (body["from"]["commit"], body["to"]["commit"]) == ("old", "new")
+    assert wait_for(lambda: restarts == ["C"])
+
+
 def test_an_add_a_node_on_the_way_refuses_says_why(make: Make, tmp_path: Path) -> None:
     (a, _, _), (b, _, b_url), (c, _, c_url) = make("A", crawls=False), make("B", crawls=False), make("C", crawls=False)
     b.add_link(c_url)
@@ -252,6 +297,6 @@ def test_every_node_serves_its_directories_by_id_and_tells_what_it_holds(make: M
     holdings = get_json(f"{url}/api/holdings")
     me = temporary.identity
     assert holdings == temporary.holdings().wire() == {"node": me.wire(), "dirs": [{"id": temporary.home, "via": [me.id]}],
-                                                       "nodes": [{"id": me.id, "name": me.name, "via": [me.id]}]}
+                                                       "nodes": [{"id": me.id, "name": me.name, "via": [me.id], **runs_here()}]}
     assert [r["id"] for r in get_json(f"{url}{dir_base(str(temporary.home))}/api/runs")["runs"]] == ["r1"]
     assert request(f"{url}/d/{urllib.parse.quote('elsewhere:/x', safe='')}/api/runs")[0] == 404
