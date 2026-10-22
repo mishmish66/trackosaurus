@@ -435,8 +435,30 @@ Every run gets a `dir` field: its member's name.
   Opaque lines are drawn without the depth test that makes a translucent line blend into a pixel once
   (`LINE_FS`), which costs the GPU a third of their time; the line tables of GPU views are shared by the charts drawing
   the same lines (`gpuTableSet`). A chart's canvas keeps its drawing while out of view (up to `CANVAS_BYTES` in all, the
-  least recently seen freed), and the chart shown alone lies over the grid (`#alone`), which keeps its layout, scroll
-  position and drawings underneath, unseen meanwhile.
+  least recently seen freed), and the chart shown alone lies over the grid (`#alone`, sticky below the header), which
+  keeps its layout and drawings underneath, unseen meanwhile; the page may scroll under it, and leaving it scrolls the
+  page back to where the grid was, if it scrolled (`App.keepGrid`, `backToGrid`: a scroll event tells of it, so leaving
+  forces no layout, as reading the scroll position or scrolling would). The observers leave the chart shown alone out
+  (`panelEl`, `observeView`): it is drawn as the one shown (`full`), and seen by them it would stay visible to the plans
+  until they report it gone, a frame after it is, its width setting its metric's blocks (12 ms more to leave it).
+- **The page scrolls the charts**: the document is the scroller, not an element of it, so a browser's own page
+  scrolling moves the charts. qutebrowser's `scroll-page` (Ctrl-D/U/F/B) and `scroll-to-perc` (gg/G) call
+  `window.scrollBy` and `window.scroll` from a JavaScript world of their own, where the page can neither catch the call
+  nor see the key (a bound key never reaches the page), and its status bar shows the document's position. The header
+  and the sidebar are `position: fixed` (the body padded by the header's height, the sidebar's grid column left empty),
+  not sticky: focusing an element in a sticky box, or scrolling it into view, scrolls the page to where the element
+  would be without sticking, and qutebrowser's `gi` and hints focus inputs so, as Playwright scrolls every element it
+  clicks into view. The resize grip and the chart shown alone are sticky below the header. The header's height is
+  `--head-h` (a ResizeObserver sets it, and `headH`): the sidebar, the sections' sticky headings and the chart shown
+  alone sit below it, the root's `scroll-padding-top` leaves an element scrolled to (a section, a panel shown again)
+  below it, and the charts in view (`inView`: `App.observeView`, an observer of the window with the header's height off
+  its top, made anew when that changes) and near it (`lookNow`, `aheadOf`: `viewBox`) are those below it. The scroll
+  keys (arrows by 60 px, Page Up/Down and Space by 90% of the window below the header, Home, End) scroll the page
+  whatever was last clicked, unless a text field, select, slider, menu or dialog has focus. Going back or forward
+  leaves the page where it is scrolled, as a reload leaves it at the top (`history.scrollRestoration = "manual"`). The
+  sidebar and the menus' lists keep their scrolling from moving the page (`overscroll-behavior: contain`), and the
+  tooltip and the menus keep left of the page's scrollbar (`TipCanvas.right`, the root element's width; `menu.open`).
+  `interactions_smoke` checks the keys, and a scroll made from a world of its own (`in_own_world`), as qutebrowser's.
 - **Colors**: the page is light or dark as the browser prefers (`prefers-color-scheme`; it declares both schemes), and
   its canvases draw in the same colors (`plot.theme`). Where the browser darkens pages by force (Chromium's forced dark
   mode, which qutebrowser's `colors.webpage.darkmode.enabled` turns on), it inverts the colors of the page's elements,
@@ -531,7 +553,13 @@ The benchmark (`tests/browser_bench.py`) is the measure: every interaction shoul
 within 10 ms of its input, and no task should block input for more than about 50 ms.
 - Per-draw work is proportional to pixels, not points (`prep` decimates per pixel).
 - Scrolling never waits for the page: no wheel listener blocks it but the pinned tooltip's, attached only while it
-  is pinned (`App.tipWheel`).
+  is pinned (`App.tipWheel`). The benchmark times a scroll by when its charts are drawn, not by its frames; to see
+  those, trace a wheel scroll over its page (DevTools `Tracing` with `devtools.timeline` and `cc`): every scroll update
+  should be handled on the compositor thread (`InputHandler::ScrollUpdate` there), Chromium marks each scroll frame
+  janky or not (`ScrollJankV4`, `is_janky`), and the main thread's `Paint`, `PrePaint` and `Layerize` sum what each
+  frame costs it. With the page as the scroller (an 80-tick scroll of 9,600 px over the benchmark's runs): no janky
+  frame, a third of the painting the chart pane scrolled as an element of its own took, and a sixth more layerizing
+  (the fixed and sticky boxes are layers of their own).
 - Charts draw first, and at once: a change of the view draws them in a microtask when its handler returns
   (`App.drawSoon`), not on the next frame. A round draws the charts in view (`inView`); the others within `NEAR_PX` of
   the view follow `NEAR_ROUND` a round, the nearest first, each round once the GPU has drawn the one before
@@ -567,7 +595,8 @@ within 10 ms of its input, and no task should block input for more than about 50
   extents come from the worker that fetched it (the first pass over an array's memory costs about as much as fetching it
   from RAM).
 - Layout and style are not read where they were just changed: the theme's colors are read once, and again when they
-  change (`plot.theme`, `watchTheme`), what is in view comes from an observer (`inView`), and only a change of the path
+  change (`plot.theme`, `watchTheme`), what is in view comes from an observer of the window below the header
+  (`inView`, `observeView`), and only a change of the path
   looks at once where its charts lie
   (`App.lookNow`, which reads the place of each chart only in the grids that reach near the view). Panels change only
   when their metrics do (`updateScopeKeys`), and then only the sections that differ.

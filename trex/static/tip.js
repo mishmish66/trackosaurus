@@ -41,6 +41,8 @@ export class TipCanvas {
     this.el = el; // the canvas: over the window, hidden while no tooltip is shown
     this.ctx = null; // made, with the canvas's size, at the first tooltip
     this.vw = this.vh = 0; // the window's size, in CSS px
+    this.right = 0; // the width of the page, the window's less its scrollbar: the tooltip keeps left of it
+    new ResizeObserver(([e]) => (this.right = e.contentBoxSize[0].inlineSize)).observe(document.documentElement);
     this.box = null; // [x, y, w, h] of the tooltip drawn, in CSS px
     this.base = new Map(); // font and line height -> `baseline`'s answer
     this.hideT = 0; // the timer that takes the cleared canvas off the page
@@ -136,7 +138,7 @@ export class TipCanvas {
     const w = snap(m.w + 2 * EDGE_X), listH = m.lines.length * TIP_ROW_PX;
     const h = snap(2 * EDGE_Y + HEAD_PX + HEAD_GAP + listH + FOOT_GAP + FOOT_RULE + FOOT_PAD + FOOT_PX);
     let x = t.e.clientX + 16, y = t.e.clientY + 12;
-    if (x + w > this.vw) x = t.e.clientX - w - 16;
+    if (x + w > (this.right || this.vw)) x = t.e.clientX - w - 16;
     if (y + h > this.vh) y = Math.max(0, this.vh - h - 4);
     [x, y] = [snap(x), snap(y)];
     this.wipe();

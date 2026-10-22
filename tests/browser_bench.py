@@ -144,8 +144,8 @@ INSTRUMENT = """async () => {
 # since before it), the end of the last such draw after t0 (t0 itself when none was needed), and the GPU time of its
 # round's draws.
 DRAWN = """([t0, every]) => {
-  const B = window.__bench, panels = document.getElementById("panels"), box = panels.getBoundingClientRect();
-  const alone = panels.classList.contains("alone"); // the chart shown alone covers the grid
+  const B = window.__bench, box = { top: document.querySelector("header").getBoundingClientRect().bottom, bottom: innerHeight }; // where charts are seen
+  const alone = document.getElementById("panels").classList.contains("alone"); // the chart shown alone covers the grid
   const shown = [...app.charts.values()].filter((c) => { const r = c.el.getBoundingClientRect();
     return alone ? c.full : r.bottom > box.top && r.top < box.bottom && r.width > 0 && c.el.checkVisibility(); });
   let last = t0, lastDraw = null;
@@ -162,7 +162,7 @@ DRAWN = """([t0, every]) => {
   return { done: shown.length > 0, ms: last - t0, gpu, charts: shown.length };
 }"""
 
-VISIBLE_PLOT = """() => { const box = document.getElementById("panels").getBoundingClientRect();
+VISIBLE_PLOT = """() => { const box = { top: document.querySelector("header").getBoundingClientRect().bottom, bottom: innerHeight };
   const c = [...app.charts.values()].find((c) => { const r = c.el.getBoundingClientRect();
     return r.top > box.top + 40 && r.bottom < box.bottom - 10 && r.width > 0 && c.el.checkVisibility() && c.view; });
   if (!c) return null;
@@ -536,7 +536,7 @@ def round_of(page: Page, res: Results, r: int, timeout_ms: float) -> None:
     """One round of the interactions within a view, starting r * 8 screens further down each round (the scrolls go to
     charts not drawn yet)."""
     H = VIEWPORT["height"]
-    page.evaluate(f"(() => {{ const p = document.getElementById('panels'); p.scrollTop = Math.min({2 * H + r * 8 * H}, p.scrollHeight - 8 * {H}); }})()")
+    page.evaluate(f"scrollTo(0, Math.min({2 * H + r * 8 * H}, document.documentElement.scrollHeight - 8 * {H}))")
     page.wait_for_timeout(1500)
     timed = timer(page, res, timeout_ms)
     timed("scroll-new", lambda: wheel(page, 4))
@@ -587,7 +587,7 @@ def navigate(page: Page, res: Results, timeout_ms: float, settle_s: float) -> No
 VERIFY = """async () => {
   const k = await import("/static/kernel.js"), { bandOf } = await import("/static/plot.js");
   const NO_TAIL = { s: [], v: [], t: [], q: [], n: 0 }, ROW = Object.fromEntries(k.STATS.map((s, i) => [s, i]));
-  const box = document.getElementById("panels").getBoundingClientRect(), keys = [...app.groups.keys()];
+  const box = { top: document.querySelector("header").getBoundingClientRect().bottom, bottom: innerHeight }, keys = [...app.groups.keys()];
   const out = { charts: 0, compared: 0, wrong: 0, eg: [] };
   for (const c of app.charts.values()) {
     const r = c.el.getBoundingClientRect(), v = c.view, g = v?.gpu;
@@ -627,7 +627,7 @@ def verify(page: Page, steps: int, generated: bool, timeout_ms: float) -> bool:
     rnd = random.Random(1)
     acts: list[str | Callable[[], object]] = [
         "app.setGroup('run')", "app.setGroup(app.defaultGroup(app.opts.path))",
-        "document.getElementById('panels').scrollTop += 900", "document.getElementById('panels').scrollTop -= 900",
+        "scrollBy(0, 900)", "scrollBy(0, -900)",
         *(EVENT.format(id="'center'", value=json.dumps(c), kind="'change'") for c in ("mean", "median", "iqm")),
         *(EVENT.format(id="'band'", value=json.dumps(b), kind="'change'") for b in ("ci", "iqr", "minmax", "std"))]
     if generated:

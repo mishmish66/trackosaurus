@@ -419,7 +419,7 @@ const menu = {
     this.el.hidden = false;
     const r = anchor.getBoundingClientRect();
     const w = this.el.offsetWidth;
-    this.el.style.left = `${Math.max(4, Math.min(r.left, innerWidth - w - 8))}px`;
+    this.el.style.left = `${Math.max(4, Math.min(r.left, document.documentElement.clientWidth - w - 8))}px`;
     this.el.style.top = `${r.bottom + 4}px`;
     this.el.querySelector("input[type=search]")?.focus();
   },
@@ -458,17 +458,32 @@ document.addEventListener("keydown", (e) => {
   if (window.app?.opts.chart) window.app.showChartAlone("");
 });
 
-/** Scroll keys move the chart pane unless a text field, select, slider, menu or dialog has focus. */
+/** The header's height, in CSS px: it stays at the top of the window while the page scrolls the charts under it
+ * (`--head-h`, which the sidebar and the chart shown alone stay below). */
+let headH = 0;
+new ResizeObserver(([e]) => {
+  if (e.borderBoxSize[0].blockSize === headH) return;
+  headH = e.borderBoxSize[0].blockSize;
+  document.documentElement.style.setProperty("--head-h", `${headH}px`);
+  window.app?.observeView();
+}).observe($("header"));
+
+/** The part of the window the charts are seen in: below the header. */
+const viewBox = () => ({ top: headH, bottom: innerHeight });
+
+history.scrollRestoration = "manual"; // going back or forward leaves the page where it is scrolled; a reload opens it at the top
+
+/** Scroll keys move the charts (the page, wherever the last click was) unless a text field, select, slider, menu or
+ * dialog has focus. */
 document.addEventListener("keydown", (e) => {
   if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
   const t = e.target;
   if (t.closest?.("#menu, dialog, select, textarea, [contenteditable]") || (t.matches?.("input") && t.type !== "checkbox")) return;
-  const pane = $("#panels");
-  const page = pane.clientHeight * 0.9;
+  const page = (innerHeight - headH) * 0.9;
   const by = { ArrowDown: 60, ArrowUp: -60, PageDown: page, PageUp: -page, " ": e.shiftKey ? -page : page }[e.key];
-  if (by !== undefined) pane.scrollBy({ top: by, behavior: Math.abs(by) > 60 ? "smooth" : "auto" });
-  else if (e.key === "Home") pane.scrollTo({ top: 0 });
-  else if (e.key === "End") pane.scrollTo({ top: pane.scrollHeight });
+  if (by !== undefined) scrollBy({ top: by, behavior: Math.abs(by) > 60 ? "smooth" : "auto" });
+  else if (e.key === "Home") scrollTo({ top: 0 });
+  else if (e.key === "End") scrollTo({ top: document.documentElement.scrollHeight });
   else return;
   e.preventDefault();
 });
@@ -523,10 +538,19 @@ class App {
         }
         if (charts) this.planNow(); // before they draw: charts whose blocks are loaded draw them at once
       },
-      { root: $("#panels"), rootMargin: `${NEAR_PX}px` },
+      { rootMargin: `${NEAR_PX}px` },
     );
-    this.ioView = new IntersectionObserver((es) => es.forEach((e) => (e.target._chart.inView = e.isIntersecting)), { root: $("#panels") });
+    this.observeView();
     watchTheme(() => this.onTheme());
+  }
+
+  /** Have each chart's `inView` follow whether it is in the part of the window the charts are seen in (`viewBox`), by
+   * an observer made anew for the header's height whenever that changes. */
+  observeView() {
+    this.ioView?.disconnect();
+    this.ioView = new IntersectionObserver((es) => es.forEach((e) => (e.target._chart.inView = e.isIntersecting)),
+                                           { rootMargin: `${-Math.round(headH)}px 0px 0px 0px` });
+    for (const c of this.charts.values()) if (!c.alone) this.ioView.observe(c.el);
   }
 
   /** Grouped rendering: some group holds several runs, and the scope is more than one run. */
@@ -861,7 +885,7 @@ class App {
    * frame: after a change of the panels, the charts then in view are planned and drawn without waiting for it. One
    * never laid out takes the size of a chart beside it in its grid (they are alike) until its own is known. */
   lookNow() {
-    const box = $("#panels").getBoundingClientRect(), near = (r, pad) => !!r && r.height > 0 && r.bottom > box.top - pad && r.top < box.bottom + pad;
+    const box = viewBox(), near = (r, pad) => !!r && r.height > 0 && r.bottom > box.top - pad && r.top < box.bottom + pad;
     const reaches = new Map(); // a grid of charts -> whether it reaches near the view: the charts of the others are not looked at
     for (const c of this.charts.values()) {
       const grid = c.el.isConnected && !c.alone ? c.el.parentNode : null;
@@ -2217,8 +2241,10 @@ class App {
     if (!p) {
       map.set(id, (p = new Make(this, key)));
       p.alone = alone;
-      this.io.observe(p.el);
-      if (kind === "metric") this.ioView.observe(p.el);
+      if (!alone) { // the chart shown alone is drawn as the one shown (`full`), whatever the observers would say of it
+        this.io.observe(p.el);
+        if (kind === "metric") this.ioView.observe(p.el);
+      }
     }
     if (kind === "metric") p.setPinned(this.pins.includes(key));
     return p.el;
@@ -2255,14 +2281,29 @@ class App {
     this.renderCrumbs();
   }
 
-  /** Show the chart shown alone (opts.chart), if any, over the grid, which keeps its layout, scroll position and
-   * drawings underneath. */
+  /** Show the chart shown alone (opts.chart), if any, over the grid, which keeps its layout and drawings underneath,
+   * and its scroll position: the page may be scrolled meanwhile, and leaving the chart scrolls it back. */
   placeAlone() {
-    const alone = this.opts.chart && this.charts.get(ALONE + this.opts.chart), pane = $("#alone");
+    const alone = this.opts.chart && this.charts.get(ALONE + this.opts.chart), pane = $("#alone"), was = !pane.hidden;
+    if (alone && !was) this.keepGrid();
     $("#panels").classList.toggle("alone", !!alone);
     pane.hidden = !alone;
     if (!alone) pane.replaceChildren();
     else if (alone.el.parentNode !== pane) pane.replaceChildren(alone.el);
+    if (!alone && was) this.backToGrid();
+  }
+
+  /** Note where the page is scrolled as a chart comes to be shown alone, and whether it scrolls meanwhile. */
+  keepGrid() {
+    this.gridY = scrollY;
+    this.gridMoved = false;
+    addEventListener("scroll", (this.gridScrolled ||= () => (this.gridMoved = true)), { passive: true, once: true });
+  }
+
+  /** Scroll the page back to where the grid was, when it scrolled while a chart was shown alone. */
+  backToGrid() {
+    removeEventListener("scroll", this.gridScrolled);
+    if (this.gridMoved) scrollTo(0, this.gridY);
   }
 
   /** "collapse all" while any chart section is open, else "expand all". */
@@ -2523,7 +2564,7 @@ class App {
    * the view. */
   aheadOf() {
     if (!this.runList) return [];
-    const box = $("#panels").getBoundingClientRect(), mid = (box.top + box.bottom) / 2, pw = this.gridPw(), seen = new Set();
+    const box = viewBox(), mid = (box.top + box.bottom) / 2, pw = this.gridPw(), seen = new Set();
     const far = (c) => {
       if (c.visible || c.full) return -1;
       const b = c.el.getBoundingClientRect();

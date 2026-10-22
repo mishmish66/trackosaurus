@@ -429,6 +429,15 @@ def cdp_session(page: Page) -> Cdp:
     return page.context.new_cdp_session(page)
 
 
+def in_own_world(page: Page, js: str) -> None:
+    """Run `js` in a JavaScript world of its own, as a browser runs its own scripts in a page (qutebrowser's scrolling:
+    window.scrollBy, window.scroll)."""
+    cdp = cdp_session(page)
+    frame = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+    world = cdp.send("Page.createIsolatedWorld", {"frameId": frame, "worldName": "browser"})["executionContextId"]
+    cdp.send("Runtime.evaluate", {"expression": js, "contextId": world})
+
+
 class JsCoverage:
     """Which lines of the UI's modules ran, from Chromium's V8 coverage and the node tests'. A page load discards the previous page's
     counts, so `take` runs before every navigation (`watch` makes the page do so) and takes are merged per file."""
@@ -593,7 +602,8 @@ def interactions_smoke(page: Page, url: str) -> bool:
     """Whether charts carry no legend and the chart controls do what they say: hover and Shift-pinned tooltips
     (which the wheel scrolls, and whose rows reveal and open runs), x and box zooms and their reset, the chart
     settings (smoothing, axes, outliers, density, reset), the sort box (type, pick, Enter, Escape), sidebar hiding,
-    group-by search, keyboard scrolling, the media slider, and back/forward (back to the grouping the folder had)."""
+    group-by search, keyboard scrolling and the browser's own page scrolling, the media slider, and back/forward (back to
+    the grouping the folder had)."""
     key = "train/loss"
     checks: dict[str, object] = {}
     sel = f".panel:has(.pname:text-is('{key}'))"
@@ -701,9 +711,25 @@ def interactions_smoke(page: Page, url: str) -> bool:
     page.keyboard.press("Escape")
     checks["leaving the group-by box applies it"] = soon("app.opts.group === 'see' && document.activeElement.id !== 'groupBy'")
     page.evaluate("app.setGroup('')")
-    page.locator("#panels").click(position={"x": 5, "y": 5})
-    for k in ("End", "Home", "PageDown", "ArrowUp"):
-        page.keyboard.press(k)
+    page.click("#runCount")  # the last click is in the sidebar: the scroll keys move the charts all the same
+    y, view = "Math.round(scrollY)", "{ top: document.querySelector('header').getBoundingClientRect().bottom, bottom: innerHeight }"
+    page.keyboard.press("End")
+    checks["End scrolls the page to the last chart"] = soon(
+        f"(() => {{ const box = {view}, r = [...document.querySelectorAll('#panels .panel')].at(-1).getBoundingClientRect();"
+        f" return scrollY > 0 && r.bottom > box.top && r.top < box.bottom; }})()")
+    page.keyboard.press("Home")
+    checks["Home scrolls it back to the top"] = soon(f"{y} === 0")
+    step = page.evaluate(f"(() => {{ const box = {view}; return Math.round(Math.min(document.documentElement.scrollHeight - innerHeight, 0.9 * (box.bottom - box.top))); }})()")
+    page.keyboard.press("PageDown")
+    checks["PageDown scrolls the charts by most of the window below the header"] = step > 0 and soon(f"Math.abs({y} - {step}) <= 1")
+    page.keyboard.press("ArrowUp")
+    checks["an arrow scrolls them by a step"] = soon(f"Math.abs({y} - {max(0, step - 60)}) <= 1")
+    page.keyboard.press("Home")
+    soon(f"{y} === 0")
+    in_own_world(page, "window.scrollBy(0, innerHeight / 2)")
+    checks["the browser's own page scrolling (qutebrowser's Ctrl-D) moves the charts under the header"] = soon(
+        f"Math.abs({y} - Math.round(Math.min(document.documentElement.scrollHeight - innerHeight, innerHeight / 2))) <= 1"
+        " && document.querySelector('header').getBoundingClientRect().top === 0")
     slider = page.locator(".panel.media input[type=range]").first
     slider.scroll_into_view_if_needed()
     soon("+document.querySelector('.panel.media input[type=range]').max > 0")
@@ -753,13 +779,15 @@ def interactions_smoke(page: Page, url: str) -> bool:
     checks["double-clicking the grip resets the width"] = soon(f"{width} === {w0}")
     page.goto(f"{url}/?alone#path=sweep")
     page.wait_for_function(READY, timeout=30000)
-    top = page.evaluate("(() => { const p = document.getElementById('panels'); p.scrollTop = Math.min(400, p.scrollHeight - p.clientHeight); return p.scrollTop; })()")
-    page.evaluate("""() => { const p = document.getElementById('panels'), box = p.getBoundingClientRect();
-        [...p.querySelectorAll('.panel button.full')].find((b) => { const r = b.getBoundingClientRect(); return r.top > box.top && r.bottom < box.bottom; }).click(); }""")
+    top = page.evaluate("(() => { scrollTo(0, Math.min(400, document.documentElement.scrollHeight - innerHeight)); return scrollY; })()")
+    page.evaluate("""() => { const box = { top: document.querySelector('header').getBoundingClientRect().bottom, bottom: innerHeight };
+        [...document.querySelectorAll('#panels .panel button.full')].find((b) => { const r = b.getBoundingClientRect(); return r.top > box.top && r.bottom < box.bottom; }).click(); }""")
     page.wait_for_function("document.getElementById('panels').classList.contains('alone')", timeout=10000)
+    page.mouse.wheel(0, -300)  # the page scrolls under the chart shown alone
+    moved = soon(f"scrollY < {top}")
     page.keyboard.press("Escape")
-    checks["leaving a chart shown alone returns to where the charts were scrolled"] = top > 0 and soon(
-        f"!document.getElementById('panels').classList.contains('alone') && Math.abs(document.getElementById('panels').scrollTop - {top}) <= 2")
+    checks["leaving a chart shown alone returns to where the charts were scrolled, though the page scrolled meanwhile"] = top > 0 and moved and soon(
+        f"!document.getElementById('panels').classList.contains('alone') && Math.abs(scrollY - {top}) <= 2")
     page.goto(f"{url}/?iqm#path=sweep&group=lr&center=iqm")
     page.wait_for_function(READY, timeout=30000)
     plot()
