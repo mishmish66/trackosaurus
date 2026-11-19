@@ -43,10 +43,11 @@ with uvx (`trex.remote`), one for all the directories it tracks on that host, so
 key that works without a prompt. On a cluster, use a host that allows long-running processes, such as a data-transfer
 node; runs written by jobs on other nodes are followed through their journals.
 
-A node keeps every directory it pulls, or has crawled over ssh, in its cache (`trex.mirror`) as the trex crawling it
-compiled it, so it answers at once and while that trex is unreachable; running runs' rows come live from it while it
-answers. A laptop's trex pulling a lab workstation's, which crawls the training machines over ssh, holds everything the
-workstation holds without reaching those machines itself:
+A node keeps every directory it pulls, or has crawled over ssh, in its cache (`trex.mirror`): the runs, and their
+metrics as coarsely as a chart shows them before it is zoomed into, a small part of what the trex crawling them holds.
+So it answers at once and while that trex is unreachable; running runs' rows come live from it while it answers, and a
+deep zoom takes its finer data from it the first time, to keep. A laptop's trex pulling a lab workstation's, which
+crawls the training machines over ssh, shows everything the workstation holds without reaching those machines itself:
 
     workstation$ trex serve ~/runs gpu-box:~/runs
     laptop$ trex serve http://workstation:13898
@@ -436,6 +437,7 @@ class Node:
         self.links: dict[str, Link] = {}  # by key
         self.pulled: dict[str, Pulled] = {}  # directory id -> where it comes from, for the others
         self.workspaces: dict[str, list[str]] = {}  # name -> member directory ids
+        self._restoring = False  # `load` is tracking what was saved: saving waits until all of it is held
         self.home: str | None = None
         self._views: dict[str, Workspace] = {}
         self._stop = threading.Event()
@@ -452,16 +454,21 @@ class Node:
 
     def load(self) -> None:
         """Track the directories and links saved in `state`, skipping directories that no longer exist; open the
-        directories it pulled, from the cache, so they answer before their links do; keep its workspaces."""
+        directories it pulled, from the cache, so they answer before their links do; keep its workspaces. Nothing is
+        saved until all of it is held again, so what is saved never lacks a part not yet restored."""
         try:
             saved = Saved.read(json.loads(self.state.read_text()) if self.state else None)
         except FileNotFoundError:
             return
-        for spec in [*saved.tracked, *saved.links]:
-            try:
-                self.track(spec, force=True, wait=False)
-            except ValueError as e:
-                print(f"[trex] skipping saved directory {spec}: {e}", file=sys.stderr, flush=True)
+        self._restoring = True
+        try:
+            for spec in [*saved.tracked, *saved.links]:
+                try:
+                    self.track(spec, force=True, wait=False)
+                except ValueError as e:
+                    print(f"[trex] skipping saved directory {spec}: {e}", file=sys.stderr, flush=True)
+        finally:
+            self._restoring = False
         with self.lock:
             for d, p in saved.pulled.items():
                 if p.link in self.links and d not in self.entries:
@@ -469,7 +476,7 @@ class Node:
                     self.pulled[d] = p
             for w, members in saved.workspaces.items():
                 self.workspaces[w] = [self._id(m) for m in members]
-            self._update_views()
+            self._changed(None)
 
     def _id(self, spec: str) -> str:
         """The id of the directory `spec` names: a local path is this node's."""
@@ -889,9 +896,10 @@ class Node:
                 write_json(self.state.with_name("history.json"), self._history)
 
     def _changed(self, spec: str | None) -> None:
-        """After a change (inside the lock): remember `spec`, update the views' members, save."""
+        """After a change (inside the lock): remember `spec`, update the views' members, save; while `load` restores
+        what was saved, nothing is remembered or saved."""
         self._update_views()
-        if self.state is None:
+        if self.state is None or self._restoring:
             return
         if spec is not None:
             self._history = [spec, *(r for r in self._history if r != spec)][:HISTORY_MAX]

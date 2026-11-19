@@ -237,6 +237,29 @@ def test_workspaces_are_saved_and_lose_members_that_stop_being_tracked(node: Nod
     assert [w["name"] for w in get_json(f"{http}/api/node")["workspaces"]] == ["both"]
 
 
+def test_workspaces_and_pulled_directories_stay_saved_through_every_restart(
+        node: Node, dirs: tuple[Path, Path], http: str, tmp_path: Path) -> None:
+    tracked(node, *dirs)
+    state = tmp_path / "state-far" / "roots.json"
+    far = Node(tmp_path / "cache-far", state, name="far")
+    try:
+        far.track(http)
+        assert wait_for(lambda: len(far.pulled) == 2)
+        far.set_workspace("mine", [d.name for d in far.served()])
+        saved, want = json.loads(state.read_text()), ({"mine": sorted(far.pulled)}, sorted(far.pulled))
+    finally:
+        far.close()
+    assert saved["workspaces"] == [{"name": "mine", "members": saved["workspaces"][0]["members"]}] and len(saved["pulled"]) == 2
+    for i in range(3):  # a restart, and the restarts after it
+        again = Node(tmp_path / f"cache-far{i}", state, name="far")
+        again.load()
+        try:
+            assert ({w: sorted(m) for w, m in again.workspaces.items()}, sorted(again.pulled)) == want
+            assert json.loads(state.read_text()) == saved
+        finally:
+            again.close()
+
+
 def test_a_workspace_can_be_renamed_and_names_are_checked(node: Node, dirs: tuple[Path, Path], http: str) -> None:
     a, b = tracked(node, *dirs)
     node.set_workspace("one", [a])
