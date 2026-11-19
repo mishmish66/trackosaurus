@@ -1007,6 +1007,37 @@ def filter_smoke(page: Page, url: str) -> bool:
             and results["seed1"][0] == [r for r in every if "seed1" in r] and results["lr ="] == [every, True])
 
 
+def typed_group_smoke(page: Page, url: str) -> bool:
+    """Whether a group-by typed at a folder is what that folder opens with from then on: back at it by the path after
+    a folder under it, which opens with its own, and after a load, the hash naming it; and typing a folder's own
+    group-by keeps nothing of it."""
+    group = "[app.opts.path, app.opts.group]"
+
+    def at(path: str) -> list[str]:
+        page.evaluate(f"app.setPath({json.dumps(path)})")
+        page.wait_for_function(READY, timeout=30000)
+        return page.evaluate(group)
+
+    page.goto(f"{url}/?typed#path=sweep")
+    page.wait_for_function(READY, timeout=30000)
+    was, own = page.evaluate("app.typedGroups()"), page.evaluate("[app.defaultGroup('sweep'), app.defaultGroup('sweep/width512')]")
+    page.evaluate("localStorage.removeItem(`groups:${app.data.rootKey}`); app.setGroup('lr')")
+    under = at("sweep/width512")
+    page.evaluate("app.setGroup('seed')")
+    seen = [at("sweep"), at("sweep/width512"), at("sweep/width512/lr0.01")[1] == page.evaluate("app.defaultGroup(app.opts.path)")]
+    page.goto(f"{url}/?typed-again#path=sweep")
+    page.wait_for_function(READY, timeout=30000)
+    loaded = [page.evaluate(group), page.evaluate("location.hash.includes('group=lr')"), page.evaluate("app.typedGroups()")]
+    page.evaluate("app.setGroup(app.defaultGroup('sweep'))")
+    cleared = [page.evaluate("app.typedGroups()"), page.evaluate("location.hash.includes('group=')")]
+    page.evaluate(f"localStorage.setItem(`groups:${{app.data.rootKey}}`, JSON.stringify({json.dumps(was)}))")
+    print(f"typed group-by: folders' own {own}; under {under}; then {seen}; loaded {loaded}; cleared {cleared}")
+    return ("lr" not in own and "seed" not in own and under == ["sweep/width512", own[1]]
+            and seen == [["sweep", "lr"], ["sweep/width512", "seed"], True]
+            and loaded == [["sweep", "lr"], True, {"sweep": "lr", "sweep/width512": "seed"}]
+            and cleared == [{"sweep/width512": "seed"}, False])
+
+
 def kept_runs_smoke(page: Page, url: str, runs: Path) -> bool:
     """Whether a view shown again (the same path, filter, grouping and sorting) shows its runs as computing them anew
     would: restored as they were kept while nothing they depend on changed, also through a change of a run's metadata
@@ -1498,13 +1529,14 @@ def no_webgl_smoke(page: Page, url: str) -> bool:
         checks["the page has no WebGL2 (what the check is of)"] = page.evaluate("!document.createElement('canvas').getContext('webgl2')")
         checks["every chart says that charts need WebGL2, drawn on its canvas"] = soon(
             f"(() => {{ const cs = {CHART_NOTICES}; return cs.length > 0 && cs.every((c) => c[1] === 'charts need WebGL2' && c[2]); }})()")
+        checks["some of them lie below the view, once the page is laid out"] = soon(
+            f"(() => {{ const cs = {CHART_NOTICES}; return cs.some((c) => !c[3]) && cs.every((c) => c[1] === 'charts need WebGL2' && c[2]); }})()")
         notices = page.evaluate(CHART_NOTICES)
-        checks["some of them lie below the view"] = any(not c[3] for c in notices)
         checks["a notice beside the status says so, and stays as the status changes"] = soon(
             "(() => { const n = document.querySelector('#needsGl'); return !n.hidden && n.textContent.includes('WebGL2')"
             " && /blocks fetched/.test(document.querySelector('#status').textContent); })()")
         checks["the runs are listed"] = page.evaluate("app.runList.length") == 18
-        checks["the media panels are there"] = page.locator("#panels .panel.media").count() == 3
+        checks["the media panels are there"] = soon("document.querySelectorAll('#panels .panel.media').length === 3")
         page.fill("#runFilter", "lr = 0.01")
         checks["a filter narrows them"] = soon("app.runList.filter((r) => r.shown).length === 6")
         page.fill("#runFilter", "")
@@ -1677,6 +1709,7 @@ def main() -> None:
             ok &= check("no_webgl_smoke", no_webgl_smoke(page, url))
             ok &= check("dots_smoke", dots_smoke(page, url, runs))
             ok &= check("flicker_smoke", flicker_smoke(page, url, runs))
+            ok &= check("typed_group_smoke", typed_group_smoke(page, url))
             ok &= check("kept_runs_smoke", kept_runs_smoke(page, url, runs))
             ok &= check("binned_smoke", binned_smoke(page, url, runs))
             ok &= check("hidden_live_smoke", hidden_live_smoke(page, url, runs))

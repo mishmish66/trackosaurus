@@ -850,7 +850,7 @@ class App {
     document.title = `${this.opts.path || this.data.info?.name || "trex"} · trex`;
     this.data.view = this.opts.path;
     if (this.groupFromHash) this.groupFromHash = false;
-    else this.opts.group = this.defaultGroup(this.opts.path);
+    else this.opts.group = this.groupFor(this.opts.path);
     this.saveHash();
     this.onRuns();
     this.renderCrumbs(); // with the info panel, whose height moves the charts: before looking where they are
@@ -873,7 +873,7 @@ class App {
     document.title = `${this.opts.path || name} · trex`;
     await this.data.loadScope(this.opts.path);
     if (this.groupFromHash) this.groupFromHash = false;
-    else (this.opts.group = this.defaultGroup(this.opts.path)), this.saveHash();
+    else (this.opts.group = this.groupFor(this.opts.path)), this.saveHash();
     this.onRuns();
     this.renderPanels();
     if (this.opts.chart && !this.charts.has(this.opts.chart)) this.setOpt("chart", "");
@@ -919,7 +919,27 @@ class App {
     return DEFAULT_GROUP;
   }
 
-  /** Whether the hash states the grouping: inside an opened group, or when it differs from the folder's default. */
+  /** The group-by a path opens with: the one last typed at it in this browser, else its folder's (`defaultGroup`). */
+  groupFor(path) {
+    const typed = this.typedGroups()[path];
+    return typeof typed === "string" ? typed : this.defaultGroup(path);
+  }
+
+  /** Keep the group-by typed at the path for the next time it is opened: none when it is its folder's own. */
+  keepGroup() {
+    const typed = this.typedGroups();
+    delete typed[this.opts.path];
+    if (this.opts.group !== this.defaultGroup(this.opts.path)) typed[this.opts.path] = this.opts.group;
+    store.set(`groups:${this.data.rootKey}`, typed);
+  }
+
+  /** The group-bys typed in this browser for the directory shown, by path. */
+  typedGroups() {
+    return store.get(`groups:${this.data.rootKey}`, {});
+  }
+
+  /** Whether the hash states the grouping: inside an opened group, or when it differs from the folder's default (a
+   * typed one does, so a link shows the same groups in another browser). */
   groupInHash() {
     return this.opts.focus.length > 0 || this.opts.group !== this.defaultGroup(this.opts.path);
   }
@@ -962,7 +982,7 @@ class App {
     if (differs("focus") || (q.has("group") && differs("group"))) {
       this.opts.focus = next.focus;
       if (q.has("group")) this.opts.group = next.group;
-      else this.opts.group = this.defaultGroup(this.opts.path);
+      else this.opts.group = this.groupFor(this.opts.path);
       this.onRuns();
     }
     if (next.chart !== this.opts.chart) {
@@ -1262,6 +1282,7 @@ class App {
     const g = formatGroupBy(parseGroupBy(expr));
     if (g === this.opts.group) return;
     this.opts.group = g;
+    this.keepGroup();
     this.saveHash();
     this.onRuns();
   }
