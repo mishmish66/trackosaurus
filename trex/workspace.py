@@ -155,7 +155,14 @@ class Workspace:
 
     def buckets_bodies(self, asks: Sequence[Ask]) -> list[bytes]:
         """Each block as `Explorer.buckets_bodies` answers it, of every member's runs it names (`_join`), the members
-        asked at once."""
+        asked at once; first each mirror among the members fetches the blocks it lacks of all the asks, in one request
+        (`Explorer.fetch`)."""
+        if any(m.src.origin.coarse for m in self.members):
+            mine: dict[str, list[Ask]] = {}
+            for a in asks:
+                for m, part in self._parts(a):
+                    mine.setdefault(m.name, []).append(part)
+            list(_asking.map(Explorer.fetch, *zip(*((m.src, mine[m.name]) for m in self.members if m.name in mine), strict=True)))
         return at_once(self._block, asks, for_workers)
 
     def _block(self, a: Ask) -> bytes:

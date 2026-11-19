@@ -292,8 +292,9 @@ class Rows:
 
 @dataclass(frozen=True, slots=True)
 class Dump:
-    """What a mirror lacks of a run: its record, the media items it lacks, its metrics, and the blocks of its levels
-    that changed since the rows the mirror's hold; every block, to take the place of the mirror's, when `replace`."""
+    """What a mirror lacks of a run: its record, the media items it lacks, its metrics, and the blocks of the levels a
+    mirror keeps (each metric's top and the KEPT below) that changed since the rows the mirror's hold; every such
+    block, to take the place of the mirror's, when `replace`."""
 
     record: RunRecord
     media: list[MediaRecord]
@@ -319,10 +320,16 @@ class Dump:
                     for (key, level, block, since), data in zip(head["blocks"], parts[1:], strict=True)])
 
 
+class Unfetched(Exception):
+    """Blocks below the levels a mirror keeps could not be fetched from its upstream."""
+
+
 class Origin(Protocol):
-    """Where an Explorer's runs come from, and what of them only it has: rows its levels do not hold yet, media files."""
+    """Where an Explorer's runs come from, and what of them only it has: rows its levels do not hold yet, media files,
+    and, of a mirror, the blocks below the levels it keeps."""
 
     key: str  # names the index: one cache directory per key
+    coarse: bool  # the index keeps each metric's levels from its top to KEPT below, and `blocks` has the finer ones
 
     def attach(self, ex: "Explorer") -> None:
         """Told once, first, of the Explorer it fills."""
@@ -358,14 +365,21 @@ class Origin(Protocol):
         """A run's media file; KeyError unless it has it."""
         ...
 
+    def blocks(self, asks: Sequence[Ask]) -> list[bytes]:
+        """The block of each ask (of runs named by id) as a bucket array, each run's `seq` the rows its buckets hold;
+        Unfetched when it cannot be reached."""
+        ...
 
-CACHE_VERSION: Final = 15  # bump whenever what the index stores changes; older caches are rebuilt
+
+CACHE_VERSION: Final = 16  # bump whenever what the index stores changes; older caches are rebuilt
 CLOSE_WAIT: Final = 5.0  # longest `close` waits for a pass in progress
 MEMO_BYTES = 1 << 30  # stacks, merged levels and answers an Explorer keeps in memory, least recently used dropped
 MEMO_MAPS: Final = 2048  # memory maps of saved levels an Explorer keeps (Linux allows a process 65530 maps by default)
 MAPS_PER_FILES: Final = 32  # before Python 3.13 each map holds a file descriptor: an Explorer then keeps at most 1/32 of the limit
 LEVELS_BYTES = int(os.environ.get("TREX_LEVELS_MB", "4096")) << 20  # saved merged levels an index keeps, least recently used deleted
 LEVELS_SAVE_EVERY = 60.0  # seconds between saves of one metric's merged levels
+KEPT: Final = 2  # levels below a metric's top that a mirror keeps: what any chart not zoomed into asks for, and a zoom of 8 in a grid's
+FETCHED_BLOCKS: Final = 400_000  # blocks below those levels a mirror keeps of the ones it fetched, the last fetched (about 1 GB)
 LEVELS_AHEAD: Final = 3  # levels above a metric's coarsest top level merged and saved ahead of requests
 MERGE_THREADS: Final = min(8, os.cpu_count() or 1)  # threads merging one level
 READ_THREADS: Final = min(8, os.cpu_count() or 1)  # threads reading and decompressing stored blocks
@@ -399,6 +413,11 @@ TABLES: Final = {
     "levels": "CREATE TABLE IF NOT EXISTS levels(key TEXT, level INTEGER, block INTEGER, path TEXT, since INTEGER, data BLOB, "
               "PRIMARY KEY(key, level, block, path))",
     "levels_path": "CREATE INDEX IF NOT EXISTS levels_path ON levels(path)",
+    # a mirror's blocks below the levels it keeps, as fetched from its upstream (in the order fetched, by rowid); seq:
+    # the rows the block holds
+    "fetched": "CREATE TABLE IF NOT EXISTS fetched(key TEXT, level INTEGER, block INTEGER, path TEXT, seq INTEGER, data BLOB, "
+               "PRIMARY KEY(key, level, block, path))",
+    "fetched_path": "CREATE INDEX IF NOT EXISTS fetched_path ON fetched(path)",
     "folders": "CREATE TABLE IF NOT EXISTS folders(path TEXT PRIMARY KEY, info TEXT NOT NULL)",
 }
 
@@ -527,14 +546,15 @@ def _events(r: Update, cur: RunRecord | None, st: RunRecord) -> list[Event]:
     return [*rows, *media, *([("run", None)] if changed else [])]
 
 
-def _record(r: Update, cur: RunRecord | None, now: float) -> RunRecord:
-    """The run's record after update `r`."""
+def _record(r: Update, cur: RunRecord | None, now: float, ver: int) -> RunRecord:
+    """The run's record after update `r`, given the one held (None of a run replaced) and the version its path had: a
+    run that takes another's place counts on from it, so that no mirror holds the same version of the other."""
     compiled = r.compiled if r.compiled is not None else cur.compiled if cur else 0
     return RunRecord(uid=r.uid, seq=r.seq, mseq=r.mseq, keys=r.keys,
                      summary=r.summary if r.summary is not None else cur.summary if cur else {},
                      sig=r.sig, heartbeat=r.heartbeat, public=r.public, state=r.state, compiled=compiled,
                      compiled_t=now if cur is None or compiled != cur.compiled else cur.compiled_t, rebuilt=r.rebuilt,
-                     ver=r.ver if r.ver is not None else cur.ver + 1 if cur else 1)
+                     ver=r.ver if r.ver is not None else ver + 1)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -1008,25 +1028,34 @@ class Explorer:
         """Write one update inside `apply`'s transaction; its record and events, and into `bumps` the metrics whose
         finished runs or levels it changes."""
         ev: list[Event] = []
+        ver = cur.ver if cur is not None else 0
         if r.reset and cur is not None:
             self._forget(r.path, bumps)
             ev.append(("delete", {"run": r.path}))
             cur = None
         self._writer.executemany("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,?)", [m.row() for m in r.media])
-        st = _record(r, cur, now)
+        st = _record(r, cur, now, ver)
         was, done = cur is not None and cur.state != "running", st.state != "running"  # finished before, and now
         if (r.compiled is not None and done) or was != done:
             bumps.update(st.keys)
         if r.compiled is not None:
-            if r.replace:
-                for t in ("levels", "metrics"):
-                    self._writer.execute(f"DELETE FROM {t} WHERE path=?", (r.path,))
-            self._writer.executemany("INSERT OR REPLACE INTO metrics VALUES (?,?,?,?,?,?)",
-                                     [(r.path, m.key, m.span.fine, m.span.top, m.span.lo, m.span.hi) for m in r.metrics])
-            self._writer.executemany("INSERT OR REPLACE INTO levels VALUES (?,?,?,?,?,?)",
-                                     [(b.key, b.level, b.block, r.path, b.since, b.data) for b in r.blocks])
+            self._write_levels(r)
         self._writer.execute("INSERT OR REPLACE INTO runs VALUES (?, ?)", (r.path, dumps(st.wire())))
         return st, ev + _events(r, cur, st)
+
+    def _write_levels(self, r: Update) -> None:
+        """Write an update's metrics and blocks inside `apply`'s transaction: in place of all the run had when
+        `replace`; else a mirror's metric whose top level rose keeps one level fewer below it."""
+        if r.replace:
+            for t in ("levels", "metrics", "fetched"):
+                self._writer.execute(f"DELETE FROM {t} WHERE path=?", (r.path,))
+        self._writer.executemany("INSERT OR REPLACE INTO metrics VALUES (?,?,?,?,?,?)",
+                                 [(r.path, m.key, m.span.fine, m.span.top, m.span.lo, m.span.hi) for m in r.metrics])
+        if self.origin.coarse and not r.replace:
+            self._writer.execute("DELETE FROM levels WHERE path=?1 AND level < (SELECT m.top - ?2 FROM metrics m "
+                                 "WHERE m.key=levels.key AND m.path=?1)", (r.path, KEPT))
+        self._writer.executemany("INSERT OR REPLACE INTO levels VALUES (?,?,?,?,?,?)",
+                                 [(b.key, b.level, b.block, r.path, b.since, b.data) for b in r.blocks])
 
     def drop(self, path: str) -> None:
         """Forget a run the origin no longer has, and tell the stream."""
@@ -1074,7 +1103,7 @@ class Explorer:
         """Delete a run's index rows inside the caller's write transaction; its metrics go into `bumps`."""
         rec = self.records.get(path)
         bumps.update(rec.keys if rec else self._gens)
-        for t in ("runs", "media", "metrics", "levels"):
+        for t in ("runs", "media", "metrics", "levels", "fetched"):
             self._writer.execute(f"DELETE FROM {t} WHERE path=?", (path,))
 
     # ---- runs ----
@@ -1178,8 +1207,8 @@ class Explorer:
 
     def dump(self, path: str, have: Have | None) -> Dump:
         """What a mirror holding `have` of run `path` lacks. A mirror holding another run of that path, or levels of
-        another rebuild, gets every block (`replace`); else those that changed since the rows its levels hold.
-        KeyError for a run the index does not have."""
+        another rebuild, gets every block of the levels it keeps (`replace`); else those that changed since the rows
+        its levels hold. KeyError for a run the index does not have."""
         c = self.reader()
         try:
             c.execute("BEGIN")
@@ -1192,8 +1221,9 @@ class Explorer:
             media = c.execute("SELECT path, seq, step, key, kind, file FROM media WHERE path=? AND seq>=? ORDER BY seq",
                               (path, have.mseq if have is not None and same else 0)).fetchall()
             metrics = c.execute("SELECT key, fine, top, lo, hi FROM metrics WHERE path=? ORDER BY key", (path,)).fetchall()
-            blocks = c.execute("SELECT key, level, block, since, data FROM levels WHERE path=? AND since>?",
-                               (path, -1 if have is None or replace else have.compiled)).fetchall()
+            blocks = c.execute(
+                "SELECT l.key, l.level, l.block, l.since, l.data FROM levels l JOIN metrics m ON m.key=l.key AND m.path=l.path "
+                "WHERE l.path=? AND l.since>? AND l.level>=m.top-?", (path, -1 if have is None or replace else have.compiled, KEPT)).fetchall()
             c.execute("COMMIT")
         finally:
             self.release(c)
@@ -1213,14 +1243,16 @@ class Explorer:
     # ---- blocks ----
 
     def buckets_bodies(self, asks: Sequence[Ask]) -> list[bytes]:
-        """`buckets_body` of each ask, in order (`at_once`)."""
+        """`buckets_body` of each ask, in order (`at_once`), a mirror having fetched the blocks it lacks (`fetch`)."""
+        self.fetch(asks)
         return at_once(lambda a: self.buckets_body(a.key, a.level, a.block, a.scope, a.runs, a.which), asks, for_workers)
 
     def buckets_body(self, key: str, level: int, index: int, scope: str = "", runs: Sequence[str] | None = None,
                      which: Which = "all") -> bytes:
         """Block `index` of `level` of `key` as a bucket array (`trex.buckets`): of the runs `runs`, or else of the runs
         under `scope` in state `which`; each run's buckets hold its compiled rows. A scope's finished runs' blocks are
-        kept in memory while those runs' levels stay the same."""
+        kept in memory while those runs' levels stay the same. Unfetched when a mirror lacks a run's block below the
+        levels it keeps (`fetch` takes those)."""
         if not bk.MIN_LEVEL <= level <= bk.MAX_LEVEL:
             raise ValueError(f"level {level} out of range")
         if runs is None and which == "finished":
@@ -1239,9 +1271,19 @@ class Explorer:
     def _block(self, key: str, level: int, index: int, paths: list[str]) -> bytes:
         """Block `index` of `level` of `key` of runs `paths` (in path order). A run whose top level is `level` or finer
         is merged from top levels (`_from_tops`); any other run's block is the one stored (`stored_block`), and when
-        every run's is, those are the answer as they are."""
+        every run's is, those are the answer as they are. A mirror's runs whose block lies below the levels it keeps
+        answer with the one fetched (`_from_fetched`), holding the rows it held when fetched."""
         parts, deep = self._from_tops(key, level, index, paths)
         seq = self._compiled(paths)
+        below = set(self._below(key, level, [paths[i] for i in deep]))
+        if below:
+            far = [i for i in deep if paths[i] in below]
+            deep = [i for i in deep if paths[i] not in below]
+            rows = self._from_fetched(key, level, index, [paths[i] for i in far], seq[far])
+            seq[far] = [s for s, _ in rows]
+            if len(far) == len(paths):
+                return bk.join(level, index, paths, seq, [blob for _, blob in rows])
+            parts.append(bk.stack([], np.empty(0, np.uint32), np.empty(0, np.int8), [blob for _, blob in rows], far).buckets)
         if deep:
             body = _stored(str(self.db_path), key, level, index, [paths[i] for i in deep], seq[deep].astype("<u4").tobytes())
             if len(deep) == len(paths):
@@ -1249,6 +1291,109 @@ class Explorer:
             b = bk.decode(body).buckets
             parts.append(b.of(np.array(deep, np.int32)[b.run]))
         return bk.encode(level, index, paths, seq, bk.union(parts))
+
+    # ---- a mirror's blocks below the levels it keeps ----
+
+    def fetch(self, asks: Sequence[Ask]) -> None:
+        """Have a mirror take from its upstream, in one request, the blocks `asks` name below the levels it keeps that
+        it has not fetched, or fetched before their runs' levels grew. What cannot be fetched stays missing."""
+        if not self.origin.coarse:
+            return
+        lacking = [Ask(a.key, a.level, a.block, runs=paths) for a in asks if (paths := self._lacking(a))]
+        if not lacking:
+            return
+        with self.lock:
+            held = {p: (st.uid, st.rebuilt) for a in lacking for p in a.runs or () if (st := self.records.get(p))}
+        try:
+            bodies = self.origin.blocks(lacking)
+        except Unfetched as e:
+            print(f"[trex] {self.origin.key}: {e}", file=sys.stderr, flush=True)
+            return
+        rows: list[tuple[str, int, int, str, int, bytes]] = []
+        for a, body in zip(lacking, bodies, strict=True):
+            with contextlib.suppress(ValueError, struct.error):
+                got = {p: (seq, zlib.compress(blob, 1)) for p, seq, blob in bk.split(body)} if body else {}
+                none = (-1, pack(bk.empty(), a.level, a.block))  # a run the upstream answered nothing of
+                rows += [(a.key, a.level, a.block, p, *got.get(p, none)) for p in a.runs or ()]
+        self._keep_fetched(rows, held)
+
+    def _keep_fetched(self, rows: Sequence[tuple[str, int, int, str, int, bytes]], held: Mapping[str, tuple[str, int]]) -> None:
+        """Store fetched blocks (key, level, block, run, rows held, data; -1 rows for an empty block of a run the
+        upstream answered nothing of: the rows its levels hold) of the runs that are still the ones `held` names (run
+        -> uid, rebuild); the oldest beyond FETCHED_BLOCKS go."""
+        with self._write_lock:
+            if self._closed:
+                return
+            with self.lock:
+                now = {p: (st.uid, st.rebuilt, st.compiled) for p in held if (st := self.records.get(p))}
+            keep = [(k, lv, b, p, now[p][2] if seq < 0 else seq, data) for k, lv, b, p, seq, data in rows
+                    if p in now and now[p][:2] == held[p]]
+            self._writer.execute("BEGIN IMMEDIATE")
+            self._writer.executemany("INSERT OR REPLACE INTO fetched VALUES (?,?,?,?,?,?)", keep)
+            self._writer.execute("DELETE FROM fetched WHERE rowid <= (SELECT max(rowid) FROM fetched) - ?", (FETCHED_BLOCKS,))
+            self._writer.execute("COMMIT")
+
+    def _lacking(self, a: Ask) -> list[str]:
+        """The runs of ask `a` whose block lies below the levels the index keeps and is not fetched, or was before
+        their levels grew."""
+        if a.runs is None and a.which == "finished":  # most asks: of a scope's finished runs, at their top levels or above
+            tops = self._top_levels(a.key, self._finished(a.key))
+            if not tops.size or int(tops.max()) - KEPT <= a.level:
+                return []
+        below = self._below(a.key, a.level, self._chosen(a.key, a.scope, a.runs, a.which))
+        if not below:
+            return []
+        have = self._fetched_seqs(a.key, a.level, a.block, below)
+        return [p for p, seq in zip(below, self._compiled(below).tolist(), strict=True) if have.get(p, -1) < seq]
+
+    def _below(self, key: str, level: int, paths: Sequence[str]) -> list[str]:
+        """Those of runs `paths` (in path order) whose block of `level` of `key` lies below the levels the index keeps:
+        a mirror's, when neither `level` nor the run's finest level is within KEPT of its top."""
+        if not self.origin.coarse or not paths:
+            return []
+        fin = self._finished(key)
+        tops = self._top_levels(key, fin)
+        maybe = [p for p in paths if (i := fin.at.get(p)) is None or int(tops[i]) - KEPT > level]
+        out: list[str] = []
+        c = self.reader()
+        try:
+            for part in batched(maybe, PATHS_PER_QUERY):
+                out += [p for p, in c.execute(f"SELECT path FROM metrics WHERE key=? AND path IN ({_marks(part)}) "
+                                              "AND max(fine, ?) < top - ? ORDER BY path", (key, *part, level, KEPT))]
+        finally:
+            self.release(c)
+        return out
+
+    def _fetched_seqs(self, key: str, level: int, index: int, paths: Sequence[str]) -> dict[str, int]:
+        """The rows held by the fetched block `index` of `level` of `key` of each of `paths` that has one."""
+        out: dict[str, int] = {}
+        c = self.reader()
+        try:
+            for part in batched(paths, PATHS_PER_QUERY):
+                out.update(c.execute(f"SELECT path, seq FROM fetched WHERE key=? AND level=? AND block=? AND path IN ({_marks(part)})",
+                                     (key, level, index, *part)))
+        finally:
+            self.release(c)
+        return out
+
+    def _from_fetched(self, key: str, level: int, index: int, paths: Sequence[str],
+                      seq: npt.NDArray[np.uint32]) -> list[tuple[int, bytes]]:
+        """(rows held, one-run bucket array) of the fetched block `index` of `level` of `key` of each of `paths`, whose
+        levels hold rows `seq`; Unfetched unless each has one holding those rows."""
+        got: dict[str, tuple[int, bytes]] = {}
+        c = self.reader()
+        try:
+            for part in batched(paths, PATHS_PER_QUERY):
+                got.update((p, (s, data)) for p, s, data in c.execute(
+                    f"SELECT path, seq, data FROM fetched WHERE key=? AND level=? AND block=? AND path IN ({_marks(part)})",
+                    (key, level, index, *part)))
+        finally:
+            self.release(c)
+        if any(p not in got or got[p][0] < s for p, s in zip(paths, seq.tolist(), strict=True)):
+            raise Unfetched(f"{self.origin.key}: block {index} of level {level} of {key} is not here, and its upstream did not give it")
+        return [(got[p][0], zlib.decompress(got[p][1])) for p in paths]
+
+    # ---- blocks from the levels kept ----
 
     def _from_tops(self, key: str, level: int, index: int, paths: list[str]) -> tuple[list[Buckets], list[int]]:
         """Block `index` of `level` of `key` of the runs of `paths` whose top level is `level` or finer, as buckets of their

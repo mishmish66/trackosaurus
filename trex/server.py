@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import buckets as bk, remote, update
 from .format import JSONValue, as_str_list
-from .index import Ask, Explorer, Have, Which, dumps
+from .index import Ask, Explorer, Have, Unfetched, Which, dumps
 from .node import Node, dir_base, link_url, resolve_root, workspace_url
 from .workspace import Workspace
 
@@ -120,6 +120,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"bad request: {e!r}"}, 400)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Unfetched as e:
+            self._json({"error": str(e)}, 503)
         except Exception as e:
             print(f"[trex] {method} {self.path}: {e!r}", file=sys.stderr, flush=True)
             self._json({"error": f"internal error: {e!r}"}, 500)

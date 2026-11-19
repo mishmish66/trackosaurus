@@ -314,6 +314,16 @@ def decode(blob: bytes) -> BucketArray:
                                              np.frombuffer(blob, np.uint32, count, at + 8 * count)))
 
 
+def split(blob: bytes) -> list[tuple[str, int, bytes]]:
+    """(path, rows held, one-run bucket array naming no run and holding no row count) of each run of bucket array
+    `blob`: what `join` puts together again; ValueError unless it is a bucket array."""
+    a = decode(blob)
+    _, _, base, *_ = HEAD.unpack_from(blob)
+    first: list[int] = np.searchsorted(a.buckets.run, np.arange(len(a.paths) + 1)).tolist()
+    return [(p, int(a.seq[i]), encode(a.level, base, [""], [0], take(a.buckets, np.arange(first[i], first[i + 1])).of(
+        np.zeros(first[i + 1] - first[i], np.int32)))) for i, p in enumerate(a.paths)]
+
+
 def _assemble(level: int, base: int, paths: Sequence[str], first: Sequence[int], seq: bytes,
               cols: Sequence[Sequence[memoryview]]) -> bytes:
     """`encode`'s bytes for runs `paths`, run i's buckets [first[i], first[i + 1]), given the bytes of `seq` and, in

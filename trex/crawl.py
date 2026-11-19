@@ -21,7 +21,7 @@ from typing import Final
 from . import buckets as bk, chunks
 from .buckets import Buckets
 from .format import (DB, INFO_FILE, JSONValue, RunState, as_dict, as_float, as_run_state, as_str, as_str_list, snapshot)
-from .index import (ROWS_EVENT_MAX, Block, Explorer, MediaRecord, Metric, Public, Rows, RunRecord, Sig, Summary, Update, mp_context, pack,
+from .index import (ROWS_EVENT_MAX, Ask, Block, Explorer, MediaRecord, Metric, Public, Rows, RunRecord, Sig, Summary, Unfetched, Update, mp_context, pack,
                     unpack, wire, worker_init)
 from .journal import JOURNAL
 
@@ -279,12 +279,16 @@ class Crawl:
     def __init__(self, root: str | os.PathLike[str], workers: int | None = None) -> None:
         self.root = Path(root).resolve()
         self.key = str(self.root)
+        self.coarse = False
         self.workers = max(1, int(workers)) if workers is not None else default_workers()
         self.dirs: dict[str, Path] = {}  # run -> its directory
         self._notes: dict[str, tuple[int, dict[str, JSONValue]]] = {}  # folder -> (mtime_ns, notes) of its trex_info.json
 
     def attach(self, ex: Explorer) -> None:
         pass
+
+    def blocks(self, asks: Sequence[Ask]) -> list[bytes]:
+        raise Unfetched(f"{self.key}: every level is in the index")
 
     def info(self) -> dict[str, object]:
         return {"root": str(self.root), "name": self.root.name}

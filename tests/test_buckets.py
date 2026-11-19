@@ -190,6 +190,16 @@ def test_joined_one_run_arrays_are_the_array_of_their_buckets_runs_without_one_i
     assert bk.join(2, 2, [], [], []) == bk.encode(2, 2, [], [], bk.empty())
 
 
+def test_an_array_split_into_its_runs_joins_into_itself() -> None:
+    names, seq = ["a", "b/c", "d"], [10, 0, 9]
+    whole = bk.encode(2, 2, names, seq, bk.union([run_at(b, i) for i, b in enumerate([block_of(0), bk.empty(), block_of(3)])]))
+    parts = bk.split(whole)
+    assert [(p, n) for p, n, _ in parts] == list(zip(names, seq)) and bk.join(2, 2, names, seq, [blob for _, _, blob in parts]) == whole
+    assert bk.split(bk.encode(2, 2, [], [], bk.empty())) == []
+    with pytest.raises(ValueError):
+        bk.split(b"XXXX" + whole[4:])
+
+
 def test_joining_refuses_arrays_of_another_block_or_of_several_runs() -> None:
     one, two = bk.encode(2, 2, [""], [0], block_of(0)), bk.encode(2, 2, ["a", "b"], [1, 1], bk.union([run_at(block_of(i), i) for i in (0, 1)]))
     for bad in (bk.encode(3, 2, [""], [0], bk.empty()), bk.encode(2, 1, [""], [0], bk.empty()), two, one[:-8], b"XXXX" + one[4:]):

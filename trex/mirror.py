@@ -4,9 +4,11 @@ a crawl scans: the record, new media, and the blocks of levels that changed sinc
 copied before the rows naming them are written. It follows the upstream's stream, which tells it what to take, and
 keeps each running run's rows beyond its levels as the stream brings them (its tail), passing them on to its own
 stream: a running run stays live by its rows, and its levels are taken anew only once its tail has grown (TAIL_ROWS),
-something its rows do not carry changed, or its tail does not continue them. So its Explorer answers everything
-itself, and, as far as the stream brought it, while the upstream is unreachable. `Upstream` is the upstream's API for
-the directory, over http or a Unix socket.
+something its rows do not carry changed, or its tail does not continue them. A mirror keeps each metric's top levels
+(`index.KEPT` below the top), which hold what a chart not zoomed into shows; a block below them it asks of the upstream
+when a request first names it (`Pull.blocks`), and keeps. So its Explorer answers every unzoomed view itself, and, as
+far as the stream brought it, while the upstream is unreachable. `Upstream` is the upstream's API for the directory,
+over http or a Unix socket.
 """
 
 import contextlib
@@ -28,7 +30,7 @@ from typing import Any, Final, Protocol
 from urllib.parse import quote, urlsplit
 
 from . import buckets as bk
-from .index import HEARTBEAT, Dump, Explorer, Have, Rows, RunRecord, RunsView, Update, dumps, sse_text
+from .index import HEARTBEAT, Ask, Dump, Explorer, Have, Rows, RunRecord, RunsView, Unfetched, Update, dumps, sse_text
 
 TIMEOUT: Final = 60.0  # seconds a request to the upstream may take
 RETRY: Final = 2.0  # seconds before reaching the upstream again after it failed
@@ -37,6 +39,7 @@ TAIL_ROWS: Final = 64  # rows a running run's tail holds past its levels before 
 LIST_EVERY: Final = 600.0  # seconds between reads of the whole run list, besides the stream's events
 DUMPS_AT_ONCE: Final = 16  # runs one request dumps
 FETCH_THREADS: Final = 8  # requests to the upstream at once for media files and tails
+ASKS_AT_ONCE: Final = 256  # blocks one request asks the upstream for (server.MAX_ASKS)
 IDLE: Final = 4  # connections to the upstream kept open between requests
 
 type Connect = Callable[[float], http.client.HTTPConnection]
@@ -161,7 +164,9 @@ class Pull:
     def __init__(self, upstream: Upstream, id: str, session: Closeable | None = None) -> None:
         self.upstream, self.id, self.session = upstream, id, session
         self.key = f"/trex-mirror/{id}"
+        self.coarse = True
         self.connected = False
+        self._lost = False  # the stream dropped and is not open again: the upstream is not asked for blocks meanwhile
         self.error = ""  # why the last pass failed, if it did
         self._lock = threading.Lock()
         self._media = Path()  # where media files are copied to: beside the index
@@ -315,7 +320,7 @@ class Pull:
         if up and not self.connected:
             self._relist.set()
             self._wake.set()
-        self.connected = up
+        self.connected, self._lost = up, not up
 
     def _event(self, ex: Explorer, kind: str, ev: Any, msg: bytes) -> None:
         """Take in an upstream event: a run with a new version or new media is due a dump, a deleted one leaves the
@@ -411,6 +416,22 @@ class Pull:
         with self._lock:
             tail = self._tails.get(path)
         return (tail.end if tail else rec.compiled), rec.mseq
+
+    def blocks(self, asks: Sequence[Ask]) -> list[bytes]:
+        """The upstream's answers to `asks` (`POST /api/buckets`, ASKS_AT_ONCE a request); Unfetched when it does not
+        answer, and at once while its stream is down."""
+        if self._lost:
+            raise Unfetched(f"{self.upstream.label} is unreachable")
+        out: list[bytes] = []
+        try:
+            for part in batched(asks, ASKS_AT_ONCE):
+                body = {"blocks": [{"key": a.key, "level": a.level, "index": a.block, "runs": list(a.runs or ())} for a in part]}
+                out += bk.unframe(self.upstream.request("POST", "/api/buckets", dumps(body).encode()))
+        except Unreachable as e:
+            raise Unfetched(str(e)) from e
+        except (KeyError, ValueError) as e:
+            raise Unfetched(f"{self.upstream.label}: {e!r}") from e
+        return out
 
     def media_file(self, path: str, file: str) -> Path:
         """The copy of run `path`'s media file `file`, copied first when missing; KeyError for one it lacks."""

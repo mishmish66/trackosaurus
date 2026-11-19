@@ -45,8 +45,9 @@ run.finish()                                    # also at exit; an uncaught exce
 - A workspace merges chosen directories into one tree; group by `dir` to compare them.
 - Add `host:path` for another machine: trex copies itself there over ssh and runs with `uvx`, so it needs only uv.
 - On a cluster, use a data-transfer node (`xfer:/scratch/me/runs`); jobs on any node stream live.
-- Add `http://host:port` to pull everything another trex holds, kept on this machine to browse offline: a laptop
-  pulling a lab workstation's trex reads every machine the workstation crawls without reaching them itself.
+- Add `http://host:port` to pull everything another trex holds, kept on this machine to browse offline (as coarsely
+  as charts show it before a zoom; a deep zoom takes its finer data from that trex the first time): a laptop pulling a
+  lab workstation's trex reads every machine the workstation crawls without reaching them itself.
 - `trex systemd-unit`, `trex launchd-plist` (macOS) or `trex runit-service` (runit, as on Void) gives a service with
   an update button in the `trex` panel.
 - `trex compact DIR` merges the commits of runs logged a few rows per commit (written before the writer merged them); rows are unchanged.

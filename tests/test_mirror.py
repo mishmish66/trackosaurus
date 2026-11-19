@@ -11,13 +11,14 @@ from typing import Any
 import pytest
 
 import trex
-from trex import buckets as bk, crawl, mirror, server
+from trex import buckets as bk, crawl, index, mirror, server
 from trex.crawl import Crawl
-from trex.index import Dump, Explorer, Rows
+from trex.index import KEPT, Ask, Dump, Explorer, Rows, Unfetched
 from trex.mirror import Pull, Unreachable, Upstream
 from trex.server import Server
+from trex.workspace import Member, Workspace
 
-from helpers import PNG, committed_rows, node_of, wait_for, write_run
+from helpers import PNG, committed_rows, node_of, post_json, wait_for, write_run
 
 type Source = tuple[Explorer, Server, str]
 
@@ -70,6 +71,30 @@ def held(ex: Explorer) -> dict[str, list[Any]]:
     return out
 
 
+def kept(ex: Explorer) -> dict[str, list[Any]]:
+    """`held`, with only the levels a mirror keeps: each metric's from its top to KEPT below."""
+    out = held(ex)
+    top = {(path, key): top for path, key, _, top, _, _ in out["metrics"]}
+    out["levels"] = [row for row in out["levels"] if row[1] >= top[row[3], row[0]] - KEPT]
+    return out
+
+
+def asked(pull: object, monkeypatch: pytest.MonkeyPatch, target: str) -> list[bytes]:
+    """The answers to the requests for `target` that mirror origin `pull` makes of its upstream from now on."""
+    assert isinstance(pull, Pull)
+    taken: list[bytes] = []
+    request = pull.upstream.request
+
+    def recorded(method: str, to: str, body: bytes | None = None) -> bytes:
+        answer = request(method, to, body)
+        if to == target:
+            taken.append(answer)
+        return answer
+
+    monkeypatch.setattr(pull.upstream, "request", recorded)
+    return taken
+
+
 def blocks(ex: Explorer, key: str, paths: list[str]) -> dict[tuple[int, int], tuple[bytes, bytes]]:
     """Every block of `key` of `paths` from below their finest levels to above their top ones, and the scope's finished
     runs' blocks at those levels."""
@@ -110,7 +135,7 @@ def test_a_mirror_answers_from_its_own_index_once_the_upstream_is_gone(source: S
         assert m.rows_json("a/r1", 300) == '{"run":"a/r1","seq0":300,"rows":[]}'
 
 
-def test_a_mirror_takes_only_the_runs_that_changed_and_of_their_levels_the_blocks_that_did(
+def test_a_mirror_takes_only_the_runs_that_changed_and_of_the_levels_it_keeps_the_blocks_that_did(
         source: Source, runs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(crawl, "REFRESH", 0.0)
     monkeypatch.setattr(mirror, "RUNNING_EVERY", 0.0)
@@ -119,29 +144,18 @@ def test_a_mirror_takes_only_the_runs_that_changed_and_of_their_levels_the_block
     assert wait_for(lambda: committed_rows(runs / "c" / "r4") == 6000)
     ex.sync()
     m = synced(url, tmp_path / "cache")
-    pull = m.origin
-    assert isinstance(pull, Pull)
-    taken: list[bytes] = []
-    request = pull.upstream.request
-
-    def recorded(method: str, target: str, body: bytes | None = None) -> bytes:
-        answer = request(method, target, body)
-        if target == "/api/dumps":
-            taken.extend(bk.unframe(answer))
-        return answer
-
-    monkeypatch.setattr(pull.upstream, "request", recorded)
+    taken = asked(m.origin, monkeypatch, "/api/dumps")
     assert m.sync() == [] and taken == []
     for i in range(6000, 6040):
         live.log({"loss": 1.0}, step=i)
     assert wait_for(lambda: committed_rows(runs / "c" / "r4") == 6040)
     ex.sync()
     assert m.sync() == ["c/r4"] and len(taken) == 1
-    dump = Dump.decode("c/r4", taken[0])
-    mine = [(level, block, since) for _, level, block, path, since, _ in held(ex)["levels"] if path == "c/r4"]
+    (dump,) = (Dump.decode("c/r4", body) for body in bk.unframe(taken[0]))
+    mine = [(level, block, since) for _, level, block, path, since, _ in kept(ex)["levels"] if path == "c/r4"]
     assert not dump.replace and sorted((b.level, b.block) for b in dump.blocks) == sorted((lv, i) for lv, i, since in mine if since == 6040)
-    assert 0 < len(dump.blocks) < len(mine) // 4 and (dump.record.compiled, dump.record.rebuilt) == (6040, 6000)
-    assert held(m) == held(ex) and m.runs("c") == ex.runs("c")
+    assert 0 < len(dump.blocks) < len(mine) and (dump.record.compiled, dump.record.rebuilt) == (6040, 6000)
+    assert held(m) == kept(ex) and m.runs("c") == ex.runs("c")
     live.finish()
 
 
@@ -309,3 +323,138 @@ def test_requests_to_an_upstream_share_connections_and_survive_one_that_went_sta
     assert len(opened) == 1
     opened[0].sock.close()
     assert json.loads(up.request("GET", "/api/info"))["protocol"] == server.PROTOCOL and len(opened) == 2
+
+
+# ---- the levels a mirror keeps, and the blocks below them ----
+
+DEEP = "c/r4"  # 6000 rows: levels 0 to 5, of which a mirror keeps 3 to 5
+
+
+@pytest.fixture
+def deep(source: Source, runs: Path) -> Source:
+    """`source`, holding a run of more levels than a mirror keeps."""
+    write_run(runs / "c" / "r4", n=6000)
+    source[0].sync()
+    return source
+
+
+def fine(paths: list[str], level: int = 0, n: int = 3) -> list[Ask]:
+    """Asks for the first `n` blocks of `level` of loss of runs `paths`."""
+    return [Ask("loss", level, i, runs=paths) for i in range(n)]
+
+
+def test_a_mirror_keeps_each_metrics_top_levels_and_fetches_the_blocks_below_them_once(
+        deep: Source, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ex, _, url = deep
+    m = synced(url, tmp_path / "cache")
+    assert held(m) == kept(ex) and {lv for _, lv, _, path, _, _ in held(m)["levels"] if path == DEEP} == {3, 4, 5}
+    assert len(held(m)["levels"]) < len(held(ex)["levels"]) // 2
+    taken = asked(m.origin, monkeypatch, "/api/buckets")
+    for level in (3, 4, 5, 6):
+        assert m.buckets_bodies(fine([DEEP], level)) == ex.buckets_bodies(fine([DEEP], level)) and taken == []
+    for paths in ([DEEP], ["a/r1", DEEP, "b/r3"]):
+        for level in (-1, 0, 2):
+            was = len(taken)
+            assert m.buckets_bodies(fine(paths, level)) == ex.buckets_bodies(fine(paths, level))
+            assert len(taken) == was + (paths == [DEEP])  # one request for all the asks, and none for blocks it has fetched
+    assert m.buckets_body("loss", 0, 1, "", None, "finished") == ex.buckets_body("loss", 0, 1, "", None, "finished")
+    assert held(m) == kept(ex)
+
+
+def test_a_mirror_of_a_mirror_fetches_through_it(deep: Source, tmp_path: Path, http_server: Callable[[Server], str]) -> None:
+    ex, _, url = deep
+    hub = synced(url, tmp_path / "hub-cache")
+    leaf = synced(http_server(server.serve(node_of(hub), "127.0.0.1", 0)), tmp_path / "leaf-cache")
+    assert held(leaf) == kept(ex)
+    assert leaf.buckets_bodies(fine([DEEP, "a/r1"])) == ex.buckets_bodies(fine([DEEP, "a/r1"]))
+
+
+def test_a_mirror_whose_upstream_is_gone_answers_the_levels_it_keeps_and_the_blocks_it_fetched(
+        deep: Source, tmp_path: Path, http_server: Callable[[Server], str]) -> None:
+    ex, srv, url = deep
+    m = synced(url, tmp_path / "cache")
+    here = http_server(server.serve(node_of(m), "127.0.0.1", 0))
+    want_kept, want_fine = ex.buckets_bodies(fine([DEEP], 3)), ex.buckets_bodies(fine([DEEP], 0, 2))
+    assert m.buckets_bodies(fine([DEEP], 0, 2)) == want_fine
+    stop(ex, srv)
+    for again in (False, True):
+        if again:
+            m.close()
+            m = mirror_of(url, tmp_path / "cache")
+        assert m.buckets_bodies(fine([DEEP], 3)) == want_kept and m.buckets_bodies(fine([DEEP], 0, 2)) == want_fine
+        with pytest.raises(Unfetched):
+            m.buckets_bodies(fine([DEEP], 0, 3))
+        with pytest.raises(Unfetched):
+            m.buckets_body("loss", 1, 0, "", None, "finished")
+    status, answer = post_json(here + "/api/buckets", {"blocks": [{"key": "loss", "level": 0, "index": 5, "runs": [DEEP]}]})
+    assert status == 503 and "not here" in answer["error"]
+
+
+def test_a_mirror_whose_stream_dropped_does_not_ask_its_upstream_for_blocks(deep: Source, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, url = deep
+    m = synced(url, tmp_path / "cache")
+    pull = m.origin
+    assert isinstance(pull, Pull)
+    taken = asked(pull, monkeypatch, "/api/buckets")
+    pull._connected(True)
+    pull._connected(False)
+    with pytest.raises(Unfetched):
+        m.buckets_bodies(fine([DEEP]))
+    pull._connected(True)
+    assert len(m.buckets_bodies(fine([DEEP]))) == 3 and len(taken) == 1
+
+
+def test_a_running_runs_fetched_block_serves_until_its_levels_grow_and_is_fetched_anew_then(
+        source: Source, runs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(crawl, "REFRESH", 0.0)
+    monkeypatch.setattr(mirror, "RUNNING_EVERY", 0.0)
+    ex, _, url = source
+    live = write_run(runs / "c" / "r4", n=6000, finish=False)
+    assert wait_for(lambda: committed_rows(runs / "c" / "r4") == 6000)
+    ex.sync()
+    m = synced(url, tmp_path / "cache")
+    last = [Ask("loss", 0, 6000 // bk.BLOCK, runs=[DEEP])]
+    first = ex.buckets_bodies(last)
+    taken = asked(m.origin, monkeypatch, "/api/buckets")
+    assert m.buckets_bodies(last) == first and bk.decode(first[0]).seq.tolist() == [6000]
+    for i in range(6000, 8400):  # past the next top level: the mirror keeps one level fewer below
+        live.log({"loss": 1.0}, step=i)
+    assert wait_for(lambda: committed_rows(runs / "c" / "r4") == 8400)
+    ex.sync()
+    assert m.buckets_bodies(last) == first and len(taken) == 1  # the rows it held when fetched: the mirror's levels hold no more
+    assert m.sync() == [DEEP] and held(m) == kept(ex) and {row[1] for row in held(m)["levels"] if row[3] == DEEP} == {4, 5, 6}
+    assert m.buckets_bodies(last) == ex.buckets_bodies(last) != first and len(taken) == 2
+    live.finish()
+
+
+def test_a_run_replaced_upstream_loses_the_blocks_fetched_of_it(deep: Source, runs: Path, tmp_path: Path) -> None:
+    ex, _, url = deep
+    m = synced(url, tmp_path / "cache")
+    m.buckets_bodies(fine([DEEP]))
+    shutil.rmtree(runs / "c" / "r4")
+    write_run(runs / "c" / "r4", n=6000, metrics=lambda i: {"loss": float(i)})
+    ex.sync()
+    assert m.sync() == [DEEP]  # another run of the same path, as many updates old, is another version
+    assert held(m) == kept(ex) and m.buckets_bodies(fine([DEEP])) == ex.buckets_bodies(fine([DEEP]))
+
+
+def test_a_mirror_keeps_the_last_blocks_it_fetched(deep: Source, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(index, "FETCHED_BLOCKS", 4)
+    ex, _, url = deep
+    m = synced(url, tmp_path / "cache")
+    for i in range(0, 12, 3):
+        m.buckets_bodies([Ask("loss", 0, i + k, runs=[DEEP]) for k in range(3)])
+    c = sqlite3.connect(m.db_path)
+    try:
+        assert sorted(b for b, in c.execute("SELECT block FROM fetched")) == [8, 9, 10, 11]
+    finally:
+        c.close()
+    assert m.buckets_bodies(fine([DEEP])) == ex.buckets_bodies(fine([DEEP]))
+
+
+def test_a_workspace_has_each_mirror_fetch_the_blocks_of_a_request_at_once(deep: Source, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ex, _, url = deep
+    m = synced(url, tmp_path / "cache")
+    taken = asked(m.origin, monkeypatch, "/api/buckets")
+    ws = Workspace("w", [Member("far", m)])
+    assert ws.buckets_bodies(fine([DEEP], 0, 5)) == ex.buckets_bodies(fine([DEEP], 0, 5)) and len(taken) == 1

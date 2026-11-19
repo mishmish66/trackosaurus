@@ -136,8 +136,10 @@ supplies only what the index does not hold: rows beyond the compiled levels (`ro
   runs' file signatures (`POLL` s), and scans each changed run (`scan`, inline or on a process pool beyond
   `INLINE_BYTES` of growth) into an `Update`: record, new media, last values, and compiled levels. Rows beyond the
   levels and media files come from the run files.
-- **`Pull`** (`trex.mirror`): a directory another trex holds, through an `Upstream`. It never forwards a browser's
-  request: its Explorer answers from its own index and tails, also while the upstream is unreachable (see Transfer).
+- **`Pull`** (`trex.mirror`): a directory another trex holds, through an `Upstream`. Its index keeps each metric's
+  levels from its top to `KEPT` below (`Origin.coarse`), and its Explorer answers those, the run list and the tails
+  from what it holds, also while the upstream is unreachable; a block below those levels it fetches from the upstream
+  when first asked for (see Transfer).
 
 `Explorer.apply(updates)` writes updates in one index transaction, then publishes their events. `Explorer.dump(path,
 have)` is the other direction: what a mirror holding `have` of a run lacks.
@@ -173,9 +175,11 @@ have)` is the other direction: what a mirror holding `have` of a run lacks.
   - `metrics(path, key, fine, top, lo, hi)`: per run and metric, its `Span`: the levels it is stored at, from `fine`
     (about one row per bucket, from the median step spacing, `buckets.finest`) to `top` (the finest at which its steps
     [lo, hi] lie in at most two blocks, `buckets.level_for`);
-  - `levels(key, level, block, path, since, data)`: the run's buckets of a metric at every level from fine to top, one
-    row per block holding buckets: a zlib-compressed one-run TKB1 array (`pack`, `unpack`) and `since`, the rows
-    compiled when the block last changed;
+  - `levels(key, level, block, path, since, data)`: the run's buckets of a metric at every level from fine to top (a
+    mirror's: from `KEPT` below its top), one row per block holding buckets: a zlib-compressed one-run TKB1 array
+    (`pack`, `unpack`) and `since`, the rows compiled when the block last changed;
+  - `fetched(key, level, block, path, seq, data)`: a mirror's blocks below the levels it keeps, as its upstream
+    answered them, each with the rows it holds (`seq`); the last `FETCHED_BLOCKS` fetched (by rowid);
   - `folders(path, info)`: folder notes (`trex_info.json`); `cache(key, value)`: the cache version.
 - **Compiling** (`crawl._compile`): a new run, or one with fewer than `REBUILD_BELOW` rows compiled, is compiled from
   every row (`buckets.pyramid`), so its finest level follows its steps; after that only the blocks its new rows fall in
@@ -199,7 +203,9 @@ have)` is the other direction: what a mirror holding `have` of a run lacks.
   dir>/media/`, named by their contents, so one copy serves every run.
 - **Node state** (`$TREX_DAEMON_DIR`): `node.json` (`Identity`: id, name), `roots.json` (`Saved`: tracked directories,
   links, pulled directories with their link and via, workspaces), `history.json` (directories and links to offer
-  again), `daemon.sock`. Pulled directories are reopened from the cache at start, so they answer before their links do.
+  again), `daemon.sock`. Pulled directories are reopened from the cache at start, so they answer before their links do. `Node.load`
+  saves nothing until everything saved is held again (`_restoring`): a save in between would write `roots.json`
+  without the workspaces and pulled directories not yet restored, to be lost at the next start.
 
 ### Answering a block
 
@@ -255,8 +261,19 @@ Workers end with the process that started them (`worker_init`), also when it is 
   seconds, and then only once its tail holds `TAIL_ROWS` rows past its levels, something its rows do not carry changed
   (its state, keys, uid or media: `_urgent`), or no tail continues its levels (none, or one beginning past them, as one
   fetched from an upstream whose levels are ahead does). A `Dump` holds the record, the media items the mirror lacks,
-  the metrics' spans, and blocks: every block (`replace`) when the mirror holds nothing, another uid or another
-  `rebuilt`; else the blocks whose `since` is beyond the mirror's `compiled`.
+  the metrics' spans, and blocks of the levels a mirror keeps: every one (`replace`) when the mirror holds nothing,
+  another uid or another `rebuilt`; else those whose `since` is beyond the mirror's `compiled`.
+- **Coarse mirrors** (`index.KEPT`, 2): a mirror keeps each metric's top level and the two below it, which is what
+  any chart not zoomed into asks for (one drawing lines `pw` px wide asks for its runs' top level raised by
+  `ceil(log2(512 / pw))`, so one 4000 px wide asks two below) and a zoom of 8 into a grid's; each level below holds
+  twice the buckets. A metric's spans stay the upstream's (`fine`, `top`), so a mirror knows what lies below. Before a request's blocks are answered (`Explorer.buckets_bodies`; a workspace's for all its
+  asks, `Workspace.buckets_bodies`), `Explorer.fetch` asks the upstream, in one `POST /api/buckets`, for the blocks
+  below the kept levels that `fetched` lacks (`Pull.blocks`; a mirror of a mirror fetches through it), and stores each
+  run's part with the rows it holds. A fetched block answers while it holds at least the rows its run's levels do, with
+  its own `seq`: a running run's is fetched anew once a dump has raised `compiled`, and is dropped with the run's
+  levels when a dump replaces them. A block that cannot be fetched (the upstream does not answer; not asked at all
+  while its stream is down, `Pull._lost`) fails its request with 503 (`Unfetched`), which the page retries as any
+  failed block, showing the coarser layers meanwhile.
 - **The stream**: the Pull follows the upstream's `/api/stream`. A `run` event whose `ver` the index lacks, or a
   `media` event, marks the run; `delete` drops it; `folder` updates folder notes; `rows` events extend running runs'
   **tails** (rows beyond their levels, fetched once by `GET /api/rows?path=&from=<compiled>` while the stream is up)
@@ -318,6 +335,10 @@ Every run gets a `dir` field: its member's name.
   copied rather than drawn; a draw whose binning is gone keeps no image, and a chart's images go with it (`dispose`).
   Every run object has the page's fields from its creation, in one order (`RUN_FIELDS`, `Data.newRun`), so code reading
   them over all runs sees one shape.
+- **Group-by**: a path opens with the group-by last typed at it in this browser (`App.groupFor`; `keepGroup` stores
+  them by path, per directory, in localStorage), else its folder's `group_by` or the nearest one above
+  (`defaultGroup`), else `DEFAULT_GROUP`. A folder or run under it opens with its own. The hash states a group-by that
+  differs from the folder's, and one in the hash is the one shown. `typed_group_smoke` covers it.
 - **Planning** (`data.js`): visible charts state what they show (`plan`, one demand per metric). A chart wants a coarse
   layer, blocks of one level over every step of its runs, and when zoomed a finer layer over its view (at most
   `FINE_BLOCKS` blocks): levels with buckets about `LINE_PX_PER_BUCKET` wide on screen (`DENSITY_PX_PER_BUCKET` for a
@@ -492,12 +513,17 @@ Every run gets a `dir` field: its member's name.
   subscribed (a workspace's to every member, `Workspace._follow`), so no run that appears in between is missed.
 - **A run's version is set where it is crawled.** `apply` bumps `ver` on every change of a crawled run (`Update.ver`
   None); a Pull copies the upstream's. Mirrors decide what to dump by comparing `ver`, so a change that leaves `ver` as
-  it was never reaches them.
+  it was never reaches them. A run that replaces another at its path counts on from the other's version (`_record`).
 - **A stored block changes only with its `since`.** Every compile writes `since` = the rows compiled for each block it
   changes, and a dump sends the blocks whose `since` is beyond what the mirror holds. A full compile sets `rebuilt`, and
   a mirror whose `rebuilt` differs takes every block (`replace`), because a full compile can change any block.
-- **Mirrors never forward requests.** Everything a Pull's Explorer answers comes from its index, its media copies and
-  its tails; the upstream is reached only to take what changed.
+- **Mirrors answer what any unzoomed chart asks without their upstream.** The run list, rows, media it has copied and
+  every block at a metric's top `KEPT` + 1 levels or above come from a Pull's index and tails. Only blocks below those
+  levels (and media files not yet copied) are fetched when asked for, and kept; a request never waits for an upstream
+  whose stream is down.
+- **A fetched block names the rows it holds.** A mirror answers a fetched block with the `seq` its upstream gave, never
+  its own `compiled`: the upstream's levels may be ahead of the mirror's, and the browser adds the rows beyond `seq`
+  from the stream.
 - **One Explorer per index directory** (its `lock`). Two processes of the same origin get separate indexes.
 - **Kept runs name all they were computed from.** `App.computeRuns` restores a view's runs while its `runsKey` and the
   metadata of the runs under its path are as they were. Whatever else it, or what it calls, comes to read (another
