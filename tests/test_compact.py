@@ -15,7 +15,7 @@ from trex import chunks, compact
 from trex.cli import main
 from trex.format import DB, connect_rw
 
-from helpers import commit_count, readback_run
+from helpers import commit_count, committed_rows, readback_run, wait_for
 
 
 @pytest.fixture
@@ -27,12 +27,13 @@ def unmerged(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def small_commit_run(d: Path, n: int = 200) -> None:
+    """A finished run of `n` rows, each in a commit of its own however slowly the commit thread runs."""
     run = trex.init(d, config={"lr": 0.1}, commit_interval=0.001)
     for i in range(n):
         run.log({"loss": i + 0.5, "nan": float("nan"), **({"eval": -float(i)} if i % 7 == 0 else {})}, step=i)
         if i % 50 == 0:
             run.log_html("report", f"<b>{i}</b>", step=i)
-        time.sleep(0.002)
+        assert wait_for(lambda: committed_rows(d) == i + 1, every=0.0005)
     run.summary(best=0.5)
     run.finish()
 
@@ -42,7 +43,7 @@ def test_compacting_a_finished_run_keeps_everything_readers_see_in_few_commits(t
     small_commit_run(d)
     before, many = readback_run(d), commit_count(d)
     r = compact.compact(d)
-    assert readback_run(d) == before and commit_count(d) == r.commits_after == 1 and r.commits_before == many > 50
+    assert readback_run(d) == before and commit_count(d) == r.commits_after == 1 and r.commits_before == many >= 200
     assert r.bytes_after < r.bytes_before and sorted(p.name for p in d.iterdir()) == ["media", DB]
 
 

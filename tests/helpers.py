@@ -36,11 +36,11 @@ def write_run(d: Path, n: int = 5, *, finish: bool = True, image: bool = False,
     return run
 
 
-def wait_for(cond: Callable[[], object], timeout: float = 20.0) -> bool:
-    """Whether `cond()` became true within `timeout` seconds."""
+def wait_for(cond: Callable[[], object], timeout: float = 20.0, every: float = 0.02) -> bool:
+    """Whether `cond()` became true within `timeout` seconds, looked at `every` seconds."""
     end = time.time() + timeout
     while not cond() and time.time() < end:
-        time.sleep(0.02)
+        time.sleep(every)
     return bool(cond())
 
 
